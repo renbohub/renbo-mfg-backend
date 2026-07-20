@@ -1,0 +1,3 @@
+ALTER TABLE "tbl_mbomdetail"
+  ALTER COLUMN "lead_time" TYPE DOUBLE PRECISION USING "lead_time"::DOUBLE PRECISION,
+  ADD COLUMN "lead_time_unit" TEXT NOT NULL DEFAULT 'HOUR';

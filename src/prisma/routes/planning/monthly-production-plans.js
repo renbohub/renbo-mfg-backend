@@ -1,0 +1,12 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/planning/MonthlyProductionPlanController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+const { approvalGate } = require("../../services/approvalRuleService");
+const monthlyPlanApproval = approvalGate({ moduleCode: "planning-ppic", pageCode: "monthly-plan", actionCode: "approve", documentType: "MonthlyProductionPlan", param: "planNumber", model: "monthlyProductionPlan", lookupField: "planNumber", numberField: "planNumber" });
+router.post("/from-mps", authorize("monthlyProductionPlan", "create"), logger("monthlyProductionPlan", "create-from-mps"), ctrl.createFromMps);
+router.post("/:planNumber/confirm", authorize("monthlyProductionPlan", "approve"), monthlyPlanApproval, logger("monthlyProductionPlan", "confirm"), ctrl.confirm);
+router.post("/:planNumber/release", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "release"), ctrl.release);
+router.get("/", authorize("monthlyProductionPlan", "read"), ctrl.list);
+router.get("/:planNumber", authorize("monthlyProductionPlan", "read"), ctrl.get);
+module.exports = router;

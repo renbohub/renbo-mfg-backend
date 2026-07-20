@@ -1,0 +1,12 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/sales/SalesOrderController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+router.get("/generate-number", authorize("salesOrder", "create"), ctrl.generateNumber);
+router.get("/", authorize("salesOrder", "read"), ctrl.list);
+router.get("/:soNumber", authorize("salesOrder", "read"), ctrl.get);
+router.post("/", authorize("salesOrder", "create"), logger("salesOrder", "create"), ctrl.create);
+router.patch("/:soNumber", authorize("salesOrder", "update"), logger("salesOrder", "update", { modelName: "salesOrderHeader", paramKey: "soNumber", whereKey: "soNumber" }), ctrl.update);
+router.delete("/:soNumber", authorize("salesOrder", "delete"), logger("salesOrder", "delete", { paramKey: "soNumber", entityField: "soNumber" }), ctrl.remove);
+module.exports = router;
+

@@ -1,0 +1,4374 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================
+// ENUM
+// ============================================
+
+enum Status {
+  Draft
+  Pending
+  Approved
+  Rejected
+  Active
+  Inactive
+  Obsolete
+}
+
+enum Category {
+  inHouse
+  Purchase
+  Vendor
+}
+
+enum BomCostType {
+  Material
+  Process
+  Overhead
+}
+
+enum DiesStatus {
+  Active
+  Maintenance
+  Retired
+  Scrapped
+  Reserved
+}
+
+enum DiesOwnerType {
+  Mitsutoyo
+  Customer
+}
+
+// ============================================
+// USER & AUTHENTICATION
+// ============================================
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  password     String
+  fullName     String?  @map("full_name")
+  email        String?
+  employeeId   String?  @unique @map("employee_id")
+  isSuperAdmin Boolean  @default(false) @map("is_super_admin")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  listMenu     Json     @default("[]") @map("list_menu")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  employee Employee? @relation(fields: [employeeId], references: [employeeId], onDelete: SetNull)
+  roleAssignments UserRole[]
+
+  @@index([username])
+  @@index([employeeId])
+  @@index([isDeleted])
+  @@map("tbl_users")
+}
+
+model ExportToken {
+  id         String    @id @default(uuid())
+  jti        String    @unique
+  tokenName  String?   @map("token_name")
+  issuedBy   String    @map("issued_by")
+  issuedAt   DateTime  @default(now()) @map("issued_at")
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  revokedBy  String?   @map("revoked_by")
+  revokeNote String?   @map("revoke_note")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  @@index([issuedBy])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@map("tbl_export_tokens")
+}
+
+// ============================================
+// SYSTEM - LOGS
+// ============================================
+
+model Log {
+  id           String @id @default(uuid())
+  nameRoute    String @map("name_route") // ebom, mbom, customer, supplier, sales-order, dll
+  action       String // create, update, delete, read, bulk-remove, dll
+  method       String // GET, POST, PUT, DELETE, PATCH
+  url          String
+  statusCode   Int    @map("status_code")
+  responseTime Int?   @map("response_time") // in milliseconds
+
+  userId    String? @map("user_id")
+  username  String?
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  entityId      String? @map("entity_id") // ID/identifier yang dimodifikasi (noReg, customerCode, dll)
+  requestParams Json?   @map("request_params") // URL params
+  changes       Json?   @map("changes") // Detail perubahan: { field: { old: x, new: y } }
+  errorMessage  String? @map("error_message") // Error tracking
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([nameRoute])
+  @@index([action])
+  @@index([entityId])
+  @@index([userId])
+  @@index([username])
+  @@index([statusCode])
+  @@index([createdAt])
+  @@map("tbl_logs")
+}
+
+model SystemSetting {
+  id           String   @id @default(uuid())
+  settingKey   String   @unique @map("setting_key")
+  settingValue String   @map("setting_value")
+  description  String?
+  updatedBy    String?  @map("updated_by")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([settingKey])
+  @@index([isDeleted])
+  @@map("tbl_system_settings")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  roleCode    String   @unique @map("role_code")
+  roleName    String   @map("role_name")
+  description String?
+  isSystem    Boolean  @default(false) @map("is_system")
+  isActive    Boolean  @default(true) @map("is_active")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdBy   String?  @map("created_by")
+  updatedBy   String?  @map("updated_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users         UserRole[]
+  permissions   RolePermission[]
+  approvalSteps ApprovalRuleStep[]
+
+  @@index([roleCode])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_roles")
+}
+
+model UserRole {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  roleId     String   @map("role_id")
+  isPrimary  Boolean  @default(false) @map("is_primary")
+  isActive   Boolean  @default(true) @map("is_active")
+  assignedBy String?  @map("assigned_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+  @@index([isActive])
+  @@map("tbl_user_roles")
+}
+
+model RolePermission {
+  id           String   @id @default(uuid())
+  roleId       String   @map("role_id")
+  moduleCode   String   @map("module_code")
+  pageCode     String   @map("page_code")
+  resourceCode String?  @map("resource_code")
+  actions      Json     @default("[]")
+  dataScope    Json?    @map("data_scope")
+  isActive     Boolean  @default(true) @map("is_active")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdBy    String?  @map("created_by")
+  updatedBy    String?  @map("updated_by")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, moduleCode, pageCode])
+  @@index([roleId])
+  @@index([moduleCode, pageCode])
+  @@index([resourceCode])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_role_permissions")
+}
+
+model ApprovalRule {
+  id                  String    @id @default(uuid())
+  ruleCode            String    @unique @map("rule_code")
+  ruleName            String    @map("rule_name")
+  moduleCode          String    @map("module_code")
+  pageCode            String    @map("page_code")
+  actionCode          String    @default("approve") @map("action_code")
+  documentType        String?   @map("document_type")
+  description         String?
+  priority            Int       @default(100)
+  minAmount           Float?    @map("min_amount")
+  maxAmount           Float?    @map("max_amount")
+  currencyCode        String?   @map("currency_code")
+  conditions          Json?
+  requireSequential   Boolean   @default(true) @map("require_sequential")
+  allowSelfApproval   Boolean   @default(false) @map("allow_self_approval")
+  effectiveFrom       DateTime? @map("effective_from")
+  effectiveUntil      DateTime? @map("effective_until")
+  isActive            Boolean   @default(true) @map("is_active")
+  isDeleted           Boolean   @default(false) @map("is_deleted")
+  createdBy           String?   @map("created_by")
+  updatedBy           String?   @map("updated_by")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  steps    ApprovalRuleStep[]
+  requests ApprovalRequest[]
+
+  @@index([ruleCode])
+  @@index([moduleCode, pageCode, actionCode])
+  @@index([priority])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_approval_rules")
+}
+
+model ApprovalRuleStep {
+  id               String   @id @default(uuid())
+  approvalRuleId   String   @map("approval_rule_id")
+  stepOrder        Int      @map("step_order")
+  stepName         String   @map("step_name")
+  approverRoleId   String?  @map("approver_role_id")
+  permissionAction String   @default("approve") @map("permission_action")
+  requiredApprovals Int     @default(1) @map("required_approvals")
+  pendingStatus    String?  @map("pending_status")
+  approvedStatus   String?  @map("approved_status")
+  rejectedStatus   String?  @map("rejected_status")
+  slaHours         Int?     @map("sla_hours")
+  canDelegate      Boolean  @default(false) @map("can_delegate")
+  isActive         Boolean  @default(true) @map("is_active")
+  isDeleted        Boolean  @default(false) @map("is_deleted")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  rule    ApprovalRule     @relation(fields: [approvalRuleId], references: [id], onDelete: Cascade)
+  role    Role?            @relation(fields: [approverRoleId], references: [id], onDelete: SetNull)
+  actions ApprovalAction[]
+
+  @@unique([approvalRuleId, stepOrder])
+  @@index([approvalRuleId])
+  @@index([approverRoleId])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_approval_rule_steps")
+}
+
+model ApprovalRequest {
+  id                String    @id @default(uuid())
+  requestNumber     String    @unique @map("request_number")
+  approvalRuleId    String    @map("approval_rule_id")
+  moduleCode        String    @map("module_code")
+  pageCode          String    @map("page_code")
+  actionCode        String    @default("approve") @map("action_code")
+  documentType      String?   @map("document_type")
+  documentId        String    @map("document_id")
+  documentNumber    String?   @map("document_number")
+  amount            Float?
+  currencyCode      String?   @map("currency_code")
+  currentStep       Int       @default(1) @map("current_step")
+  status            String    @default("Pending")
+  context           Json?
+  requestedByUserId String?   @map("requested_by_user_id")
+  requestedBy       String?   @map("requested_by")
+  requestedAt       DateTime  @default(now()) @map("requested_at")
+  completedAt       DateTime? @map("completed_at")
+  isDeleted         Boolean   @default(false) @map("is_deleted")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  rule    ApprovalRule   @relation(fields: [approvalRuleId], references: [id], onDelete: Restrict)
+  actions ApprovalAction[]
+
+  @@index([moduleCode, pageCode, actionCode, documentId, isDeleted])
+  @@index([requestNumber])
+  @@index([approvalRuleId])
+  @@index([moduleCode, pageCode, actionCode])
+  @@index([documentId])
+  @@index([status])
+  @@index([requestedByUserId])
+  @@index([isDeleted])
+  @@map("tbl_approval_requests")
+}
+
+model ApprovalAction {
+  id            String   @id @default(uuid())
+  requestId     String   @map("request_id")
+  ruleStepId    String?  @map("rule_step_id")
+  stepOrder     Int      @map("step_order")
+  action        String
+  actedByUserId String?  @map("acted_by_user_id")
+  actedBy       String?  @map("acted_by")
+  notes         String?
+  metadata      Json?
+  actedAt       DateTime @default(now()) @map("acted_at")
+
+  request ApprovalRequest  @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  step    ApprovalRuleStep? @relation(fields: [ruleStepId], references: [id], onDelete: SetNull)
+
+  @@index([requestId])
+  @@index([ruleStepId])
+  @@index([stepOrder])
+  @@index([action])
+  @@index([actedByUserId])
+  @@map("tbl_approval_actions")
+}
+
+model NumberingRule {
+  id            String   @id @default(uuid())
+  ruleKey       String   @unique @map("rule_key")
+  ruleName      String   @map("rule_name")
+  prefix        String   @default("")
+  pattern       String   @default("{PREFIX}-{SEQ}")
+  sequenceLength Int     @default(4) @map("sequence_length")
+  nextNumber    Int      @default(1) @map("next_number")
+  incrementBy   Int      @default(1) @map("increment_by")
+  processStep   Int      @default(10) @map("process_step")
+  insertionStart Int     @default(11) @map("insertion_start")
+  siblingAlphaMode String @default("SAME_PROCESS") @map("sibling_alpha_mode")
+  inheritBranchAlpha Boolean @default(true) @map("inherit_branch_alpha")
+  resetPolicy   String   @default("NONE") @map("reset_policy")
+  lastResetKey  String?  @map("last_reset_key")
+  isActive      Boolean  @default(true) @map("is_active")
+  notes         String?
+  updatedBy     String?  @map("updated_by")
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@index([ruleKey])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_numbering_rules")
+}
+
+// ============================================
+// MASTER DATA - UOM (Unit of Measure)
+// ============================================
+
+model Uom {
+  id        String   @id @default(uuid())
+  uomCode   String   @unique @map("uom_code")
+  uomName   String?  @map("uom_name")
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomHeaders         MBOMHeader[]
+  mbomDetails         MBOMDetail[]
+  ebomHeaders         EBOMHeader[]
+  ebomDetails         EBOMDetail[]
+  salesOrderDetails   SalesOrderDetail[]
+  quotationDetails    QuotationDetail[]
+  products            Product[]
+  productPriceLists   ProductPriceList[]
+  manufacturingOrders ManufacturingOrder[]
+  workOrders          WorkOrder[]
+
+  @@index([uomCode])
+  @@index([uomName])
+  @@index([isDeleted])
+  @@map("tbl_uom")
+}
+
+// ============================================
+// MASTER DATA - CURRENCY
+// ============================================
+
+model Currency {
+  id           String   @id @default(uuid())
+  currencyCode String   @unique @map("currency_code")
+  currencyName String?  @map("currency_name")
+  symbol       String?
+  exchangeRate Float    @default(1.0) @map("exchange_rate")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  customers          Customer[]
+  salesOrderHeaders  SalesOrderHeader[]
+  quotationHeaders   QuotationHeader[]
+  vendorPriceLists   VendorPriceList[]
+  partPriceLists     PartPriceList[]
+  materialPriceLists MaterialPriceList[]
+  productPriceLists  ProductPriceList[]
+  mbomCostHeaders    MBOMCostHeader[]
+  ebomCostHeaders    EBOMCostHeader[]
+  purchaseOrders     PurchaseOrder[]
+  purchaseInvoices   PurchaseInvoice[]
+
+  @@index([currencyCode])
+  @@index([isDeleted])
+  @@map("tbl_currency")
+}
+
+// ============================================
+// MASTER DATA - CUSTOMER
+// ============================================
+
+model Customer {
+  id                     String   @id @default(uuid())
+  customerCode           String   @unique @map("customer_code")
+  customerName           String?  @map("customer_name")
+  contact                String?
+  phone                  String?
+  email                  String?
+  billingAddress         String?  @map("billing_address")
+  shippingAddress        String?  @map("shipping_address")
+  currencyCode           String?  @map("currency_code")
+  paymentTerms           String?  @map("payment_terms")
+  taxId                  String?  @map("tax_id")
+  notes                  String?
+  status                 String? // Active, Inactive
+  customerClassification String[] @default([]) @map("customer_classification") // Regular, Dies Only, Job Order
+  isDeleted              Boolean  @default(false) @map("is_deleted")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  currency          Currency?          @relation(fields: [currencyCode], references: [currencyCode])
+  salesOrderHeaders SalesOrderHeader[]
+  quotationHeaders  QuotationHeader[]
+  vendorPriceLists  VendorPriceList[]
+
+  @@index([customerCode])
+  @@index([customerName])
+  @@index([contact])
+  @@index([phone])
+  @@index([email])
+  @@index([currencyCode])
+  @@index([isDeleted])
+  @@map("tbl_customer")
+}
+
+// ============================================
+// MASTER DATA - SUPPLIER
+// ============================================
+
+model Supplier {
+  id              String   @id @default(uuid())
+  supplierCode    String   @unique @map("supplier_code")
+  supplierName    String?  @map("supplier_name")
+  contact         String?
+  phone           String?
+  email           String?
+  billingAddress  String?  @map("billing_address")
+  shippingAddress String?  @map("shipping_address")
+  leadTimeDays    Int?     @map("lead_time_days")
+  taxId           String?  @map("tax_id")
+  notes           String?
+  status          String   @default("Active") // Active, Inactive
+  users           String[] @default([]) // ["operational", "engineer", "other"]
+  isDeleted       Boolean  @default(false) @map("is_deleted")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  materialPriceLists MaterialPriceList[]
+  productPriceLists  ProductPriceList[]
+  partPriceLists     PartPriceList[]
+  entityProcesses    EntityVendorProcess[]
+  mainBusinesses     SupplierMainBusiness[]
+  purchaseOrders     PurchaseOrder[]
+  purchaseInvoices   PurchaseInvoice[]
+  parts              Part[]
+
+  @@index([supplierCode])
+  @@index([supplierName])
+  @@index([contact])
+  @@index([phone])
+  @@index([email])
+  @@index([isDeleted])
+  @@map("tbl_supplier")
+}
+
+// ============================================
+// MASTER DATA - VENDOR
+// ============================================
+
+model Vendor {
+  id              String   @id @default(uuid())
+  vendorCode      String   @unique @map("vendor_code")
+  vendorName      String?  @map("vendor_name")
+  contact         String?
+  phone           String?
+  email           String?
+  billingAddress  String?  @map("billing_address")
+  shippingAddress String?  @map("shipping_address")
+  leadTimeDays    Int?     @map("lead_time_days")
+  taxId           String?  @map("tax_id")
+  notes           String?
+  status          String   @default("Active") // Active, Inactive
+  users           String[] @default([]) // ["oprational", "engineer", "other"]
+  isDeleted       Boolean  @default(false) @map("is_deleted")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  entityProcesses  EntityVendorProcess[]
+  mainBusinesses   VendorMainBusiness[]
+  vendorPriceLists VendorPriceList[]
+  purchaseOrders   PurchaseOrder[]
+  purchaseInvoices PurchaseInvoice[]
+
+  @@index([vendorCode])
+  @@index([vendorName])
+  @@index([contact])
+  @@index([phone])
+  @@index([email])
+  @@index([isDeleted])
+  @@map("tbl_vendor")
+}
+
+// ============================================
+// MASTER DATA - MAIN BUSINESS
+// ============================================
+
+model MainBusiness {
+  id               String   @id @default(uuid())
+  mainBusinessCode String   @unique @map("main_business_code")
+  mainBusinessName String?  @map("main_business_name")
+  notes            String?
+  isDeleted        Boolean  @default(false) @map("is_deleted")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  vendors   VendorMainBusiness[]
+  suppliers SupplierMainBusiness[]
+
+  @@index([mainBusinessCode])
+  @@index([mainBusinessName])
+  @@index([isDeleted])
+  @@map("tbl_main_business")
+}
+
+model VendorMainBusiness {
+  id             String   @id @default(uuid())
+  vendorId       String   @map("vendor_id")
+  mainBusinessId String   @map("main_business_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  vendor       Vendor       @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  mainBusiness MainBusiness @relation(fields: [mainBusinessId], references: [id], onDelete: Cascade)
+
+  @@unique([vendorId, mainBusinessId])
+  @@index([vendorId])
+  @@index([mainBusinessId])
+  @@map("tbl_vendor_main_business")
+}
+
+model SupplierMainBusiness {
+  id             String   @id @default(uuid())
+  supplierId     String   @map("supplier_id")
+  mainBusinessId String   @map("main_business_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  supplier     Supplier     @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  mainBusiness MainBusiness @relation(fields: [mainBusinessId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, mainBusinessId])
+  @@index([supplierId])
+  @@index([mainBusinessId])
+  @@map("tbl_supplier_main_business")
+}
+
+// ============================================
+// MASTER DATA - VENDOR PROCESS
+// ============================================
+
+model VendorProcess {
+  id                String   @id @default(uuid())
+  category          String?  @map("category")
+  vendorProcessCode String   @unique @map("vendor_process_code")
+  vendorProcessName String?  @map("vendor_process_name")
+  notes             String?
+  isDeleted         Boolean  @default(false) @map("is_deleted")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  entityProcesses        EntityVendorProcess[]
+  vendorPriceListDetails VendorPriceListDetail[]
+
+  @@index([vendorProcessCode])
+  @@index([vendorProcessName])
+  @@index([category])
+  @@index([isDeleted])
+  @@map("tbl_vendor_process")
+}
+
+// ============================================
+// MASTER DATA - ENTITY VENDOR PROCESS (UNIFIED JUNCTION)
+// ============================================
+
+model EntityVendorProcess {
+  id              String   @id @default(uuid())
+  entityType      String   @map("entity_type") // "vendor", "supplier", atau "vendorPriceList"
+  vendorId        String?  @map("vendor_id")
+  supplierId      String?  @map("supplier_id")
+  priceListId     String?  @map("price_list_id")
+  vendorProcessId String   @map("vendor_process_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  // Relations
+  vendor        Vendor?          @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  supplier      Supplier?        @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  priceList     VendorPriceList? @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  vendorProcess VendorProcess    @relation(fields: [vendorProcessId], references: [id], onDelete: Cascade)
+
+  @@unique([entityType, vendorId, supplierId, priceListId, vendorProcessId])
+  @@index([entityType])
+  @@index([vendorId])
+  @@index([supplierId])
+  @@index([priceListId])
+  @@index([vendorProcessId])
+  @@map("tbl_entity_vendorprocess")
+}
+
+// ============================================
+// MASTER DATA - PART
+// ============================================
+
+model Part {
+  id           String  @id @default(uuid())
+  partCode     String  @unique @map("part_code")
+  partNumber   String? @map("part_no")
+  partName     String? @map("part_name")
+  model        String?
+  variant      String?
+  customerCode String? @map("customer_code")
+
+  // Multiple customers untuk purchase part
+  customerCodes String[] @default([]) @map("customer_codes")
+
+  itemType       String? @map("item_type") // FG, WIP, RAW
+  rawType        String? @map("raw_type") // MATERIAL, PURCHASE_PART (only when itemType = RAW)
+  partType       String  @default("STANDARD") @map("part_type") // STANDARD, COMP
+  hasDrawing     Boolean @default(false) @map("has_drawing")
+  componentLevel Int     @default(0) @map("component_level")
+  processSequence Int    @default(0) @map("process_sequence")
+  bomLevel        Int    @default(0) @map("bom_level")
+  branchCode     String? @map("branch_code")
+  category       String? // e.g., PD, WD, MD, DLL
+  status         String? @default("Active") // Active, Inactive
+  statusService  String? @map("status_service") // Service, Non Service
+  planningPolicy String? @map("planning_policy") // MTO = SO-based, MTS = forecast-based
+  assemblyPolicy String  @default("INLINE") @map("assembly_policy") // INLINE, SUB_ASSEMBLY
+  bufferStock    Float   @default(0) @map("buffer_stock") // Buffer stock percentage untuk planning
+
+  // Transaction permissions mengikuti master Part pada Figma.
+  canPurchase    Boolean @default(true) @map("can_purchase")
+  canManufacture Boolean @default(true) @map("can_manufacture")
+  canSell        Boolean @default(true) @map("can_sell")
+  canStore       Boolean @default(true) @map("can_store")
+  canUseInBom    Boolean @default(true) @map("can_use_in_bom")
+  canSubcontract Boolean @default(true) @map("can_subcontract")
+  canTrackLot    Boolean @default(true) @map("can_track_lot")
+  canTrackSerial Boolean @default(true) @map("can_track_serial")
+
+  materialId String? @map("material_id")
+  supplierId String? @map("supplier_id")
+  processId  String? @map("process_id")
+
+  photos Json? @map("photos") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+
+  noPhp     String? @map("no_php")
+  statusPhp String? @map("status_php") // Non-Php, Php
+
+  // Packing Info - BOX
+  pcsPerBox Float? @map("pcs_per_box") // Pcs/Box
+  kgPerBox  Float? @map("kg_per_box") // Kg/Box
+
+  // Packing Info - Plastic
+  packingPlastic   String? @map("packing_plastic") // Nama/jenis plastik
+  pcsPerPlastic    Float?  @map("pcs_per_plastic") // Pcs per plastik
+  kgPerPlastic     Float?  @map("kg_per_plastic") // Kg per plastik
+  qtyPlasticPerBox Float?  @map("qty_plastic_per_box") // Qty plastik per box
+  // qtyPcsPerBox dan qtyKgPerBox adalah calculated field di frontend
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomDetails          MBOMDetail[]
+  mbomHeaders          MBOMHeader[]
+  ebomDetails          EBOMDetail[]
+  ebomHeaders          EBOMHeader[]
+  quotationDetails     QuotationDetail[]
+  salesOrderDetails    SalesOrderDetail[]
+  vendorPriceLists     VendorPriceList[]
+  partPriceLists       PartPriceList[]
+  material             Material?            @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  supplier             Supplier?            @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  process              Process?             @relation(fields: [processId], references: [id], onDelete: SetNull)
+  partBases            PartBase[]
+  attachments          PartAttachment[]
+  diesParts            DiesPart[]
+  diesUsages           DiesUsage[]
+  manufacturingOrders  ManufacturingOrder[]
+  mpsDetails           MPSDetail[]
+  mrpRequirements      MRPRequirement[]
+  plannedOrders        PlannedOrder[]
+  forecastDetails      ForecastDetail[]
+  qualityInspections   QualityInspection[]
+  mrpDirtyItems        MRPDirtyItem[]
+  bomRelationsAsParent BOMRelation[]        @relation("BOMRelationParent")
+  bomRelationsAsChild  BOMRelation[]        @relation("BOMRelationChild")
+  itemLevelsAsRoot     ItemLevel[]          @relation("ItemLevelRoot")
+  itemLevelsAsItem     ItemLevel[]          @relation("ItemLevelItem")
+  mrpPeggings          MRPPegging[]
+
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([partName])
+  @@index([model])
+  @@index([variant])
+  @@index([customerCode])
+  @@index([itemType])
+  @@index([rawType])
+  @@index([partType])
+  @@index([hasDrawing])
+  @@index([componentLevel])
+  @@index([processSequence])
+  @@index([bomLevel])
+  @@index([branchCode])
+  @@index([assemblyPolicy])
+  @@index([category])
+  @@index([status])
+  @@index([supplierId])
+  @@index([processId])
+  @@index([isDeleted])
+  @@map("tbl_part")
+}
+
+// ============================================
+// MASTER DATA - DIES (MOLD/TOOLING)
+// ============================================
+
+model Dies {
+  id                  String            @id @default(uuid())
+  diesCode            String            @unique @map("dies_code")
+  diesNumber          String?           @map("dies_number") // Nomor fisik Dies
+  diesName            String?           @map("dies_name")
+  ownerType           DiesOwnerType     @default(Mitsutoyo) @map("owner_type") // Company atau Customer
+  customerCode        String?           @map("customer_code") // Jika milik customer
+  category            String? // Dies Only, Dies & Part
+  status              DiesStatus        @default(Active)
+  location            String? // Lokasi fisik dies (warehouse, storage)
+  warehouseCode       String?           @map("warehouse_code")
+  // Shot Counter Tracking
+  shotCounter         Int               @default(0) @map("shot_counter") // Jumlah shot sudah dilakukan
+  maxShotLifetime     Int?              @map("max_shot_lifetime") // Batas maksimal shot sebelum overhaul
+  // Financial
+  purchaseDate        DateTime?         @map("purchase_date")
+  purchaseCost        Float?            @map("purchase_cost")
+  currencyCode        String?           @default("IDR") @map("currency_code")
+  depreciationRate    Float?            @map("depreciation_rate") // % per tahun
+  // Maintenance Schedule
+  lastMaintenanceDate DateTime?         @map("last_maintenance_date")
+  nextMaintenanceDate DateTime?         @map("next_maintenance_date")
+  maintenanceInterval Int?              @map("maintenance_interval") // Interval dalam hari
+  // Specifications
+  cavity              Int? // Jumlah cavity
+  tonnage             Float? // Tonnage machine yang dibutuhkan
+  cycleTime           Float?            @map("cycle_time") // Cycle time standar (detik)
+  // Files & Documentation
+  photos              Json?             @map("photos") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  drawings            Json?             @map("drawings") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  specs               Json?             @map("specs") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  notes               String?
+  isDeleted           Boolean           @default(false) @map("is_deleted")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+  // Relations
+  diesParts           DiesPart[]
+  maintenances        DiesMaintenance[]
+  usages              DiesUsage[]
+  workOrders          WorkOrder[]
+
+  @@index([diesCode])
+  @@index([diesNumber])
+  @@index([diesName])
+  @@index([ownerType])
+  @@index([customerCode])
+  @@index([category])
+  @@index([status])
+  @@index([location])
+  @@index([warehouseCode])
+  @@index([shotCounter])
+  @@index([nextMaintenanceDate])
+  @@index([isDeleted])
+  @@map("tbl_dies")
+}
+
+// ============================================
+// MASTER DATA - DIES-PART RELATION
+// ============================================
+
+model DiesPart {
+  id             String    @id @default(uuid())
+  diesId         String    @map("dies_id")
+  partId         String    @map("part_id")
+  isPrimary      Boolean   @default(true) @map("is_primary") // Dies utama untuk part ini?
+  isActive       Boolean   @default(true) @map("is_active") // Masih aktif digunakan?
+  effectiveDate  DateTime  @default(now()) @map("effective_date")
+  expiryDate     DateTime? @map("expiry_date")
+  expectedOutput Int?      @map("expected_output") // Expected output per shot (cavity)
+  notes          String?
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  // Relations
+  dies           Dies      @relation(fields: [diesId], references: [id], onDelete: Cascade)
+  part           Part      @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  @@index([diesId])
+  @@index([partId])
+  @@index([diesId, partId, isActive])
+  @@index([isPrimary])
+  @@index([isActive])
+  @@map("tbl_dies_part")
+}
+
+// ============================================
+// MASTER DATA - DIES MAINTENANCE HISTORY
+// ============================================
+
+model DiesMaintenance {
+  id                  String    @id @default(uuid())
+  diesId              String    @map("dies_id")
+  maintenanceNumber   String    @unique @map("maintenance_number")
+  maintenanceDate     DateTime  @default(now()) @map("maintenance_date")
+  maintenanceType     String    @map("maintenance_type") // Preventive, Corrective, Overhaul, Inspection
+  // Before Maintenance
+  shotCounterBefore   Int?      @map("shot_counter_before")
+  statusBefore        String?   @map("status_before")
+  // Work Performed
+  workDescription     String?   @map("work_description")
+  partsReplaced       String?   @map("parts_replaced") // List parts yang diganti
+  // After Maintenance
+  shotCounterReset    Boolean   @default(false) @map("shot_counter_reset") // Reset counter?
+  statusAfter         String?   @map("status_after")
+  // Vendor/Workshop
+  performedBy         String?   @map("performed_by")
+  vendorCode          String?   @map("vendor_code") // Jika maintenance by vendor
+  // Financial
+  cost                Float?    @default(0)
+  currencyCode        String?   @default("IDR") @map("currency_code")
+  // Downtime
+  startDate           DateTime? @map("start_date")
+  endDate             DateTime? @map("end_date")
+  downtime            Float?    @map("downtime") // in minutes
+  // Next Schedule
+  nextMaintenanceDate DateTime? @map("next_maintenance_date")
+  notes               String?
+  isDeleted           Boolean   @default(false) @map("is_deleted")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+  // Relations
+  dies                Dies      @relation(fields: [diesId], references: [id], onDelete: Cascade)
+
+  @@index([diesId])
+  @@index([maintenanceNumber])
+  @@index([maintenanceDate])
+  @@index([maintenanceType])
+  @@index([vendorCode])
+  @@index([isDeleted])
+  @@map("tbl_dies_maintenance")
+}
+
+// ============================================
+// MASTER DATA - DIES USAGE TRACKING
+// ============================================
+
+model DiesUsage {
+  id              String     @id @default(uuid())
+  diesId          String     @map("dies_id")
+  partId          String?    @map("part_id")
+  usageDate       DateTime   @default(now()) @map("usage_date")
+  // Production Reference
+  referenceType   String?    @map("reference_type") // SO, MANUFACTURING_ORDER, MPS
+  referenceNumber String?    @map("reference_number")
+  // Usage Details
+  shotCount       Int        @default(0) @map("shot_count") // Jumlah shot dalam usage ini
+  qtyProduced     Float      @default(0) @map("qty_produced") // Qty part produced
+  qtyGood         Float      @default(0) @map("qty_good") // Qty good/accepted
+  qtyReject       Float      @default(0) @map("qty_reject") // Qty reject
+  // Machine & Operator
+  machineCode     String?    @map("machine_code")
+  operatorName    String?    @map("operator_name")
+  shift           String? // 1A, 1B, 2A, 2B, 3A, 3C
+  // Duration
+  startTime       DateTime?  @map("start_time")
+  endTime         DateTime?  @map("end_time")
+  runningMinutes  Float?     @map("running_minutes")
+  notes           String?
+  isDeleted       Boolean    @default(false) @map("is_deleted")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+  // Relations
+  dies            Dies       @relation(fields: [diesId], references: [id], onDelete: Cascade)
+  part            Part?      @relation(fields: [partId], references: [id], onDelete: SetNull)
+  workOrder       WorkOrder?
+
+  @@index([diesId])
+  @@index([usageDate])
+  @@index([partId])
+  @@index([referenceType])
+  @@index([referenceNumber])
+  @@index([machineCode])
+  @@index([isDeleted])
+  @@map("tbl_dies_usage")
+}
+
+// ============================================
+// MASTER DATA - MACHINE
+// ============================================
+
+model Machine {
+  id           String  @id @default(uuid())
+  machineCode  String  @unique @map("machine_code")
+  machineName  String? @map("machine_name")
+  machineType  String? @map("machine_type") // Press, Injection, CNC, Welding, dll
+  brand        String? // Merek/pabrikan
+  modelNumber  String? @map("model_number") // Nomor model
+  serialNumber String? @map("serial_number") // Nomor seri
+
+  // Spesifikasi Teknis
+  capacity     Float? // Kapasitas produksi
+  capacityUnit String? @map("capacity_unit") // Satuan kapasitas (pcs/jam, kg/jam, dll)
+  tonnage      Float? // Tonnage (untuk mesin press)
+  powerKw      Float?  @map("power_kw") // Daya listrik (kW)
+  voltage      Float? // Tegangan (V)
+  cycleTime    Float?  @map("cycle_time") // Cycle time standar (detik)
+
+  // Lokasi
+  location      String? // Lokasi fisik mesin
+  warehouseCode String? @map("warehouse_code")
+  lineCode      String? @map("line_code") // Kode lini produksi
+
+  // Status
+  status String @default("Active") // Active, Inactive, Maintenance, Retired
+
+  // Informasi Pembelian & Keuangan
+  purchaseDate     DateTime? @map("purchase_date")
+  purchaseCost     Float?    @map("purchase_cost")
+  currencyCode     String?   @default("IDR") @map("currency_code")
+  depreciationRate Float?    @map("depreciation_rate") // % per tahun
+  costingRate      Float?    @map("costing_rate") // Rate standar untuk costing proses
+  costingRateType  String?   @default("PER_HOUR") @map("costing_rate_type") // PER_SECOND, PER_MINUTE, PER_HOUR, PER_CYCLE
+
+  // Jadwal Maintenance
+  lastMaintenanceDate DateTime? @map("last_maintenance_date")
+  nextMaintenanceDate DateTime? @map("next_maintenance_date")
+  maintenanceInterval Int?      @map("maintenance_interval") // Interval dalam hari
+
+  // Dokumentasi
+  photos   Json? @map("photos") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  drawings Json? @map("drawings") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  workOrders    WorkOrder[]
+  mbomProcesses MBOMProcess[]
+
+  @@index([machineCode])
+  @@index([machineName])
+  @@index([machineType])
+  @@index([brand])
+  @@index([status])
+  @@index([location])
+  @@index([warehouseCode])
+  @@index([lineCode])
+  @@index([nextMaintenanceDate])
+  @@index([isDeleted])
+  @@map("tbl_machine")
+}
+
+model PartBase {
+  id String @id @default(uuid())
+
+  partId String @map("part_id")
+
+  baseOn String @map("base_on") // e.g., "Quotation", "Actual", dll
+
+  CSP String? @map("CSP") // e.g., C, S, P
+
+  thickness   Float? // T
+  width       Float? // W
+  length      Float? // P/L
+  cavity      Int? // CAV
+  netWeight   Float? @map("net_weight") // Berat part jadi
+  scrapWeight Float? @map("scrap_weight") // Berat scrap aktual yang dihasilkan
+  grossWeight Float? @map("gross_weight") // Total material awal (net + scrap)
+
+  cycleTime Float? @map("cycle_time") // CT: Cycle time (detik) — CT-Q jika baseOn=Quotation, CT-A jika baseOn=Actual
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  part Part @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  @@map("tbl_part_base")
+}
+
+// ============================================
+// MASTER DATA - PART ATTACHMENT
+// ============================================
+
+model PartAttachment {
+  id          String   @id @default(uuid())
+  partId      String   @map("part_id")
+  title       String // Title/label untuk file (e.g., "Technical Drawing", "Photo", "Spec Sheet")
+  // fileName    String   @map("file_name")
+  // fileUrl     String   @map("file_url")
+  // fileType    String?  @map("file_type") // image/jpeg, application/pdf, dll
+  // fileSize    Int?     @map("file_size") // in bytes
+  files       Json     @map("files") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  description String?
+  uploadedBy  String?  @map("uploaded_by")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  part Part @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  @@index([partId])
+  @@index([title])
+  @@index([isDeleted])
+  @@map("tbl_part_attachment")
+}
+
+// ============================================
+// MASTER DATA - MATERIAL
+// ============================================
+
+model Material {
+  id           String  @id @default(uuid())
+  materialCode String  @unique @map("material_code")
+  materialName String? @map("material_name")
+  materialType String? @map("material_type")
+  itemCategory String? @map("item_category")
+  materialFamily String? @map("material_family")
+  materialForm String? @map("material_form")
+  materialGrade String? @map("material_grade")
+  attributeSet String? @map("attribute_set")
+  status       String? @default("Draft")
+  canTrackLot  Boolean @default(false) @map("can_track_lot")
+  spec         String?
+  thickness    Float?
+  width        Float?
+  CSP          String? @map("CSP")
+  density      Float?  @map("density")
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  materialPriceLists MaterialPriceList[]
+  parts              Part[]
+
+  @@index([materialCode])
+  @@index([materialType])
+  @@index([materialFamily])
+  @@index([materialForm])
+  @@index([spec])
+  @@index([thickness])
+  @@index([width])
+  @@index([CSP])
+  @@index([isDeleted])
+  @@map("tbl_material")
+}
+
+// ============================================
+// MASTER DATA - PROCESS UNTUK BOM PROCESS
+// ============================================
+
+model Process {
+  id          String   @id @default(uuid())
+  processCode String   @unique @map("process_code")
+  processName String?  @map("process_name")
+  notes       String?
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomProcesses MBOMProcess[]
+  ebomProcesses EBOMProcess[]
+  subProcesses  SubProcess[]
+  workOrders    WorkOrder[]
+  parts         Part[]
+
+  @@index([processCode])
+  @@index([processName])
+  @@index([isDeleted])
+  @@map("tbl_process")
+}
+
+// ============================================
+// MASTER DATA - SUBPROCESS (untuk EBOM)
+// ============================================
+
+model SubProcess {
+  id             String   @id @default(uuid())
+  subProcessCode String   @unique @map("sub_process_code")
+  subProcessName String?  @map("sub_process_name")
+  processId      String   @map("process_id") // FK → Process induk
+  notes          String?
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  process       Process       @relation(fields: [processId], references: [id])
+  ebomProcesses EBOMProcess[]
+
+  @@index([subProcessCode])
+  @@index([subProcessName])
+  @@index([processId])
+  @@index([isDeleted])
+  @@map("tbl_subprocess")
+}
+
+// ============================================
+// MASTER DATA - PAYMENT TERMS
+// ============================================
+
+model PaymentTerm {
+  id          String   @id @default(uuid())
+  termCode    String   @unique @map("term_code")
+  description String?
+  days        Int      @default(0)
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([termCode])
+  @@index([description])
+  @@index([isDeleted])
+  @@map("tbl_paymentterm")
+}
+
+// ============================================
+// MASTER DATA - PRICE LIST VENDOR
+// ============================================
+
+model VendorPriceList {
+  id String @id @default(uuid())
+
+  vendorId   String? @map("vendor_id")
+  partId     String? @map("part_id")
+  customerId String? @map("customer_id")
+
+  category String @map("category") // e.g., PD, WD, MD, DLL
+
+  // Quotation file dari vendor
+  quotationFiles Json? @map("quotation_files") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+
+  currencyCode String @default("IDR") @map("currency_code")
+  pricingYear  Int?   @map("pricing_year") // e.g., 2024, 2025, 2026
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  currency             Currency                @relation(fields: [currencyCode], references: [currencyCode])
+  vendor               Vendor?                 @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  part                 Part?                   @relation(fields: [partId], references: [id], onDelete: SetNull)
+  customer             Customer?               @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  entityProcesses      EntityVendorProcess[]
+  details              VendorPriceListDetail[]
+  purchaseOrderDetails PurchaseOrderDetail[]
+  vendorProcessOrders  VendorProcessOrder[]
+
+  @@index([currencyCode])
+  @@index([vendorId])
+  @@index([partId])
+  @@index([customerId])
+  @@index([category])
+  @@index([pricingYear])
+  @@index([isDeleted])
+  @@map("tbl_vendor_pricelist")
+}
+
+model VendorPriceListDetail {
+  id                String @id @default(uuid())
+  vendorPriceListId String @map("vendor_price_list_id")
+  vendorProcessId   String @map("vendor_process_id")
+  sequence          Int?   @map("sequence")
+
+  january   Float? @map("january")
+  february  Float? @map("february")
+  march     Float? @map("march")
+  april     Float? @map("april")
+  may       Float? @map("may")
+  june      Float? @map("june")
+  july      Float? @map("july")
+  august    Float? @map("august")
+  september Float? @map("september")
+  october   Float? @map("october")
+  november  Float? @map("november")
+  december  Float? @map("december")
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  vendorPriceList VendorPriceList @relation(fields: [vendorPriceListId], references: [id], onDelete: Cascade)
+  vendorProcess   VendorProcess   @relation(fields: [vendorProcessId], references: [id], onDelete: Restrict)
+
+  @@unique([vendorPriceListId, vendorProcessId])
+  @@index([vendorPriceListId])
+  @@index([vendorProcessId])
+  @@index([isDeleted])
+  @@map("tbl_vendor_pricelist_detail")
+}
+
+// ============================================
+// MASTER DATA - PRICE LIST PART
+// ============================================
+
+model PartPriceList {
+  id String @id @default(uuid())
+
+  partId String? @map("part_id")
+  supplierId String? @map("supplier_id")
+
+  currencyCode String @default("IDR") @map("currency_code")
+  pricingYear  Int?   @map("pricing_year") // e.g., 2024, 2025, 2026
+
+  january   Float? @map("january")
+  february  Float? @map("february")
+  march     Float? @map("march")
+  april     Float? @map("april")
+  may       Float? @map("may")
+  june      Float? @map("june")
+  july      Float? @map("july")
+  august    Float? @map("august")
+  september Float? @map("september")
+  october   Float? @map("october")
+  november  Float? @map("november")
+  december  Float? @map("december")
+
+  statusService String? @map("status_service") // e.g., Service, Non-Service
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  currency Currency @relation(fields: [currencyCode], references: [currencyCode])
+  part     Part?    @relation(fields: [partId], references: [id], onDelete: SetNull)
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([currencyCode])
+  @@index([partId])
+  @@index([supplierId])
+  @@index([isDeleted])
+  @@map("tbl_part_pricelist")
+}
+
+// ============================================
+// MASTER DATA - PRICE LIST MATERIAL
+// ============================================
+
+model MaterialPriceList {
+  id String @id @default(uuid())
+
+  materialId String? @map("material_id")
+  supplierId String? @map("supplier_id")
+
+  currencyCode String @default("IDR") @map("currency_code")
+  pricingYear  Int?   @map("pricing_year") // e.g., 2024, 2025, 2026
+
+  january   Float? @map("january")
+  february  Float? @map("february")
+  march     Float? @map("march")
+  april     Float? @map("april")
+  may       Float? @map("may")
+  june      Float? @map("june")
+  july      Float? @map("july")
+  august    Float? @map("august")
+  september Float? @map("september")
+  october   Float? @map("october")
+  november  Float? @map("november")
+  december  Float? @map("december")
+
+  CSP          String? @map("CSP") // e.g., C, S, P
+  thickness    Float?  @map("thickness")
+  partNumberCP String? @map("part_number_cp")
+  partNameCP   String? @map("part_name_cp")
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  currency Currency  @relation(fields: [currencyCode], references: [currencyCode])
+  material Material? @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([currencyCode])
+  @@index([materialId])
+  @@index([supplierId])
+  @@index([CSP])
+  @@index([partNumberCP])
+  @@index([partNameCP])
+  @@index([pricingYear])
+  @@index([isDeleted])
+  @@map("tbl_material_pricelist")
+}
+
+// ============================================
+// MASTER DATA - DEPARTMENT
+// ============================================
+
+model Department {
+  id             String   @id @default(uuid())
+  departmentCode String   @unique @map("department_code")
+  departmentName String?  @map("department_name")
+  notes          String?
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  employees            Employee[]
+  divisions            Division[]
+  purchaseRequisitions PurchaseRequisition[]
+
+  @@index([departmentCode])
+  @@index([departmentName])
+  @@index([isDeleted])
+  @@map("tbl_department")
+}
+
+// ============================================
+// MASTER DATA - DIVISION
+// ============================================
+
+model Division {
+  id           String   @id @default(uuid())
+  divisionCode String   @unique @map("division_code")
+  divisionName String?  @map("division_name")
+  departmentId String?  @map("department_id") // Divisi berada di bawah departemen mana
+  notes        String?
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  department        Department?        @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  employees         Employee[]
+  employeeDivisions EmployeeDivision[]
+
+  @@index([divisionCode])
+  @@index([divisionName])
+  @@index([departmentId])
+  @@index([isDeleted])
+  @@map("tbl_division")
+}
+
+// ============================================
+// MASTER DATA - EMPLOYEE / KARYAWAN
+// ============================================
+
+model Employee {
+  id            String    @id @default(uuid())
+  employeeId    String    @unique @map("employee_id") // NIK / nomor karyawan
+  firstName     String?   @map("first_name")
+  lastName      String?   @map("last_name")
+  fullName      String?   @map("full_name")
+  email         String?
+  phone         String?
+  nationalId    String?   @map("national_id")
+  birthPlace    String?   @map("birth_place")
+  birthDate     DateTime? @map("birth_date")
+  gender        String?
+  maritalStatus String?   @map("marital_status")
+  religion      String?
+  bloodType     String?   @map("blood_type")
+  heightCm      Int?      @map("height_cm")
+  weightKg      Int?      @map("weight_kg")
+  address       String?
+  position      String? // Jabatan
+  profilePhoto  Json?     @map("profile_photo")
+  signature     Json?
+  departmentId  String?   @map("department_id")
+  divisionId    String?   @map("division_id")
+  hireDate      DateTime? @map("hire_date")
+  status        String    @default("Active") // Active, Inactive
+  notes         String?
+  isDeleted     Boolean   @default(false) @map("is_deleted")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  department        Department?        @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  division          Division?          @relation(fields: [divisionId], references: [id], onDelete: SetNull)
+  user              User?
+  employeeDivisions EmployeeDivision[]
+
+  @@index([employeeId])
+  @@index([fullName])
+  @@index([nationalId])
+  @@index([birthDate])
+  @@index([departmentId])
+  @@index([divisionId])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_employee")
+}
+
+model EmployeeDivision {
+  id         String   @id @default(uuid())
+  employeeId String   @map("employee_id")
+  divisionId String   @map("division_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  division Division @relation(fields: [divisionId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, divisionId])
+  @@index([employeeId])
+  @@index([divisionId])
+  @@map("tbl_employee_division")
+}
+
+// ============================================
+// MASTER DATA - PRODUCT (CONSUMABLE)
+// ============================================
+
+model Product {
+  id          String   @id @default(uuid())
+  productCode String   @unique @map("product_code")
+  productName String?  @map("product_name")
+  description String?
+  uomCode     String?  @map("uom_code")
+  category    String? // e.g., Consumable, Chemical, Packaging, Spare Part, dll
+  notes       String?
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  uom                        Uom?                        @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+  productPriceLists          ProductPriceList[]
+  purchaseOrderDetails       PurchaseOrderDetail[]
+  purchaseInvoiceDetails     PurchaseInvoiceDetail[]
+  purchaseRequisitionDetails PurchaseRequisitionDetail[]
+  stockBalances              StockBalance[]
+  stockMovements             StockMovement[]
+  stockReservations          StockReservation[]
+  stockOpnameDetails         StockOpnameDetail[]
+  lotMasters                 LotMaster[]
+  materialIssueDetails       MaterialIssueDetail[]
+
+  @@index([productCode])
+  @@index([productName])
+  @@index([uomCode])
+  @@index([isDeleted])
+  @@map("tbl_product")
+}
+
+// ============================================
+// MASTER DATA - PRICE LIST PRODUCT (CONSUMABLE)
+// ============================================
+
+model ProductPriceList {
+  id String @id @default(uuid())
+
+  productId  String? @map("product_id")
+  supplierId String? @map("supplier_id")
+
+  currencyCode String @default("IDR") @map("currency_code")
+  pricingYear  Int?   @map("pricing_year") // e.g., 2024, 2025, 2026
+
+  january   Float? @map("january")
+  february  Float? @map("february")
+  march     Float? @map("march")
+  april     Float? @map("april")
+  may       Float? @map("may")
+  june      Float? @map("june")
+  july      Float? @map("july")
+  august    Float? @map("august")
+  september Float? @map("september")
+  october   Float? @map("october")
+  november  Float? @map("november")
+  december  Float? @map("december")
+
+  uomCode String? @map("uom_code")
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  currency Currency  @relation(fields: [currencyCode], references: [currencyCode])
+  product  Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+  supplier Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  uom      Uom?      @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+
+  @@index([currencyCode])
+  @@index([productId])
+  @@index([supplierId])
+  @@index([uomCode])
+  @@index([pricingYear])
+  @@index([isDeleted])
+  @@map("tbl_product_pricelist")
+}
+
+// ============================================
+// ENGINEERING - EBOM HEADER
+// ============================================
+
+model EBOMHeader {
+  id            String    @id @default(uuid())
+  noReg         String    @unique @map("no_reg")
+  partId        String?   @map("part_id")
+  uomCode       String?   @map("uom_code")
+  revision      Int       @default(1)
+  ecnNumber     String?   @map("ecn_number") // Engineering Change Notice number
+  status        Status    @default(Draft) // Draft, Pending, Approved, Rejected, Obsolete
+  effectiveDate DateTime? @map("effective_date")
+  expiryDate    DateTime? @map("expiry_date")
+  approvedBy    String?   @map("approved_by")
+  approvedAt    DateTime? @map("approved_at")
+  createdBy     String?   @map("created_by")
+  notes         String?
+  isDeleted     Boolean   @default(false) @map("is_deleted")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  details         EBOMDetail[]
+  ebomcostHeaders EBOMCostHeader[]
+  part            Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  uom             Uom?             @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+
+  @@index([noReg])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([status])
+  @@index([ecnNumber])
+  @@index([isDeleted])
+  @@map("tbl_ebomheader")
+}
+
+// ============================================
+// ENGINEERING - EBOM DETAIL
+// ============================================
+
+model EBOMDetail {
+  id                  String   @id @default(uuid())
+  noReg               String   @map("no_reg")
+  parentDetailId      String?  @map("parent_detail_id")
+  levelComponent      Int      @default(0) @map("level_component")
+  partId              String?  @map("part_id")
+  qty                 Float    @default(0)
+  uomCode             String?  @map("uom_code")
+  category            Category @default(Purchase) // inHouse, Purchase, Vendor
+  scrapFactor         Float    @default(0) @map("scrap_factor")
+  leadTime            Int      @default(0) @map("lead_time") // Engineering estimate; manufacturing lead time is finalized in MBOM
+  findNumber          String?  @map("find_number") // Nomor referensi pada gambar teknik (drawing)
+  referenceDesignator String?  @map("reference_designator") // e.g., R1, C2, U5
+  createdBy           String?  @map("created_by")
+  notes               String?
+  isDeleted           Boolean  @default(false) @map("is_deleted")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ebomHeader      EBOMHeader       @relation(fields: [noReg], references: [noReg], onDelete: Cascade)
+  parentDetail    EBOMDetail?      @relation("EBOMDetailTree", fields: [parentDetailId], references: [id], onDelete: SetNull)
+  children        EBOMDetail[]     @relation("EBOMDetailTree")
+  ebomProcesses   EBOMProcess[]
+  ebomcostDetails EBOMCostDetail[]
+  part            Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  uom             Uom?             @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+
+  @@index([noReg])
+  @@index([parentDetailId])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([category])
+  @@index([levelComponent])
+  @@index([isDeleted])
+  @@map("tbl_ebomdetail")
+}
+
+// ============================================
+// ENGINEERING - EBOM PROCESS
+// ============================================
+
+model EBOMProcess {
+  id           String   @id @default(uuid())
+  noReg        String   @map("no_reg")
+  ebomDetailId String   @map("ebom_detail_id")
+  parentId     String?  @map("parent_id") // NULL = proses utama, berisi ID = subprocess
+  processId    String?  @map("process_id") // Diisi jika proses utama (parentId = null)
+  subProcessId String?  @map("sub_process_id") // Diisi jika subprocess (parentId != null)
+  sequence     Int      @default(0)
+  cycleTime    Float    @default(0) @map("cycle_time")
+  notes        String?
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ebomDetail      EBOMDetail?      @relation(fields: [ebomDetailId], references: [id], onDelete: Cascade)
+  ebomcostDetails EBOMCostDetail[]
+  process         Process?         @relation(fields: [processId], references: [id])
+  subProcess      SubProcess?      @relation(fields: [subProcessId], references: [id])
+  parent          EBOMProcess?     @relation("EBOMSubprocess", fields: [parentId], references: [id], onDelete: Cascade)
+  subprocesses    EBOMProcess[]    @relation("EBOMSubprocess")
+
+  @@index([noReg])
+  @@index([ebomDetailId])
+  @@index([parentId])
+  @@index([processId])
+  @@index([subProcessId])
+  @@index([sequence])
+  @@index([isDeleted])
+  @@map("tbl_ebomprocess")
+}
+
+// ============================================
+// ENGINEERING - EBOM COST HEADER
+// ============================================
+
+model EBOMCostHeader {
+  id           String  @id @default(uuid())
+  ebomId       String  @map("ebom_id") // FK → EBOMHeader.id
+  costVersion  Int     @default(1) @map("cost_version")
+  qtyBase      Float   @default(1) @map("qty_base")
+  currencyCode String  @map("currency_code")
+  costModel    String? @map("cost_model") // misal: STANDARD, CURRENT, QUOTE, dll
+
+  materialCost Float  @default(0) @map("material_cost")
+  processCost  Float  @default(0) @map("process_cost")
+  overheadCost Float  @default(0) @map("overhead_cost")
+  totalCost    Float  @default(0) @map("total_cost")
+  costPerUnit  Float? @map("cost_per_unit") // Cost per unit kalkulasi
+
+  status     Status  @default(Draft) // Draft, Active, Obsolete
+  isStandard Boolean @default(false) @map("is_standard")
+
+  validFrom DateTime? @map("valid_from")
+  validTo   DateTime? @map("valid_to")
+
+  notes     String?
+  createdBy String?  @map("created_by")
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ebom     EBOMHeader       @relation(fields: [ebomId], references: [id], onDelete: Cascade)
+  currency Currency         @relation(fields: [currencyCode], references: [currencyCode])
+  details  EBOMCostDetail[]
+
+  @@index([ebomId])
+  @@index([currencyCode])
+  @@index([status])
+  @@index([isStandard])
+  @@index([isDeleted])
+  @@map("tbl_ebomcost_header")
+}
+
+// ============================================
+// ENGINEERING - EBOM COST DETAIL
+// ============================================
+
+model EBOMCostDetail {
+  id               String      @id @default(uuid())
+  ebomCostHeaderId String      @map("ebom_cost_header_id")
+  type             BomCostType @default(Material) // Material, Process, Overhead
+
+  ebomDetailId  String? @map("ebom_detail_id") // kalau MATERIAL
+  ebomProcessId String? @map("ebom_process_id") // kalau PROCESS
+
+  qty    Float @default(0)
+  rate   Float @default(0)
+  amount Float @default(0)
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  ebomCostHeader EBOMCostHeader @relation(fields: [ebomCostHeaderId], references: [id], onDelete: Cascade)
+  ebomDetail     EBOMDetail?    @relation(fields: [ebomDetailId], references: [id])
+  ebomProcess    EBOMProcess?   @relation(fields: [ebomProcessId], references: [id])
+
+  @@index([ebomCostHeaderId])
+  @@index([type])
+  @@index([ebomDetailId])
+  @@index([ebomProcessId])
+  @@index([isDeleted])
+  @@map("tbl_ebomcost_detail")
+}
+
+// ============================================
+// PRODUCTION - MBOM HEADER
+// ============================================
+
+model MBOMHeader {
+  id            String    @id @default(uuid())
+  noReg         String    @unique @map("no_reg")
+  partId        String?   @map("part_id")
+  uomCode       String?   @map("uom_code")
+  revision      Int       @default(1)
+  effectiveDate DateTime? @map("effective_date")
+  expiryDate    DateTime? @map("expiry_date")
+  createdBy     String?   @map("created_by")
+  notes         String?
+  isDeleted     Boolean   @default(false) @map("is_deleted")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  details           MBOMDetail[]
+  part              Part?              @relation(fields: [partId], references: [id], onDelete: SetNull)
+  uom               Uom?               @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+  mbomcostHeaders   MBOMCostHeader[]
+  quotationDetails  QuotationDetail[]
+  salesOrderDetails SalesOrderDetail[]
+  mpsdetails        MPSDetail[]
+  bomRelations      BOMRelation[]
+
+  @@index([noReg])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([isDeleted])
+  @@map("tbl_mbomheader")
+}
+
+model MBOMDraft {
+  id            String    @id @default(uuid())
+  draftNumber   String    @unique @map("draft_number")
+  payload       Json
+  status        String    @default("DRAFT")
+  createdBy     String?   @map("created_by")
+  updatedBy     String?   @map("updated_by")
+  approvedBy    String?   @map("approved_by")
+  approvedNoReg String?   @map("approved_no_reg")
+  approvedAt    DateTime? @map("approved_at")
+  isDeleted     Boolean   @default(false) @map("is_deleted")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([createdBy])
+  @@index([isDeleted])
+  @@map("tbl_mbom_draft")
+}
+
+// ============================================
+// PRODUCTION - MBOM DETAIL
+// ============================================
+
+model MBOMDetail {
+  id                     String   @id @default(uuid())
+  noReg                  String   @map("no_reg")
+  parentDetailId         String?  @map("parent_detail_id")
+  levelComponent         Int      @default(0) @map("level_component")
+  partId                 String?  @map("part_id")
+  qty                    Float    @default(0)
+  uomCode                String?  @map("uom_code")
+  category               Category @default(Purchase) // inHouse, Purchase, Vendor
+  assemblyPolicyOverride String   @default("DEFAULT") @map("assembly_policy_override") // DEFAULT, INLINE, SUB_ASSEMBLY
+  scrapFactor            Float    @default(0) @map("scrap_factor") // Auto-calculated dari PartBase (baseOn='Actual'): (scrapWeight/grossWeight)*100
+  materialThickness      Float?   @map("material_thickness") // Snapshot T (mm) dari Master Material
+  materialWidth          Float?   @map("material_width") // Snapshot W (mm) dari Master Material
+  materialPitch          Float?   @map("material_pitch") // P/pitch pemakaian material (mm)
+  materialCavity         Int?     @map("material_cavity") // Output part per pitch/shot
+  materialDensity        Float?   @map("material_density") // Snapshot density (kg/mm3), contoh baja 0.00000785
+  grossWeight            Float    @default(0) @map("gross_weight") // kg per pcs = T*W*P*density/cavity
+  leadTime               Float    @default(0) @map("lead_time") // Nilai lead time sesuai leadTimeUnit; tidak dikalikan quantity
+  leadTimeUnit           String   @default("HOUR") @map("lead_time_unit") // SECOND, MINUTE, HOUR, DAY (1 hari kerja = 8 jam)
+  createdBy              String?  @map("created_by")
+  notes                  String?
+  isDeleted              Boolean  @default(false) @map("is_deleted")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomHeader      MBOMHeader       @relation(fields: [noReg], references: [noReg], onDelete: Cascade)
+  parentDetail    MBOMDetail?      @relation("MBOMDetailTree", fields: [parentDetailId], references: [id], onDelete: SetNull)
+  children        MBOMDetail[]     @relation("MBOMDetailTree")
+  mbomProcesses   MBOMProcess[]
+  workOrders      WorkOrder[]
+  part            Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  uom             Uom?             @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+  mbomcostDetails MBOMCostDetail[]
+  mrpRequirements MRPRequirement[]
+
+  @@index([noReg])
+  @@index([parentDetailId])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([category])
+  @@index([assemblyPolicyOverride])
+  @@index([isDeleted])
+  @@map("tbl_mbomdetail")
+}
+
+// ============================================
+// PRODUCTION - MBOM PROCESS
+// ============================================
+
+model MBOMProcess {
+  id           String   @id @default(uuid())
+  noReg        String   @map("no_reg")
+  mbomDetailId String   @map("bom_detail_id")
+  processId    String   @map("process_id")
+  occurrenceCode String? @map("occurrence_code")
+  routingNumber String? @map("routing_number")
+  machineId    String?  @map("machine_id")
+  sequence     Int      @default(0)
+  cycleTime    Float    @default(0) @map("cycle_time")
+  notes        String?
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomDetail      MBOMDetail?      @relation(fields: [mbomDetailId], references: [id], onDelete: Cascade)
+  process         Process?         @relation(fields: [processId], references: [id])
+  machine         Machine?         @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  mbomcostDetails MBOMCostDetail[]
+
+  @@index([noReg])
+  @@index([mbomDetailId])
+  @@index([processId])
+  @@index([occurrenceCode])
+  @@index([routingNumber])
+  @@index([machineId])
+  @@index([sequence])
+  @@index([isDeleted])
+  @@map("tbl_mbomprocess")
+}
+
+// ============================================
+// PRODUCTION - MBOM COST HEADER
+// ============================================
+
+model MBOMCostHeader {
+  id           String  @id @default(uuid())
+  mbomId       String  @map("mbom_id") // FK → MBOMHeader.id (lebih aman)
+  costVersion  Int     @default(1) @map("cost_version")
+  qtyBase      Float   @default(1) @map("qty_base")
+  currencyCode String  @map("currency_code")
+  costModel    String? @map("cost_model") // misal: STANDARD, CURRENT, QUOTE, dll
+
+  materialCost Float  @default(0) @map("material_cost")
+  processCost  Float  @default(0) @map("process_cost")
+  overheadCost Float  @default(0) @map("overhead_cost")
+  totalCost    Float  @default(0) @map("total_cost")
+  costPerUnit  Float? @map("cost_per_unit") // Cost per unit kalkulasi
+
+  status     Status  @default(Draft) // Draft, Active, Obsolete
+  isStandard Boolean @default(false) @map("is_standard")
+
+  validFrom DateTime? @map("valid_from")
+  validTo   DateTime? @map("valid_to")
+
+  notes     String?
+  createdBy String?  @map("created_by")
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbom     MBOMHeader       @relation(fields: [mbomId], references: [id], onDelete: Cascade)
+  currency Currency         @relation(fields: [currencyCode], references: [currencyCode])
+  details  MBOMCostDetail[]
+
+  @@index([mbomId])
+  @@index([currencyCode])
+  @@index([status])
+  @@index([isStandard])
+  @@index([isDeleted])
+  @@map("tbl_mbomcost_header")
+}
+
+// ============================================
+// PRODUCTION - MBOM COST DETAIL
+// ============================================
+
+model MBOMCostDetail {
+  id               String      @id @default(uuid())
+  mbomCostHeaderId String      @map("mbom_cost_header_id")
+  type             BomCostType @default(Material) // Material, Process, Overhead
+
+  mbomDetailId  String? @map("mbom_detail_id") // kalau MATERIAL
+  mbomProcessId String? @map("mbom_process_id") // kalau PROCESS
+  machineId     String? @map("machine_id") // snapshot reference dari MBOMProcess saat costing dibuat
+
+  machineCodeSnapshot     String? @map("machine_code_snapshot")
+  machineNameSnapshot     String? @map("machine_name_snapshot")
+  machineRateTypeSnapshot String? @map("machine_rate_type_snapshot")
+
+  qty    Float @default(0)
+  rate   Float @default(0)
+  amount Float @default(0)
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mbomCostHeader MBOMCostHeader @relation(fields: [mbomCostHeaderId], references: [id], onDelete: Cascade)
+  mbomDetail     MBOMDetail?    @relation(fields: [mbomDetailId], references: [id])
+  mbomProcess    MBOMProcess?   @relation(fields: [mbomProcessId], references: [id])
+
+  @@index([mbomCostHeaderId])
+  @@index([type])
+  @@index([mbomDetailId])
+  @@index([mbomProcessId])
+  @@index([machineId])
+  @@index([isDeleted])
+  @@map("tbl_mbomcost_detail")
+}
+
+// ============================================
+// SALES - QUOTATION HEADER
+// ============================================
+
+model QuotationHeader {
+  id              String    @id @default(uuid())
+  quotationNumber String    @unique @map("quotation_number")
+  quotationDate   DateTime  @default(now()) @map("quotation_date")
+  customerCode    String?   @map("customer_code")
+  customerName    String?   @map("customer_name")
+  contact         String?
+  phone           String?
+  email           String?
+  billingAddress  String?   @map("billing_address")
+  shippingAddress String?   @map("shipping_address")
+  paymentTerms    String?   @map("payment_terms")
+  taxId           String?   @map("tax_id")
+  currencyCode    String    @default("IDR") @map("currency_code")
+  validUntil      DateTime? @map("valid_until")
+  status          String    @default("Draft") // Draft, Accepted, Rejected, Expired, Converted
+  totalAmount     Float     @default(0) @map("total_amount")
+  convertedToSO   String?   @map("converted_to_so") // Reference ke SO Number jika sudah diconvert
+  notes           String?
+  createdBy       String?   @map("created_by")
+  approvedBy      String?   @map("approved_by")
+  approvedDate    DateTime? @map("approved_date")
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  customer    Customer?          @relation(fields: [customerCode], references: [customerCode], onDelete: SetNull)
+  currency    Currency           @relation(fields: [currencyCode], references: [currencyCode])
+  details     QuotationDetail[]
+  salesOrders SalesOrderHeader[]
+
+  @@index([quotationNumber])
+  @@index([customerCode])
+  @@index([quotationDate])
+  @@index([validUntil])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_quotationheader")
+}
+
+// ============================================
+// SALES - QUOTATION DETAIL
+// ============================================
+
+model QuotationDetail {
+  id              String    @id @default(uuid())
+  quotationNumber String    @map("quotation_number")
+  lineNumber      Int       @map("line_number")
+  partCode        String?   @map("part_code")
+  partNumber      String?   @map("part_number")
+  partName        String?   @map("part_name")
+  uomCode         String?   @map("uom_code")
+  mbomHeaderId    String?   @map("mbom_header_id")
+  qty             Float
+  unitPrice       Float     @default(0) @map("unit_price")
+  discount        Float     @default(0)
+  discountType    String    @default("percent") @map("discount_type") // "percent" atau "nominal"
+  tax             Float     @default(0)
+  totalAmount     Float     @default(0) @map("total_amount")
+  deliveryDate    DateTime? @map("delivery_date")
+  notes           String?
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  quotationHeader QuotationHeader @relation(fields: [quotationNumber], references: [quotationNumber], onDelete: Cascade)
+  part            Part?           @relation(fields: [partCode], references: [partCode])
+  uom             Uom?            @relation(fields: [uomCode], references: [uomCode])
+  mbom            MBOMHeader?     @relation(fields: [mbomHeaderId], references: [id])
+
+  @@index([quotationNumber])
+  @@index([partCode])
+  @@index([uomCode])
+  @@index([mbomHeaderId])
+  @@index([isDeleted])
+  @@map("tbl_quotationdetail")
+}
+
+// ============================================
+// SALES - SALES ORDER HEADER
+// ============================================
+
+model SalesOrderHeader {
+  id              String    @id @default(uuid())
+  soNumber        String    @unique @map("so_number")
+  soDate          DateTime  @default(now()) @map("so_date")
+  quotationNumber String?   @map("quotation_number") // Reference ke Quotation asal
+  customerCode    String?   @map("customer_code")
+  customerName    String?   @map("customer_name")
+  contact         String?
+  phone           String?
+  email           String?
+  billingAddress  String?   @map("billing_address")
+  shippingAddress String?   @map("shipping_address")
+  paymentTerms    String?   @map("payment_terms")
+  taxId           String?   @map("tax_id")
+  currencyCode    String    @default("IDR") @map("currency_code")
+  deliveryDate    DateTime? @map("delivery_date")
+  status          String    @default("Draft") // Draft, Confirmed, In Progress, Ready to Deliver, Delivered, Cancelled
+  totalAmount     Float     @default(0) @map("total_amount")
+  notes           String?
+  createdBy       String?   @map("created_by")
+  approvedBy      String?   @map("approved_by")
+  approvedDate    DateTime? @map("approved_date")
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  customer          Customer?              @relation(fields: [customerCode], references: [customerCode], onDelete: SetNull)
+  currency          Currency               @relation(fields: [currencyCode], references: [currencyCode])
+  quotation         QuotationHeader?       @relation(fields: [quotationNumber], references: [quotationNumber], onDelete: SetNull)
+  details           SalesOrderDetail[]
+  attachments       SalesOrderAttachment[]
+  deliverySchedules DeliverySchedule[]
+
+  @@index([soNumber])
+  @@index([customerCode])
+  @@index([soDate])
+  @@index([deliveryDate])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_salesorderheader")
+}
+
+// ============================================
+// SALES - SALES ORDER DETAIL
+// ============================================
+
+model SalesOrderDetail {
+  id           String    @id @default(uuid())
+  soNumber     String    @map("so_number")
+  lineNumber   Int       @map("line_number")
+  partCode     String?   @map("part_code")
+  partNumber   String?   @map("part_number")
+  partName     String?   @map("part_name")
+  uomCode      String?   @map("uom_code")
+  mbomHeaderId String?   @map("mbom_header_id")
+  qty          Float
+  unitPrice    Float     @default(0) @map("unit_price")
+  discount     Float     @default(0)
+  discountType String    @default("percent") @map("discount_type") // "percent" atau "nominal"
+  tax          Float     @default(0)
+  totalAmount  Float     @default(0) @map("total_amount")
+  qtyProduced  Float     @default(0) @map("qty_produced")
+  qtyDelivered Float     @default(0) @map("qty_delivered")
+  status       String    @default("Pending") // Pending, In Planning, In Production, Completed, Cancelled
+  deliveryDate DateTime? @map("delivery_date")
+  notes        String?
+  isDeleted    Boolean   @default(false) @map("is_deleted")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  soHeader                SalesOrderHeader         @relation(fields: [soNumber], references: [soNumber], onDelete: Cascade)
+  part                    Part?                    @relation(fields: [partCode], references: [partCode])
+  uom                     Uom?                     @relation(fields: [uomCode], references: [uomCode])
+  mbom                    MBOMHeader?              @relation(fields: [mbomHeaderId], references: [id])
+  deliveryScheduleDetails DeliveryScheduleDetail[]
+
+  @@index([soNumber])
+  @@index([partCode])
+  @@index([uomCode])
+  @@index([mbomHeaderId])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_salesorderdetail")
+}
+
+// ============================================
+// SALES - SO ATTACHMENTS
+// ============================================
+
+model SalesOrderAttachment {
+  id          String   @id @default(uuid())
+  soNumber    String   @map("so_number")
+  title       String // Title/label untuk file
+  files       Json     @map("files") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  description String?
+  uploadedBy  String?  @map("uploaded_by")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  soHeader SalesOrderHeader @relation(fields: [soNumber], references: [soNumber], onDelete: Cascade)
+
+  @@index([soNumber])
+  @@index([isDeleted])
+  @@map("tbl_salesorder_attachment")
+}
+
+// ============================================
+// SALES - DELIVERY SCHEDULE (HEADER)
+// ============================================
+
+model DeliverySchedule {
+  id                String    @id @default(uuid())
+  scheduleNumber    String    @unique @map("schedule_number")
+  soNumber          String    @map("so_number")
+  plannedDate       DateTime  @map("planned_date")
+  actualDate        DateTime? @map("actual_date")
+  status            String    @default("Scheduled") // Scheduled, On Process, In Transit, Delivered, Cancelled
+  deliveryAddress   String?   @map("delivery_address")
+  shippingMethod    String?   @map("shipping_method")
+  trackingNumber    String?   @map("tracking_number")
+  notes             String?
+  deliveredBy       String?   @map("delivered_by")
+  receivedBy        String?   @map("received_by")
+  receivedSignature String?   @map("received_signature")
+  isDeleted         Boolean   @default(false) @map("is_deleted")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  soHeader SalesOrderHeader         @relation(fields: [soNumber], references: [soNumber], onDelete: Cascade)
+  details  DeliveryScheduleDetail[]
+
+  @@index([scheduleNumber])
+  @@index([soNumber])
+  @@index([plannedDate])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_delivery_schedule")
+}
+
+// ============================================
+// SALES - DELIVERY SCHEDULE DETAIL
+// ============================================
+
+model DeliveryScheduleDetail {
+  id             String   @id @default(uuid())
+  scheduleNumber String   @map("schedule_number")
+  soDetailId     String   @map("so_detail_id")
+  lineNumber     Int      @map("line_number")
+  qty            Float // Qty yang akan dikirim di schedule ini
+  qtyDelivered   Float    @default(0) @map("qty_delivered") // Qty actual terkirim
+  notes          String?
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  schedule DeliverySchedule @relation(fields: [scheduleNumber], references: [scheduleNumber], onDelete: Cascade)
+  soDetail SalesOrderDetail @relation(fields: [soDetailId], references: [id], onDelete: Cascade)
+
+  @@index([scheduleNumber])
+  @@index([soDetailId])
+  @@index([isDeleted])
+  @@map("tbl_delivery_schedule_detail")
+}
+
+// ============================================
+// INVENTORY - LOT MASTER
+// ============================================
+
+model LotMaster {
+  id                String    @id @default(uuid())
+  lotNumber         String    @unique @map("lot_number")
+  partCode          String?   @map("part_code")
+  productId         String?   @map("product_id")
+  description       String? // Item bebas tanpa master
+  supplierBatch     String?   @map("supplier_batch") // Nomor batch dari supplier
+  manufacturingDate DateTime? @map("manufacturing_date")
+  expiryDate        DateTime? @map("expiry_date")
+  notes             String?
+  isDeleted         Boolean   @default(false) @map("is_deleted")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([lotNumber])
+  @@index([partCode])
+  @@index([productId])
+  @@index([description])
+  @@index([expiryDate])
+  @@index([isDeleted])
+  @@map("tbl_lot_master")
+}
+
+// ============================================
+// INVENTORY - RACK (RAK PENYIMPANAN)
+// ============================================
+
+model Rack {
+  id           String   @id @default(uuid())
+  rackCode     String   @unique @map("rack_code")
+  rackName     String?  @map("rack_name")
+  zone         String? // Zona/area dalam warehouse (A, B, C, dll)
+  row          String? // Baris rak
+  level        String? // Level/tingkat rak
+  position     String? // Posisi spesifik
+  capacity     Float? // Kapasitas (m3, pallet, kg, dll)
+  capacityUnit String?  @map("capacity_unit") // Satuan kapasitas
+  isActive     Boolean  @default(true) @map("is_active")
+  notes        String?
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  stockBalances        StockBalance[]
+  sourceMovements      StockMovement[]      @relation("sourceRack")
+  destinationMovements StockMovement[]      @relation("destinationRack")
+  goodsReceiptDetails  GoodsReceiptDetail[]
+  stockReservations    StockReservation[]
+  stockOpnameDetails   StockOpnameDetail[]
+
+  @@index([rackCode])
+  @@index([rackName])
+  @@index([zone])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_rack")
+}
+
+// ============================================
+// INVENTORY - WAREHOUSE / LOCATION
+// ============================================
+
+model Warehouse {
+  id            String   @id @default(uuid())
+  warehouseCode String   @unique @map("warehouse_code")
+  warehouseName String   @map("warehouse_name")
+  location      String? // Alamat fisik
+  type          String   @default("Main") // Main, Sub, Transit, Quarantine
+  isActive      Boolean  @default(true) @map("is_active")
+  capacity      Float? // Kapasitas (m3, pallet, dll)
+  notes         String?
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  stockBalances      StockBalance[]
+  stockMovements     StockMovement[]
+  stockReservations  StockReservation[]
+  stockOpnameHeaders StockOpnameHeader[]
+  stockOpnameDetails StockOpnameDetail[]
+  goodsReceipts      GoodsReceipt[]
+  materialIssues     MaterialIssue[]
+
+  @@index([warehouseCode])
+  @@index([warehouseName])
+  @@index([type])
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_warehouse")
+}
+
+// ============================================
+// INVENTORY - STOCK BALANCE
+// ============================================
+
+model StockBalance {
+  id            String   @id @default(uuid())
+  warehouseCode String   @map("warehouse_code")
+  rackCode      String?  @map("rack_code") // Kode rak penyimpanan (opsional)
+  lotNumber     String?  @map("lot_number") // LOT number untuk traceability (opsional)
+  partCode      String?  @map("part_code") // Key stock item: partCode asli (opsional untuk consumable/service)
+  partNumber    String?  @map("part_number")
+  partName      String?  @map("part_name")
+  productId     String?  @map("product_id")
+  description   String?
+  spec          String?
+  thickness     Float?   @map("thickness")
+  width         Float?
+  CSP           String?  @map("CSP")
+  uomCode       String?  @map("uom_code") // UOM saldo; menjadi bagian identitas agar qty berbeda UOM tidak tercampur
+  stockType     String?  @map("stock_type") // Kategori fisik inventory: Material, Consumable, Asset, Finished Goods, Semi-Finished, dll. Bukan selalu sama dengan poType; reject/scrap/rework dibedakan lewat rack/status.
+  qtyOnHand     Float    @default(0) @map("qty_on_hand") // Stock fisik tersedia
+  qtyReserved   Float    @default(0) @map("qty_reserved") // Dialokasikan untuk SO/Production
+  qtyQC         Float    @default(0) @map("qty_qc") // Stock masih dalam proses QC / inspection
+  qtyAvailable  Float    @default(0) @map("qty_available") // qtyOnHand - qtyReserved - qtyQC
+  minStock      Float    @default(0) @map("min_stock") // Safety stock minimum
+  maxStock      Float?   @map("max_stock") // Maximum stock level
+  reorderPoint  Float?   @map("reorder_point") // Trigger untuk reorder
+  lastMovement  DateTime @default(now()) @map("last_movement")
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  warehouse                    Warehouse                     @relation(fields: [warehouseCode], references: [warehouseCode])
+  rack                         Rack?                         @relation(fields: [rackCode], references: [rackCode], onDelete: SetNull)
+  product                      Product?                      @relation(fields: [productId], references: [id], onDelete: SetNull)
+  stockReservations            StockReservation[]
+  stockOpnameDetails           StockOpnameDetail[]
+  sourceManufacturingOrders    ManufacturingOrder[]          @relation("ManufacturingOrderSourceWip")
+  manufacturingOrderSourceWips ManufacturingOrderSourceWip[]
+
+  @@unique([warehouseCode, rackCode, lotNumber, partCode, productId, description, spec, thickness, width, CSP, partNumber, uomCode], map: "tbl_stock_balance_wh_rack_lot_identity_uom_key")
+  @@index([warehouseCode])
+  @@index([rackCode])
+  @@index([lotNumber])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([partName])
+  @@index([productId])
+  @@index([uomCode])
+  @@index([stockType])
+  @@index([qtyOnHand])
+  @@index([qtyAvailable])
+  @@index([isDeleted])
+  @@map("tbl_stock_balance")
+}
+
+model ManufacturingOrderSourceWip {
+  id                   String   @id @default(uuid())
+  manufacturingOrderId String   @map("manufacturing_order_id")
+  moNumber             String   @map("mo_number")
+  lineNumber           Int      @default(1) @map("line_number")
+  stockBalanceId       String?  @map("stock_balance_id")
+  qty                  Float    @default(0)
+  warehouseCode        String?  @map("warehouse_code")
+  rackCode             String?  @map("rack_code")
+  lotNumber            String?  @map("lot_number")
+  partCode             String?  @map("part_code")
+  partNumber           String?  @map("part_number")
+  partName             String?  @map("part_name")
+  stockType            String?  @map("stock_type")
+  isDeleted            Boolean  @default(false) @map("is_deleted")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  manufacturingOrder ManufacturingOrder @relation(fields: [manufacturingOrderId], references: [id], onDelete: Cascade)
+  stockBalance       StockBalance?      @relation(fields: [stockBalanceId], references: [id], onDelete: SetNull)
+
+  @@index([manufacturingOrderId])
+  @@index([moNumber])
+  @@index([stockBalanceId])
+  @@index([lineNumber])
+  @@index([isDeleted])
+  @@map("tbl_manufacturing_order_source_wip")
+}
+
+// ============================================
+// INVENTORY - STOCK MOVEMENT
+// ============================================
+
+model StockMovement {
+  id                       String   @id @default(uuid())
+  movementNumber           String   @unique @map("movement_number")
+  movementDate             DateTime @default(now()) @map("movement_date")
+  movementType             String   @map("movement_type") // IN, OUT, TRANSFER, ADJUSTMENT
+  direction                String?  @map("direction") // IN, OUT (untuk TRANSFER akan tercatat 2 baris: OUT + IN)
+  transactionType          String?  @map("transaction_type") // Kategori bisnis utama: PURCHASE_RECEIVE, QUALITY_RELEASE, QC_HOLD, PRODUCTION, SALES, RETURN, REJECT, REWORK, SCRAP, STOCK_OPNAME
+  warehouseCode            String   @map("warehouse_code")
+  rackCode                 String?  @map("rack_code")
+  destinationWarehouseCode String?  @map("destination_warehouse_code")
+  lotNumber                String?  @map("lot_number") // LOT untuk traceability
+  destinationRackCode      String?  @map("destination_rack_code")
+  partCode                 String?  @map("part_code")
+  partNumber               String?  @map("part_number")
+  partName                 String?  @map("part_name")
+  productId                String?  @map("product_id")
+  description              String?
+  spec                     String?
+  thickness                Float?   @map("thickness")
+  width                    Float?
+  CSP                      String?  @map("CSP")
+  stockType                String?  @map("stock_type") // Snapshot kategori fisik inventory pada saat mutasi. Dari poType untuk purchasing, dari production flow untuk FG/Semi-Finished.
+  qty                      Float
+  deltaQty                 Float?   @map("delta_qty") // Signed qty: + masuk, - keluar
+  qtyBefore                Float?   @map("qty_before")
+  qtyAfter                 Float?   @map("qty_after")
+  adjustmentType           String?  @map("adjustment_type") // INCREASE, DECREASE
+  transferGroupId          String?  @map("transfer_group_id")
+  uomCode                  String?  @map("uom_code")
+  qualityBucket            String?  @map("quality_bucket")
+  referenceType            String?  @map("reference_type") // Dokumen/proses sumber: GR, INCOMING_INSPECTION, QUALITY_INSPECTION, PRODUCTION_LOG, MANUFACTURING_ORDER, SO, STO, MRP
+  referenceNumber          String?  @map("reference_number")
+  notes                    String?
+  performedBy              String?  @map("performed_by")
+  isDeleted                Boolean  @default(false) @map("is_deleted")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  warehouse       Warehouse @relation(fields: [warehouseCode], references: [warehouseCode])
+  rack            Rack?     @relation("sourceRack", fields: [rackCode], references: [rackCode], onDelete: SetNull)
+  destinationRack Rack?     @relation("destinationRack", fields: [destinationRackCode], references: [rackCode], onDelete: SetNull)
+  product         Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([movementNumber])
+  @@index([movementDate])
+  @@index([movementType])
+  @@index([direction])
+  @@index([transactionType])
+  @@index([warehouseCode])
+  @@index([rackCode])
+  @@index([destinationWarehouseCode])
+  @@index([destinationRackCode])
+  @@index([lotNumber])
+  @@index([transferGroupId])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([partName])
+  @@index([productId])
+  @@index([spec])
+  @@index([thickness])
+  @@index([width])
+  @@index([CSP])
+  @@index([stockType])
+  @@index([qualityBucket])
+  @@index([referenceType])
+  @@index([referenceNumber])
+  @@index([isDeleted])
+  @@map("tbl_stock_movement")
+}
+
+// ============================================
+// INVENTORY - STOCK RESERVATION
+// ============================================
+
+model StockReservation {
+  id                String    @id @default(uuid())
+  reservationNumber String    @unique @map("reservation_number")
+  reservationDate   DateTime  @default(now()) @map("reservation_date")
+  stockBalanceId    String?   @map("stock_balance_id")
+  warehouseCode     String    @map("warehouse_code")
+  rackCode          String?   @map("rack_code")
+  lotNumber         String?   @map("lot_number")
+  partCode          String?   @map("part_code")
+  partNumber        String?   @map("part_number")
+  partName          String?   @map("part_name")
+  productId         String?   @map("product_id")
+  description       String?
+  spec              String?
+  thickness         Float?    @map("thickness")
+  width             Float?
+  CSP               String?   @map("CSP")
+  qtyReserved       Float     @map("qty_reserved")
+  qtyReleased       Float     @default(0) @map("qty_released") // Sudah digunakan
+  referenceType     String    @map("reference_type") // SO, MANUFACTURING_ORDER, MPS
+  referenceNumber   String    @map("reference_number")
+  status            String    @default("Active") // Active, Released, Cancelled
+  expiryDate        DateTime? @map("expiry_date")
+  notes             String?
+  isDeleted         Boolean   @default(false) @map("is_deleted")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  warehouse    Warehouse     @relation(fields: [warehouseCode], references: [warehouseCode])
+  rack         Rack?         @relation(fields: [rackCode], references: [rackCode])
+  product      Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+  stockBalance StockBalance? @relation(fields: [stockBalanceId], references: [id], onDelete: SetNull)
+
+  @@index([reservationNumber])
+  @@index([warehouseCode])
+  @@index([rackCode])
+  @@index([lotNumber])
+  @@index([stockBalanceId])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([partName])
+  @@index([productId])
+  @@index([description])
+  @@index([spec])
+  @@index([thickness])
+  @@index([width])
+  @@index([CSP])
+  @@index([referenceType])
+  @@index([referenceNumber])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_stock_reservation")
+}
+
+// ============================================
+// INVENTORY - STOCK OPNAME (STO)
+// ============================================
+
+model StockOpnameHeader {
+  id                   String    @id @default(uuid())
+  stoNo                String    @unique @map("sto_no")
+  stoType              String    @map("sto_type") // MATERIAL, WIP, FG
+  warehouseCode        String    @map("warehouse_code")
+  stoDate              DateTime  @default(now()) @map("sto_date")
+  status               String    @default("DRAFT") // DRAFT, COUNTING, WAITING_APPROVAL, APPROVED, ADJUSTED, CLOSED
+  notes                String?
+  inventoryFrozen      Boolean   @default(false) @map("inventory_frozen")
+  createdBy            String?   @map("created_by")
+  checkerBy            String?   @map("checker_by")
+  checkerApprovedAt    DateTime? @map("checker_approved_at")
+  supervisorApprovedBy String?   @map("supervisor_approved_by")
+  supervisorApprovedAt DateTime? @map("supervisor_approved_at")
+  inventoryApprovedBy  String?   @map("inventory_approved_by")
+  inventoryApprovedAt  DateTime? @map("inventory_approved_at")
+  approvedBy           String?   @map("approved_by")
+  approvedAt           DateTime? @map("approved_at")
+  adjustedBy           String?   @map("adjusted_by")
+  adjustedAt           DateTime? @map("adjusted_at")
+  closedBy             String?   @map("closed_by")
+  closedAt             DateTime? @map("closed_at")
+  isDeleted            Boolean   @default(false) @map("is_deleted")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  warehouse Warehouse           @relation(fields: [warehouseCode], references: [warehouseCode])
+  details   StockOpnameDetail[]
+
+  @@index([stoNo])
+  @@index([stoType])
+  @@index([warehouseCode])
+  @@index([stoDate])
+  @@index([status])
+  @@index([createdBy])
+  @@index([approvedBy])
+  @@index([isDeleted])
+  @@map("tbl_sto_headers")
+}
+
+model StockOpnameDetail {
+  id               String    @id @default(uuid())
+  stoHeaderId      String    @map("sto_header_id")
+  stockBalanceId   String?   @map("stock_balance_id")
+  partCode         String?   @map("part_code")
+  partNumber       String?   @map("part_number")
+  partName         String?   @map("part_name")
+  productId        String?   @map("product_id")
+  description      String?
+  spec             String?
+  thickness        Float?    @map("thickness")
+  width            Float?
+  CSP              String?   @map("CSP")
+  stockType        String?   @map("stock_type")
+  warehouseCode    String    @map("warehouse_code")
+  rackCode         String?   @map("rack_code")
+  lotNumber        String?   @map("lot_number")
+  uomCode          String?   @map("uom_code")
+  systemQty        Float     @default(0) @map("system_qty")
+  actualQty        Float?    @map("actual_qty")
+  varianceQty      Float     @default(0) @map("variance_qty")
+  varianceAmount   Float     @default(0) @map("variance_amount")
+  varianceStatus   String    @default("MATCH") @map("variance_status") // MATCH, SHORTAGE, EXCESS
+  reason           String?
+  countedBy        String?   @map("counted_by")
+  countedAt        DateTime? @map("counted_at")
+  adjustmentNumber String?   @map("adjustment_number")
+  isDeleted        Boolean   @default(false) @map("is_deleted")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  header       StockOpnameHeader @relation(fields: [stoHeaderId], references: [id], onDelete: Cascade)
+  stockBalance StockBalance?     @relation(fields: [stockBalanceId], references: [id], onDelete: SetNull)
+  warehouse    Warehouse         @relation(fields: [warehouseCode], references: [warehouseCode])
+  rack         Rack?             @relation(fields: [rackCode], references: [rackCode], onDelete: SetNull)
+  product      Product?          @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([stoHeaderId])
+  @@index([stockBalanceId])
+  @@index([warehouseCode])
+  @@index([rackCode])
+  @@index([lotNumber])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([productId])
+  @@index([stockType])
+  @@index([varianceStatus])
+  @@index([countedBy])
+  @@index([isDeleted])
+  @@map("tbl_sto_details")
+}
+
+// ============================================
+// PLANNING - FORECAST
+// ============================================
+
+model Forecast {
+  id             String    @id @default(uuid())
+  forecastNumber String    @unique @map("forecast_number")
+  forecastName   String?   @map("forecast_name")
+  periodStart    DateTime  @map("period_start") // Base period start
+  periodEnd      DateTime  @map("period_end") // Base period end
+  customerCode   String?   @map("customer_code") // Optional: forecast per customer
+  status         String    @default("Draft") // Draft, Confirmed, Obsolete
+  notes          String?
+  createdBy      String?   @map("created_by")
+  approvedBy     String?   @map("approved_by")
+  approvedDate   DateTime? @map("approved_date")
+  isDeleted      Boolean   @default(false) @map("is_deleted")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  details ForecastDetail[]
+
+  @@index([forecastNumber])
+  @@index([periodStart])
+  @@index([periodEnd])
+  @@index([customerCode])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_forecast")
+}
+
+// ============================================
+// PLANNING - FORECAST DETAIL
+// ============================================
+
+model ForecastDetail {
+  id             String  @id @default(uuid())
+  forecastNumber String  @map("forecast_number")
+  lineNumber     Int     @map("line_number")
+  partCode       String  @map("part_code")
+  partId         String? @map("part_id")
+  uomCode        String? @map("uom_code")
+
+  // M+1 Period (Base month + 1)
+  M1Forecast DateTime? @map("m1_forecast") // Tanggal forecast M+1
+  M1Qty      Float     @default(0) @map("m1_qty") // Forecast qty untuk M+1
+
+  // M+2 Period (Base month + 2)
+  M2Forecast DateTime? @map("m2_forecast") // Tanggal forecast M+2
+  M2Qty      Float     @default(0) @map("m2_qty")
+
+  // M+3 Period (Base month + 3)
+  M3Forecast DateTime? @map("m3_forecast") // Tanggal forecast M+3
+  M3Qty      Float     @default(0) @map("m3_qty")
+
+  notes     String?
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  forecast   Forecast    @relation(fields: [forecastNumber], references: [forecastNumber], onDelete: Cascade)
+  part       Part?       @relation(fields: [partId], references: [id], onDelete: SetNull)
+  mpsDetails MPSDetail[]
+
+  @@index([forecastNumber])
+  @@index([partCode])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([isDeleted])
+  @@map("tbl_forecast_detail")
+}
+
+// ============================================
+// PLANNING - MPS (Master Production Schedule)
+// ============================================
+
+model MPS {
+  id             String    @id @default(uuid())
+  mpsNumber      String    @unique @map("mps_number")
+  mpsName        String?   @map("mps_name")
+  periodStart    DateTime  @map("period_start") // Planning period start
+  periodEnd      DateTime  @map("period_end") // Planning period end
+  forecastNumber String?   @map("forecast_number") // Reference ke Demand Forecast
+  status         String    @default("Draft") // Draft, Confirmed, Released, Completed
+  notes          String?
+  createdBy      String?   @map("created_by")
+  approvedBy     String?   @map("approved_by")
+  approvedDate   DateTime? @map("approved_date")
+  isDeleted      Boolean   @default(false) @map("is_deleted")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  details MPSDetail[]
+  mrpRuns MRPRun[]
+
+  @@index([mpsNumber])
+  @@index([periodStart])
+  @@index([periodEnd])
+  @@index([forecastNumber])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_mps")
+}
+
+// ============================================
+// PLANNING - MPS DETAIL
+// ============================================
+
+model MPSDetail {
+  id                   String   @id @default(uuid())
+  mpsNumber            String   @map("mps_number")
+  lineNumber           Int      @map("line_number")
+  partCode             String   @map("part_code")
+  partId               String?  @map("part_id")
+  mbomHeaderId         String?  @map("mbom_header_id")
+  forecastQty          Float    @default(0) @map("forecast_qty") // Forecast bulan berjalan sebelum buffer
+  actualSalesOrderQty  Float    @default(0) @map("actual_sales_order_qty") // SO aktual pada bucket yang sama
+  bufferBaseQty        Float    @default(0) @map("buffer_base_qty") // Forecast part pada bulan berikutnya
+  bufferPercent        Float    @default(0) @map("buffer_percent")
+  bufferQty            Float    @default(0) @map("buffer_qty")
+  bufferOverridden     Boolean  @default(false) @map("buffer_overridden")
+  bufferReferenceScope String   @default("PARENT_FG") @map("buffer_reference_scope")
+  effectiveDemandQty   Float    @default(0) @map("effective_demand_qty") // Forecast + buffer, minimum akan dinet terhadap SO di MRP
+  productionPercent    Float    @default(100) @map("production_percent")
+  productionOverridden Boolean  @default(false) @map("production_overridden")
+  qtyPlanned           Float    @map("qty_planned") // Target MPS = max((forecast + buffer) x production %, SO aktual)
+  startDate            DateTime @map("start_date")
+  endDate              DateTime @map("end_date")
+  priority             Int      @default(1) // Priority level
+  status               String   @default("Planned") // Planned, In Progress, Completed, Cancelled
+  soNumber             String?  @map("so_number") // Reference jika dari SO
+  customerCode         String?  @map("customer_code")
+  // Traceability: dari forecast mana row ini berasal
+  forecastDetailId     String?  @map("forecast_detail_id") // FK ke ForecastDetail
+  forecastPeriodOffset Int?     @map("forecast_period_offset") // 1=M1, 2=M2, 3=M3 (dari forecast mana)
+  notes                String?
+  isDeleted            Boolean  @default(false) @map("is_deleted")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mps             MPS              @relation(fields: [mpsNumber], references: [mpsNumber], onDelete: Cascade)
+  mbom            MBOMHeader?      @relation(fields: [mbomHeaderId], references: [id])
+  part            Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  forecastDetail  ForecastDetail?  @relation(fields: [forecastDetailId], references: [id], onDelete: SetNull)
+  mrpRequirements MRPRequirement[]
+
+  @@index([mpsNumber])
+  @@index([partCode])
+  @@index([partId])
+  @@index([mbomHeaderId])
+  @@index([startDate])
+  @@index([endDate])
+  @@index([priority])
+  @@index([status])
+  @@index([soNumber])
+  @@index([customerCode])
+  @@index([forecastDetailId])
+  @@index([isDeleted])
+  @@map("tbl_mps_detail")
+}
+
+// ============================================
+// PLANNING - MRP RUN (MRP Execution Header)
+// ============================================
+
+model MRPRun {
+  id                    String   @id @default(uuid())
+  runNumber             String   @unique @map("run_number")
+  planNumber            String?  @map("plan_number")
+  planRevision          Int      @default(1) @map("plan_revision")
+  planScope             String?  @map("plan_scope") // MPS, SO, Manual
+  isCurrentPlan         Boolean  @default(true) @map("is_current_plan")
+  runDate               DateTime @default(now()) @map("run_date")
+  mpsNumber             String?  @map("mps_number") // Reference ke MPS
+  planHorizon           Int      @default(90) @map("plan_horizon") // Planning horizon in days
+  cutoffDate            DateTime @map("cutoff_date") // Cut-off date untuk calculation
+  status                String   @default("Running") // Running, Completed, Failed
+  totalRequirements     Int      @default(0) @map("total_requirements") // Total requirement lines generated
+  totalPlannedOrders    Int      @default(0) @map("total_planned_orders") // Total planned orders
+  soDemandConsumedQty   Float    @default(0) @map("so_demand_consumed_qty")
+  soDemandImpactedLines Int      @default(0) @map("so_demand_impacted_lines")
+  nettingSummary        Json?    @map("netting_summary")
+  executionTime         Int?     @map("execution_time") // Execution time in seconds
+  errorMessage          String?  @map("error_message")
+  notes                 String?
+  runBy                 String?  @map("run_by")
+  isDeleted             Boolean  @default(false) @map("is_deleted")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mps           MPS?             @relation(fields: [mpsNumber], references: [mpsNumber])
+  requirements  MRPRequirement[]
+  plannedOrders PlannedOrder[]
+
+  @@index([runNumber])
+  @@index([planNumber])
+  @@index([planNumber, planRevision])
+  @@index([isCurrentPlan])
+  @@index([runDate])
+  @@index([mpsNumber])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_mrp_run")
+}
+
+// ============================================
+// PLANNING - MRP REQUIREMENT
+// ============================================
+
+model MRPRequirement {
+  id                  String    @id @default(uuid())
+  runNumber           String    @map("run_number")
+  parentRequirementId String?   @map("parent_requirement_id")
+  rootRequirementId   String?   @map("root_requirement_id")
+  treePath            String?   @map("tree_path")
+  levelMBOM           Int       @default(0) @map("level_mbom") // BOM level (0=FG, 1=sub-assy, 2=component)
+  mbomLevelComponent  Int?      @map("mbom_level_component")
+  mbomDetailId        String?   @map("mbom_detail_id")
+  partCode            String    @map("part_code")
+  partId              String?   @map("part_id")
+  requirementType     String    @map("requirement_type") // Independent (dari MPS), Dependent (dari BOM explosion)
+  sourceType          String?   @map("source_type") // MPS, SO, FORECAST
+  sourceNumber        String?   @map("source_number")
+  mpsDetailId         String?   @map("mps_detail_id") // FK ke MPSDetail untuk traceability MPS → MRP
+  requiredDate        DateTime  @map("required_date")
+  grossRequirement    Float     @map("gross_requirement") // Total requirement
+  forecastQty         Float     @default(0) @map("forecast_qty")
+  soConsumedQty       Float     @default(0) @map("so_consumed_qty")
+  effectiveDemandQty  Float     @default(0) @map("effective_demand_qty")
+  bufferBaseQty       Float     @default(0) @map("buffer_base_qty") // Demand purchase part pada bulan A+1
+  bufferPercent       Float     @default(0) @map("buffer_percent") // Default master Part, dapat dioverride per bucket MRP
+  bufferQty           Float     @default(0) @map("buffer_qty") // bufferBaseQty * bufferPercent / 100
+  bufferOverridden    Boolean   @default(false) @map("buffer_overridden")
+  bufferReferenceScope String   @default("PARENT_FG") @map("buffer_reference_scope")
+  consumptionSources  Json?     @map("consumption_sources")
+  onHandQty           Float     @default(0) @map("on_hand_qty") // Stock tersedia
+  allocatedQty        Float     @default(0) @map("allocated_qty") // Reserved stock
+  netRequirement      Float     @map("net_requirement") // Gross - OnHand - Allocated
+  plannedOrderQty     Float     @default(0) @map("planned_order_qty") // Qty planned order
+  orderPercent        Float     @default(100) @map("order_percent") // Override PPIC atas forecast; SO tetap minimum
+  adjustedOrderQty    Float     @default(0) @map("adjusted_order_qty") // Qty setelah Order % dan netting stock
+  orderType           String?   @map("order_type") // Purchase, Production
+  leadTime            Int       @default(0) @map("lead_time") // Lead time in days
+  orderDate           DateTime? @map("order_date") // Calculated order date
+  notes               String?
+  isDeleted           Boolean   @default(false) @map("is_deleted")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  mrpRun            MRPRun           @relation(fields: [runNumber], references: [runNumber], onDelete: Cascade)
+  parentRequirement MRPRequirement?  @relation("MRPRequirementTree", fields: [parentRequirementId], references: [id], onDelete: SetNull)
+  children          MRPRequirement[] @relation("MRPRequirementTree")
+  part              Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  mpsDetail         MPSDetail?       @relation(fields: [mpsDetailId], references: [id], onDelete: SetNull)
+  mbomDetail        MBOMDetail?      @relation(fields: [mbomDetailId], references: [id], onDelete: SetNull)
+
+  @@index([runNumber])
+  @@index([parentRequirementId])
+  @@index([rootRequirementId])
+  @@index([treePath])
+  @@index([levelMBOM])
+  @@index([mbomLevelComponent])
+  @@index([mbomDetailId])
+  @@index([partCode])
+  @@index([partId])
+  @@index([requirementType])
+  @@index([sourceType])
+  @@index([sourceNumber])
+  @@index([mpsDetailId])
+  @@index([requiredDate])
+  @@index([orderType])
+  @@index([isDeleted])
+  @@map("tbl_mrp_requirement")
+}
+
+// ============================================
+// PLANNING - PLANNED ORDER
+// ============================================
+
+model PlannedOrder {
+  id              String   @id @default(uuid())
+  orderNumber     String   @unique @map("order_number")
+  runNumber       String?  @map("run_number") // Nullable: SO-driven planned order tidak punya runNumber
+  orderType       String   @map("order_type") // Purchase, Production
+  partCode        String   @map("part_code")
+  partId          String?  @map("part_id")
+  qty             Float
+  uomCode         String?  @map("uom_code")
+  requiredDate    DateTime @map("required_date")
+  orderDate       DateTime @map("order_date") // Planned order date (required - lead time)
+  supplierCode    String?  @map("supplier_code") // Untuk purchase orders
+  vendorCode      String?  @map("vendor_code") // Untuk vendor orders
+  mbomHeaderId    String?  @map("mbom_header_id") // Untuk manufacturing orders
+  referenceType   String?  @map("reference_type") // SO, MRP, dll
+  referenceNumber String?  @map("reference_number") // soNumber#lineNumber atau mrpRunNumber
+  status          String   @default("Planned") // Planned, Monthly Planned, Partially Released, Released, Covered, Cancelled
+  priority        Int      @default(1)
+  notes           String?
+  isDeleted       Boolean  @default(false) @map("is_deleted")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  mrpRun MRPRun? @relation(fields: [runNumber], references: [runNumber], onDelete: Cascade)
+  part   Part?   @relation(fields: [partId], references: [id], onDelete: SetNull)
+
+  @@index([orderNumber])
+  @@index([runNumber])
+  @@index([orderType])
+  @@index([partCode])
+  @@index([partId])
+  @@index([requiredDate])
+  @@index([orderDate])
+  @@index([supplierCode])
+  @@index([vendorCode])
+  @@index([mbomHeaderId])
+  @@index([referenceType])
+  @@index([referenceNumber])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_planned_order")
+}
+
+// ============================================
+// PLANNING - MONTHLY PRODUCTION PLAN
+// ============================================
+
+model MonthlyProductionPlan {
+  id          String    @id @default(uuid())
+  planNumber  String    @unique @map("plan_number")
+  planMonth   DateTime  @map("plan_month")
+  periodStart DateTime  @map("period_start")
+  periodEnd   DateTime  @map("period_end")
+  status      String    @default("Draft") // Draft, Confirmed, Released, Closed, Cancelled
+  sourceType  String    @default("PlannedOrder") @map("source_type")
+  notes       String?
+  confirmedBy String?   @map("confirmed_by")
+  confirmedAt DateTime? @map("confirmed_at")
+  releasedBy  String?   @map("released_by")
+  releasedAt  DateTime? @map("released_at")
+  closedBy    String?   @map("closed_by")
+  closedAt    DateTime? @map("closed_at")
+  createdBy   String?   @map("created_by")
+  isDeleted   Boolean   @default(false) @map("is_deleted")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  details MonthlyProductionPlanDetail[]
+
+  @@index([planNumber])
+  @@index([planMonth])
+  @@index([periodStart])
+  @@index([periodEnd])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_monthly_production_plan")
+}
+
+model MonthlyProductionPlanDetail {
+  id                       String    @id @default(uuid())
+  planId                   String    @map("plan_id")
+  lineNumber               Int       @map("line_number")
+  plannedOrderNumber       String?   @map("planned_order_number")
+  manufacturingOrderNumber String?   @map("manufacturing_order_number")
+  partCode                 String    @map("part_code")
+  partId                   String?   @map("part_id")
+  mpsDetailId              String?   @map("mps_detail_id")
+  forecastQty              Float     @default(0) @map("forecast_qty")
+  actualSalesOrderQty      Float     @default(0) @map("actual_sales_order_qty")
+  bufferBaseQty            Float     @default(0) @map("buffer_base_qty")
+  bufferPercent            Float     @default(0) @map("buffer_percent")
+  bufferQty                Float     @default(0) @map("buffer_qty")
+  productionPercent        Float     @default(100) @map("production_percent")
+  effectiveDemandQty       Float     @default(0) @map("effective_demand_qty")
+  qtyPlanned               Float     @map("qty_planned")
+  qtyReleased              Float     @default(0) @map("qty_released")
+  uomCode                  String?   @map("uom_code")
+  requiredDate             DateTime? @map("required_date")
+  priority                 Int       @default(1)
+  status                   String    @default("Planned") // Planned, Converted, Cancelled
+  notes                    String?
+  isDeleted                Boolean   @default(false) @map("is_deleted")
+  createdAt                DateTime  @default(now()) @map("created_at")
+  updatedAt                DateTime  @updatedAt @map("updated_at")
+
+  plan MonthlyProductionPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, lineNumber])
+  @@index([planId])
+  @@index([plannedOrderNumber])
+  @@index([manufacturingOrderNumber])
+  @@index([partCode])
+  @@index([partId])
+  @@index([mpsDetailId])
+  @@index([requiredDate])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_monthly_production_plan_detail")
+}
+
+// ============================================
+// PLANNING - MRP DIRTY ITEM QUEUE
+// ============================================
+
+model MRPDirtyItem {
+  id           String    @id @default(uuid())
+  itemId       String    @map("item_id")
+  reason       String // SO, STOCK, BOM, PO, PRODUCTION, FORECAST
+  sourceNumber String?   @map("source_number")
+  status       String    @default("Pending") // Pending, Processing, Done, Failed
+  processedAt  DateTime? @map("processed_at")
+  notes        String?
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  item Part @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId])
+  @@index([reason])
+  @@index([status])
+  @@index([sourceNumber])
+  @@map("tbl_mrp_dirty_item")
+}
+
+// ============================================
+// PLANNING - BOM RELATION GRAPH
+// ============================================
+
+model BOMRelation {
+  id             String    @id @default(uuid())
+  parentItemId   String    @map("parent_item_id")
+  childItemId    String    @map("child_item_id")
+  mbomHeaderId   String?   @map("mbom_header_id")
+  levelComponent Int       @default(0) @map("level_component")
+  effectiveDate  DateTime? @map("effective_date")
+  expiryDate     DateTime? @map("expiry_date")
+  notes          String?
+  isDeleted      Boolean   @default(false) @map("is_deleted")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  parentItem Part        @relation("BOMRelationParent", fields: [parentItemId], references: [id], onDelete: Cascade)
+  childItem  Part        @relation("BOMRelationChild", fields: [childItemId], references: [id], onDelete: Cascade)
+  mbomHeader MBOMHeader? @relation(fields: [mbomHeaderId], references: [id], onDelete: SetNull)
+
+  @@unique([parentItemId, childItemId, mbomHeaderId])
+  @@index([parentItemId])
+  @@index([childItemId])
+  @@index([mbomHeaderId])
+  @@index([levelComponent])
+  @@index([isDeleted])
+  @@map("tbl_bom_relation")
+}
+
+// ============================================
+// PLANNING - ITEM LEVEL
+// ============================================
+
+model ItemLevel {
+  id         String   @id @default(uuid())
+  rootItemId String   @map("root_item_id")
+  itemId     String   @map("item_id")
+  level      Int      @default(0)
+  path       String? // Contoh: FG>A>B>C
+  sourceType String?  @map("source_type")
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  rootItem Part @relation("ItemLevelRoot", fields: [rootItemId], references: [id], onDelete: Cascade)
+  item     Part @relation("ItemLevelItem", fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([rootItemId, itemId])
+  @@index([rootItemId])
+  @@index([itemId])
+  @@index([level])
+  @@index([isActive])
+  @@map("tbl_item_level")
+}
+
+// ============================================
+// PLANNING - MRP PEGGING
+// ============================================
+
+model MRPPegging {
+  id               String   @id @default(uuid())
+  demandType       String   @map("demand_type") // Forecast, SO, MPS, MRP
+  demandNumber     String   @map("demand_number")
+  demandLineNumber Int?     @map("demand_line_number")
+  supplyType       String   @map("supply_type") // PlannedOrder, MO, PO
+  supplyNumber     String   @map("supply_number")
+  supplyLineNumber Int?     @map("supply_line_number")
+  itemId           String   @map("item_id")
+  qtyPegged        Float    @map("qty_pegged")
+  status           String   @default("Active") // Active, Released, Closed
+  notes            String?
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  item Part @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([demandType])
+  @@index([demandNumber])
+  @@index([supplyType])
+  @@index([supplyNumber])
+  @@index([itemId])
+  @@index([status])
+  @@map("tbl_mrp_pegging")
+}
+
+// ============================================
+// PLANNING - MRP PARTIAL SNAPSHOT
+// ============================================
+
+model MRPPartialSnapshot {
+  id             String    @id @default(uuid())
+  snapshotNumber String    @unique @map("snapshot_number")
+  snapshotDate   DateTime  @default(now()) @map("snapshot_date")
+  runScope       String    @default("Partial") @map("run_scope")
+  cutoffDate     DateTime? @map("cutoff_date")
+  dirtyCount     Int       @default(0) @map("dirty_count")
+  impactedCount  Int       @default(0) @map("impacted_count")
+  mpsCount       Int       @default(0) @map("mps_count")
+  status         String    @default("Completed")
+  snapshotJson   Json      @map("snapshot_json")
+  resultsJson    Json?     @map("results_json")
+  notes          String?
+  createdBy      String?   @map("created_by")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@index([snapshotDate])
+  @@index([runScope])
+  @@index([status])
+  @@map("tbl_mrp_partial_snapshot")
+}
+
+// ============================================
+// PURCHASING - PURCHASE REQUISITION (PR)
+// ============================================
+
+model PurchaseRequisition {
+  id              String    @id @default(uuid())
+  prNumber        String    @unique @map("pr_number")
+  prDate          DateTime  @default(now()) @map("pr_date")
+  requestedBy     String?   @map("requested_by")
+  departmentId    String?   @map("department_id")
+  requiredDate    DateTime  @map("required_date")
+  priority        String    @default("Normal") // Normal, Urgent, Critical
+  poType          String    @default("Other") @map("po_type") // Consumable, Material, Out Process, Maintenance, Service, Asset, Other
+  status          String    @default("Draft") // Draft, Submitted, Approved, Rejected, Partially Ordered, Completed
+  totalAmount     Float     @default(0) @map("total_amount")
+  approvedBy      String?   @map("approved_by")
+  approvedDate    DateTime? @map("approved_date")
+  rejectedBy      String?   @map("rejected_by")
+  rejectedDate    DateTime? @map("rejected_date")
+  rejectionReason String?   @map("rejection_reason")
+  convertedToPO   String?   @map("converted_to_po") // PO Number
+  notes           String?
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  details        PurchaseRequisitionDetail[]
+  purchaseOrders PurchaseOrderPR[]
+  department     Department?                 @relation(fields: [departmentId], references: [id])
+
+  @@index([prNumber])
+  @@index([prDate])
+  @@index([requestedBy])
+  @@index([departmentId])
+  @@index([priority])
+  @@index([poType])
+  @@index([status])
+  @@index([requiredDate])
+  @@index([isDeleted])
+  @@map("tbl_purchase_requisition")
+}
+
+// ============================================
+// PURCHASING - PURCHASE REQUISITION DETAIL
+// ============================================
+
+model PurchaseRequisitionDetail {
+  id                 String   @id @default(uuid())
+  prNumber           String   @map("pr_number")
+  lineNumber         Int      @map("line_number")
+  partCode           String?  @map("part_code") // untuk Material, Out Process
+  partNumber         String?  @map("part_number")
+  partName           String?  @map("part_name")
+  productId          String?  @map("product_id") // untuk Consumable
+  description        String?  @map("description") // untuk Maintenance, Service, Asset
+  spec               String? // Snapshot dari PartBase Material Specification
+  thickness          Float? // Snapshot dari PartBase
+  width              Float? // Snapshot dari PartBase
+  CSP                String?  @map("CSP") // Snapshot dari PartBase
+  qty                Float
+  orderedQty         Float    @default(0) @map("ordered_qty") // Total qty yang sudah di-PO-kan
+  uomCode            String?  @map("uom_code")
+  estimatedPrice     Float    @default(0) @map("estimated_price")
+  totalAmount        Float    @default(0) @map("total_amount")
+  preferredSupplier  String?  @map("preferred_supplier")
+  preferredVendor    String?  @map("preferred_vendor")
+  plannedOrderNumber String?  @map("planned_order_number") // Reference dari MRP
+  notes              String?
+  isDeleted          Boolean  @default(false) @map("is_deleted")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  pr        PurchaseRequisition   @relation(fields: [prNumber], references: [prNumber], onDelete: Cascade)
+  product   Product?              @relation(fields: [productId], references: [id], onDelete: SetNull)
+  poDetails PurchaseOrderDetail[]
+
+  @@index([prNumber])
+  @@index([partCode])
+  @@index([productId])
+  @@index([preferredSupplier])
+  @@index([preferredVendor])
+  @@index([plannedOrderNumber])
+  @@index([isDeleted])
+  @@map("tbl_purchase_requisition_detail")
+}
+
+// ============================================
+// PURCHASING - PURCHASE ORDER (PO)
+// ============================================
+
+model PurchaseOrder {
+  id              String    @id @default(uuid())
+  poNumber        String    @unique @map("po_number")
+  poDate          DateTime  @default(now()) @map("po_date")
+  supplierCode    String?   @map("supplier_code")
+  supplierName    String?   @map("supplier_name")
+  vendorCode      String?   @map("vendor_code")
+  vendorName      String?   @map("vendor_name")
+  contact         String?
+  phone           String?
+  email           String?
+  billingAddress  String?   @map("billing_address")
+  shippingAddress String?   @map("shipping_address")
+  deliveryDate    DateTime  @map("delivery_date")
+  paymentTerms    String?   @map("payment_terms")
+  quotationNumber String?   @map("quotation_number")
+  quotationFiles  Json?     @map("quotation_files") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  poType          String    @default("Other") @map("po_type") // Consumable, Material, Out Process, Maintenance, Service, Asset, Other
+  currencyCode    String    @default("IDR") @map("currency_code")
+  status          String    @default("Draft") // Draft, Checking by Operational Manager, Checking by Engineering Manager, Checking by Sacho, Approved, Revising, Rejected, Sent, Confirmed, Partial Receipt, Completed, Cancelled
+  totalAmount     Float     @default(0) @map("total_amount")
+  notes           String?
+  createdBy       String?   @map("created_by")
+  checkedBy       String?   @map("checked_by")
+  checkedDate     DateTime? @map("checked_date")
+  approvedBy      String?   @map("approved_by")
+  approvedDate    DateTime? @map("approved_date")
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  purchaseRequisitions PurchaseOrderPR[]
+  comments             PurchaseOrderComment[]
+  supplier             Supplier?              @relation(fields: [supplierCode], references: [supplierCode], onDelete: SetNull)
+  vendor               Vendor?                @relation(fields: [vendorCode], references: [vendorCode], onDelete: SetNull)
+  currency             Currency               @relation(fields: [currencyCode], references: [currencyCode])
+  details              PurchaseOrderDetail[]
+  goodsReceipts        GoodsReceipt[]
+  purchaseInvoices     PurchaseInvoice[]      @relation("PurchaseInvoicePrimaryPO")
+  purchaseInvoiceLinks PurchaseInvoicePO[]
+
+  @@index([poNumber])
+  @@index([poDate])
+  @@index([supplierCode])
+  @@index([deliveryDate])
+  @@index([quotationNumber])
+  @@index([status])
+  @@index([poType])
+  @@index([currencyCode])
+  @@index([isDeleted])
+  @@map("tbl_purchase_order")
+}
+
+model PurchaseOrderComment {
+  id         String   @id @default(uuid())
+  poNumber   String   @map("po_number")
+  parentId   String?  @map("parent_id")
+  type       String   @default("revision")
+  message    String
+  fromStatus String?  @map("from_status")
+  toStatus   String?  @map("to_status")
+  createdBy  String?  @map("created_by")
+  userId     String?  @map("user_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  po      PurchaseOrder          @relation(fields: [poNumber], references: [poNumber], onDelete: Cascade)
+  parent  PurchaseOrderComment?  @relation("PurchaseOrderCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies PurchaseOrderComment[] @relation("PurchaseOrderCommentReplies")
+
+  @@index([poNumber])
+  @@index([parentId])
+  @@index([type])
+  @@index([createdBy])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("tbl_purchase_order_comments")
+}
+
+// ============================================
+// PURCHASING - PURCHASE ORDER PR (JUNCTION)
+// ============================================
+
+model PurchaseOrderPR {
+  id       String @id @default(uuid())
+  poNumber String @map("po_number")
+  prNumber String @map("pr_number")
+
+  // Relations
+  po PurchaseOrder       @relation(fields: [poNumber], references: [poNumber], onDelete: Cascade)
+  pr PurchaseRequisition @relation(fields: [prNumber], references: [prNumber], onDelete: Cascade)
+
+  @@unique([poNumber, prNumber])
+  @@index([poNumber])
+  @@index([prNumber])
+  @@map("tbl_purchase_order_pr")
+}
+
+// ============================================
+// PURCHASING - PURCHASE ORDER DETAIL
+// ============================================
+
+model PurchaseOrderDetail {
+  id                   String    @id @default(uuid())
+  poNumber             String    @map("po_number")
+  lineNumber           Int       @map("line_number")
+  prDetailId           String?   @map("pr_detail_id") // FK ke PurchaseRequisitionDetail (opsional)
+  productId            String?   @map("product_id") // Reference ke Product (utama untuk Consumable)
+  description          String?   @map("description") // Deskripsi item, wajib untuk Maintenance/Service/Asset
+  partCode             String?   @map("part_code") // Utama untuk Material, Out Process
+  partNumber           String?   @map("part_number")
+  partName             String?   @map("part_name")
+  spec                 String? // Snapshot dari PartBase Material Specification
+  thickness            Float? // Snapshot dari PartBase
+  width                Float? // Snapshot dari PartBase
+  CSP                  String?   @map("CSP") // Snapshot dari PartBase
+  qty                  Float
+  uomCode              String?   @map("uom_code")
+  unitPrice            Float     @default(0) @map("unit_price")
+  vendorPriceListId    String?   @map("vendor_price_list_id")
+  vendorPriceBreakdown Json?     @map("vendor_price_breakdown")
+  discount             Float     @default(0)
+  discountType         String    @default("percent") @map("discount_type") // "percent" atau "nominal"
+  tax                  Float     @default(0)
+  totalAmount          Float     @default(0) @map("total_amount")
+  qtyReceived          Float     @default(0) @map("qty_received") // Tracking qty received via GR
+  deliveryDate         DateTime? @map("delivery_date")
+  category             String?   @map("category") // Office, PSE, PD, WD, MD, DIES, TOOLS, MCN
+  notes                String?
+  isDeleted            Boolean   @default(false) @map("is_deleted")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  po                     PurchaseOrder              @relation(fields: [poNumber], references: [poNumber], onDelete: Cascade)
+  prDetail               PurchaseRequisitionDetail? @relation(fields: [prDetailId], references: [id], onDelete: SetNull)
+  product                Product?                   @relation(fields: [productId], references: [id], onDelete: SetNull)
+  vendorPriceList        VendorPriceList?           @relation(fields: [vendorPriceListId], references: [id], onDelete: SetNull)
+  goodsReceiptDetails    GoodsReceiptDetail[]
+  purchaseInvoiceDetails PurchaseInvoiceDetail[]
+
+  @@index([poNumber])
+  @@index([prDetailId])
+  @@index([partCode])
+  @@index([productId])
+  @@index([vendorPriceListId])
+  @@index([uomCode])
+  @@index([category])
+  @@index([isDeleted])
+  @@map("tbl_purchase_order_detail")
+}
+
+// ============================================
+// PURCHASING - GOODS RECEIPT (GR)
+// ============================================
+
+model GoodsReceipt {
+  id                 String    @id @default(uuid())
+  grNumber           String    @unique @map("gr_number")
+  grDate             DateTime  @default(now()) @map("gr_date")
+  poNumber           String    @map("po_number")
+  poType             String?   @map("po_type") // Copy dari PO header: Consumable, Material, Out Process, Maintenance, Service, Asset
+  stockType          String?   @map("stock_type") // Kategori inventory hasil mapping poType untuk GR/StockMovement purchasing: Consumable, Material, OutProcess, Maintenance, Service, Asset
+  warehouseCode      String    @map("warehouse_code") // Destination warehouse
+  deliveryNoteNumber String?   @map("delivery_note_number") // Default nomor surat jalan untuk detail GR
+  receivedBy         String?   @map("received_by")
+  receivedDate       DateTime? @map("received_date")
+  status             String    @default("Draft") // Draft, Received Pending Inspection, Partially Inspected, Completed, Cancelled
+  notes              String?
+  isDeleted          Boolean   @default(false) @map("is_deleted")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  po                  PurchaseOrder        @relation(fields: [poNumber], references: [poNumber])
+  warehouse           Warehouse            @relation(fields: [warehouseCode], references: [warehouseCode])
+  details             GoodsReceiptDetail[]
+  incomingInspections IncomingInspection[]
+
+  @@index([grNumber])
+  @@index([grDate])
+  @@index([poNumber])
+  @@index([poType])
+  @@index([warehouseCode])
+  @@index([deliveryNoteNumber])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_goods_receipt")
+}
+
+// ============================================
+// PURCHASING - GOODS RECEIPT DETAIL
+// ============================================
+
+model GoodsReceiptDetail {
+  id                 String   @id @default(uuid())
+  grNumber           String   @map("gr_number")
+  lineNumber         Int      @map("line_number")
+  poDetailId         String   @map("po_detail_id")
+  qtyOrdered         Float    @map("qty_ordered")
+  qtyReceived        Float    @map("qty_received") // Actual received
+  qtyInspected       Float    @default(0) @map("qty_inspected") // Akumulasi qty yang sudah di-inspection
+  deliveryNoteNumber String?  @map("delivery_note_number") // Nomor surat jalan per detail
+  deliveryNoteFiles  Json?    @map("delivery_note_files") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
+  lotNumber          String?  @map("lot_number") // LOT number untuk traceability (opsional)
+  supplierLotNumber  String?  @map("supplier_lot_number") // LOT/batch number dari supplier/vendor
+  rackCode           String?  @map("rack_code") // Rack tujuan per item (opsional, override default warehouse putaway)
+  uomCode            String?  @map("uom_code")
+  unitPrice          Float    @default(0) @map("unit_price") // Snapshot dari PO untuk historical tracking
+  totalPrice         Float    @default(0) @map("total_price") // qtyReceived * unitPrice
+  notes              String?
+  isDeleted          Boolean  @default(false) @map("is_deleted")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  gr                        GoodsReceipt               @relation(fields: [grNumber], references: [grNumber], onDelete: Cascade)
+  poDetail                  PurchaseOrderDetail        @relation(fields: [poDetailId], references: [id])
+  rack                      Rack?                      @relation(fields: [rackCode], references: [rackCode])
+  incomingInspectionDetails IncomingInspectionDetail[]
+  purchaseInvoiceDetails    PurchaseInvoiceDetail[]
+
+  @@index([grNumber])
+  @@index([poDetailId])
+  @@index([deliveryNoteNumber])
+  @@index([lotNumber])
+  @@index([supplierLotNumber])
+  @@index([rackCode])
+  @@index([isDeleted])
+  @@map("tbl_goods_receipt_detail")
+}
+
+// ============================================
+// PURCHASING - PURCHASE INVOICE
+// ============================================
+
+model PurchaseInvoice {
+  id                    String    @id @default(uuid())
+  invoiceNumber         String    @unique @map("invoice_number")
+  supplierInvoiceNumber String    @map("supplier_invoice_number")
+  invoiceDate           DateTime  @default(now()) @map("invoice_date")
+  dueDate               DateTime? @map("due_date")
+  poNumber              String    @map("po_number")
+  supplierCode          String?   @map("supplier_code")
+  supplierName          String?   @map("supplier_name")
+  vendorCode            String?   @map("vendor_code")
+  vendorName            String?   @map("vendor_name")
+  currencyCode          String    @default("IDR") @map("currency_code")
+  subtotalAmount        Float     @default(0) @map("subtotal_amount")
+  discountAmount        Float     @default(0) @map("discount_amount")
+  taxAmount             Float     @default(0) @map("tax_amount")
+  totalAmount           Float     @default(0) @map("total_amount")
+  status                String    @default("Draft") // Draft, Submitted, Matched, Need Review, Approved, Posted, Paid, Cancelled
+  matchStatus           String    @default("Unchecked") @map("match_status") // Unchecked, Matched, Variance
+  invoiceFiles          Json?     @map("invoice_files") // [{ fileName, fileUrl, fileType, fileSize }]
+  notes                 String?
+  createdBy             String?   @map("created_by")
+  submittedBy           String?   @map("submitted_by")
+  submittedDate         DateTime? @map("submitted_date")
+  approvedBy            String?   @map("approved_by")
+  approvedDate          DateTime? @map("approved_date")
+  paidBy                String?   @map("paid_by")
+  paidDate              DateTime? @map("paid_date")
+  isDeleted             Boolean   @default(false) @map("is_deleted")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  po             PurchaseOrder            @relation("PurchaseInvoicePrimaryPO", fields: [poNumber], references: [poNumber], onDelete: Restrict)
+  supplier       Supplier?                @relation(fields: [supplierCode], references: [supplierCode], onDelete: SetNull)
+  vendor         Vendor?                  @relation(fields: [vendorCode], references: [vendorCode], onDelete: SetNull)
+  currency       Currency                 @relation(fields: [currencyCode], references: [currencyCode])
+  details        PurchaseInvoiceDetail[]
+  payments       PurchaseInvoicePayment[]
+  purchaseOrders PurchaseInvoicePO[]
+
+  @@index([invoiceNumber])
+  @@index([supplierInvoiceNumber])
+  @@index([invoiceDate])
+  @@index([dueDate])
+  @@index([poNumber])
+  @@index([supplierCode])
+  @@index([vendorCode])
+  @@index([currencyCode])
+  @@index([status])
+  @@index([matchStatus])
+  @@index([isDeleted])
+  @@map("tbl_purchase_invoice")
+}
+
+model PurchaseInvoicePO {
+  id            String   @id @default(uuid())
+  invoiceNumber String   @map("invoice_number")
+  poNumber      String   @map("po_number")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  invoice PurchaseInvoice @relation(fields: [invoiceNumber], references: [invoiceNumber], onDelete: Cascade)
+  po      PurchaseOrder   @relation(fields: [poNumber], references: [poNumber], onDelete: Restrict)
+
+  @@unique([invoiceNumber, poNumber])
+  @@index([invoiceNumber])
+  @@index([poNumber])
+  @@map("tbl_purchase_invoice_po")
+}
+
+// ============================================
+// PURCHASING - PURCHASE INVOICE DETAIL
+// ============================================
+
+model PurchaseInvoiceDetail {
+  id             String   @id @default(uuid())
+  invoiceNumber  String   @map("invoice_number")
+  lineNumber     Int      @map("line_number")
+  poDetailId     String   @map("po_detail_id")
+  grDetailId     String?  @map("gr_detail_id")
+  productId      String?  @map("product_id")
+  description    String?  @map("description")
+  partCode       String?  @map("part_code")
+  partNumber     String?  @map("part_number")
+  partName       String?  @map("part_name")
+  spec           String?
+  thickness      Float?
+  width          Float?
+  CSP            String?  @map("CSP")
+  qtyInvoiced    Float    @map("qty_invoiced")
+  uomCode        String?  @map("uom_code")
+  unitPrice      Float    @default(0) @map("unit_price")
+  discount       Float    @default(0)
+  discountType   String   @default("percent") @map("discount_type")
+  tax            Float    @default(0)
+  totalAmount    Float    @default(0) @map("total_amount")
+  varianceAmount Float    @default(0) @map("variance_amount")
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  invoice  PurchaseInvoice     @relation(fields: [invoiceNumber], references: [invoiceNumber], onDelete: Cascade)
+  poDetail PurchaseOrderDetail @relation(fields: [poDetailId], references: [id])
+  grDetail GoodsReceiptDetail? @relation(fields: [grDetailId], references: [id])
+  product  Product?            @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceNumber])
+  @@index([poDetailId])
+  @@index([grDetailId])
+  @@index([productId])
+  @@index([partCode])
+  @@map("tbl_purchase_invoice_detail")
+}
+
+// ============================================
+// PURCHASING - PURCHASE INVOICE PAYMENT
+// ============================================
+
+model PurchaseInvoicePayment {
+  id                 String    @id @default(uuid())
+  invoiceNumber      String    @map("invoice_number")
+  lineNumber         Int       @map("line_number")
+  paymentPlan        String?   @map("payment_plan")
+  plannedPaymentDate DateTime? @map("planned_payment_date")
+  actualPaymentDate  DateTime? @map("actual_payment_date")
+  amountPayment      Float     @default(0) @map("amount_payment")
+  outstandingPayment Float     @default(0) @map("outstanding_payment")
+  notes              String?
+  createdBy          String?   @map("created_by")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  invoice PurchaseInvoice @relation(fields: [invoiceNumber], references: [invoiceNumber], onDelete: Cascade)
+
+  @@index([invoiceNumber])
+  @@index([actualPaymentDate])
+  @@index([plannedPaymentDate])
+  @@map("tbl_purchase_invoice_payment")
+}
+
+// ============================================
+// PURCHASING - INCOMING INSPECTION
+// ============================================
+
+model IncomingInspection {
+  id               String    @id @default(uuid())
+  inspectionNumber String    @unique @map("inspection_number")
+  inspectionDate   DateTime  @default(now()) @map("inspection_date")
+  grNumber         String    @map("gr_number")
+  status           String    @default("Open") // Open, In Progress, Completed, Cancelled
+  decision         String    @default("Pending") // Pending, Accepted, Partially Accepted, Rejected
+  inspectedBy      String?   @map("inspected_by")
+  approvedBy       String?   @map("approved_by")
+  approvedAt       DateTime? @map("approved_at")
+  notes            String?
+  isDeleted        Boolean   @default(false) @map("is_deleted")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  gr      GoodsReceipt               @relation(fields: [grNumber], references: [grNumber], onDelete: Cascade)
+  details IncomingInspectionDetail[]
+
+  @@index([inspectionNumber])
+  @@index([grNumber])
+  @@index([status])
+  @@index([decision])
+  @@index([isDeleted])
+  @@map("tbl_incoming_inspection")
+}
+
+model IncomingInspectionDetail {
+  id             String   @id @default(uuid())
+  inspectionId   String   @map("inspection_id")
+  grDetailId     String   @map("gr_detail_id")
+  lineNumber     Int      @map("line_number")
+  qtyInspected   Float    @default(0) @map("qty_inspected")
+  qtyAccepted    Float    @default(0) @map("qty_accepted")
+  qtyRejected    Float    @default(0) @map("qty_rejected")
+  qtyRework      Float    @default(0) @map("qty_rework")
+  disposition    String?
+  defectCode     String?  @map("defect_code")
+  defectCategory String?  @map("defect_category")
+  notes          String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  inspection IncomingInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  grDetail   GoodsReceiptDetail @relation(fields: [grDetailId], references: [id], onDelete: Cascade)
+
+  @@index([inspectionId])
+  @@index([grDetailId])
+  @@map("tbl_incoming_inspection_detail")
+}
+
+// ============================================
+// PRODUCTION - MANUFACTURING ORDER
+// ============================================
+
+model ManufacturingOrder {
+  id                                    String                        @id @default(uuid())
+  moNumber                              String                        @unique @map("mo_number") // MO-YYYYMMDD-001
+  moDate                                DateTime                      @default(now()) @map("mo_date")
+  // Reference sumber
+  referenceType                         String?                       @map("reference_type") // Internal, MRPPlannedOrder
+  plannedOrderNumber                    String?                       @map("planned_order_number") // FK ke PlannedOrder.orderNumber (jika referenceType = MRPPlannedOrder)
+  monthlyProductionPlanNumber           String?                       @map("monthly_production_plan_number")
+  monthlyProductionPlanLineNumber       Int?                          @map("monthly_production_plan_line_number")
+  // Part yang diproduksi
+  partId                                String?                       @map("part_id")
+  // Qty
+  qtyPlanned                            Float                         @map("qty_planned")
+  uomCode                               String?                       @map("uom_code")
+  materialRequirementUomMode            String                        @default("kg") @map("material_requirement_uom_mode") // kg, ORIGINAL, BY_ITEM_TYPE
+  qtyProduced                           Float                         @default(0) @map("qty_produced")
+  qtyGood                               Float                         @default(0) @map("qty_good")
+  qtyReject                             Float                         @default(0) @map("qty_reject")
+  // Input source: default MBOM material, optional existing WIP stock
+  inputSourceType                       String                        @default("MBOM") @map("input_source_type") // MBOM, WIP_STOCK
+  sourceStockBalanceId                  String?                       @map("source_stock_balance_id")
+  sourceWarehouseCode                   String?                       @map("source_warehouse_code")
+  sourceRackCode                        String?                       @map("source_rack_code")
+  sourceLotNumber                       String?                       @map("source_lot_number")
+  sourcePartCode                        String?                       @map("source_part_code")
+  sourcePartNumber                      String?                       @map("source_part_number")
+  sourcePartName                        String?                       @map("source_part_name")
+  sourceStockType                       String?                       @map("source_stock_type")
+  sourceQtyPlanned                      Float?                        @map("source_qty_planned")
+  parentMoNumber                        String?                       @map("parent_mo_number")
+  rootMoNumber                          String?                       @map("root_mo_number")
+  sourceReferenceType                   String?                       @map("source_reference_type")
+  sourcePlannedOrderNumber              String?                       @map("source_planned_order_number")
+  sourceMonthlyProductionPlanNumber     String?                       @map("source_monthly_production_plan_number")
+  sourceMonthlyProductionPlanLineNumber Int?                          @map("source_monthly_production_plan_line_number")
+  sourceStartSequence                   Int?                          @map("source_start_sequence")
+  sourceStartProcessLabel               String?                       @map("source_start_process_label")
+  sourceReworkTraceType                 String?                       @map("source_rework_trace_type")
+  sourceReworkReferenceType             String?                       @map("source_rework_reference_type")
+  sourceReworkReferenceNumber           String?                       @map("source_rework_reference_number")
+  sourceReworkReferenceLabel            String?                       @map("source_rework_reference_label")
+  isReworkChild                         Boolean                       @default(false) @map("is_rework_child")
+  // Schedule
+  plannedStartDate                      DateTime?                     @map("planned_start_date")
+  plannedEndDate                        DateTime?                     @map("planned_end_date")
+  actualStartDate                       DateTime?                     @map("actual_start_date")
+  actualEndDate                         DateTime?                     @map("actual_end_date")
+  // Status
+  status                                String                        @default("Draft") @map("status") // Draft, Planned, Released, In Progress, Completed, Cancelled
+  notes                                 String?
+  createdBy                             String?                       @map("created_by")
+  isDeleted                             Boolean                       @default(false) @map("is_deleted")
+  createdAt                             DateTime                      @default(now()) @map("created_at")
+  updatedAt                             DateTime                      @updatedAt @map("updated_at")
+  // Relations
+  part                                  Part?                         @relation(fields: [partId], references: [id], onDelete: SetNull)
+  uom                                   Uom?                          @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+  sourceStockBalance                    StockBalance?                 @relation("ManufacturingOrderSourceWip", fields: [sourceStockBalanceId], references: [id], onDelete: SetNull)
+  sourceWipAllocations                  ManufacturingOrderSourceWip[]
+  workOrders                            WorkOrder[]
+  productionLogs                        ProductionLog[]
+  downtimeLogs                          DowntimeLog[]
+  qualityInspections                    QualityInspection[]
+  materialIssues                        MaterialIssue[]
+  wipEntries                            WIPEntry[]
+
+  @@index([moNumber])
+  @@index([referenceType])
+  @@index([plannedOrderNumber])
+  @@index([monthlyProductionPlanNumber])
+  @@index([monthlyProductionPlanLineNumber])
+  @@index([partId])
+  @@index([uomCode])
+  @@index([inputSourceType])
+  @@index([sourceStockBalanceId])
+  @@index([parentMoNumber])
+  @@index([rootMoNumber])
+  @@index([sourceReferenceType])
+  @@index([sourcePlannedOrderNumber])
+  @@index([sourceStartSequence])
+  @@index([isReworkChild])
+  @@index([status])
+  @@index([plannedStartDate])
+  @@index([plannedEndDate])
+  @@index([isDeleted])
+  @@map("tbl_manufacturing_order")
+}
+
+// ============================================
+// PRODUCTION - VENDOR PROCESS ORDER
+// ============================================
+
+model VendorProcessOrder {
+  id                    String              @id @default(uuid())
+  orderNumber           String              @unique @map("order_number")
+  orderDate             DateTime            @default(now()) @map("order_date")
+  moId                  String              @map("mo_id")
+  moNumber              String              @map("mo_number")
+  mbomHeaderId          String?             @map("mbom_header_id")
+  mbomNoReg             String?             @map("mbom_no_reg")
+  mbomDetailId          String?             @map("mbom_detail_id")
+  mbomProcessId         String?             @map("mbom_process_id")
+  processId             String?             @map("process_id")
+  processCode           String?             @map("process_code")
+  processName           String?             @map("process_name")
+  sequence              Int                 @default(0)
+  vendorCode            String?             @map("vendor_code")
+  vendorName            String?             @map("vendor_name")
+  inputPartId           String?             @map("input_part_id")
+  inputPartCode         String?             @map("input_part_code")
+  inputPartNumber       String?             @map("input_part_number")
+  inputPartName         String?             @map("input_part_name")
+  outputPartId          String?             @map("output_part_id")
+  outputPartCode        String?             @map("output_part_code")
+  outputPartNumber      String?             @map("output_part_number")
+  outputPartName        String?             @map("output_part_name")
+  isReworkOrder         Boolean             @default(false) @map("is_rework_order")
+  reworkSourceType      String?             @map("rework_source_type")
+  reworkReferenceType   String?             @map("rework_reference_type")
+  reworkReferenceNumber String?             @map("rework_reference_number")
+  reworkReferenceLabel  String?             @map("rework_reference_label")
+  spec                  String?
+  thickness             Float?
+  width                 Float?
+  CSP                   String?             @map("CSP")
+  stockType             String              @default("WIP") @map("stock_type")
+  qtyPlanned            Float               @default(0) @map("qty_planned")
+  qtySent               Float               @default(0) @map("qty_sent")
+  qtyReceived           Float               @default(0) @map("qty_received")
+  qtyAccepted           Float               @default(0) @map("qty_accepted")
+  qtyReject             Float               @default(0) @map("qty_reject")
+  qtyRework             Float               @default(0) @map("qty_rework")
+  qtyScrap              Float               @default(0) @map("qty_scrap")
+  uomCode               String?             @map("uom_code")
+  vendorPriceListId     String?             @map("vendor_price_list_id")
+  vendorRate            Float               @default(0) @map("vendor_rate")
+  vendorCurrency        String?             @map("vendor_currency")
+  plannedVendorCost     Float               @default(0) @map("planned_vendor_cost")
+  actualVendorCost      Float               @default(0) @map("actual_vendor_cost")
+  sourceWarehouseCode   String?             @map("source_warehouse_code")
+  sourceRackCode        String?             @map("source_rack_code")
+  sourceLotNumber       String?             @map("source_lot_number")
+  vendorWarehouseCode   String?             @map("vendor_warehouse_code")
+  vendorRackCode        String?             @map("vendor_rack_code")
+  vendorLotNumber       String?             @map("vendor_lot_number")
+  receiveWarehouseCode  String?             @map("receive_warehouse_code")
+  receiveRackCode       String?             @map("receive_rack_code")
+  receiveLotNumber      String?             @map("receive_lot_number")
+  dueDate               DateTime?           @map("due_date")
+  sentAt                DateTime?           @map("sent_at")
+  receivedAt            DateTime?           @map("received_at")
+  closedAt              DateTime?           @map("closed_at")
+  status                String              @default("Planned") // Planned, Ready to Send, Sent, Partial Received, QC Hold, Completed, Closed, Cancelled
+  notes                 String?
+  createdBy             String?             @map("created_by")
+  isDeleted             Boolean             @default(false) @map("is_deleted")
+  createdAt             DateTime            @default(now()) @map("created_at")
+  updatedAt             DateTime            @updatedAt @map("updated_at")
+  vendorPriceList       VendorPriceList?    @relation(fields: [vendorPriceListId], references: [id], onDelete: SetNull)
+  qualityInspections    QualityInspection[]
+
+  @@index([orderNumber])
+  @@index([moId])
+  @@index([moNumber])
+  @@index([mbomHeaderId])
+  @@index([mbomNoReg])
+  @@index([mbomDetailId])
+  @@index([mbomProcessId])
+  @@index([processId])
+  @@index([sequence])
+  @@index([vendorCode])
+  @@index([vendorPriceListId])
+  @@index([outputPartCode])
+  @@index([isReworkOrder])
+  @@index([reworkSourceType])
+  @@index([reworkReferenceNumber])
+  @@index([stockType])
+  @@index([status])
+  @@index([dueDate])
+  @@index([isDeleted])
+  @@map("tbl_vendor_process_order")
+}
+
+// ============================================
+// PRODUCTION - WORK ORDER
+// ============================================
+
+model WorkOrder {
+  id                    String              @id @default(uuid())
+  woNumber              String              @unique @map("wo_number") // WO-YYYYMMDD-001
+  woDate                DateTime            @default(now()) @map("wo_date")
+  moId                  String              @map("mo_id") // FK ke ManufacturingOrder
+  mbomDetailId          String?             @map("mbom_detail_id") // FK ke MBOMDetail sumber routing/component
+  outputPartId          String?             @map("output_part_id")
+  outputPartCode        String?             @map("output_part_code")
+  outputPartNumber      String?             @map("output_part_number")
+  outputPartName        String?             @map("output_part_name")
+  isReworkOrder         Boolean             @default(false) @map("is_rework_order")
+  reworkSourceType      String?             @map("rework_source_type")
+  reworkReferenceType   String?             @map("rework_reference_type")
+  reworkReferenceNumber String?             @map("rework_reference_number")
+  reworkReferenceLabel  String?             @map("rework_reference_label")
+  // Routing reference (dari MBOMProcess)
+  processId             String?             @map("process_id") // FK ke Process
+  sequence              Int                 @default(0) // Urutan proses dalam routing
+  cycleTime             Float               @default(0) @map("cycle_time") // Cycle time per unit (detik), mengikuti MBOMProcess dan Machine
+  // Assign ke dies/mesin/operator
+  diesId                String?             @map("dies_id")
+  machineId             String?             @map("machine_id") // FK ke Machine.id
+  machineCostingRate    Float?              @map("machine_costing_rate")
+  machineRateType       String?             @map("machine_rate_type")
+  machineCurrency       String?             @map("machine_currency")
+  plannedProcessCost    Float               @default(0) @map("planned_process_cost")
+  actualProcessCost     Float               @default(0) @map("actual_process_cost")
+  operatorName          String?             @map("operator_name")
+  shift                 String? // 1A, 1B, 2A, 2B, 3A, 3C
+  // Schedule
+  plannedDate           DateTime            @map("planned_date")
+  plannedQty            Float               @map("planned_qty")
+  uomCode               String?             @map("uom_code")
+  // Realisasi
+  shotCount             Int                 @default(0) @map("shot_count") // Diisi saat selesai
+  qtyProduced           Float               @default(0) @map("qty_produced")
+  qtyGood               Float               @default(0) @map("qty_good")
+  qtyReject             Float               @default(0) @map("qty_reject")
+  startTime             DateTime?           @map("start_time")
+  endTime               DateTime?           @map("end_time")
+  runningMinutes        Float?              @map("running_minutes")
+  // Status lifecycle: Draft, Planned, Released, Material Issued, In Production, QC Pending, Rework, Completed, Cancelled. Legacy data may still use In Progress.
+  status                String              @default("Draft")
+  diesUsageId           String?             @unique @map("dies_usage_id") // FK ke DiesUsage yang dibuat otomatis
+  notes                 String?
+  isDeleted             Boolean             @default(false) @map("is_deleted")
+  createdAt             DateTime            @default(now()) @map("created_at")
+  updatedAt             DateTime            @updatedAt @map("updated_at")
+  // Relations
+  manufacturingOrder    ManufacturingOrder  @relation(fields: [moId], references: [id], onDelete: Cascade)
+  mbomDetail            MBOMDetail?         @relation(fields: [mbomDetailId], references: [id], onDelete: SetNull)
+  uom                   Uom?                @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
+  dies                  Dies?               @relation(fields: [diesId], references: [id], onDelete: SetNull)
+  diesUsage             DiesUsage?          @relation(fields: [diesUsageId], references: [id], onDelete: SetNull)
+  machine               Machine?            @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  process               Process?            @relation(fields: [processId], references: [id], onDelete: SetNull)
+  productionLogs        ProductionLog[]
+  downtimeLogs          DowntimeLog[]
+  qualityInspections    QualityInspection[]
+  materialIssues        MaterialIssue[]
+  wipEntries            WIPEntry[]
+
+  @@index([woNumber])
+  @@index([moId])
+  @@index([mbomDetailId])
+  @@index([diesId])
+  @@index([machineId])
+  @@index([processId])
+  @@index([outputPartCode])
+  @@index([uomCode])
+  @@index([sequence])
+  @@index([isReworkOrder])
+  @@index([reworkSourceType])
+  @@index([reworkReferenceNumber])
+  @@index([shift])
+  @@index([plannedDate])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_work_order")
+}
+
+// ============================================
+// PRODUCTION - DAILY PRODUCTION SCHEDULE
+// ============================================
+
+model DailyProductionSchedule {
+  id             String   @id @default(uuid())
+  scheduleNumber String   @unique @map("schedule_number")
+  scheduleDate   DateTime @map("schedule_date")
+  shift          String
+  moId           String?  @map("mo_id")
+  moNumber       String?  @map("mo_number")
+  woId           String?  @map("wo_id")
+  woNumber       String?  @map("wo_number")
+  partId         String?  @map("part_id")
+  partCode       String?  @map("part_code")
+  processId      String?  @map("process_id")
+  machineId      String?  @map("machine_id")
+  plannedQty     Float    @map("planned_qty")
+  actualQty      Float    @default(0) @map("actual_qty")
+  uomCode        String?  @map("uom_code")
+  operatorName   String?  @map("operator_name")
+  sequence       Int      @default(0)
+  status         String   @default("Draft") // Draft, Released, In Progress, Completed, Cancelled
+  notes          String?
+  createdBy      String?  @map("created_by")
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  productionLogs ProductionLog[]
+
+  @@index([scheduleNumber])
+  @@index([scheduleDate])
+  @@index([shift])
+  @@index([moId])
+  @@index([moNumber])
+  @@index([woId])
+  @@index([woNumber])
+  @@index([partId])
+  @@index([partCode])
+  @@index([processId])
+  @@index([machineId])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_daily_production_schedule")
+}
+
+// ============================================
+// PRODUCTION - PRODUCTION LOG (Log Produksi Per Shift)
+// ============================================
+
+model ProductionLog {
+  id             String    @id @default(uuid())
+  logNumber      String    @unique @map("log_number") // LOG-YYYYMMDD-001
+  logDate        DateTime  @default(now()) @map("log_date")
+  dpsId          String?   @map("dps_id")
+  moId           String    @map("mo_id")
+  woId           String?   @map("wo_id")
+  shift          String // 1A, 1B, 2A, 2B, 3A, 3C
+  machineCode    String?   @map("machine_code")
+  operatorName   String    @map("operator_name")
+  qtyPlanned     Float     @default(0) @map("qty_planned")
+  qtyProduced    Float     @default(0) @map("qty_produced")
+  qtyGood        Float     @default(0) @map("qty_good")
+  qtyReject      Float     @default(0) @map("qty_reject")
+  qtyRework      Float     @default(0) @map("qty_rework")
+  startTime      DateTime? @map("start_time")
+  endTime        DateTime? @map("end_time")
+  runningMinutes Float?    @map("running_minutes")
+  downtime       Float? // dalam menit
+  downtimeReason String?   @map("downtime_reason")
+  source         String?
+  hmiTopic       String?   @map("hmi_topic")
+  // Status: Open = masih berjalan, Submitted = diajukan, Approved = disetujui
+  status         String    @default("Open")
+  notes          String?
+  isDeleted      Boolean   @default(false) @map("is_deleted")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  dailyProductionSchedule DailyProductionSchedule? @relation(fields: [dpsId], references: [id], onDelete: SetNull)
+  manufacturingOrder      ManufacturingOrder       @relation(fields: [moId], references: [id], onDelete: Cascade)
+  workOrder               WorkOrder?               @relation(fields: [woId], references: [id], onDelete: SetNull)
+  downtimeLogs            DowntimeLog[]
+  qualityInspections      QualityInspection[]
+
+  @@index([logNumber])
+  @@index([dpsId])
+  @@index([moId])
+  @@index([woId])
+  @@index([logDate])
+  @@index([shift])
+  @@index([machineCode])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_production_log")
+}
+
+// ============================================
+// PRODUCTION - DOWNTIME LOG
+// ============================================
+
+model DowntimeLog {
+  id              String    @id @default(uuid())
+  downtimeNumber  String    @unique @map("downtime_number") // DT-YYYYMMDD-001
+  downtimeDate    DateTime  @default(now()) @map("downtime_date")
+  moId            String    @map("mo_id")
+  woId            String?   @map("wo_id")
+  productionLogId String?   @map("production_log_id")
+  shift           String? // 1A, 1B, 2A, 2B, 3A, 3C
+  machineCode     String?   @map("machine_code")
+  operatorName    String?   @map("operator_name")
+  startTime       DateTime? @map("start_time")
+  endTime         DateTime? @map("end_time")
+  durationMinutes Float     @default(0) @map("duration_minutes")
+  reason          String
+  category        String?
+  status          String    @default("Open")
+  notes           String?
+  isDeleted       Boolean   @default(false) @map("is_deleted")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  manufacturingOrder ManufacturingOrder @relation(fields: [moId], references: [id], onDelete: Cascade)
+  workOrder          WorkOrder?         @relation(fields: [woId], references: [id], onDelete: SetNull)
+  productionLog      ProductionLog?     @relation(fields: [productionLogId], references: [id], onDelete: SetNull)
+
+  @@index([downtimeNumber])
+  @@index([downtimeDate])
+  @@index([moId])
+  @@index([woId])
+  @@index([productionLogId])
+  @@index([shift])
+  @@index([machineCode])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_downtime_log")
+}
+
+// ============================================
+// PRODUCTION - QUALITY INSPECTION (Header)
+// ============================================
+
+model QualityInspection {
+  id                   String    @id @default(uuid())
+  inspectionNumber     String    @unique @map("inspection_number") // QC-YYYYMMDD-001
+  inspectionDate       DateTime  @default(now()) @map("inspection_date")
+  moId                 String    @map("mo_id")
+  woId                 String?   @map("wo_id")
+  productionLogId      String?   @map("production_log_id")
+  vendorProcessOrderId String?   @map("vendor_process_order_id")
+  partId               String?   @map("part_id")
+  batchNumber          String?   @map("batch_number")
+  sampleSize           Int       @default(1) @map("sample_size")
+  qtyInspected         Float     @default(0) @map("qty_inspected")
+  qtyPassed            Float     @default(0) @map("qty_passed")
+  qtyFailed            Float     @default(0) @map("qty_failed")
+  qtyRework            Float     @default(0) @map("qty_rework")
+  // Pending / Accepted / Rejected / Conditional Accept / Rework
+  decision             String    @default("Pending")
+  inspectedBy          String    @map("inspected_by")
+  approvedBy           String?   @map("approved_by")
+  approvedAt           DateTime? @map("approved_at")
+  // Draft / Completed
+  status               String    @default("Draft")
+  notes                String?
+  isDeleted            Boolean   @default(false) @map("is_deleted")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  manufacturingOrder ManufacturingOrder        @relation(fields: [moId], references: [id], onDelete: Cascade)
+  workOrder          WorkOrder?                @relation(fields: [woId], references: [id], onDelete: SetNull)
+  productionLog      ProductionLog?            @relation(fields: [productionLogId], references: [id], onDelete: SetNull)
+  vendorProcessOrder VendorProcessOrder?       @relation(fields: [vendorProcessOrderId], references: [id], onDelete: SetNull)
+  part               Part?                     @relation(fields: [partId], references: [id], onDelete: SetNull)
+  details            QualityInspectionDetail[]
+
+  @@index([inspectionNumber])
+  @@index([moId])
+  @@index([woId])
+  @@index([productionLogId])
+  @@index([vendorProcessOrderId])
+  @@index([partId])
+  @@index([decision])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_quality_inspection")
+}
+
+// ============================================
+// PRODUCTION - QUALITY INSPECTION DETAIL (Parameter per Inspeksi)
+// ============================================
+
+model QualityInspectionDetail {
+  id            String   @id @default(uuid())
+  inspectionId  String   @map("inspection_id")
+  lineNumber    Int      @map("line_number")
+  // Nama parameter: Dimensi, Visual, Kekerasan, Berat, dll
+  parameterName String   @map("parameter_name")
+  standard      String? // Nilai standar / spec
+  actualValue   String?  @map("actual_value")
+  unit          String? // mm, kg, HRC, dll
+  isPass        Boolean  @default(true) @map("is_pass")
+  notes         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  inspection QualityInspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  @@index([inspectionId])
+  @@index([isPass])
+  @@map("tbl_quality_inspection_detail")
+}
+
+// ============================================
+// PRODUCTION - MATERIAL ISSUE (Pengeluaran Material ke Lantai Produksi)
+// ============================================
+
+model MaterialIssue {
+  id            String   @id @default(uuid())
+  issueNumber   String   @unique @map("issue_number") // MI-YYYYMMDD-001
+  issueDate     DateTime @default(now()) @map("issue_date")
+  moId          String   @map("mo_id")
+  woId          String?  @map("wo_id")
+  warehouseCode String   @map("warehouse_code")
+  issuedBy      String?  @map("issued_by")
+  receivedBy    String?  @map("received_by")
+  // Draft / Issued / Partially Returned / Closed
+  status        String   @default("Draft")
+  notes         String?
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  manufacturingOrder ManufacturingOrder    @relation(fields: [moId], references: [id], onDelete: Cascade)
+  workOrder          WorkOrder?            @relation(fields: [woId], references: [id], onDelete: SetNull)
+  warehouse          Warehouse             @relation(fields: [warehouseCode], references: [warehouseCode])
+  details            MaterialIssueDetail[]
+
+  @@index([issueNumber])
+  @@index([moId])
+  @@index([woId])
+  @@index([warehouseCode])
+  @@index([status])
+  @@index([isDeleted])
+  @@map("tbl_material_issue")
+}
+
+// ============================================
+// PRODUCTION - MATERIAL ISSUE DETAIL (Item per Pengeluaran Material)
+// ============================================
+
+model MaterialIssueDetail {
+  id                String   @id @default(uuid())
+  issueId           String   @map("issue_id")
+  lineNumber        Int      @map("line_number")
+  partCode          String?  @map("part_code") // Part / material code
+  partNumber        String?  @map("part_number")
+  partName          String?  @map("part_name")
+  spec              String?
+  thickness         Float?
+  width             Float?
+  CSP               String?  @map("CSP")
+  productId         String?  @map("product_id") // Consumable product
+  description       String? // Deskripsi item bebas
+  stockBalanceId    String?  @map("stock_balance_id")
+  requirementSource String?  @map("requirement_source")
+  isSubAssembly     Boolean  @default(false) @map("is_sub_assembly")
+  rackCode          String?  @map("rack_code")
+  qtyRequired       Float    @map("qty_required") // Qty sesuai kebutuhan produksi
+  qtyIssued         Float    @default(0) @map("qty_issued") // Qty yang benar-benar dikeluarkan
+  qtyReturned       Float    @default(0) @map("qty_returned") // Qty yang dikembalikan
+  uomCode           String?  @map("uom_code")
+  lotNumber         String?  @map("lot_number")
+  notes             String?
+  isDeleted         Boolean  @default(false) @map("is_deleted")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  materialIssue MaterialIssue @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  product       Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([issueId])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([partName])
+  @@index([spec])
+  @@index([thickness])
+  @@index([width])
+  @@index([CSP])
+  @@index([productId])
+  @@index([stockBalanceId])
+  @@index([requirementSource])
+  @@index([isSubAssembly])
+  @@index([rackCode])
+  @@index([lotNumber])
+  @@index([isDeleted])
+  @@map("tbl_material_issue_detail")
+}
+
+// ============================================
+// PRODUCTION - WIP ENTRY (Work In Progress Ledger)
+// ============================================
+
+model WIPEntry {
+  id            String   @id @default(uuid())
+  entryNumber   String   @unique @map("entry_number") // WIP-YYYYMMDD-0001
+  entryDate     DateTime @default(now()) @map("entry_date")
+  moId          String   @map("mo_id")
+  woId          String?  @map("wo_id")
+  // Tipe biaya: Material, Labor, Overhead, Scrap
+  costType      String   @map("cost_type") // Material | Labor | Overhead | Scrap
+  // Sumber transaksi
+  sourceType    String   @map("source_type") // MaterialIssue | WorkOrder | ProductionLog | QualityInspection | Manual
+  sourceId      String?  @map("source_id") // ID dokumen sumber
+  sourceRef     String?  @map("source_ref") // Nomor dokumen sumber (MI-xxx, WO-xxx)
+  partCode      String?  @map("part_code")
+  partNumber    String?  @map("part_number")
+  partName      String?  @map("part_name")
+  uomCode       String?  @map("uom_code")
+  warehouseCode String?  @map("warehouse_code")
+  rackCode      String?  @map("rack_code")
+  lotNumber     String?  @map("lot_number")
+  stockType     String?  @map("stock_type")
+  // Nilai
+  qty           Float    @default(0)
+  rate          Float    @default(0) // Biaya per unit
+  amount        Float    @default(0) // qty × rate (atau manual)
+  // Direction: IN = akumulasi WIP, OUT = transfer keluar WIP (FG receipt, scrap)
+  direction     String   @default("IN") // IN | OUT
+  notes         String?
+  createdBy     String?  @map("created_by")
+  isDeleted     Boolean  @default(false) @map("is_deleted")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  manufacturingOrder ManufacturingOrder @relation(fields: [moId], references: [id], onDelete: Cascade)
+  workOrder          WorkOrder?         @relation(fields: [woId], references: [id], onDelete: SetNull)
+
+  @@index([entryNumber])
+  @@index([moId])
+  @@index([woId])
+  @@index([costType])
+  @@index([sourceType])
+  @@index([partCode])
+  @@index([partNumber])
+  @@index([direction])
+  @@index([entryDate])
+  @@index([isDeleted])
+  @@map("tbl_wip_entry")
+}
+
+// ============================================
+// SYSTEM - NOTIFICATIONS
+// ============================================
+
+model Notification {
+  id        String    @id @default(uuid())
+  type      String // "purchase_order", "sales_order", "bom", "production", dll
+  title     String // "Purchase Order Baru", "SO#12345 Diupdate", dll
+  message   String // Detail message
+  entityId  String?   @map("entity_id") // ID/identifier dari entity terkait (poNumber, soNumber, dll)
+  entityUrl String?   @map("entity_url") // Deep link ke detail page
+  userId    String?   @map("user_id") // Target user (null = broadcast ke semua)
+  isRead    Boolean   @default(false) @map("is_read")
+  readAt    DateTime? @map("read_at")
+  metadata  Json?     @default("{}") // Additional data (priority, sender, etc)
+  createdBy String?   @map("created_by") // User yang trigger notification
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([type])
+  @@index([isRead])
+  @@index([createdAt])
+  @@map("tbl_notifications")
+}

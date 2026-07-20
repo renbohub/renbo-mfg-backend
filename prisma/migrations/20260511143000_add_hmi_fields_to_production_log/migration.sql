@@ -1,0 +1,4 @@
+ALTER TABLE "tbl_production_log"
+  ADD COLUMN IF NOT EXISTS "running_minutes" DOUBLE PRECISION,
+  ADD COLUMN IF NOT EXISTS "source" TEXT,
+  ADD COLUMN IF NOT EXISTS "hmi_topic" TEXT;

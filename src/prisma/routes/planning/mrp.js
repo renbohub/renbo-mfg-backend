@@ -1,0 +1,18 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/planning/MRPController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+
+router.get("/generate-number", authorize("mrp", "create"), ctrl.generateNumber);
+router.get("/", authorize("mrp", "read"), ctrl.list);
+router.post("/run", authorize("mrp", "create"), logger("mrp", "run"), ctrl.runMRP);
+router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);
+router.get("/:runNumber/requirements", authorize("mrp", "read"), ctrl.getRequirements);
+router.patch("/:runNumber/requirements/buffer", authorize("mrp", "update"), logger("mrp", "update-buffer"), ctrl.updateRequirementBuffer);
+router.patch("/:runNumber/requirements/order-percent", authorize("mrp", "update"), logger("mrp", "update-order-percent"), ctrl.updateRequirementBuffer);
+router.post("/:runNumber/output/purchase-request", authorize("mrp", "release"), logger("mrp", "release-purchase-request"), ctrl.createPurchaseRequestOutput);
+router.post("/:runNumber/output/production-plan", authorize("mrp", "release"), logger("mrp", "release-production-plan"), ctrl.createProductionPlanOutput);
+router.get("/:runNumber/planned-orders", authorize("mrp", "read"), ctrl.getPlannedOrders);
+router.get("/:runNumber", authorize("mrp", "read"), ctrl.get);
+router.delete("/:runNumber", authorize("mrp", "delete"), logger("mrp", "delete", { modelName: "MRPRun", paramKey: "runNumber", whereKey: "runNumber" }), ctrl.remove);
+module.exports = router;

@@ -1,0 +1,11 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/master-data/NumberingRuleController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+router.get("/:ruleKey/preview", authorize("numbering-rules", "read"), ctrl.preview);
+router.get("/", authorize("numbering-rules", "read"), ctrl.list);
+router.get("/:ruleKey", authorize("numbering-rules", "read"), ctrl.get);
+router.post("/", authorize("numbering-rules", "create"), logger("numbering-rule", "create"), ctrl.create);
+router.patch("/:id", authorize("numbering-rules", "update"), logger("numbering-rule", "update", { modelName: "numberingRule" }), ctrl.update);
+router.patch("/:id/remove", authorize("numbering-rules", "delete"), logger("numbering-rule", "delete", { modelName: "numberingRule" }), ctrl.remove);
+module.exports = router;

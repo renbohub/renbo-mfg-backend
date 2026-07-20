@@ -1,0 +1,3 @@
+ALTER TABLE "tbl_part"
+ALTER COLUMN "item_type" DROP DEFAULT,
+ALTER COLUMN "item_type" DROP NOT NULL;
