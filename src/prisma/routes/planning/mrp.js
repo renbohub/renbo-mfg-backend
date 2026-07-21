@@ -4,6 +4,7 @@ const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
 router.get("/generate-number", authorize("mrp", "create"), ctrl.generateNumber);
+router.get("/general-summary", authorize("mrp", "read"), ctrl.generalSummary);
 router.get("/", authorize("mrp", "read"), ctrl.list);
 router.post("/run", authorize("mrp", "create"), logger("mrp", "run"), ctrl.runMRP);
 router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);

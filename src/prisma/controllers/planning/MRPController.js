@@ -1503,6 +1503,9 @@ function enrichRequirementPlanningGroups(requirements = []) {
       planningCustomerCode: mpsDetail?.customerCode || "Tanpa Customer",
       planningMonth: mpsDetail?.startDate || mpsDetail?.endDate || row.requiredDate,
       planningPartCode: root.partCode || mpsDetail?.partCode || row.partCode,
+      planningPartNumber: root.part?.partNumber || row.part?.partNumber || null,
+      planningPartName: root.part?.partName || row.part?.partName || null,
+      planningPartItemType: root.part?.itemType || row.part?.itemType || null,
     };
   });
 }
@@ -3943,6 +3946,56 @@ exports.getRequirements = async (req, res, next) => {
     });
   } catch (e) {
     next(e);
+  }
+};
+
+// Read model lintas header MRP.  Header detail tetap tersedia di /:runNumber;
+// endpoint ini hanya mengagregasi kebutuhan aktif per bulan/customer/part.
+exports.generalSummary = async (req, res, next) => {
+  try {
+    const rows = await prisma.mRPRequirement.findMany({
+      where: { isDeleted: false, orderType: "Purchase", mrpRun: { isDeleted: false, isCurrentPlan: true } },
+      select: {
+        partCode: true, requiredDate: true, grossRequirement: true, forecastQty: true,
+        soConsumedQty: true, bufferQty: true, netRequirement: true, adjustedOrderQty: true,
+        part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, rawType: true, partType: true } },
+        mrpRun: { select: { runNumber: true, mpsNumber: true, runDate: true } },
+        mpsDetail: { select: { customerCode: true, startDate: true, endDate: true, mps: { select: { forecastNumber: true } } } },
+      },
+      orderBy: [{ requiredDate: "asc" }, { partCode: "asc" }],
+      take: 20000,
+    });
+    const grouped = new Map();
+    for (const row of rows) {
+      const month = planningMonthKey(row.mpsDetail?.startDate || row.requiredDate) || "Tanpa Bulan";
+      const forecastNumber = row.mpsDetail?.mps?.forecastNumber || "Tanpa Forecast";
+      const customerCode = row.mpsDetail?.customerCode || "Tanpa Customer";
+      const partCode = row.partCode || row.part?.partCode || "Tanpa Part";
+      const key = [month, forecastNumber, customerCode, partCode].join("|");
+      const current = grouped.get(key) || {
+        month, forecastNumber, customerCode, partCode,
+        partNumber: row.part?.partNumber || null, partName: row.part?.partName || null,
+        itemType: row.part?.itemType || null, rawType: row.part?.rawType || null, partType: row.part?.partType || null,
+        runNumbers: new Set(), mpsNumbers: new Set(), forecastQty: 0, actualSalesOrderQty: 0,
+        bufferQty: 0, grossRequirement: 0, netRequirement: 0, adjustedOrderQty: 0,
+      };
+      if (row.mrpRun?.runNumber) current.runNumbers.add(row.mrpRun.runNumber);
+      if (row.mrpRun?.mpsNumber) current.mpsNumbers.add(row.mrpRun.mpsNumber);
+      current.forecastQty += Number(row.forecastQty || 0);
+      current.actualSalesOrderQty += Number(row.soConsumedQty || 0);
+      current.bufferQty += Number(row.bufferQty || 0);
+      current.grossRequirement += Number(row.grossRequirement || 0);
+      current.netRequirement += Number(row.netRequirement || 0);
+      current.adjustedOrderQty += Number(row.adjustedOrderQty ?? row.netRequirement ?? 0);
+      grouped.set(key, current);
+    }
+    res.json([...grouped.values()].map((row) => ({
+      ...row,
+      runNumbers: [...row.runNumbers],
+      mpsNumbers: [...row.mpsNumbers],
+    })));
+  } catch (error) {
+    next(error);
   }
 };
 

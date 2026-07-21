@@ -93,7 +93,7 @@ exports.monthlySummary = async (req, res, next) => {
         mpsNumber: true, partCode: true, customerCode: true, startDate: true,
         forecastQty: true, actualSalesOrderQty: true, bufferQty: true, effectiveDemandQty: true, qtyPlanned: true, notes: true,
         mps: { select: { forecastNumber: true, status: true } },
-        part: { select: { partName: true, itemType: true, partType: true, productionUomCode: true, baseUomCode: true } },
+        part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, partType: true, productionUomCode: true, baseUomCode: true } },
       },
       orderBy: [{ startDate: "asc" }, { partCode: "asc" }],
       take: 10000,
@@ -114,7 +114,7 @@ exports.monthlySummary = async (req, res, next) => {
       const inherited = (field) => number(row[field]) || number(parent?.[field]);
       const uomCode = row.part?.productionUomCode || row.part?.baseUomCode || null;
       const key = [month, forecastNumber, customerCode, row.partCode, scheduleType, uomCode || "-"].join("|");
-      const current = monthly.get(key) || { month, forecastNumber, customerCode, partCode: row.partCode, partName: row.part?.partName || null, itemType, partType, itemScope, scheduleType, uomCode, mpsNumbers: [], forecastQty: 0, actualSalesOrderQty: 0, bufferQty: 0, effectiveDemandQty: 0, qtyPlanned: 0 };
+      const current = monthly.get(key) || { month, forecastNumber, customerCode, partCode: row.partCode || row.part?.partCode, partNumber: row.part?.partNumber || null, partName: row.part?.partName || null, itemType, partType, itemScope, scheduleType, uomCode, mpsNumbers: [], forecastQty: 0, actualSalesOrderQty: 0, bufferQty: 0, effectiveDemandQty: 0, qtyPlanned: 0 };
       current.mpsNumbers.push(row.mpsNumber);
       current.forecastQty += inherited("forecastQty");
       current.actualSalesOrderQty += inherited("actualSalesOrderQty");
