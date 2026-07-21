@@ -1,0 +1,11 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/outgoing/OutgoingTransactionController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+router.post("/delivery-schedules", authorize("salesOrder", "create"), logger("delivery-schedule", "create"), ctrl.createSchedule);
+router.post("/delivery-schedules/:scheduleNumber/pick", authorize("salesOrder", "update"), logger("delivery-schedule", "pick"), ctrl.pick);
+router.post("/delivery-schedules/:scheduleNumber/pack", authorize("salesOrder", "update"), logger("delivery-schedule", "pack"), ctrl.pack);
+router.post("/delivery-schedules/:scheduleNumber/ship", authorize("salesOrder", "update"), logger("shipment", "ship"), ctrl.markShipment);
+router.post("/delivery-schedules/:scheduleNumber/pod", authorize("salesOrder", "update"), logger("shipment", "pod"), ctrl.confirmPod);
+router.post("/delivery-schedules/:scheduleNumber/fail", authorize("salesOrder", "update"), logger("shipment", "fail"), ctrl.markFailed);
+module.exports = router;

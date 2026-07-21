@@ -374,6 +374,7 @@ model Uom {
   id        String   @id @default(uuid())
   uomCode   String   @unique @map("uom_code")
   uomName   String?  @map("uom_name")
+  category  String?  @map("category")
   notes     String?
   isDeleted Boolean  @default(false) @map("is_deleted")
   createdAt DateTime @default(now()) @map("created_at")
@@ -390,6 +391,9 @@ model Uom {
   productPriceLists   ProductPriceList[]
   manufacturingOrders ManufacturingOrder[]
   workOrders          WorkOrder[]
+  conversionsFrom     UomConversion[] @relation("UomConversionFrom")
+  conversionsTo       UomConversion[] @relation("UomConversionTo")
+  itemUomMappings     ItemUomMapping[]
 
   @@index([uomCode])
   @@index([uomName])
@@ -499,6 +503,7 @@ model Supplier {
   purchaseOrders     PurchaseOrder[]
   purchaseInvoices   PurchaseInvoice[]
   parts              Part[]
+  supplierItems      SupplierItem[]
 
   @@index([supplierCode])
   @@index([supplierName])
@@ -683,6 +688,17 @@ model Part {
   assemblyPolicy String  @default("INLINE") @map("assembly_policy") // INLINE, SUB_ASSEMBLY
   bufferStock    Float   @default(0) @map("buffer_stock") // Buffer stock percentage untuk planning
 
+  // Normalized fields are nullable so legacy Part records remain valid.
+  itemClass          String? @map("item_class")
+  procurementType    String? @map("procurement_type")
+  baseUomCode        String? @map("base_uom_code")
+  purchaseUomCode    String? @map("purchase_uom_code")
+  stockUomCode       String? @map("stock_uom_code")
+  productionUomCode  String? @map("production_uom_code")
+  salesUomCode       String? @map("sales_uom_code")
+  defaultWarehouseId String? @map("default_warehouse_id")
+  safetyStock        Float?  @map("safety_stock")
+
   // Transaction permissions mengikuti master Part pada Figma.
   canPurchase    Boolean @default(true) @map("can_purchase")
   canManufacture Boolean @default(true) @map("can_manufacture")
@@ -746,6 +762,9 @@ model Part {
   itemLevelsAsRoot     ItemLevel[]          @relation("ItemLevelRoot")
   itemLevelsAsItem     ItemLevel[]          @relation("ItemLevelItem")
   mrpPeggings          MRPPegging[]
+  supplierItems        SupplierItem[]
+  itemUomMappings      ItemUomMapping[]
+  routingHeaders       RoutingHeader[]
 
   @@index([partCode])
   @@index([partNumber])
@@ -762,6 +781,8 @@ model Part {
   @@index([bomLevel])
   @@index([branchCode])
   @@index([assemblyPolicy])
+  @@index([itemClass])
+  @@index([procurementType])
   @@index([category])
   @@index([status])
   @@index([supplierId])
@@ -1003,6 +1024,7 @@ model Machine {
   // Relations
   workOrders    WorkOrder[]
   mbomProcesses MBOMProcess[]
+  workCenterMachines WorkCenterMachine[]
 
   @@index([machineCode])
   @@index([machineName])
@@ -1103,6 +1125,7 @@ model Material {
   // Relations
   materialPriceLists MaterialPriceList[]
   parts              Part[]
+  attributeValues    MaterialAttributeValue[]
 
   @@index([materialCode])
   @@index([materialType])
@@ -1114,6 +1137,201 @@ model Material {
   @@index([CSP])
   @@index([isDeleted])
   @@map("tbl_material")
+}
+
+// Additive material specification structure. Legacy Material fields remain the fallback.
+model MaterialAttributeSet {
+  id          String   @id @default(uuid())
+  setCode     String   @unique @map("set_code")
+  setName     String   @map("set_name")
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  definitions MaterialAttributeDefinition[]
+
+  @@index([isActive])
+  @@index([isDeleted])
+  @@map("tbl_material_attribute_set")
+}
+
+model MaterialAttributeDefinition {
+  id             String   @id @default(uuid())
+  attributeSetId String   @map("attribute_set_id")
+  attributeCode  String   @map("attribute_code")
+  attributeName  String   @map("attribute_name")
+  dataType       String   @default("TEXT") @map("data_type")
+  unitCode       String?  @map("unit_code")
+  isRequired     Boolean  @default(false) @map("is_required")
+  sequence       Int      @default(0)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  attributeSet MaterialAttributeSet     @relation(fields: [attributeSetId], references: [id], onDelete: Cascade)
+  values       MaterialAttributeValue[]
+
+  @@unique([attributeSetId, attributeCode])
+  @@index([attributeSetId])
+  @@map("tbl_material_attribute_definition")
+}
+
+model MaterialAttributeValue {
+  id                    String   @id @default(uuid())
+  materialId            String   @map("material_id")
+  attributeDefinitionId String   @map("attribute_definition_id")
+  valueText             String?  @map("value_text")
+  valueNumber           Float?   @map("value_number")
+  valueBoolean          Boolean? @map("value_boolean")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  material            Material                    @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  attributeDefinition MaterialAttributeDefinition @relation(fields: [attributeDefinitionId], references: [id], onDelete: Cascade)
+
+  @@unique([materialId, attributeDefinitionId])
+  @@index([materialId])
+  @@index([attributeDefinitionId])
+  @@map("tbl_material_attribute_value")
+}
+
+model UomConversion {
+  id          String   @id @default(uuid())
+  fromUomCode String   @map("from_uom_code")
+  toUomCode   String   @map("to_uom_code")
+  factor      Float
+  isActive    Boolean  @default(true) @map("is_active")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  fromUom Uom @relation("UomConversionFrom", fields: [fromUomCode], references: [uomCode])
+  toUom   Uom @relation("UomConversionTo", fields: [toUomCode], references: [uomCode])
+
+  @@unique([fromUomCode, toUomCode])
+  @@index([fromUomCode])
+  @@index([toUomCode])
+  @@map("tbl_uom_conversion")
+}
+
+model ItemUomMapping {
+  id        String   @id @default(uuid())
+  partId    String   @map("part_id")
+  uomCode   String   @map("uom_code")
+  usageType String   @default("STOCK") @map("usage_type")
+  factor    Float    @default(1)
+  isPrimary Boolean  @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  part Part @relation(fields: [partId], references: [id], onDelete: Cascade)
+  uom  Uom  @relation(fields: [uomCode], references: [uomCode])
+
+  @@unique([partId, uomCode, usageType])
+  @@index([partId])
+  @@index([uomCode])
+  @@map("tbl_item_uom_mapping")
+}
+
+model SupplierItem {
+  id               String    @id @default(uuid())
+  supplierId       String    @map("supplier_id")
+  partId           String    @map("part_id")
+  supplierItemCode String?   @map("supplier_item_code")
+  leadTimeDays     Int?      @map("lead_time_days")
+  moq              Float?
+  orderMultiple    Float?    @map("order_multiple")
+  packSize         Float?    @map("pack_size")
+  purchaseUomCode  String?   @map("purchase_uom_code")
+  isPreferred      Boolean   @default(false) @map("is_preferred")
+  priority         Int       @default(100)
+  price            Float?
+  currencyCode     String?   @map("currency_code")
+  validFrom        DateTime? @map("valid_from")
+  validUntil       DateTime? @map("valid_until")
+  isActive         Boolean   @default(true) @map("is_active")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  part     Part     @relation(fields: [partId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, partId, supplierItemCode])
+  @@index([supplierId])
+  @@index([partId])
+  @@index([isPreferred])
+  @@map("tbl_supplier_item")
+}
+
+model WorkCenter {
+  id                    String              @id @default(uuid())
+  workCenterCode        String              @unique @map("work_center_code")
+  workCenterName        String              @map("work_center_name")
+  plantCode             String?             @map("plant_code")
+  lineCode              String?             @map("line_code")
+  capacityMinutesPerDay Float?              @map("capacity_minutes_per_day")
+  efficiencyPercent     Float               @default(100) @map("efficiency_percent")
+  isActive              Boolean             @default(true) @map("is_active")
+  notes                 String?
+  createdAt             DateTime            @default(now()) @map("created_at")
+  updatedAt             DateTime            @updatedAt @map("updated_at")
+  machines              WorkCenterMachine[]
+  routingOperations     RoutingOperation[]
+  @@map("tbl_work_center")
+}
+
+model WorkCenterMachine {
+  id           String     @id @default(uuid())
+  workCenterId String     @map("work_center_id")
+  machineId    String     @map("machine_id")
+  isPrimary    Boolean    @default(false) @map("is_primary")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  workCenter   WorkCenter @relation(fields: [workCenterId], references: [id], onDelete: Cascade)
+  machine      Machine    @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  @@unique([workCenterId, machineId])
+  @@map("tbl_work_center_machine")
+}
+
+model RoutingHeader {
+  id             String             @id @default(uuid())
+  routingCode    String             @unique @map("routing_code")
+  partId         String?            @map("part_id")
+  revision       String             @default("1")
+  status         String             @default("DRAFT")
+  effectiveFrom  DateTime?          @map("effective_from")
+  effectiveUntil DateTime?          @map("effective_until")
+  notes          String?
+  isDeleted      Boolean            @default(false) @map("is_deleted")
+  createdAt      DateTime           @default(now()) @map("created_at")
+  updatedAt      DateTime           @updatedAt @map("updated_at")
+  part           Part?              @relation(fields: [partId], references: [id], onDelete: SetNull)
+  operations     RoutingOperation[]
+  @@map("tbl_routing_header")
+}
+
+model RoutingOperation {
+  id              String       @id @default(uuid())
+  routingHeaderId String       @map("routing_header_id")
+  sequence        Int
+  processId       String?      @map("process_id")
+  workCenterId    String?      @map("work_center_id")
+  setupMinutes    Float        @default(0) @map("setup_minutes")
+  cycleSeconds    Float        @default(0) @map("cycle_seconds")
+  runMinutes      Float        @default(0) @map("run_minutes")
+  yieldPercent    Float        @default(100) @map("yield_percent")
+  isSubcontract   Boolean      @default(false) @map("is_subcontract")
+  isActive        Boolean      @default(true) @map("is_active")
+  notes           String?
+  createdAt       DateTime     @default(now()) @map("created_at")
+  updatedAt       DateTime     @updatedAt @map("updated_at")
+  routingHeader   RoutingHeader @relation(fields: [routingHeaderId], references: [id], onDelete: Cascade)
+  workCenter      WorkCenter?  @relation(fields: [workCenterId], references: [id], onDelete: SetNull)
+  mbomProcesses   MBOMProcess[]
+  @@unique([routingHeaderId, sequence])
+  @@map("tbl_routing_operation")
 }
 
 // ============================================
@@ -1870,6 +2088,7 @@ model MBOMProcess {
   occurrenceCode String? @map("occurrence_code")
   routingNumber String? @map("routing_number")
   machineId    String?  @map("machine_id")
+  routingOperationId String? @map("routing_operation_id")
   sequence     Int      @default(0)
   cycleTime    Float    @default(0) @map("cycle_time")
   notes        String?
@@ -1881,6 +2100,7 @@ model MBOMProcess {
   mbomDetail      MBOMDetail?      @relation(fields: [mbomDetailId], references: [id], onDelete: Cascade)
   process         Process?         @relation(fields: [processId], references: [id])
   machine         Machine?         @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  routingOperation RoutingOperation? @relation(fields: [routingOperationId], references: [id], onDelete: SetNull)
   mbomcostDetails MBOMCostDetail[]
 
   @@index([noReg])
@@ -1889,6 +2109,7 @@ model MBOMProcess {
   @@index([occurrenceCode])
   @@index([routingNumber])
   @@index([machineId])
+  @@index([routingOperationId])
   @@index([sequence])
   @@index([isDeleted])
   @@map("tbl_mbomprocess")
@@ -2193,6 +2414,16 @@ model DeliverySchedule {
   deliveredBy       String?   @map("delivered_by")
   receivedBy        String?   @map("received_by")
   receivedSignature String?   @map("received_signature")
+  pickedAt          DateTime? @map("picked_at")
+  packedAt          DateTime? @map("packed_at")
+  shippedAt         DateTime? @map("shipped_at")
+  deliveredAt       DateTime? @map("delivered_at")
+  vehicle           String?
+  driver            String?
+  carrier           String?
+  podUrl            String?   @map("pod_url")
+  failureReason     String?   @map("failure_reason")
+  returnedQty       Float     @default(0) @map("returned_qty")
   isDeleted         Boolean   @default(false) @map("is_deleted")
   createdAt         DateTime  @default(now()) @map("created_at")
   updatedAt         DateTime  @updatedAt @map("updated_at")
@@ -2313,6 +2544,10 @@ model Warehouse {
   type          String   @default("Main") // Main, Sub, Transit, Quarantine
   isActive      Boolean  @default(true) @map("is_active")
   capacity      Float? // Kapasitas (m3, pallet, dll)
+  availableForMrp        Boolean @default(true) @map("available_for_mrp")
+  availableForProduction Boolean @default(true) @map("available_for_production")
+  availableForDelivery   Boolean @default(true) @map("available_for_delivery")
+  stockStatus            String  @default("AVAILABLE") @map("stock_status")
   notes         String?
   isDeleted     Boolean  @default(false) @map("is_deleted")
   createdAt     DateTime @default(now()) @map("created_at")

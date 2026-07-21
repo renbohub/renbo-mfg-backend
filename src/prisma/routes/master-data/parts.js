@@ -8,6 +8,7 @@ const { uploadPartWithAttachments } = require("../../middleware/uploads");
 router.post("/bulk-create", authorize("parts", "create"), logger("part", "bulk-create"), ctrl.bulkCreate);
 router.patch("/bulk-remove", authorize("parts", "delete"), logger("part", "bulk-remove", { modelName: 'part' }), ctrl.bulkRemove);
 router.get("/all-codes", authorize("parts", "read"), ctrl.getAllCodes);
+router.get("/:partCode/compatibility", authorize("parts", "read"), ctrl.getCompatibilityProfile);
 router.get("/migrate-part-codes/candidates", authorize("parts", "read"), ctrl.partCodeMigrationCandidates);
 router.post("/migrate-part-codes", authorize("parts", "update"), logger("part", "migrate-part-codes", { modelName: 'part' }), ctrl.migratePartCodesToPrimaryCustomer);
 router.post("/:id/clone", authorize("parts", "create"), logger("part", "clone", { modelName: 'part' }), ctrl.clone);

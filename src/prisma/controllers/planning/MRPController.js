@@ -1469,6 +1469,15 @@ async function syncProductionRequirementsToMps(tx, mps, requirements, mbomHeader
       partCode: row.partCode,
       partId: row.partId,
       mbomHeaderId: mbomHeaderByPartCode[row.partCode] || null,
+      // Child/SFG schedule inherits the planning context of its FG receipt.
+      // This keeps buffer visible and traceable throughout the production tree.
+      forecastQty: Number(row.source.forecastQty || 0),
+      actualSalesOrderQty: Number(row.source.actualSalesOrderQty || 0),
+      bufferBaseQty: Number(row.source.bufferBaseQty || 0),
+      bufferPercent: Number(row.source.bufferPercent || 0),
+      bufferQty: Number(row.source.bufferQty || 0),
+      effectiveDemandQty: Number(row.source.effectiveDemandQty || 0),
+      productionPercent: Number(row.source.productionPercent || 100),
       qtyPlanned: roundPlanningQty(row.qtyPlanned),
       startDate: row.startDate,
       endDate: row.endDate,
@@ -1476,7 +1485,7 @@ async function syncProductionRequirementsToMps(tx, mps, requirements, mbomHeader
       status: "Planned",
       customerCode: row.source.customerCode,
       forecastPeriodOffset: row.source.forecastPeriodOffset,
-      notes: `${GENERATED_MPS_CHILD_NOTE_PREFIX} Generated from ${runNumber}; source ${row.source.partCode}`,
+      notes: `${GENERATED_MPS_CHILD_NOTE_PREFIX} Generated from ${runNumber}; source ${row.source.partCode}; [MPS-SOURCE:${row.source.id}]`,
     })),
   });
   return generated.length;

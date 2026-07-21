@@ -14,6 +14,7 @@
     "db:backfill:mo-trace": "node scripts/backfill-mo-trace-and-wip-sources.js",
     "db:backfill:production-runtime": "node scripts/backfill-production-runtime-fields.js",
     "db:verify:prefixed-codes": "node scripts/verify-prefixed-master-codes.js",
+    "test:revision-contracts": "node scripts/verify-revision-contracts.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

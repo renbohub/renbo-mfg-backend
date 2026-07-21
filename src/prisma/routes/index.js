@@ -36,6 +36,11 @@ const employeesRouter = require("./master-data/employees");
 const productsRouter = require("./master-data/products");
 const productPriceListsRouter = require("./master-data/product-price-lists");
 const numberingRulesRouter = require("./master-data/numbering-rules");
+const foundationRouter = require("./master-data/foundation");
+const routingRouter = require("./engineering/routing");
+const controlTowerRouter = require("./dashboard/control-tower");
+const incomingTransactionRouter = require("./incoming/transactions");
+const outgoingTransactionRouter = require("./outgoing/transactions");
 
 
 const mbomRouter = require("./mbom/bom");
@@ -152,6 +157,11 @@ function registerRoutes(app) {
   api.use("/master-data/products", auth, productsRouter);
   api.use("/master-data/product-price-lists", auth, productPriceListsRouter);
   api.use("/master-data/numbering-rules", auth, numberingRulesRouter);
+  api.use("/master-data/foundation", auth, foundationRouter);
+  api.use("/engineering", auth, routingRouter);
+  api.use("/dashboard/control-tower", auth, controlTowerRouter);
+  api.use("/incoming", auth, incomingTransactionRouter);
+  api.use("/outgoing", auth, outgoingTransactionRouter);
 
   // Engineering (EBOM) routes
 

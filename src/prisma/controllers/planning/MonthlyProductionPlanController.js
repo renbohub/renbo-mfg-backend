@@ -57,6 +57,36 @@ function detailFromMps(row, lineNumber) {
   };
 }
 
+function sourcePartCode(row) {
+  return String(row?.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim() || null;
+}
+
+// Production Plan is an execution proposal: PPIC may reduce/increase the
+// forecast portion here without changing the approved MPS.  Actual SO remains
+// a hard floor, and child/SFG quantities follow their parent FG proportionally.
+function derivePlanDetails(mpsDetails, productionPercent) {
+  const ratio = productionPercent / 100;
+  const isProcess = (row) => isGeneratedProcess(row);
+  const receipts = mpsDetails.filter((row) => !isProcess(row));
+  const receiptById = new Map(receipts.map((row) => [row.id, row]));
+  const receiptByLegacyKey = new Map(receipts.map((row) => [`${row.customerCode || ""}|${row.partCode}|${row.forecastPeriodOffset || ""}`, row]));
+  const receiptByMonth = new Map(receipts.map((row) => [`${row.customerCode || ""}|${row.partCode}|${monthKey(row.startDate)}`, row]));
+  const adjustedReceiptQty = new Map(receipts.map((row) => [row.id, Math.max(number(row.effectiveDemandQty) * ratio, number(row.actualSalesOrderQty))]));
+  return mpsDetails.map((row) => {
+    if (!isProcess(row)) return { ...row, qtyPlanned: adjustedReceiptQty.get(row.id) };
+    const sourceId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+    const source = receiptById.get(sourceId) || receiptByLegacyKey.get(`${row.customerCode || ""}|${sourcePartCode(row) || ""}|${row.forecastPeriodOffset || ""}`) || receiptByMonth.get(`${row.customerCode || ""}|${sourcePartCode(row) || ""}|${monthKey(row.startDate)}`);
+    if (!source) return { ...row, qtyPlanned: number(row.qtyPlanned) * ratio };
+    const sourceOriginalQty = Math.max(number(source.qtyPlanned), 0);
+    const childFactor = sourceOriginalQty > 0 ? number(row.qtyPlanned) / sourceOriginalQty : 1;
+    return {
+      ...row,
+      forecastQty: number(row.forecastQty) || number(source.forecastQty), actualSalesOrderQty: number(row.actualSalesOrderQty) || number(source.actualSalesOrderQty), bufferBaseQty: number(row.bufferBaseQty) || number(source.bufferBaseQty), bufferPercent: number(row.bufferPercent) || number(source.bufferPercent), bufferQty: number(row.bufferQty) || number(source.bufferQty), effectiveDemandQty: number(row.effectiveDemandQty) || number(source.effectiveDemandQty), productionPercent,
+      qtyPlanned: Math.max(adjustedReceiptQty.get(source.id) * childFactor, number(source.actualSalesOrderQty) * childFactor),
+    };
+  });
+}
+
 async function withMpsSnapshot(plan) {
   const mpsNumber = String(plan?.sourceType || "").startsWith("MPS:") ? String(plan.sourceType).slice(4) : null;
   if (!mpsNumber) return plan;
@@ -98,13 +128,15 @@ exports.createFromMps = async (req, res, next) => {
   try {
     const mpsNumber = text(req.body?.mpsNumber);
     if (!mpsNumber) return res.status(400).json({ message: "MPS wajib dipilih." });
+    const productionPercent = req.body?.productionPercent == null ? 100 : Number(req.body.productionPercent);
+    if (!Number.isFinite(productionPercent) || productionPercent < 0 || productionPercent > 100) return res.status(400).json({ message: "Persentase Production Plan harus antara 0 sampai 100." });
     const mps = await prisma.mPS.findFirst({
       where: { mpsNumber, isDeleted: false },
       include: { details: { where: { isDeleted: false, status: { not: "Cancelled" } }, include: { part: true }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }] } },
     });
     if (!mps) return res.status(404).json({ message: "MPS tidak ditemukan." });
     if (mps.status !== "Confirmed") return res.status(409).json({ message: "MPS harus Confirmed sebelum dibuat menjadi Production Plan." });
-    const validDetails = mps.details.filter((row) => !(isGeneratedProcess(row) && String(row.part?.itemType || "").toUpperCase() === "FG"));
+    const validDetails = derivePlanDetails(mps.details, productionPercent).filter((row) => !(isGeneratedProcess(row) && String(row.part?.itemType || "").toUpperCase() === "FG"));
     if (!validDetails.length) return res.status(400).json({ message: "MPS belum mempunyai FG receipt atau child/SFG process." });
     const completedMrp = await prisma.mRPRun.findFirst({ where: { mpsNumber, isDeleted: false, isCurrentPlan: true, status: "Completed" }, orderBy: { createdAt: "desc" }, select: { runNumber: true } });
     if (!completedMrp) return res.status(409).json({ message: "Jalankan MRP sampai Completed sebelum membuat Production Plan agar material sudah diperiksa." });
@@ -145,7 +177,7 @@ exports.createFromMps = async (req, res, next) => {
             periodEnd: monthEnd(planMonth),
             status: "Draft",
             sourceType,
-            notes: `Production plan dari ${mps.mpsNumber}; material check ${completedMrp.runNumber}`,
+            notes: `Production plan dari ${mps.mpsNumber}; material check ${completedMrp.runNumber}; adjustment ${productionPercent}% (minimum SO aktual)`,
             createdBy: req.user?.username || req.user?.email || null,
             details: {
               create: details.map((row, index) => detailFromMps(row, index + 1)),
@@ -157,7 +189,7 @@ exports.createFromMps = async (req, res, next) => {
       }
       return plans;
     });
-    res.status(201).json({ items: result, total: result.length, sourceMpsNumber: mps.mpsNumber, mrpRunNumber: completedMrp.runNumber });
+    res.status(201).json({ items: result, total: result.length, sourceMpsNumber: mps.mpsNumber, mrpRunNumber: completedMrp.runNumber, productionPercent });
   } catch (error) { next(error); }
 };
 

@@ -187,6 +187,39 @@ exports.resolve = async (req, res, next) => {
   }
 };
 
+exports.simulate = async (req, res, next) => {
+  try {
+    const input = { ...req.query, ...(req.body || {}) };
+    const rule = await resolveApprovalRule({
+      moduleCode: input.moduleCode,
+      pageCode: input.pageCode,
+      actionCode: input.actionCode,
+      documentType: input.documentType,
+      amount: input.amount,
+      currencyCode: input.currencyCode,
+      context: input.context || input,
+    });
+    res.json({
+      matched: Boolean(rule),
+      rule: rule ? { id: rule.id, ruleCode: rule.ruleCode, ruleName: rule.ruleName, requireSequential: rule.requireSequential } : null,
+      steps: (rule?.steps || []).map((step) => ({ stepOrder: step.stepOrder, stepName: step.stepName, role: step.role?.roleName || step.role?.roleCode || null, requiredApprovals: step.requiredApprovals, slaHours: step.slaHours, canDelegate: step.canDelegate })),
+    });
+  } catch (error) { next(error); }
+};
+
+exports.dashboard = async (_req, res, next) => {
+  try {
+    const [pending, overdue, rejected, revisionRequired, approvedToday] = await Promise.all([
+      prisma.approvalRequest.count({ where: { isDeleted: false, status: { in: ["Pending", "In Approval"] } } }),
+      prisma.approvalRequest.count({ where: { isDeleted: false, status: { in: ["Pending", "In Approval"] }, requestedAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } } }),
+      prisma.approvalRequest.count({ where: { isDeleted: false, status: "Rejected" } }),
+      prisma.approvalRequest.count({ where: { isDeleted: false, status: "Revision Required" } }),
+      prisma.approvalRequest.count({ where: { isDeleted: false, status: "Approved", completedAt: { gte: new Date(new Date().setHours(0, 0, 0, 0)) } } }),
+    ]);
+    res.json({ pending, overdue, rejected, revisionRequired, approvedToday });
+  } catch (error) { next(error); }
+};
+
 exports.create = async (req, res, next) => {
   try {
     const data = normalizeRule(req.body, req);

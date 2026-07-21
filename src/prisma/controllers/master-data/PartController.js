@@ -5,6 +5,7 @@ const { convertNumericFields } = require("../../utils/numericConverter");
 const { deletePartPhoto, deletePartAttachment } = require("../../middleware/uploads");
 const { normalizeAssemblyPolicy } = require("../../utils/assemblyPolicy");
 const { generateConfiguredNumber, getRule, formatNumber } = require("../../services/numberingService");
+const { resolveItemCompatibility } = require("../../services/itemCompatibilityService");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -918,6 +919,16 @@ exports.get = async (req, res, next) => {
     const transformed = mapDoc(doc);
     await attachCustomersToPartDoc(transformed);
     res.json(transformed);
+  } catch (e) { next(e); }
+};
+
+exports.getCompatibilityProfile = async (req, res, next) => {
+  try {
+    const doc = await prisma.part.findFirst({
+      where: { partCode: req.params.partCode, isDeleted: false },
+    });
+    if (!doc) return res.status(404).json({ message: "Part not found" });
+    res.json(resolveItemCompatibility(doc));
   } catch (e) { next(e); }
 };
 

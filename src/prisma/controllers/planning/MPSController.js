@@ -67,7 +67,7 @@ exports.list = async (req, res, next) => {
   try {
     const page = Math.max(number(req.query.page) || 1, 1); const limit = Math.min(Math.max(number(req.query.limit) || 20, 1), 500); const q = text(req.query.q || req.query.search);
     const where = { isDeleted: false, ...(q ? { OR: [{ mpsNumber: { contains: q, mode: "insensitive" } }, { mpsName: { contains: q, mode: "insensitive" } }, { forecastNumber: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
-    const [items, total] = await Promise.all([prisma.mPS.findMany({ where, include, orderBy: { createdAt: "desc" }, skip: (page - 1) * limit, take: limit }), prisma.mPS.count({ where })]);
+    const [items, total] = await Promise.all([prisma.mPS.findMany({ where, include, orderBy: [{ periodStart: "desc" }, { createdAt: "desc" }], skip: (page - 1) * limit, take: limit }), prisma.mPS.count({ where })]);
     res.json({ items: items.map((item) => {
       const receiptLines = item.details.filter((row) => !isGeneratedProcess(row));
       const processLines = item.details.filter((row) => isGeneratedProcess(row) && String(row.part?.itemType || "").toUpperCase() !== "FG");
@@ -79,6 +79,52 @@ exports.list = async (req, res, next) => {
         processLineCount: processLines.length,
       };
     }), total, page, limit });
+  } catch (error) { next(error); }
+};
+
+// Read model for both newly generated monthly MPS and legacy MPS documents
+// whose header covers more than one month.  It deliberately derives the month
+// from each detail's startDate, so no historical document needs rewriting.
+exports.monthlySummary = async (req, res, next) => {
+  try {
+    const details = await prisma.mPSDetail.findMany({
+      where: { isDeleted: false, mps: { isDeleted: false } },
+      select: {
+        mpsNumber: true, partCode: true, customerCode: true, startDate: true,
+        forecastQty: true, actualSalesOrderQty: true, bufferQty: true, effectiveDemandQty: true, qtyPlanned: true, notes: true,
+        mps: { select: { forecastNumber: true, status: true } },
+        part: { select: { partName: true, itemType: true, partType: true, productionUomCode: true, baseUomCode: true } },
+      },
+      orderBy: [{ startDate: "asc" }, { partCode: "asc" }],
+      take: 10000,
+    });
+    const monthly = new Map();
+    const receiptByMonth = new Map(details.filter((row) => !isGeneratedProcess(row) && row.startDate).map((row) => [`${row.customerCode || ""}|${row.partCode}|${monthKey(row.startDate)}`, row]));
+    for (const row of details) {
+      if (!row.startDate) continue;
+      const month = monthKey(row.startDate);
+      const customerCode = row.customerCode || "Tanpa Customer";
+      const forecastNumber = row.mps?.forecastNumber || "Tanpa Forecast";
+      const itemType = String(row.part?.itemType || "UNKNOWN").toUpperCase();
+      const partType = String(row.part?.partType || "STANDARD").toUpperCase();
+      const itemScope = itemType === "FG" && partType !== "COMP" ? "FG NON-COMP" : partType !== "COMP" ? "NON-COMP" : "COMP";
+      const scheduleType = isGeneratedProcess(row) ? "CHILD / PROCESS" : "FG RECEIPT";
+      const sourcePart = String(row.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim();
+      const parent = isGeneratedProcess(row) ? receiptByMonth.get(`${row.customerCode || ""}|${sourcePart || ""}|${month}`) : null;
+      const inherited = (field) => number(row[field]) || number(parent?.[field]);
+      const uomCode = row.part?.productionUomCode || row.part?.baseUomCode || null;
+      const key = [month, forecastNumber, customerCode, row.partCode, scheduleType, uomCode || "-"].join("|");
+      const current = monthly.get(key) || { month, forecastNumber, customerCode, partCode: row.partCode, partName: row.part?.partName || null, itemType, partType, itemScope, scheduleType, uomCode, mpsNumbers: [], forecastQty: 0, actualSalesOrderQty: 0, bufferQty: 0, effectiveDemandQty: 0, qtyPlanned: 0 };
+      current.mpsNumbers.push(row.mpsNumber);
+      current.forecastQty += inherited("forecastQty");
+      current.actualSalesOrderQty += inherited("actualSalesOrderQty");
+      current.bufferQty += inherited("bufferQty");
+      current.effectiveDemandQty += inherited("effectiveDemandQty");
+      current.qtyPlanned += number(row.qtyPlanned);
+      monthly.set(key, current);
+    }
+    const items = [...monthly.values()].map((row) => ({ ...row, mpsNumbers: [...new Set(row.mpsNumbers)], mpsCount: new Set(row.mpsNumbers).size })).sort((left, right) => `${left.month}|${left.forecastNumber}|${left.customerCode}|${left.partCode}`.localeCompare(`${right.month}|${right.forecastNumber}|${right.customerCode}|${right.partCode}`));
+    res.json({ items, total: items.length, filters: { months: [...new Set(items.map((row) => row.month))], forecasts: [...new Set(items.map((row) => row.forecastNumber))], customers: [...new Set(items.map((row) => row.customerCode))] } });
   } catch (error) { next(error); }
 };
 
@@ -132,37 +178,46 @@ exports.createFromForecast = async (req, res, next) => {
     if (forecast.status !== "Confirmed") return res.status(409).json({ message: "Forecast harus berstatus Confirmed sebelum dibuat menjadi MPS" });
     const periods = forecast.details.flatMap((row) => forecastPeriods(row).map((period) => ({ row, ...period })));
     if (!periods.length) return res.status(400).json({ message: "Forecast belum memiliki demand bulanan dengan qty lebih dari nol" });
-    const doc = await prisma.$transaction(async (tx) => {
-      const mpsNumber = text(req.body.mpsNumber) || await nextNumber(tx);
-      const periodStart = new Date(Math.min(...periods.map((row) => row.month.getTime())));
-      const periodEnd = new Date(Math.max(...periods.map((row) => monthEnd(row.month).getTime())));
-      const forecastByPartMonth = new Map(periods.map((item) => [`${item.row.partCode}|${monthKey(item.month)}`, number(item.qty)]));
-      const details = periods.map(({ row, month, qty, offset }, index) => {
-        const nextMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1);
-        const forecastQty = number(qty);
-        const bufferBaseQty = number(forecastByPartMonth.get(`${row.partCode}|${monthKey(nextMonth)}`));
-        const bufferPercent = Math.max(number(row.part?.bufferStock), 0);
-        const bufferQty = Number(((bufferBaseQty * bufferPercent) / 100).toFixed(6));
-        const effectiveDemandQty = forecastQty + bufferQty;
-        return {
-          lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
-          forecastQty, actualSalesOrderQty: 0, bufferBaseQty, bufferPercent, bufferQty, effectiveDemandQty, productionPercent: 100,
-          qtyPlanned: effectiveDemandQty, startDate: month, endDate: monthEnd(month), priority: 1, status: "Planned", customerCode: forecast.customerCode,
-          forecastDetailId: row.id, forecastPeriodOffset: offset, notes: `${FG_RECEIPT_PREFIX} Generated from forecast ${forecast.forecastNumber}`,
-        };
-      });
-      const actualSo = await buildActualSalesOrderByMpsBucket(tx, details);
-      for (const detail of details) {
-        const actual = actualSo.byBucket.get(mpsBucketKey(detail.partCode, detail.customerCode, detail.startDate)) || { qty: 0, soNumbers: [] };
-        detail.actualSalesOrderQty = number(actual.qty);
-        detail.soNumber = [...new Set(actual.soNumbers)].join(",") || null;
-        detail.qtyPlanned = Math.max(detail.effectiveDemandQty, detail.actualSalesOrderQty);
+    const docs = await prisma.$transaction(async (tx) => {
+      const periodsByMonth = new Map();
+      for (const period of periods) {
+        const key = monthKey(period.month);
+        if (!periodsByMonth.has(key)) periodsByMonth.set(key, []);
+        periodsByMonth.get(key).push(period);
       }
-      const created = await tx.mPS.create({ data: { mpsNumber, mpsName: text(req.body.mpsName) || `MPS ${forecast.forecastNumber}`, periodStart, periodEnd, forecastNumber: forecast.forecastNumber, status: "Draft", notes: text(req.body.notes) || `Generated from confirmed forecast ${forecast.forecastNumber}`, createdBy: req.user?.username || req.user?.email || null, details: { create: details } }, include });
+      if (text(req.body.mpsNumber) && periodsByMonth.size > 1) throw Object.assign(new Error("Nomor MPS manual hanya dapat dipakai bila forecast mencakup satu bulan"), { statusCode: 400 });
+      const forecastByPartMonth = new Map(periods.map((item) => [`${item.row.partCode}|${monthKey(item.month)}`, number(item.qty)]));
+      const created = [];
+      for (const [periodKey, monthlyPeriods] of [...periodsByMonth.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+        const periodStart = new Date(monthlyPeriods[0].month.getFullYear(), monthlyPeriods[0].month.getMonth(), 1);
+        const mpsNumber = text(req.body.mpsNumber) || await nextNumber(tx);
+        const details = monthlyPeriods.map(({ row, month, qty, offset }, index) => {
+          const nextMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1);
+          const forecastQty = number(qty);
+          const bufferBaseQty = number(forecastByPartMonth.get(`${row.partCode}|${monthKey(nextMonth)}`));
+          const bufferPercent = Math.max(number(row.part?.bufferStock), 0);
+          const bufferQty = Number(((bufferBaseQty * bufferPercent) / 100).toFixed(6));
+          const effectiveDemandQty = forecastQty + bufferQty;
+          return {
+            lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
+            forecastQty, actualSalesOrderQty: 0, bufferBaseQty, bufferPercent, bufferQty, effectiveDemandQty, productionPercent: 100,
+            qtyPlanned: effectiveDemandQty, startDate: periodStart, endDate: monthEnd(periodStart), priority: 1, status: "Planned", customerCode: forecast.customerCode,
+            forecastDetailId: row.id, forecastPeriodOffset: offset, notes: `${FG_RECEIPT_PREFIX} Generated from forecast ${forecast.forecastNumber}`,
+          };
+        });
+        const actualSo = await buildActualSalesOrderByMpsBucket(tx, details);
+        for (const detail of details) {
+          const actual = actualSo.byBucket.get(mpsBucketKey(detail.partCode, detail.customerCode, detail.startDate)) || { qty: 0, soNumbers: [] };
+          detail.actualSalesOrderQty = number(actual.qty);
+          detail.soNumber = [...new Set(actual.soNumbers)].join(",") || null;
+          detail.qtyPlanned = Math.max(detail.effectiveDemandQty, detail.actualSalesOrderQty);
+        }
+        created.push(await tx.mPS.create({ data: { mpsNumber, mpsName: text(req.body.mpsName) ? `${text(req.body.mpsName)} - ${periodKey}` : `MPS ${forecast.forecastNumber} - ${periodKey}`, periodStart, periodEnd: monthEnd(periodStart), forecastNumber: forecast.forecastNumber, status: "Draft", notes: text(req.body.notes) || `Generated from confirmed forecast ${forecast.forecastNumber} for ${periodKey}`, createdBy: req.user?.username || req.user?.email || null, details: { create: details } }, include }));
+      }
       await tx.forecast.update({ where: { forecastNumber: forecast.forecastNumber }, data: { status: "Consumed" } });
       return created;
     });
-    res.status(201).json(doc);
+    res.status(201).json({ ...docs[0], items: docs, mpsNumbers: docs.map((doc) => doc.mpsNumber), message: `${docs.length} MPS bulanan berhasil dibuat` });
   } catch (error) { next(error); }
 };
 

@@ -1,0 +1,10 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/engineering/RoutingController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+router.get("/work-centers", authorize("machines", "read"), ctrl.listWorkCenters);
+router.post("/work-centers", authorize("machines", "create"), logger("work-center", "create"), ctrl.createWorkCenter);
+router.get("/routings", authorize("mbom", "read"), ctrl.listRoutings);
+router.post("/routings", authorize("mbom", "create"), logger("routing", "create"), ctrl.createRouting);
+router.patch("/mbom-processes/:id/link", authorize("mbom", "update"), logger("mbom-process", "link-routing"), ctrl.linkMbomProcess);
+module.exports = router;

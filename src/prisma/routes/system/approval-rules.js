@@ -5,6 +5,8 @@ const { logger } = require("../../middleware/logger");
 
 router.get("/roles", authorize("approval-rules", "read"), controller.roles);
 router.get("/resolve", authorize("approval-rules", "read"), controller.resolve);
+router.post("/simulate", authorize("approval-rules", "read"), controller.simulate);
+router.get("/dashboard", authorize("approval-rules", "read"), controller.dashboard);
 router.get("/", authorize("approval-rules", "read"), controller.list);
 router.get("/:id", authorize("approval-rules", "read"), controller.get);
 router.post("/", authorize("approval-rules", "create"), logger("approval-rules", "create"), controller.create);
