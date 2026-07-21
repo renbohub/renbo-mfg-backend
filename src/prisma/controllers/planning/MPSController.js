@@ -1,4 +1,5 @@
 const { prisma } = require("../../index");
+const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
@@ -178,6 +179,7 @@ exports.createFromForecast = async (req, res, next) => {
     if (forecast.status !== "Confirmed") return res.status(409).json({ message: "Forecast harus berstatus Confirmed sebelum dibuat menjadi MPS" });
     const periods = forecast.details.flatMap((row) => forecastPeriods(row).map((period) => ({ row, ...period })));
     if (!periods.length) return res.status(400).json({ message: "Forecast belum memiliki demand bulanan dengan qty lebih dari nol" });
+    const formulas = await getFormulaSet(prisma, "planning");
     const docs = await prisma.$transaction(async (tx) => {
       const periodsByMonth = new Map();
       for (const period of periods) {
@@ -196,8 +198,8 @@ exports.createFromForecast = async (req, res, next) => {
           const forecastQty = number(qty);
           const bufferBaseQty = number(forecastByPartMonth.get(`${row.partCode}|${monthKey(nextMonth)}`));
           const bufferPercent = Math.max(number(row.part?.bufferStock), 0);
-          const bufferQty = Number(((bufferBaseQty * bufferPercent) / 100).toFixed(6));
-          const effectiveDemandQty = forecastQty + bufferQty;
+          const bufferQty = evaluateFromSet(formulas, "MPS_BUFFER_QTY", { bufferBaseQty, bufferPercent });
+          const effectiveDemandQty = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty, bufferQty });
           return {
             lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
             forecastQty, actualSalesOrderQty: 0, bufferBaseQty, bufferPercent, bufferQty, effectiveDemandQty, productionPercent: 100,
@@ -210,7 +212,7 @@ exports.createFromForecast = async (req, res, next) => {
           const actual = actualSo.byBucket.get(mpsBucketKey(detail.partCode, detail.customerCode, detail.startDate)) || { qty: 0, soNumbers: [] };
           detail.actualSalesOrderQty = number(actual.qty);
           detail.soNumber = [...new Set(actual.soNumbers)].join(",") || null;
-          detail.qtyPlanned = Math.max(detail.effectiveDemandQty, detail.actualSalesOrderQty);
+          detail.qtyPlanned = evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty: detail.effectiveDemandQty, productionPercent: detail.productionPercent, actualSalesOrderQty: detail.actualSalesOrderQty });
         }
         created.push(await tx.mPS.create({ data: { mpsNumber, mpsName: text(req.body.mpsName) ? `${text(req.body.mpsName)} - ${periodKey}` : `MPS ${forecast.forecastNumber} - ${periodKey}`, periodStart, periodEnd: monthEnd(periodStart), forecastNumber: forecast.forecastNumber, status: "Draft", notes: text(req.body.notes) || `Generated from confirmed forecast ${forecast.forecastNumber} for ${periodKey}`, createdBy: req.user?.username || req.user?.email || null, details: { create: details } }, include }));
       }
@@ -248,12 +250,13 @@ exports.updateAdjustments = async (req, res, next) => {
       targetDetails = allParentRows.filter((row) => !isGeneratedProcess(row));
     }
     const actualSo = await buildActualSalesOrderByMpsBucket(prisma, targetDetails);
+    const formulas = await getFormulaSet(prisma, "planning");
     await prisma.$transaction(targetDetails.map((row) => {
       const actual = actualSo.byDetailId.get(row.id) || { qty: 0, soNumbers: [] };
-      const bufferQty = Number(((number(row.bufferBaseQty) * bufferPercent) / 100).toFixed(6));
-      const effectiveDemandQty = number(row.forecastQty) + bufferQty;
+      const bufferQty = evaluateFromSet(formulas, "MPS_BUFFER_QTY", { bufferBaseQty: number(row.bufferBaseQty), bufferPercent });
+      const effectiveDemandQty = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty: number(row.forecastQty), bufferQty });
       const actualSalesOrderQty = Math.max(number(row.actualSalesOrderQty), number(actual.qty));
-      const qtyPlanned = Math.max(Number(((effectiveDemandQty * productionPercent) / 100).toFixed(6)), actualSalesOrderQty);
+      const qtyPlanned = evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty, productionPercent, actualSalesOrderQty });
       return prisma.mPSDetail.update({
         where: { id: row.id },
         data: { bufferPercent, bufferQty, bufferOverridden: true, bufferReferenceScope: scope, effectiveDemandQty, productionPercent, productionOverridden: true, actualSalesOrderQty, soNumber: [...new Set(actual.soNumbers)].join(",") || row.soNumber || null, qtyPlanned },

@@ -1,0 +1,10 @@
+const router = require("express").Router();
+const ctrl = require("../../controllers/system/MasterFormulaController");
+const { authorize } = require("../../middleware/auth");
+router.get("/", authorize("master-formulas", "read"), ctrl.list);
+router.get("/:id", authorize("master-formulas", "read"), ctrl.get);
+router.post("/simulate", authorize("master-formulas", "read"), ctrl.simulate);
+router.post("/", authorize("master-formulas", "create"), ctrl.create);
+router.patch("/:id", authorize("master-formulas", "update"), ctrl.update);
+router.delete("/:id", authorize("master-formulas", "delete"), ctrl.remove);
+module.exports = router;

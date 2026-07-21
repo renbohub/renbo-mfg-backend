@@ -89,6 +89,7 @@ const exportRouter = require("./export");
 const systemSettingsRouter = require("./system-settings");
 const rolesRouter = require("./system/roles");
 const approvalRulesRouter = require("./system/approval-rules");
+const masterFormulasRouter = require("./system/master-formulas");
 const approvalsRouter = require("./system/approvals");
 
 const BASE_PATH = "/api";
@@ -126,6 +127,7 @@ function registerRoutes(app) {
   api.use("/logs", auth, logsRouter);
   api.use("/system/roles", auth, rolesRouter);
   api.use("/system/approval-rules", auth, approvalRulesRouter);
+  api.use("/system/master-formulas", auth, masterFormulasRouter);
   api.use("/approvals", auth, approvalsRouter);
 
   // Master Data routes
