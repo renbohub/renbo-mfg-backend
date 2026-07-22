@@ -4,7 +4,7 @@ const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormula
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
 const date = (value) => value ? new Date(value) : null;
-const include = { details: { where: { isDeleted: false }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }], include: { part: true, forecastDetail: true, mbom: true } } };
+const include = { details: { where: { isDeleted: false }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }], include: { part: { include: { process: true } }, forecastDetail: true, mbom: true } } };
 const GENERATED_PROCESS_PREFIX = "[MRP-PRODUCTION]";
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith(GENERATED_PROCESS_PREFIX);
