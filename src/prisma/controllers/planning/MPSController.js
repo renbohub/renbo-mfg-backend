@@ -143,6 +143,32 @@ exports.get = async (req, res, next) => {
         soNumber: row.soNumber || [...new Set(actual.soNumbers)].join(",") || null,
       };
     });
+    // Resolve the process column from the parent FG mBOM.  Generated SFG rows
+    // do not carry an mbomHeaderId, so use the source FG in their trace note
+    // and build a bottom-up process path (deepest BOM level first).
+    const receiptRows = doc.details.filter((row) => !isGeneratedProcess(row));
+    const parentPartIds = [...new Set(receiptRows.map((row) => row.partId).filter(Boolean))];
+    const parentHeaders = parentPartIds.length ? await prisma.mBOMHeader.findMany({
+      where: { partId: { in: parentPartIds }, isDeleted: false },
+      orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
+      include: { details: { where: { isDeleted: false }, include: { part: true, mbomProcesses: { where: { isDeleted: false }, include: { process: true } } } } },
+    }) : [];
+    const headerByPartId = new Map();
+    parentHeaders.forEach((header) => { if (!headerByPartId.has(header.partId)) headerByPartId.set(header.partId, header); });
+    const parentByCode = new Map(receiptRows.map((row) => [row.partCode, row]));
+    doc.details = doc.details.map((row) => {
+      if (!isGeneratedProcess(row)) return row;
+      const sourceCode = String(row.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim();
+      const parent = parentByCode.get(sourceCode);
+      const header = parent ? headerByPartId.get(parent.partId) : null;
+      const child = header?.details?.find((detail) => detail.part?.partCode === row.partCode);
+      if (!header || !child) return row;
+      const path = header.details
+        .filter((detail) => Number(detail.levelComponent || 0) <= Number(child.levelComponent || 0) && detail.mbomProcesses?.length)
+        .sort((left, right) => Number(right.levelComponent || 0) - Number(left.levelComponent || 0) || Number(right.mbomProcesses?.[0]?.sequence || 0) - Number(left.mbomProcesses?.[0]?.sequence || 0))
+        .flatMap((detail) => detail.mbomProcesses.map((process) => ({ name: process.process?.processName || process.process?.processCode || "Process", level: detail.levelComponent, sequence: process.sequence })));
+      return path.length ? { ...row, processPath: path } : row;
+    });
     const productionPlans = await prisma.monthlyProductionPlan.findMany({
       where: { sourceType: `MPS:${doc.mpsNumber}`, isDeleted: false },
       select: { planNumber: true, planMonth: true, status: true, _count: { select: { details: true } } },
