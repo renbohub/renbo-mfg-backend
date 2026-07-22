@@ -294,7 +294,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         cursor = addDays(cursor, -1);
       }
       if (remainingMinutes > 0) {
-        pushIssue(issues, { severity: "blocking", code: "PLAN_CAPACITY_SHORTAGE", planNumber: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode, routeId: route.id, machineCode: machine.machineCode, message: `${machine.machineCode} kekurangan ${round(remainingMinutes)} menit untuk ${detail.partCode} dalam horizon.` }, issueKeys);
+        pushIssue(issues, { severity: "overridable", code: "PLAN_CAPACITY_SHORTAGE", planNumber: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode, routeId: route.id, machineCode: machine.machineCode, message: `${machine.machineCode} kekurangan ${round(remainingMinutes)} menit untuk ${detail.partCode} dalam horizon.` }, issueKeys);
         unscheduled.push({ source: "PROPOSED", reference: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode, processCode: route.process?.processCode || null, machineCode: machine.machineCode, qty: round(remainingMinutes / cycleMinutes, 3), uomCode: detail.uomCode, minutes: round(remainingMinutes), reason: "Kapasitas horizon tidak mencukupi" });
       }
     }
@@ -327,6 +327,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   }
 
   const blockingIssues = issues.filter((issue) => issue.severity === "blocking");
+  const overridableIssues = issues.filter((issue) => issue.severity === "overridable");
   return {
     parameters: { startDate: dateKey(range.start), endDate: dateKey(range.end), shiftHours, shiftsPerDay, efficiencyPercent, availableMinutesPerMachineDay: baseAvailableMinutes, planNumber },
     dates: range.dates,
@@ -353,6 +354,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       ok: blockingIssues.length === 0,
       blockingCount: blockingIssues.length,
       warningCount: issues.filter((issue) => issue.severity === "warning").length,
+      overridableCount: overridableIssues.length,
       infoCount: issues.filter((issue) => issue.severity === "info").length,
       issues,
     },

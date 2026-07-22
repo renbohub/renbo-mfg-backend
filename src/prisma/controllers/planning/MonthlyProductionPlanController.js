@@ -102,7 +102,10 @@ async function withMpsSnapshot(plan) {
     details: plan.details.map((detail) => {
       const sourceLine = String(detail.notes || "").match(/\[MPS-LINE:(\d+)\]/)?.[1];
       const source = byId.get(detail.mpsDetailId) || byLineNumber.get(sourceLine);
-      return source ? { ...detail, ...Object.fromEntries(["forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferPercent", "bufferQty", "productionPercent", "effectiveDemandQty"].map((field) => [field, source[field]])), mpsDetailId: source.id } : detail;
+      if (!source) return detail;
+      const synced = { ...detail, ...Object.fromEntries(["forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferPercent", "bufferQty", "productionPercent", "effectiveDemandQty"].map((field) => [field, source[field]])), mpsDetailId: source.id };
+      if (plan.status === "Draft") synced.qtyPlanned = Math.max(number(source.effectiveDemandQty) * number(source.productionPercent || 100) / 100, number(source.actualSalesOrderQty));
+      return synced;
     }),
   };
 }
@@ -156,13 +159,16 @@ exports.createFromMps = async (req, res, next) => {
         if (existing) {
           if (existing.status === "Draft") {
             let nextLineNumber = Math.max(0, ...existing.details.map((row) => number(row.lineNumber))) + 1;
+            const matchedIds = new Set();
             for (const row of details) {
               const sourceLineMarker = `[MPS-LINE:${row.lineNumber}]`;
               const matched = existing.details.find((detail) => detail.mpsDetailId === row.id || String(detail.notes || "").includes(sourceLineMarker));
               const data = detailFromMps(row, matched?.lineNumber || nextLineNumber++);
-              if (matched) await tx.monthlyProductionPlanDetail.update({ where: { id: matched.id }, data });
+              if (matched) { matchedIds.add(matched.id); await tx.monthlyProductionPlanDetail.update({ where: { id: matched.id }, data }); }
               else await tx.monthlyProductionPlanDetail.create({ data: { ...data, planId: existing.id } });
             }
+            const stale = existing.details.filter((detail) => !matchedIds.has(detail.id));
+            if (stale.length) await tx.monthlyProductionPlanDetail.updateMany({ where: { id: { in: stale.map((detail) => detail.id) } }, data: { isDeleted: true, status: "Cancelled", notes: "Synchronized: MPS line no longer active" } });
           }
           const synchronized = await tx.monthlyProductionPlan.findFirst({ where: { id: existing.id }, include });
           plans.push({ ...serialize(synchronized), existing: true, synchronized: existing.status === "Draft" });
@@ -210,10 +216,24 @@ exports.release = async (req, res, next) => {
     if (!plan) return res.status(404).json({ message: "Monthly Production Plan tidak ditemukan." });
     if (plan.status !== "Confirmed") return res.status(409).json({ message: `Production Plan harus Confirmed sebelum release, status saat ini ${plan.status}.` });
     const capacity = await buildCapacitySnapshot(prisma, { ...(req.body || {}), planNumber: plan.planNumber, startDate: plan.periodStart, endDate: plan.periodEnd });
-    if (!capacity.readiness.ok || capacity.summary.unscheduledCount > 0 || capacity.summary.overloadedCells > 0) {
+    const hasOverridable = Number(capacity.readiness.overridableCount || 0) > 0 || Number(capacity.summary.overloadedCells || 0) > 0;
+    const overrideApproved = plan.capacityOverrideApproved === true;
+    if (!capacity.readiness.ok || capacity.summary.unscheduledCount > 0 || (hasOverridable && !overrideApproved)) {
       return res.status(409).json({ message: "Production Plan belum dapat direlease. Lengkapi routing machine/cycle time dan selesaikan overload pada Capacity Planning.", code: "CAPACITY_NOT_READY", capacity: { summary: capacity.summary, readiness: capacity.readiness, unscheduled: capacity.unscheduled } });
     }
     const updated = await prisma.monthlyProductionPlan.update({ where: { planNumber: plan.planNumber }, data: { status: "Released", releasedBy: req.user?.username || req.user?.email || null, releasedAt: new Date() }, include });
     res.json(serialize(updated));
+  } catch (error) { next(error); }
+};
+
+exports.capacityOverride = async (req, res, next) => {
+  try {
+    const plan = await prisma.monthlyProductionPlan.findFirst({ where: { planNumber: req.params.planNumber, isDeleted: false }, include });
+    if (!plan) return res.status(404).json({ message: "Monthly Production Plan tidak ditemukan." });
+    if (!["Draft", "Confirmed"].includes(plan.status)) return res.status(409).json({ message: "Capacity override hanya dapat dilakukan sebelum release." });
+    const reason = String(req.body?.reason || req.body?.notes || "").trim();
+    if (reason.length < 10) return res.status(400).json({ message: "Reason override minimal 10 karakter." });
+    const updated = await prisma.monthlyProductionPlan.update({ where: { planNumber: plan.planNumber }, data: { capacityOverrideApproved: true, capacityOverrideReason: reason, capacityOverrideBy: req.user?.username || req.user?.email || "system", capacityOverrideAt: new Date() }, include });
+    res.json({ ...serialize(updated), capacityOverride: { approved: true, reason } });
   } catch (error) { next(error); }
 };
