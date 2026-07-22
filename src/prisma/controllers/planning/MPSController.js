@@ -148,6 +148,14 @@ exports.get = async (req, res, next) => {
     // and build a bottom-up process path (deepest BOM level first).
     const receiptRows = doc.details.filter((row) => !isGeneratedProcess(row));
     const parentPartIds = [...new Set(receiptRows.map((row) => row.partId).filter(Boolean))];
+    const generatedPartIds = [...new Set(doc.details.filter((row) => isGeneratedProcess(row)).map((row) => row.partId).filter(Boolean))];
+    const directRoutingDetails = generatedPartIds.length ? await prisma.mBOMDetail.findMany({
+      where: { partId: { in: generatedPartIds }, isDeleted: false, mbomProcesses: { some: { isDeleted: false } } },
+      include: { part: true, mbomHeader: { select: { revision: true, updatedAt: true } }, mbomProcesses: { where: { isDeleted: false }, include: { process: true } } },
+      orderBy: [{ updatedAt: "desc" }],
+    }) : [];
+    const directRoutingByPartId = new Map();
+    directRoutingDetails.forEach((detail) => { if (!directRoutingByPartId.has(detail.partId)) directRoutingByPartId.set(detail.partId, detail); });
     const parentHeaders = parentPartIds.length ? await prisma.mBOMHeader.findMany({
       where: { partId: { in: parentPartIds }, isDeleted: false },
       orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
@@ -161,7 +169,8 @@ exports.get = async (req, res, next) => {
       const sourceCode = String(row.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim();
       const parent = parentByCode.get(sourceCode);
       const header = parent ? headerByPartId.get(parent.partId) : null;
-      const child = header?.details?.find((detail) => detail.part?.partCode === row.partCode);
+      const direct = directRoutingByPartId.get(row.partId);
+      const child = direct || header?.details?.find((detail) => detail.part?.partCode === row.partCode);
       if (!header || !child) return row;
       // Only use routing attached to this part's own BOM detail. Do not walk
       // ancestors: that creates fabricated Finish Goods/Welding chains.
