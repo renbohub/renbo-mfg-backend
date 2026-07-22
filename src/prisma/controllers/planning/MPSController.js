@@ -163,10 +163,12 @@ exports.get = async (req, res, next) => {
       const header = parent ? headerByPartId.get(parent.partId) : null;
       const child = header?.details?.find((detail) => detail.part?.partCode === row.partCode);
       if (!header || !child) return row;
-      const path = header.details
-        .filter((detail) => Number(detail.levelComponent || 0) <= Number(child.levelComponent || 0) && detail.mbomProcesses?.length)
-        .sort((left, right) => Number(right.levelComponent || 0) - Number(left.levelComponent || 0) || Number(right.mbomProcesses?.[0]?.sequence || 0) - Number(left.mbomProcesses?.[0]?.sequence || 0))
-        .flatMap((detail) => detail.mbomProcesses.map((process) => ({ name: process.process?.processName || process.process?.processCode || "Process", level: detail.levelComponent, sequence: process.sequence })));
+      // Only use routing attached to this part's own BOM detail. Do not walk
+      // ancestors: that creates fabricated Finish Goods/Welding chains.
+      const path = (child.mbomProcesses || [])
+        .slice()
+        .sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0))
+        .map((process) => ({ name: process.process?.processName || process.process?.processCode || "Process", occurrenceCode: process.occurrenceCode || null, routingNumber: process.routingNumber || null, level: child.levelComponent, sequence: process.sequence }));
       return path.length ? { ...row, processPath: path } : row;
     });
     const productionPlans = await prisma.monthlyProductionPlan.findMany({
