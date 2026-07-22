@@ -343,7 +343,9 @@ async function assignProcessOccurrenceCodes(details, db = prisma) {
   const groups = new Map();
   usages.forEach((usage) => { if (!groups.has(usage.process.processId)) groups.set(usage.process.processId, []); groups.get(usage.process.processId).push(usage); });
   groups.forEach((items, processId) => {
-    items.sort((a, b) => a.detailIndex - b.detailIndex || Number(a.process.sequence || 0) - Number(b.process.sequence || 0) || a.processIndex - b.processIndex);
+    // Occurrence numbering follows the bottom-up BOM order: the deepest
+    // detail receives -1, then the next level receives -2, etc.
+    items.sort((a, b) => b.detailIndex - a.detailIndex || Number(a.process.sequence || 0) - Number(b.process.sequence || 0) || a.processIndex - b.processIndex);
     const processCode = codeById.get(processId);
     if (!processCode) throw badRequest("Master proses tidak ditemukan atau sudah nonaktif.");
     items.forEach((item, index) => { item.process.occurrenceCode = items.length === 1 ? processCode : `${processCode}-${index + 1}`; });
@@ -855,6 +857,7 @@ exports.get = async (req, res, next) => {
     });
 
     if (!doc) return res.status(404).json({ message: "MBOM not found" });
+    await assignProcessOccurrenceCodes(doc.details);
     res.json(mapDoc(doc));
   } catch (e) {
     next(e);
