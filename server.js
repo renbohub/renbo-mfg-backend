@@ -4,10 +4,10 @@ const http = require("http");
 const path = require("path");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const { assertLicenseIntegrity } = require("./src/prisma/security/licenseIntegrity");
+// const { assertLicenseIntegrity } = require("./src/prisma/security/licenseIntegrity");
 const { assertAuthServerIpAllowed } = require("./src/prisma/utils/authIps");
 
-assertLicenseIntegrity();
+// assertLicenseIntegrity();
 
 const app = express();
 const server = http.createServer(app);

@@ -1,4 +1,5 @@
 const { randomUUID } = require("crypto");
+const { Prisma } = require("@prisma/client");
 const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
@@ -2517,10 +2518,28 @@ exports.get = async (req, res, next) => {
     );
     const releasedOrderNumbers = enrichedPlannedOrders.map((row) => row.orderNumber).filter(Boolean);
     const prLinks = releasedOrderNumbers.length ? await prisma.purchaseRequisitionDetail.findMany({
-      where: { plannedOrderNumber: { in: releasedOrderNumbers }, isDeleted: false, pr: { isDeleted: false } },
-      select: { plannedOrderNumber: true, prNumber: true, pr: { select: { status: true } } },
+      where: {
+        isDeleted: false,
+        pr: { isDeleted: false },
+        OR: [
+          { plannedOrderNumber: { in: releasedOrderNumbers } },
+          { sourcePlannedOrderNumbers: { not: Prisma.DbNull } },
+        ],
+      },
+      select: { plannedOrderNumber: true, sourcePlannedOrderNumbers: true, prNumber: true, pr: { select: { status: true } } },
     }) : [];
-    const prByPlannedOrder = new Map(prLinks.map((row) => [row.plannedOrderNumber, { prNumber: row.prNumber, status: row.pr.status }]));
+    const releasedOrderSet = new Set(releasedOrderNumbers);
+    const prByPlannedOrder = new Map();
+    for (const row of prLinks) {
+      const sourceNumbers = Array.isArray(row.sourcePlannedOrderNumbers)
+        ? row.sourcePlannedOrderNumbers
+        : [];
+      for (const orderNumber of [row.plannedOrderNumber, ...sourceNumbers].filter(Boolean)) {
+        if (releasedOrderSet.has(orderNumber)) {
+          prByPlannedOrder.set(orderNumber, { prNumber: row.prNumber, status: row.pr.status });
+        }
+      }
+    }
     res.json(mapDoc({
       ...mrpRun,
       requirements: groupedRequirements,
@@ -3430,6 +3449,7 @@ exports.runMRP = async (req, res, next) => {
               requiredDate: mrpReq.requiredDate,
               orderDate,
               supplierCode: isProduction ? null : partnerMap[mrpReq.partCode]?.supplierCode || null,
+              supplierProposalSource: !isProduction && partnerMap[mrpReq.partCode]?.supplierCode ? "PART_MASTER" : null,
               vendorCode: isProduction ? null : partnerMap[mrpReq.partCode]?.vendorCode || null,
               referenceType: "MRP",
               referenceNumber: planIdentity.planNumber || runNumber,
@@ -4225,6 +4245,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
             requiredDate: row.requiredDate,
             orderDate: row.orderDate || row.requiredDate,
             supplierCode: partnerMap[partCode]?.supplierCode || null,
+            supplierProposalSource: partnerMap[partCode]?.supplierCode ? "PART_MASTER" : null,
             vendorCode: partnerMap[partCode]?.vendorCode || null,
             referenceType: "MRP",
             referenceNumber: run.planNumber || runNumber,
@@ -4267,6 +4288,259 @@ async function nextMrpPurchaseRequestNumber(tx) {
   return `${prefix}${String(sequence).padStart(3, "0")}`;
 }
 
+function getProcurementRows(body = {}) {
+  const candidates = body.orders || body.plannedOrders || body.items || [];
+  return Array.isArray(candidates) ? candidates.filter((row) => row && row.orderNumber) : [];
+}
+
+function normalizeLotAllocations(value) {
+  const rows = Array.isArray(value) ? value : value && typeof value === "object" ? [value] : [];
+  return rows.map((row, index) => {
+    const qtyKg = Number(row.qtyKg ?? row.allocatedQtyKg ?? row.qty ?? 0);
+    if (!Number.isFinite(qtyKg) || qtyKg <= 0) {
+      throw Object.assign(new Error(`Alokasi lot baris ${index + 1}: qtyKg harus lebih dari 0.`), { status: 400 });
+    }
+    const partCode = normalizePartCode(row.partCode || row.childPartCode);
+    const fgPartCode = normalizePartCode(row.fgPartCode || row.parentPartCode);
+    if (!partCode && !fgPartCode) {
+      throw Object.assign(new Error(`Alokasi lot baris ${index + 1}: partCode atau fgPartCode wajib diisi.`), { status: 400 });
+    }
+    return {
+      partCode: partCode || null,
+      fgPartCode: fgPartCode || null,
+      qtyKg,
+      sourceType: row.sourceType || row.demandType || null,
+      sourceNumber: row.sourceNumber || row.demandNumber || null,
+      plannedOrderNumber: row.plannedOrderNumber || null,
+      materialCode: row.materialCode || null,
+      notes: row.notes || null,
+    };
+  });
+}
+
+const procurementDayKey = (value) => {
+  const parsed = value ? new Date(value) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : "";
+};
+
+/**
+ * Raw material demand is purchased by Material Master identity, not by the
+ * internal child-part code that happened to consume it. Compatible demands
+ * are consolidated while their child part / FG / planned-order pegging stays
+ * available in lotAllocations and sourcePlannedOrderNumbers.
+ */
+function buildMrpPurchaseRequestDetails(orders, partByCode, runNumber, kgUomCode) {
+  const groups = new Map();
+  for (const order of orders) {
+    const part = partByCode.get(order.partCode);
+    if (isRawMaterialPart(part) && !part?.material?.materialCode) {
+      throw Object.assign(new Error(`${order.orderNumber}: raw material ${order.partCode} belum terhubung ke Material Master.`), { status: 409 });
+    }
+    const rawMaterial = isRawMaterialPart(part) && part?.material?.materialCode;
+    const usesPpicLotPlan = rawMaterial && Number(order.purchaseQtyKg || 0) > 0;
+    if (rawMaterial && !usesPpicLotPlan) {
+      throw Object.assign(new Error(`${order.orderNumber}: raw material ${part.material.materialCode} wajib memiliki rencana lot dan KG/lot dari PPIC sebelum dibuatkan PR.`), { status: 409 });
+    }
+    const key = rawMaterial
+      ? [
+          "MATERIAL",
+          part.material.materialCode,
+          order.supplierCode || "",
+          procurementDayKey(order.requiredDate),
+          usesPpicLotPlan ? Number(order.kgPerLot || 0) : "NO_LOT",
+          usesPpicLotPlan ? "KG" : (order.uomCode || ""),
+        ].join("|")
+      : `PART|${order.orderNumber}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ order, part, rawMaterial, usesPpicLotPlan });
+  }
+
+  return [...groups.values()].map((entries, index) => {
+    const first = entries[0];
+    const { order, part } = first;
+    if (!first.rawMaterial) {
+      return {
+        lineNumber: index + 1,
+        partCode: order.partCode,
+        // Drawing number and internal part code are intentionally separate.
+        partNumber: part?.partNumber || null,
+        partName: part?.partName || null,
+        qty: Number(order.qty || 0),
+        uomCode: order.uomCode || null,
+        preferredSupplier: order.supplierCode || null,
+        proposedSupplierCode: order.supplierCode || null,
+        supplierProposalSource: order.supplierProposalSource || (order.supplierCode ? "PART_MASTER" : null),
+        preferredVendor: order.vendorCode || null,
+        plannedOrderNumber: order.orderNumber,
+        sourcePlannedOrderNumbers: [order.orderNumber],
+        notes: `MRP ${runNumber}; Order % sudah diterapkan pada planned order`,
+      };
+    }
+
+    const material = part.material;
+    const sourceNumbers = entries.map((entry) => entry.order.orderNumber);
+    const qty = entries.reduce((sum, entry) => sum + Number(entry.usesPpicLotPlan ? entry.order.purchaseQtyKg : entry.order.qty || 0), 0);
+    const lotCount = first.usesPpicLotPlan
+      ? entries.reduce((sum, entry) => sum + Number(entry.order.lotCount || 0), 0)
+      : null;
+    const purchaseQtyKg = first.usesPpicLotPlan ? qty : null;
+    const allocations = entries.flatMap((entry) => {
+      const existing = Array.isArray(entry.order.lotAllocations) ? entry.order.lotAllocations : [];
+      if (existing.length) {
+        return existing.map((allocation) => ({
+          ...allocation,
+          plannedOrderNumber: allocation.plannedOrderNumber || entry.order.orderNumber,
+          materialCode: allocation.materialCode || material.materialCode,
+          sourcePartCode: allocation.sourcePartCode || entry.order.partCode,
+        }));
+      }
+      const qtyKg = Number(entry.usesPpicLotPlan
+        ? entry.order.purchaseQtyKg
+        : (isKgUom(entry.order.uomCode) ? entry.order.qty : 0));
+      return qtyKg > 0 ? [{
+        partCode: entry.order.partCode,
+        fgPartCode: null,
+        qtyKg,
+        sourceType: entry.order.referenceType || "MRP",
+        sourceNumber: entry.order.referenceNumber || runNumber,
+        plannedOrderNumber: entry.order.orderNumber,
+        materialCode: material.materialCode,
+        sourcePartCode: entry.order.partCode,
+        notes: "Auto pegging dari kebutuhan MRP",
+      }] : [];
+    });
+    const materialLabel = material.materialName || material.spec || material.materialCode;
+    return {
+      lineNumber: index + 1,
+      // Kept as a legacy trace/fallback. UI/API identity for this line is the
+      // explicit Material Master snapshot below.
+      partCode: order.partCode,
+      partNumber: null,
+      partName: materialLabel,
+      materialId: material.id,
+      materialCode: material.materialCode,
+      materialName: materialLabel,
+      materialType: material.materialType || null,
+      description: [material.materialCode, material.materialType, material.spec].filter(Boolean).join(" - "),
+      qty,
+      uomCode: first.usesPpicLotPlan ? (kgUomCode || "KG") : (order.uomCode || null),
+      preferredSupplier: order.supplierCode || null,
+      proposedSupplierCode: order.supplierCode || null,
+      supplierProposalSource: order.supplierProposalSource || (order.supplierCode ? "PART_MASTER" : null),
+      lotCount,
+      kgPerLot: first.usesPpicLotPlan ? Number(order.kgPerLot) : null,
+      purchaseQtyKg,
+      lotAllocations: allocations.length ? allocations : null,
+      preferredVendor: order.vendorCode || null,
+      plannedOrderNumber: sourceNumbers[0],
+      sourcePlannedOrderNumbers: sourceNumbers,
+      notes: first.usesPpicLotPlan
+        ? `MRP ${runNumber}; material ${material.materialCode}; sumber ${sourceNumbers.join(", ")}; pembelian ${lotCount} lot x ${Number(order.kgPerLot)} kg = ${qty} ${kgUomCode || "KG"}`
+        : `MRP ${runNumber}; material ${material.materialCode}; kebutuhan gabungan ${sourceNumbers.join(", ")}`,
+    };
+  });
+}
+
+async function applyPlannedOrderProcurement(tx, runNumber, body = {}, username = "system") {
+  const rows = getProcurementRows(body);
+  if (!rows.length) return [];
+  const orderNumbers = [...new Set(rows.map((row) => String(row.orderNumber)))];
+  const orders = await tx.plannedOrder.findMany({
+    where: { runNumber, orderNumber: { in: orderNumbers }, orderType: "Purchase", isDeleted: false },
+    include: { part: { select: { itemType: true, rawType: true } } },
+  });
+  if (orders.length !== orderNumbers.length) {
+    const found = new Set(orders.map((row) => row.orderNumber));
+    const missing = orderNumbers.filter((number) => !found.has(number));
+    throw Object.assign(new Error(`Planned purchase order tidak ditemukan pada MRP ini: ${missing.join(", ")}`), { status: 404 });
+  }
+  const supplierCodes = [...new Set(rows.map((row) => row.supplierCode || row.proposedSupplierCode).filter(Boolean))];
+  if (supplierCodes.length) {
+    const suppliers = await tx.supplier.findMany({
+      where: { supplierCode: { in: supplierCodes }, isDeleted: false },
+      select: { supplierCode: true },
+    });
+    const valid = new Set(suppliers.map((row) => row.supplierCode));
+    const invalid = supplierCodes.filter((code) => !valid.has(code));
+    if (invalid.length) throw Object.assign(new Error(`Supplier tidak ditemukan/aktif: ${invalid.join(", ")}`), { status: 400 });
+  }
+  const orderByNumber = new Map(orders.map((order) => [order.orderNumber, order]));
+  const updated = [];
+  for (const input of rows) {
+    const order = orderByNumber.get(String(input.orderNumber));
+    if (order.status !== "Planned") {
+      throw Object.assign(new Error(`${order.orderNumber} berstatus ${order.status}; proposal PPIC hanya dapat diubah sebelum release ke PR.`), { status: 409 });
+    }
+    const supplierCode = input.supplierCode ?? input.proposedSupplierCode;
+    const lotCountRaw = input.lotCount ?? input.purchaseLotQty;
+    const kgPerLotRaw = input.kgPerLot;
+    const allocationsRaw = input.lotAllocations ?? input.materialAllocations ?? input.allocations ?? input.allocation;
+    const data = {};
+    if (supplierCode !== undefined) {
+      data.supplierCode = supplierCode || null;
+      data.supplierProposalSource = supplierCode ? "PPIC" : null;
+    }
+    if (lotCountRaw !== undefined || kgPerLotRaw !== undefined || allocationsRaw !== undefined) {
+      if (!isRawMaterialPart(order.part)) {
+        throw Object.assign(new Error(`${order.orderNumber}: perencanaan lot hanya berlaku untuk raw material.`), { status: 400 });
+      }
+      const lotCount = Number(lotCountRaw ?? order.lotCount ?? 0);
+      const kgPerLot = Number(kgPerLotRaw ?? order.kgPerLot ?? 0);
+      if (!Number.isInteger(lotCount) || lotCount <= 0 || !Number.isFinite(kgPerLot) || kgPerLot <= 0) {
+        throw Object.assign(new Error(`${order.orderNumber}: lotCount harus bilangan bulat positif dan kgPerLot harus lebih dari 0.`), { status: 400 });
+      }
+      const purchaseQtyKg = roundPlanningQty(lotCount * kgPerLot);
+      const demandKg = isKgUom(order.uomCode) ? Number(order.qty || 0) : 0;
+      if (demandKg > 0 && purchaseQtyKg + 0.000001 < demandKg) {
+        throw Object.assign(new Error(`${order.orderNumber}: total pembelian ${purchaseQtyKg} kg belum menutup kebutuhan MRP ${demandKg} kg.`), { status: 409 });
+      }
+      const allocations = allocationsRaw === undefined
+        ? (order.lotAllocations || null)
+        : normalizeLotAllocations(allocationsRaw);
+      const allocationPartCodes = [...new Set((allocations || []).flatMap((row) => [row.partCode, row.fgPartCode]).filter(Boolean))];
+      if (allocationPartCodes.length) {
+        const validParts = await tx.part.findMany({
+          where: { partCode: { in: allocationPartCodes }, isDeleted: false },
+          select: { partCode: true },
+        });
+        const validPartCodes = new Set(validParts.map((row) => normalizePartCode(row.partCode)));
+        const invalidPartCodes = allocationPartCodes.filter((code) => !validPartCodes.has(code));
+        if (invalidPartCodes.length) {
+          throw Object.assign(new Error(`${order.orderNumber}: part alokasi tidak ditemukan: ${invalidPartCodes.join(", ")}`), { status: 400 });
+        }
+      }
+      const allocatedKg = Array.isArray(allocations) ? allocations.reduce((sum, row) => sum + Number(row.qtyKg || 0), 0) : 0;
+      if (allocatedKg > purchaseQtyKg + 0.000001) {
+        throw Object.assign(new Error(`${order.orderNumber}: alokasi ${allocatedKg} kg melebihi total pembelian ${purchaseQtyKg} kg.`), { status: 409 });
+      }
+      data.lotCount = lotCount;
+      data.kgPerLot = kgPerLot;
+      data.purchaseQtyKg = purchaseQtyKg;
+      data.lotAllocations = allocations;
+      data.notes = [order.notes, `PPIC lot plan: ${lotCount} lot x ${kgPerLot} kg = ${purchaseQtyKg} kg (${username})`].filter(Boolean).join(" | ");
+    }
+    updated.push(await tx.plannedOrder.update({ where: { orderNumber: order.orderNumber }, data }));
+  }
+  return updated;
+}
+
+exports.updatePlannedOrderProcurement = async (req, res, next) => {
+  try {
+    const runNumber = await resolveCurrentRunNumber(req.params.runNumber);
+    if (!runNumber) return res.status(404).json({ message: "MRP Run tidak ditemukan" });
+    const items = await prisma.$transaction((tx) => applyPlannedOrderProcurement(
+      tx,
+      runNumber,
+      req.body || {},
+      req.user?.username || req.user?.email || "system",
+    ));
+    res.json({ message: "Proposal supplier dan perencanaan lot PPIC berhasil disimpan.", items });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ message: error.message });
+    next(error);
+  }
+};
+
 // Output MRP purchase-only. Planned order yang sudah menjadi PR tidak dibuat ulang.
 exports.createPurchaseRequestOutput = async (req, res, next) => {
   try {
@@ -4276,8 +4550,19 @@ exports.createPurchaseRequestOutput = async (req, res, next) => {
       const run = await tx.mRPRun.findFirst({ where: { runNumber, isDeleted: false }, select: { runNumber: true, status: true, planNumber: true } });
       if (!run) throw Object.assign(new Error("MRP Run tidak ditemukan"), { status: 404 });
       if (run.status !== "Completed") throw Object.assign(new Error("MRP harus Completed sebelum membuat Purchase Request"), { status: 409 });
+      await applyPlannedOrderProcurement(tx, runNumber, req.body || {}, req.user?.username || req.user?.email || "system");
+      const selectedOrderNumbers = Array.isArray(req.body?.selectedOrderNumbers)
+        ? req.body.selectedOrderNumbers.map(String)
+        : getProcurementRows(req.body || {}).map((row) => String(row.orderNumber));
       const orders = await tx.plannedOrder.findMany({
-        where: { runNumber, isDeleted: false, orderType: "Purchase", status: "Planned", qty: { gt: 0 } },
+        where: {
+          runNumber,
+          isDeleted: false,
+          orderType: "Purchase",
+          status: "Planned",
+          qty: { gt: 0 },
+          ...(selectedOrderNumbers.length ? { orderNumber: { in: selectedOrderNumbers } } : {}),
+        },
         orderBy: [{ requiredDate: "asc" }, { orderNumber: "asc" }],
       });
       if (!orders.length) {
@@ -4285,34 +4570,25 @@ exports.createPurchaseRequestOutput = async (req, res, next) => {
         return { created: false, prNumbers: existing.map((row) => row.prNumber), message: "Tidak ada planned purchase order baru untuk dikeluarkan." };
       }
       const partCodes = [...new Set(orders.map((row) => row.partCode))];
-      const parts = await tx.part.findMany({ where: { partCode: { in: partCodes }, isDeleted: false }, select: { partCode: true, partName: true, partNumber: true, material: { select: { materialCode: true, materialName: true } } } });
+      const parts = await tx.part.findMany({ where: { partCode: { in: partCodes }, isDeleted: false }, select: { partCode: true, partName: true, partNumber: true, itemType: true, rawType: true, material: { select: { id: true, materialCode: true, materialName: true, materialType: true, spec: true } } } });
       const partByCode = new Map(parts.map((part) => [part.partCode, part]));
+      const kgUom = await tx.uom.findFirst({
+        where: { uomCode: { in: ["KG", "kg", "Kg", "KGS", "kgs"] }, isDeleted: false },
+        select: { uomCode: true },
+      });
       const prNumber = await nextMrpPurchaseRequestNumber(tx);
       const requiredDate = orders.reduce((earliest, order) => !earliest || new Date(order.requiredDate) < earliest ? new Date(order.requiredDate) : earliest, null) || new Date();
+      const requestDetails = buildMrpPurchaseRequestDetails(orders, partByCode, runNumber, kgUom?.uomCode || "KG");
       const created = await tx.purchaseRequisition.create({
         data: {
           prNumber,
           requestedBy: req.user?.username || req.user?.email || "PPIC",
           requiredDate,
+          sourceType: "MRP",
           poType: "Material",
           status: "Draft",
           notes: `Generated from MRP ${run.planNumber || runNumber}`,
-          details: { create: orders.map((order, index) => {
-            const part = partByCode.get(order.partCode);
-            return {
-              lineNumber: index + 1,
-              partCode: order.partCode,
-              partNumber: part?.partNumber || order.partCode,
-              partName: part?.partName || null,
-              description: part?.material?.materialName || null,
-              qty: Number(order.qty || 0),
-              uomCode: order.uomCode || null,
-              preferredSupplier: order.supplierCode || null,
-              preferredVendor: order.vendorCode || null,
-              plannedOrderNumber: order.orderNumber,
-              notes: `MRP ${runNumber}; Order % sudah diterapkan pada planned order`,
-            };
-          }) },
+          details: { create: requestDetails },
         },
         include: { details: true },
       });

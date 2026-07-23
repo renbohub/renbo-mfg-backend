@@ -13,6 +13,7 @@ router.patch("/:runNumber/requirements/buffer", authorize("mrp", "update"), logg
 router.patch("/:runNumber/requirements/order-percent", authorize("mrp", "update"), logger("mrp", "update-order-percent"), ctrl.updateRequirementBuffer);
 router.post("/:runNumber/output/purchase-request", authorize("mrp", "release"), logger("mrp", "release-purchase-request"), ctrl.createPurchaseRequestOutput);
 router.post("/:runNumber/output/production-plan", authorize("mrp", "release"), logger("mrp", "release-production-plan"), ctrl.createProductionPlanOutput);
+router.patch("/:runNumber/planned-orders/procurement", authorize("mrp", "update"), logger("mrp", "update-procurement-proposal"), ctrl.updatePlannedOrderProcurement);
 router.get("/:runNumber/planned-orders", authorize("mrp", "read"), ctrl.getPlannedOrders);
 router.get("/:runNumber", authorize("mrp", "read"), ctrl.get);
 router.delete("/:runNumber", authorize("mrp", "delete"), logger("mrp", "delete", { modelName: "MRPRun", paramKey: "runNumber", whereKey: "runNumber" }), ctrl.remove);

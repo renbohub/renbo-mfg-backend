@@ -53,8 +53,8 @@ const stockBalancesRouter = require("./inventory/stock-balances");
 
 
 const purchaseOrderRouter = require("./purchasing/purchase-orders");
+const purchaseRequisitionsRouter = require("./purchasing/purchase-requisitions");
 const {
-  purchaseRequisitionsRouter,
   purchaseInvoicesRouter,
   goodsReceiptsRouter,
   incomingInspectionsRouter,
