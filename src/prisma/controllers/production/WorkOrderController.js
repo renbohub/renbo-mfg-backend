@@ -22,6 +22,7 @@ const {
   getMaterialRequirements,
   syncManufacturingOrderQtyFromWorkOrders,
 } = require("./services/productionWorkflowService");
+const { assertQuantity } = require("../../utils/uomQuantity");
 const {
   emitPlanningPlannedOrderBulkUpdate,
 } = require("../planning/services/planningRealtimeService");
@@ -1096,6 +1097,7 @@ exports.create = async (req, res, next) => {
       });
       data.uomCode = mo?.uomCode || null;
     }
+    assertQuantity(data.plannedQty, data.uomCode, "Planned Qty");
     Object.assign(
       data,
       await buildMachineCostSnapshot(prisma, data.machineId, data.cycleTime),
@@ -1159,7 +1161,7 @@ exports.update = async (req, res, next) => {
     const current = await prisma.workOrder.findUnique({
       where: { woNumber: req.params.woNumber },
       include: {
-        manufacturingOrder: { select: { partId: true } },
+        manufacturingOrder: { select: { partId: true, uomCode: true } },
       },
     });
 
@@ -1170,6 +1172,7 @@ exports.update = async (req, res, next) => {
     }
 
     const updateData = { ...data };
+    if (updateData.plannedQty !== undefined) assertQuantity(updateData.plannedQty, current.uomCode || current.manufacturingOrder?.uomCode, "Planned Qty");
     if (updateData.shift !== undefined) updateData.shift = assertProductionShift(updateData.shift);
     if (plannedDate !== undefined) updateData.plannedDate = new Date(plannedDate);
     if (startTime !== undefined) updateData.startTime = startTime ? new Date(startTime) : null;

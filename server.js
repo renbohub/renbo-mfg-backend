@@ -36,7 +36,7 @@ app.use(function (req, res, next) {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Page-Module, X-Page-Code, X-Page-Record"
   );
   res.header("Access-Control-Allow-Methods", "PUT, PATCH, POST, GET, DELETE, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
@@ -74,9 +74,12 @@ app.use((req, res, next) => {
 });
 
 // --- Error handler global (tetap paling bawah)
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   console.error("ERROR:", err);
-  const code = err.status || 400;
+  const code = err.status || 500;
+  const { recordError } = require("./src/prisma/utils/pageContext");
+  req.contextErrorRecorded = true;
+  recordError(req, err, code);
   res.status(code).json({ message: err.message || "Error" });
 });
 

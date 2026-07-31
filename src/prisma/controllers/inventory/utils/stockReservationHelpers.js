@@ -18,11 +18,18 @@ const isSpecialRackCode = (rackCode) => {
 };
 
 const buildExcludeSpecialRackCondition = () => ({
-  NOT: {
-    OR: SPECIAL_RACK_PREFIXES.map((prefix) => ({
-      rackCode: { startsWith: prefix, mode: "insensitive" },
-    })),
-  },
+  // PostgreSQL NULL does not satisfy NOT (LIKE ...). Explicitly include
+  // rack-less stock because a movement may be valid before putaway.
+  OR: [
+    { rackCode: null },
+    {
+      NOT: {
+        OR: SPECIAL_RACK_PREFIXES.map((prefix) => ({
+          rackCode: { startsWith: prefix, mode: "insensitive" },
+        })),
+      },
+    },
+  ],
 });
 
 const resolveReservationBalanceWhere = (

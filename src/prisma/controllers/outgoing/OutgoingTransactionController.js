@@ -1,6 +1,35 @@
 const crypto = require("crypto");
 const { prisma } = require("../../index");
+const { buildSoLineReferenceNumber } = require("../../services/production/sales-order/soReservationService");
+const { syncOperationalSalesOrderStatus } = require("../../services/production/sales-order/soStatusService");
 const scheduleNumber = () => `DS-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+
+async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy) {
+  let remaining = Number(qty || 0);
+  const referenceNumber = buildSoLineReferenceNumber(soNumber, soDetail.lineNumber);
+  const reservations = await tx.stockReservation.findMany({
+    where: { referenceType: "SO", referenceNumber, status: "Active", isDeleted: false },
+    orderBy: { createdAt: "asc" },
+    include: { stockBalance: true },
+  });
+  for (const reservation of reservations) {
+    if (remaining <= 0) break;
+    const open = Math.max(0, Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0));
+    const available = Number(reservation.stockBalance?.qtyOnHand || 0);
+    const take = Math.min(remaining, open, available);
+    if (take <= 0) continue;
+    const balance = reservation.stockBalance;
+    const qtyBefore = Number(balance.qtyOnHand || 0);
+    const qtyAfter = qtyBefore - take;
+    const reservedAfter = Math.max(0, Number(balance.qtyReserved || 0) - take);
+    await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: qtyAfter, qtyReserved: reservedAfter, qtyAvailable: Math.max(0, qtyAfter - reservedAfter - Number(balance.qtyQC || 0)), lastMovement: new Date() } });
+    const releasedAfter = Number(reservation.qtyReleased || 0) + take;
+    await tx.stockReservation.update({ where: { id: reservation.id }, data: { qtyReleased: releasedAfter, status: releasedAfter + 0.0001 >= Number(reservation.qtyReserved || 0) ? "Released" : "Active" } });
+    await tx.stockMovement.create({ data: { movementNumber: `OUT-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, movementDate: new Date(), movementType: "OUT", direction: "OUT", transactionType: "SALES", warehouseCode: balance.warehouseCode, rackCode: balance.rackCode || null, lotNumber: balance.lotNumber || null, partCode: balance.partCode, partNumber: balance.partNumber || null, partName: balance.partName || null, materialId: balance.materialId || null, materialCode: balance.materialCode || null, materialName: balance.materialName || null, materialType: balance.materialType || null, productId: balance.productId || null, description: balance.description || null, spec: balance.spec || null, thickness: balance.thickness ?? null, width: balance.width ?? null, CSP: balance.CSP || null, stockType: balance.stockType || "Finished Goods", qty: take, deltaQty: -take, qtyBefore, qtyAfter, uomCode: balance.uomCode || soDetail.uomCode || null, qualityBucket: "GOOD", referenceType: "DELIVERY_SCHEDULE", referenceNumber: soNumber, notes: `Outbound otomatis untuk ${soNumber} / line ${soDetail.lineNumber}`, performedBy: performedBy || "system" } });
+    remaining -= take;
+  }
+  if (remaining > 0.0001) throw Object.assign(new Error(`Stok/reservation FG tidak cukup untuk SO ${soNumber} line ${soDetail.lineNumber}. Kekurangan ${remaining}.`), { statusCode: 409 });
+}
 
 async function transitionSchedule(scheduleNumber, expectedStatus, data) {
   return prisma.$transaction(async (tx) => {
@@ -17,6 +46,7 @@ exports.createSchedule = async (req, res, next) => {
     const item = await prisma.$transaction(async (tx) => {
       const so = await tx.salesOrderHeader.findFirst({ where: { soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false } } } });
       if (!so) throw Object.assign(new Error("Sales Order not found"), { statusCode: 404 });
+      if (!["Confirmed", "Approved", "Ready to Deliver", "In Progress"].includes(so.status)) throw Object.assign(new Error(`Sales Order harus Confirmed/Approved sebelum Delivery Schedule. Status saat ini ${so.status}.`), { statusCode: 409 });
       const number = scheduleNumber();
       const scheduleDetails = details.map((line, index) => {
         const soDetail = so.details.find((detail) => detail.id === line.soDetailId);
@@ -60,10 +90,16 @@ exports.pack = async (req, res, next) => {
 exports.confirmPod = async (req, res, next) => {
   try {
     const item = await prisma.$transaction(async (tx) => {
-      const schedule = await tx.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, status: "In Transit", isDeleted: false }, include: { details: true } });
+      const schedule = await tx.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, status: "In Transit", isDeleted: false }, include: { details: { include: { soDetail: true } }, soHeader: true } });
       if (!schedule) throw Object.assign(new Error("Shipment in transit not found"), { statusCode: 409 });
-      await Promise.all(schedule.details.map((detail) => tx.deliveryScheduleDetail.update({ where: { id: detail.id }, data: { qtyDelivered: detail.qty } }).then(() => tx.salesOrderDetail.update({ where: { id: detail.soDetailId }, data: { qtyDelivered: { increment: detail.qty } } }))));
-      return tx.deliverySchedule.update({ where: { id: schedule.id }, data: { status: "Delivered", deliveredAt: new Date(), receivedBy: req.body.receivedBy || null, receivedSignature: req.body.receivedSignature || null, podUrl: req.body.podUrl || null } });
+      for (const detail of schedule.details) {
+        await consumeSalesReservations(tx, schedule.soNumber, detail.soDetail, detail.qty, req.user?.username || req.user?.email || "system");
+        await tx.deliveryScheduleDetail.update({ where: { id: detail.id }, data: { qtyDelivered: detail.qty } });
+        await tx.salesOrderDetail.update({ where: { id: detail.soDetailId }, data: { qtyDelivered: { increment: detail.qty } } });
+      }
+      const delivered = await tx.deliverySchedule.update({ where: { id: schedule.id }, data: { status: "Delivered", deliveredAt: new Date(), receivedBy: req.body.receivedBy || null, receivedSignature: req.body.receivedSignature || null, podUrl: req.body.podUrl || null } });
+      await syncOperationalSalesOrderStatus(tx, schedule.soNumber);
+      return delivered;
     });
     res.json(item);
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }

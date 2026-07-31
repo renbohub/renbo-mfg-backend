@@ -17,6 +17,7 @@ const {
   syncOperationalSalesOrderStatus,
 } = require("../../services/production/sales-order/soStatusService");
 const { generateDailyNumber } = require("./services/productionIntegrationHelpers");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 // Generate nomor Inspeksi QC otomatis: QC-YYYYMMDD-001
 async function generateQcNumber() {
@@ -1572,9 +1573,16 @@ async function syncWorkOrderFromCompletedQc(tx, woId, performedBy = "system") {
   };
 
   const qcHoldQty = totalQcHoldFromLogs || totalProduced;
+  // A partial DPP/production log must not complete the WO early.  Previously
+  // the first approved QC batch could mark a WO Completed even when only a
+  // fraction of its planned quantity had been produced, blocking the
+  // remaining DPP schedules and allowing the next sequence to start.
+  const plannedQty = Number(wo.plannedQty || 0);
+  const productionComplete = totalProduced + 0.000001 >= plannedQty;
   const canComplete = ["QC Pending", "In Production", "In Progress"].includes(wo.status)
     && qcHoldQty > 0
-    && totalInspected >= qcHoldQty;
+    && totalInspected >= qcHoldQty
+    && productionComplete;
   const needsRework = (totalProductionRework + totalQcRework) > 0 && !["Completed", "Cancelled"].includes(wo.status);
   if (needsRework && !canComplete) {
     updateData.status = "Rework";
@@ -2128,6 +2136,11 @@ async function normalizeQualityInspectionInput(tx, data, options = {}) {
     throw error;
   }
 
+  for (const field of ["qtyInspected", "qtyPassed", "qtyFailed"]) {
+    if (normalized[field] !== undefined && normalized[field] !== null && normalized[field] !== "") {
+      assertQuantity(normalized[field], normalized.uomCode || sourceUomCode, field);
+    }
+  }
   validateQualityInspectionQty(normalized, { sourceQty, hasSourceQty, uomCode: sourceUomCode });
   normalized.decision = calculateDecision(normalized);
   normalized.qtyRework = 0;
@@ -3192,6 +3205,14 @@ exports.fgReceiptHistory = async (req, res, next) => {
   } catch (e) {
     next(e);
   }
+};
+
+exports.fgReceiptDetail = async (req, res, next) => {
+  try {
+    const movement = await prisma.stockMovement.findFirst({ where: { movementNumber: req.params.movementNumber, referenceType: "QUALITY_INSPECTION", transactionType: "PRODUCTION", movementType: "IN", stockType: "Finished Goods", isDeleted: false } });
+    if (!movement) return res.status(404).json({ message: "FG Receipt tidak ditemukan." });
+    res.json(mapDoc({ ...movement, qtyReceived: movement.qty, receivedAt: movement.movementDate, targetLocation: { warehouseCode: movement.warehouseCode, rackCode: movement.rackCode, lotNumber: movement.lotNumber }, fgPart: { partCode: movement.partCode, partNumber: movement.partNumber, partName: movement.partName, stockType: movement.stockType } }));
+  } catch (error) { next(error); }
 };
 
 exports.receiveFg = async (req, res, next) => {

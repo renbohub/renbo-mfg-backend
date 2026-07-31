@@ -11,6 +11,7 @@ router.get("/all-codes", authorize("parts", "read"), ctrl.getAllCodes);
 router.get("/:partCode/compatibility", authorize("parts", "read"), ctrl.getCompatibilityProfile);
 router.get("/migrate-part-codes/candidates", authorize("parts", "read"), ctrl.partCodeMigrationCandidates);
 router.post("/migrate-part-codes", authorize("parts", "update"), logger("part", "migrate-part-codes", { modelName: 'part' }), ctrl.migratePartCodesToPrimaryCustomer);
+router.post("/shift-process-sequences", authorize("parts", "update"), logger("part", "shift-process-sequences", { modelName: 'part' }), ctrl.shiftProcessSequences);
 router.post("/:id/clone", authorize("parts", "create"), logger("part", "clone", { modelName: 'part' }), ctrl.clone);
 
 // CRUD routes

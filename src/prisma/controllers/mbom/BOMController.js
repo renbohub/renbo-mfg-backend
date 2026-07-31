@@ -6,6 +6,7 @@ const { notificationHelper } = require("../../utils/notificationHelper");
 const { normalizeAssemblyPolicyOverride } = require("../../utils/assemblyPolicy");
 const { normalizeDurationUnit } = require("../../utils/duration");
 const { generateConfiguredNumber } = require("../../services/numberingService");
+const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 
 // ============================================
 // REUSABLE INCLUDES & QUERIES
@@ -44,6 +45,8 @@ const MBOM_DETAIL_INCLUDE = {
       },
     },
     uom: true,
+    materialForm: true,
+    alternateMaterialForm: true,
     mbomProcesses: {
       where: { isDeleted: false },
       include: {
@@ -85,6 +88,8 @@ const MBOM_HEADER_INCLUDE_NO_FILTER = {
         },
       },
       uom: true,
+      materialForm: true,
+      alternateMaterialForm: true,
       parentDetail: true,
       children: true,
       mbomProcesses: {
@@ -96,6 +101,33 @@ const MBOM_HEADER_INCLUDE_NO_FILTER = {
     },
   },
 };
+
+async function getSequenceInsertionPolicy(doc, db = prisma) {
+  const [salesOrders, forecasts, mps] = await Promise.all([
+    db.salesOrderDetail.count({
+      where: { mbomHeaderId: doc.id, isDeleted: false, status: { not: "Cancelled" } },
+    }),
+    doc.partId
+      ? db.forecastDetail.count({
+        where: {
+          partId: doc.partId,
+          isDeleted: false,
+          forecast: { is: { isDeleted: false, status: { not: "Obsolete" } } },
+          OR: [{ M1Qty: { gt: 0 } }, { M2Qty: { gt: 0 } }, { M3Qty: { gt: 0 } }],
+        },
+      })
+      : 0,
+    db.mPSDetail.count({
+      where: { mbomHeaderId: doc.id, isDeleted: false, status: { not: "Cancelled" } },
+    }),
+  ]);
+  const locked = salesOrders > 0 || forecasts > 0 || mps > 0;
+  return {
+    locked,
+    strategy: locked ? "INSERT_SLOT" : "SHIFT_MAIN_SEQUENCE",
+    usage: { salesOrders, forecasts, mps },
+  };
+}
 
 function getForeignKeyErrorMessage(error) {
   const target = `${error.meta?.field_name || error.meta?.constraint || error.message || ""}`;
@@ -365,6 +397,12 @@ function prepareMBOMProcessData(process, noReg, mbomDetailId) {
     occurrenceCode: process.occurrenceCode || null,
     routingNumber: process.routingNumber || null,
     machineId: process.machineId || null,
+    alternativeMachineIds: Array.isArray(process.alternativeMachineIds)
+      ? [...new Set(process.alternativeMachineIds.filter(Boolean).filter((machineId) => machineId !== process.machineId))]
+      : [],
+    diesId: process.diesId || null,
+    routingMode: String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR" ? "VENDOR" : "INHOUSE",
+    vendorId: process.vendorId || null,
     sequence: process.sequence || 0,
     cycleTime: process.cycleTime || 0,
     notes: process.occurrenceCode || process.notes || null,
@@ -413,10 +451,16 @@ function buildMBOMSearchQuery(q) {
     { noReg: { contains: q, mode: "insensitive" } },
     { notes: { contains: q, mode: "insensitive" } },
     { part: { partCode: { contains: q, mode: "insensitive" } } },
+    { part: { partNumber: { contains: q, mode: "insensitive" } } },
     { part: { partName: { contains: q, mode: "insensitive" } } },
     {
       details: {
         some: { part: { partCode: { contains: q, mode: "insensitive" } } },
+      },
+    },
+    {
+      details: {
+        some: { part: { partNumber: { contains: q, mode: "insensitive" } } },
       },
     },
     {
@@ -451,7 +495,15 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
   let materialPitch = detail.materialPitch ?? null;
   let materialCavity = detail.materialCavity ?? null;
   let materialDensity = detail.materialDensity ?? null;
-  let grossWeight = Math.max(Number(detail.grossWeight || 0), 0);
+  let materialFormId = detail.materialFormId || null;
+  const materialScheme = String(detail.materialScheme || "DEFAULT").trim().toUpperCase() === "ALTERNATIVE" ? "ALTERNATIVE" : "DEFAULT";
+  let defaultGrossWeight = Math.max(Number(detail.defaultGrossWeight ?? detail.grossWeight ?? 0), 0);
+  const alternateMaterialFormId = detail.alternateMaterialFormId || null;
+  const alternateMaterialPitch = detail.alternateMaterialPitch ?? null;
+  const alternateMaterialCavity = detail.alternateMaterialCavity
+    ? Math.max(1, Math.round(Number(detail.alternateMaterialCavity)))
+    : null;
+  let alternateGrossWeight = Math.max(Number(detail.alternateGrossWeight || 0), 0);
 
   // Auto-calculate scrapFactor dari PartBase (baseOn='Actual').
   // Field ini sengaja diturunkan dari master part agar konsisten di create/update MBOM.
@@ -469,9 +521,17 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
       materialThickness = rawPart.material?.thickness ?? materialThickness;
       materialWidth = rawPart.material?.width ?? materialWidth;
       materialDensity = rawPart.material?.density ?? materialDensity;
+      if (!materialFormId) {
+        throw badRequest("Material Form default wajib dipilih di BOM untuk raw material.");
+      }
       const thickness = Number(materialThickness || 0); const width = Number(materialWidth || 0);
       const pitch = Number(materialPitch || 0); const cavity = Math.max(1, Number(materialCavity || 1)); const density = Number(materialDensity || 0);
-      if (thickness > 0 && width > 0 && pitch > 0 && density > 0) grossWeight = thickness * width * pitch * density / cavity;
+      if (thickness > 0 && width > 0 && pitch > 0 && density > 0) defaultGrossWeight = thickness * width * pitch * density / cavity;
+      const altPitch = Number(alternateMaterialPitch || 0);
+      const altCavity = Math.max(1, Number(alternateMaterialCavity || 1));
+      if (thickness > 0 && width > 0 && altPitch > 0 && density > 0) {
+        alternateGrossWeight = thickness * width * altPitch * density / altCavity;
+      }
     }
     const partBase = await db.partBase.findFirst({
       where: {
@@ -484,6 +544,14 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
 
     scrapFactor = calculateScrapFactorFromPartBase(partBase);
   }
+
+  if (materialScheme === "ALTERNATIVE" && !(alternateGrossWeight > 0)) {
+    throw badRequest("Skema material alternatif belum lengkap. Isi form, pitch, dan cavity sebelum dipakai untuk MRP.");
+  }
+  if (alternateMaterialFormId && alternateMaterialFormId === materialFormId) {
+    throw badRequest("Material Form alternatif harus berbeda dari Material Form default.");
+  }
+  const grossWeight = materialScheme === "ALTERNATIVE" ? alternateGrossWeight : defaultGrossWeight;
 
   const data = convertNumericFields({
     levelComponent: detail.levelComponent || 0,
@@ -499,6 +567,13 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
     materialCavity: materialCavity ? Math.max(1, Math.round(Number(materialCavity))) : null,
     materialDensity,
     grossWeight,
+    defaultGrossWeight,
+    materialFormId,
+    materialScheme,
+    alternateMaterialFormId,
+    alternateMaterialPitch,
+    alternateMaterialCavity,
+    alternateGrossWeight: alternateGrossWeight || null,
     leadTime: detail.leadTime || 0,
     leadTimeUnit: normalizeDurationUnit(detail.leadTimeUnit),
     createdBy: createdBy,
@@ -514,6 +589,10 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
     'materialCavity',
     'materialDensity',
     'grossWeight',
+    'defaultGrossWeight',
+    'alternateMaterialPitch',
+    'alternateMaterialCavity',
+    'alternateGrossWeight',
     'leadTime'
   ]);
 
@@ -858,7 +937,9 @@ exports.get = async (req, res, next) => {
 
     if (!doc) return res.status(404).json({ message: "MBOM not found" });
     await assignProcessOccurrenceCodes(doc.details);
-    res.json(mapDoc(doc));
+    const transformed = mapDoc(doc);
+    transformed.sequenceInsertionPolicy = await getSequenceInsertionPolicy(doc);
+    res.json(transformed);
   } catch (e) {
     next(e);
   }
@@ -957,10 +1038,19 @@ exports.create = async (req, res, next) => {
         }
       }
 
-      return tx.mBOMHeader.findUnique({
+      const created = await tx.mBOMHeader.findUnique({
         where: { id: createdHeader.id },
         include: MBOM_HEADER_INCLUDE,
       });
+      await queueDirtyPartCodes(tx, [
+        created.part?.partCode,
+        ...(created.details || []).map((detail) => detail.part?.partCode),
+      ], {
+        reason: "BOM",
+        sourceNumber: created.noReg,
+        notes: "mBOM dibuat; struktur kebutuhan MRP berubah.",
+      });
+      return created;
     });
 
     // Send notification
@@ -1027,7 +1117,16 @@ exports.update = async (req, res, next) => {
           throw badRequest("MBOM Header not found");
         }
 
-        return createMBOMRevision(tx, sourceHeader, headerData, normalizedDetails, req);
+        const revision = await createMBOMRevision(tx, sourceHeader, headerData, normalizedDetails, req);
+        await queueDirtyPartCodes(tx, [
+          revision.part?.partCode,
+          ...(revision.details || []).map((detail) => detail.part?.partCode),
+        ], {
+          reason: "BOM",
+          sourceNumber: revision.noReg,
+          notes: "Revisi mBOM dibuat; struktur kebutuhan MRP berubah.",
+        });
+        return revision;
       });
 
       try {
@@ -1176,10 +1275,19 @@ exports.update = async (req, res, next) => {
         }
       }
 
-      return tx.mBOMHeader.findUnique({
+      const updated = await tx.mBOMHeader.findUnique({
         where: { id: updatedHeader.id },
         include: MBOM_HEADER_INCLUDE,
       });
+      await queueDirtyPartCodes(tx, [
+        updated.part?.partCode,
+        ...(updated.details || []).map((detail) => detail.part?.partCode),
+      ], {
+        reason: "BOM",
+        sourceNumber: updated.noReg,
+        notes: "mBOM diubah; struktur kebutuhan MRP berubah.",
+      });
+      return updated;
     });
 
     // Send notification
@@ -1221,9 +1329,24 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    await prisma.mBOMHeader.update({
-      where: { noReg: req.params.noReg },
-      data: { isDeleted: true },
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.mBOMHeader.findUnique({
+        where: { noReg: req.params.noReg },
+        include: MBOM_HEADER_INCLUDE,
+      });
+      if (!existing) throw badRequest("MBOM Header not found");
+      await tx.mBOMHeader.update({
+        where: { noReg: req.params.noReg },
+        data: { isDeleted: true },
+      });
+      await queueDirtyPartCodes(tx, [
+        existing.part?.partCode,
+        ...(existing.details || []).map((detail) => detail.part?.partCode),
+      ], {
+        reason: "BOM",
+        sourceNumber: existing.noReg,
+        notes: "mBOM dihapus; struktur kebutuhan MRP berubah.",
+      });
     });
 
     res.json({ ok: true });

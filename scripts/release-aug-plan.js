@@ -1,0 +1,3 @@
+require("dotenv").config({ quiet: true }); const { prisma } = require("../src/prisma"); const ctrl=require("../src/prisma/controllers/planning/MonthlyProductionPlanController");
+function invoke(fn){return new Promise((resolve,reject)=>{const req={params:{planNumber:"MPP-202608-001"},body:{},user:{username:"system"}};const res={statusCode:200,status(c){this.statusCode=c;return this},json(v){resolve({statusCode:this.statusCode,body:v})}};fn(req,res,reject)})}
+(async()=>{const r=await invoke(ctrl.release);console.log(JSON.stringify(r,null,2));if(r.statusCode>=300)process.exitCode=1})().catch(e=>{console.error(e);process.exitCode=1}).finally(()=>prisma.$disconnect());

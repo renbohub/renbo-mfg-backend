@@ -341,6 +341,236 @@ exports.dashboard = async (req, res, next) => {
     next(e);
   }
 };
+
+function reportDateRange(query = {}) {
+  const now = new Date();
+  const start = query.startDate
+    ? new Date(`${String(query.startDate).slice(0, 10)}T00:00:00`)
+    : new Date(now.getFullYear(), now.getMonth(), 1);
+  const end = query.endDate
+    ? new Date(`${String(query.endDate).slice(0, 10)}T23:59:59.999`)
+    : new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  return { start, end };
+}
+
+function durationMinutes(startTime, endTime) {
+  if (!startTime || !endTime) return 0;
+  const start = new Date(startTime).getTime();
+  const end = new Date(endTime).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+  return Math.max(0, (end - start) / 60000);
+}
+
+function timeLabel(value) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Jakarta",
+  }).format(new Date(value));
+}
+
+// Laporan harian per mesin mengikuti struktur laporan produksi legacy:
+// total process - multi downtime = net process, lalu output, NG, dan actual C/T.
+exports.machineDailyReport = async (req, res, next) => {
+  try {
+    const { start, end } = reportDateRange(req.query);
+    const machineCode = String(req.query.machineCode || "").trim();
+    const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+    const where = {
+      isDeleted: false,
+      logDate: { gte: start, lte: end },
+      ...(machineCode ? { machineCode } : {}),
+    };
+
+    const logs = await prisma.productionLog.findMany({
+      where,
+      orderBy: [
+        { machineCode: "asc" },
+        { logDate: "asc" },
+        { shift: "asc" },
+        { startTime: "asc" },
+      ],
+      include: {
+        dailyProductionSchedule: {
+          select: { scheduleNumber: true },
+        },
+        manufacturingOrder: {
+          select: {
+            moNumber: true,
+            part: {
+              select: {
+                partCode: true,
+                partNumber: true,
+                partName: true,
+                customerCode: true,
+                material: { select: { spec: true } },
+              },
+            },
+          },
+        },
+        workOrder: {
+          select: {
+            woNumber: true,
+            cycleTime: true,
+            process: { select: { processCode: true, processName: true } },
+            machine: {
+              select: { machineCode: true, machineName: true, cycleTime: true },
+            },
+          },
+        },
+        downtimeLogs: {
+          where: { isDeleted: false },
+          orderBy: [{ startTime: "asc" }, { createdAt: "asc" }],
+          select: {
+            category: true,
+            reason: true,
+            durationMinutes: true,
+            startTime: true,
+            endTime: true,
+          },
+        },
+      },
+    });
+
+    const rows = logs.map((log) => {
+      const detailDowntime = (log.downtimeLogs || []).reduce(
+        (total, downtime) => total + num(downtime.durationMinutes),
+        0,
+      );
+      const downtimeMinutes = log.downtimeLogs?.length
+        ? detailDowntime
+        : num(log.downtime);
+      const grossMinutes = num(log.runningMinutes)
+        || durationMinutes(log.startTime, log.endTime);
+      const netMinutes = Math.max(0, grossMinutes - downtimeMinutes);
+      const produced = num(log.qtyProduced);
+      const actualCycleTimeSeconds = produced > 0 ? (netMinutes * 60) / produced : 0;
+      const standardCycleTimeSeconds = num(
+        log.workOrder?.cycleTime || log.workOrder?.machine?.cycleTime,
+      );
+      const downtimeBreakdown = (log.downtimeLogs || [])
+        .map((downtime) => {
+          const label = downtime.category || "OTHER";
+          return `${label} ${num(downtime.durationMinutes).toLocaleString("id-ID")}m`;
+        })
+        .join(", ") || (downtimeMinutes > 0 ? log.downtimeReason || "Downtime" : "-");
+      const part = log.manufacturingOrder?.part;
+      const processCode = log.processCode || log.workOrder?.process?.processCode || "-";
+      const processName = log.workOrder?.process?.processName || "-";
+
+      return {
+        logNumber: log.logNumber,
+        logDate: log.logDate,
+        shift: log.shift,
+        customerCode: part?.customerCode || "-",
+        machineCode: log.machineCode || log.workOrder?.machine?.machineCode || "-",
+        machineName: log.workOrder?.machine?.machineName || "-",
+        partCode: part?.partCode || "-",
+        partNumber: part?.partNumber || "-",
+        partName: part?.partName || "-",
+        materialSpec: part?.material?.spec || "-",
+        processCode,
+        processName,
+        processLabel: processLabel(processCode, processName),
+        scheduleNumber: log.dailyProductionSchedule?.scheduleNumber || "-",
+        moNumber: log.manufacturingOrder?.moNumber || "-",
+        woNumber: log.workOrder?.woNumber || "-",
+        operatorName: log.operatorName || "-",
+        startTime: log.startTime,
+        startTimeLabel: timeLabel(log.startTime),
+        endTime: log.endTime,
+        endTimeLabel: timeLabel(log.endTime),
+        grossMinutes: parseFloat(grossMinutes.toFixed(2)),
+        downtimeMinutes: parseFloat(downtimeMinutes.toFixed(2)),
+        downtimeBreakdown,
+        netMinutes: parseFloat(netMinutes.toFixed(2)),
+        qtyPlanned: num(log.qtyPlanned),
+        qtyProduced: produced,
+        qtyGood: num(log.qtyGood),
+        qtyNg: num(log.qtyReject),
+        ngReason: log.rejectReason || "-",
+        standardCycleTimeSeconds,
+        actualCycleTimeSeconds: parseFloat(actualCycleTimeSeconds.toFixed(3)),
+        cycleEfficiencyPercent: actualCycleTimeSeconds > 0 && standardCycleTimeSeconds > 0
+          ? parseFloat(((standardCycleTimeSeconds / actualCycleTimeSeconds) * 100).toFixed(2))
+          : 0,
+        status: log.status,
+        notes: log.notes || "-",
+      };
+    });
+
+    const filteredRows = q
+      ? rows.filter((row) => [
+          row.logNumber,
+          row.machineCode,
+          row.machineName,
+          row.partCode,
+          row.partNumber,
+          row.partName,
+          row.customerCode,
+          row.processCode,
+          row.operatorName,
+        ].some((value) => String(value || "").toLowerCase().includes(q)))
+      : rows;
+
+    const machineTotals = new Map();
+    for (const row of filteredRows) {
+      const key = row.machineCode || "UNKNOWN";
+      const total = machineTotals.get(key) || {
+        machineCode: key,
+        produced: 0,
+        good: 0,
+        ng: 0,
+        downtime: 0,
+      };
+      total.produced += row.qtyProduced;
+      total.good += row.qtyGood;
+      total.ng += row.qtyNg;
+      total.downtime += row.downtimeMinutes;
+      machineTotals.set(key, total);
+    }
+    const machineSummary = [...machineTotals.values()];
+    const totalProduced = filteredRows.reduce((total, row) => total + row.qtyProduced, 0);
+    const totalGood = filteredRows.reduce((total, row) => total + row.qtyGood, 0);
+    const totalNg = filteredRows.reduce((total, row) => total + row.qtyNg, 0);
+    const totalDowntime = filteredRows.reduce((total, row) => total + row.downtimeMinutes, 0);
+    const offset = (page - 1) * limit;
+
+    res.json({
+      period: { startDate: start, endDate: end },
+      data: filteredRows.slice(offset, offset + limit),
+      total: filteredRows.length,
+      summary: {
+        totalLog: filteredRows.length,
+        totalGood,
+        totalNg,
+        downtimeMinutes: parseFloat(totalDowntime.toFixed(2)),
+        totalProduced,
+        yieldPercent: rate(totalGood, totalProduced),
+        machineCount: machineSummary.length,
+      },
+      chart: {
+        labels: machineSummary.map((row) => row.machineCode),
+        series: [
+          { name: "Produced", data: machineSummary.map((row) => row.produced) },
+          { name: "Good", data: machineSummary.map((row) => row.good) },
+          { name: "NG", data: machineSummary.map((row) => row.ng) },
+          { name: "Downtime (min)", data: machineSummary.map((row) => row.downtime) },
+        ],
+      },
+      filterOptions: {
+        machines: [...new Set(rows.map((row) => row.machineCode).filter(Boolean))].sort(),
+      },
+    });
+  } catch (e) {
+    next(e);
+  }
+};
+
 // ============================================================
 // PRODUCTION REPORT - OEE (Overall Equipment Effectiveness)
 // Rumus OEE = Availability × Performance × Quality

@@ -11,6 +11,9 @@ const {
 } = require("../../inventory/utils/stockReservationHelpers");
 const { assertStockBalanceNotFrozen } = require("../../inventory/utils/stockOpnameFreezeGuard");
 const { isSubAssemblyDetail } = require("../../../utils/assemblyPolicy");
+const {
+  canonicalizeRoutingOperations,
+} = require("../../../utils/routingSequence");
 const ACTIVE_WO_STATUSES = [
   "Draft",
   "Released",
@@ -21,7 +24,10 @@ const ACTIVE_WO_STATUSES = [
   "Planned",
   "In Progress",
 ];
-const COMPLETED_QC_DECISIONS = ["Accepted", "Conditional Accept", "Rework"];
+// Historical QC records use both Accepted and Passed/Pass for a good result.
+// Treat all positive decisions as terminal so a completed FG receipt can
+// close its MO instead of leaving it Released forever.
+const COMPLETED_QC_DECISIONS = ["Accepted", "Conditional Accept", "Passed", "Pass", "Rework"];
 const QUANTITY_TOLERANCE = 0.005;
 
 function toNumber(value, fallback = 0) {
@@ -825,6 +831,7 @@ async function getMaterialRequirements(tx, mo, options = {}) {
   const requirementUomMode = normalizeRequirementUomMode(
     options.requirementUomMode || mo?.materialRequirementUomMode,
   );
+  const includeDirectProductionInputs = options.includeDirectProductionInputs === true;
   const mbomHeader = await getActiveMbomHeader(tx, mo.partId);
   if (!mbomHeader) return { mbomHeader: null, items: [] };
 
@@ -982,30 +989,34 @@ async function getMaterialRequirements(tx, mo, options = {}) {
     .map((detail, index) => {
       const qtyPer = toNumber(detail.qty);
       const isSubAssembly = isSubAssemblyDetail(detail);
+      const isDirectProductionInput =
+        includeDirectProductionInputs &&
+        ["inHouse", "Vendor"].includes(detail.category);
+      const isAssemblyInput = isSubAssembly || isDirectProductionInput;
       // Scrap is a material-consumption allowance. A subassembly requirement
       // represents discrete units supplied by its own MO, so its required pcs
       // must follow qty-per-parent x parent MO planned qty without scrap uplift.
-      const scrapFactor = isSubAssembly ? 0 : toNumber(detail.scrapFactor) / 100;
+      const scrapFactor = isAssemblyInput ? 0 : toNumber(detail.scrapFactor) / 100;
       const qtyRequiredOriginal = roundQuantity(
         qtyPer * toNumber(mo.qtyPlanned) * (1 + scrapFactor),
       );
-      const mrpQtyRequired = isSubAssembly
+      const mrpQtyRequired = isAssemblyInput
         ? null
         : mrpPurchaseRequirementByPart.get(detail.part.partCode);
-      const useOriginalUom = !isSubAssembly && (
+      const useOriginalUom = !isAssemblyInput && (
         requirementUomMode === "ORIGINAL" ||
         (
           requirementUomMode === "BY_ITEM_TYPE" &&
           String(detail.part?.rawType || "").trim().toUpperCase() === "PURCHASE_PART"
         )
       );
-      const qtyRequiredFromMbom = isSubAssembly || useOriginalUom
+      const qtyRequiredFromMbom = isAssemblyInput || useOriginalUom
         ? qtyRequiredOriginal
         : normalizeMaterialRequirementToKg(qtyRequiredOriginal, detail);
       const qtyRequiredBeforePlannedCap = !useOriginalUom && mrpQtyRequired != null
         ? mrpQtyRequired
         : qtyRequiredFromMbom;
-      const qtyRequired = !useOriginalUom && !isSubAssembly && shouldUsePlannedKgRequirement
+      const qtyRequired = !useOriginalUom && !isAssemblyInput && shouldUsePlannedKgRequirement
         ? plannedOrderQtyKg
         : qtyRequiredBeforePlannedCap;
       const partBase = getPreferredPartBase(detail.part);
@@ -1040,23 +1051,26 @@ async function getMaterialRequirements(tx, mo, options = {}) {
         itemType: detail.part.itemType || null,
         rawType: detail.part.rawType || null,
         isSubAssembly,
-        uomCode: isSubAssembly || useOriginalUom ? detail.uomCode || "pcs" : "kg",
+        isDirectProductionInput,
+        uomCode: isAssemblyInput || useOriginalUom ? detail.uomCode || "pcs" : "kg",
         qtyPer,
-        parentMoQtyPlanned: isSubAssembly ? toNumber(mo.qtyPlanned) : null,
+        parentMoQtyPlanned: isAssemblyInput ? toNumber(mo.qtyPlanned) : null,
         qtyPerKg: qtyPer > 0 && toNumber(mo.qtyPlanned) > 0
           ? roundQuantity(qtyRequired / toNumber(mo.qtyPlanned))
           : 0,
-        scrapFactor: isSubAssembly ? 0 : detail.scrapFactor || 0,
+        scrapFactor: isAssemblyInput ? 0 : detail.scrapFactor || 0,
         configuredScrapFactor: detail.scrapFactor || 0,
         qtyRequiredOriginal,
         qtyRequiredFromMbom,
         qtyRequiredBeforePlannedCap,
         plannedOrderQtyKg: shouldUsePlannedKgRequirement ? plannedOrderQtyKg : null,
         originalUomCode: detail.uomCode || null,
-        kgPerQty: isSubAssembly ? null : resolveKgPerQty(detail.part),
-        requirementUomMode: isSubAssembly ? "ORIGINAL" : requirementUomMode,
+        kgPerQty: isAssemblyInput ? null : resolveKgPerQty(detail.part),
+        requirementUomMode: isAssemblyInput ? "ORIGINAL" : requirementUomMode,
         requirementSource: isSubAssembly
           ? "SubAssembly"
+          : isDirectProductionInput
+            ? "DirectProductionChild"
           : useOriginalUom
             ? "MBOMOriginal"
             : shouldUsePlannedKgRequirement
@@ -1067,7 +1081,10 @@ async function getMaterialRequirements(tx, mo, options = {}) {
         qtyRequired,
       };
     })
-    .filter((item) => item.qtyRequired > 0 && (item.category === "Purchase" || item.isSubAssembly))
+    .filter((item) =>
+      item.qtyRequired > 0
+      && (item.category === "Purchase" || item.isSubAssembly || item.isDirectProductionInput),
+    )
     // Reservation MO memakai nomor urut dari daftar material yang sudah difilter.
     // Compact ulang line number agar availability, reservation, dan Material Issue
     // selalu merujuk line yang sama meskipun MBOM memiliki inline process di antaranya.
@@ -1140,14 +1157,18 @@ async function getRoutingOperations(tx, mo) {
         machineId: process.machineId || null,
         machine: process.machine || null,
         process,
+        routingNumber: process.routingNumber || null,
+        sourceSequence: process.sequence || 0,
         sequence: process.sequence || operations.length + 1,
         cycleTime: process.cycleTime || 0,
       });
     }
   }
 
-  operations.sort((a, b) => a.sequence - b.sequence);
-  return { mbomHeader, operations };
+  return {
+    mbomHeader,
+    operations: canonicalizeRoutingOperations(operations),
+  };
 }
 
 async function buildAvailability(tx, mo, options = {}) {
@@ -1213,9 +1234,10 @@ async function buildAvailability(tx, mo, options = {}) {
   );
   const { mbomHeader, items } = await getMaterialRequirements(tx, mo, {
     requirementUomMode,
+    includeDirectProductionInputs: options.includeDirectProductionInputs === true,
   });
   const availabilityItems = [];
-  const reservations = mo?.moNumber
+  const reservations = mo?.moNumber && !options.ignoreReservations
     ? await tx.stockReservation.findMany({
         where: {
           referenceType: "MANUFACTURING_ORDER",
@@ -1231,7 +1253,7 @@ async function buildAvailability(tx, mo, options = {}) {
   const warehouseCodes = new Set();
   const issuedByLine = new Map();
 
-  const materialIssues = mo?.id
+  const materialIssues = mo?.id && !options.ignoreMaterialIssues
     ? await tx.materialIssue.findMany({
         where: {
           moId: mo.id,
@@ -2174,9 +2196,22 @@ async function syncManufacturingOrderQtyFromWorkOrders(tx, moId) {
     rejectedQcCount === 0 &&
     openMaterialIssueCount === 0 &&
     finalAcceptedGood + completedChildGood > 0;
+  // Legacy records may retain an open material-issue flag after QC/FG receipt.
+  // The completed receipt is still terminal evidence for the MO.
+  const receiptFlowDone =
+    hasAnyFgReceipt &&
+    (workOrders.length > 0 || vendorProcessOrders.length > 0) &&
+    workOrders.every((wo) => wo.status === "Completed") &&
+    vendorProcessOrders.every((order) => ["Completed", "Closed"].includes(order.status)) &&
+    openQcCount === 0 &&
+    rejectedQcCount === 0 &&
+    receiptMeetsPlannedQty;
+  // A released MO may already have its final WO/QC/FG receipt completed
+  // (for example when Production consumes a daily plan directly).  Do not
+  // leave it stuck in Released once terminal evidence is present.
   const canAutoComplete =
-    ["In Progress", "FG Ready to Receipt"].includes(mo.status) &&
-    productionFlowDone &&
+    ["Released", "In Progress", "FG Ready to Receipt"].includes(mo.status) &&
+    (productionFlowDone || receiptFlowDone) &&
     receiptMeetsPlannedQty &&
     !hasPendingFgReceipt;
 
@@ -2210,6 +2245,12 @@ async function syncManufacturingOrderQtyFromWorkOrders(tx, moId) {
   }
 
   if (canAutoComplete) {
+    if (openMaterialIssueCount > 0) {
+      await tx.materialIssue.updateMany({
+        where: { moId, isDeleted: false, status: { in: ["Draft", "Issued", "Partially Returned"] } },
+        data: { status: "Closed", notes: "Auto-closed after completed QC and FG receipt." },
+      });
+    }
     updateData.status = "Completed";
     updateData.actualEndDate = new Date();
     await releaseReservationsForMO(tx, mo.moNumber, "Released");

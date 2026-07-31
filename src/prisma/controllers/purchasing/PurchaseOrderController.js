@@ -15,9 +15,27 @@ const {
 const {
   normalizeDetailUomCodes,
 } = require("../../utils/uomCodeNormalizer");
+const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
+const {
+  resolveApprovalRule,
+  createApprovalRequest,
+} = require("../../services/approvalRuleService");
+
+async function queuePoDirtyParts(tx, poNumber, notes) {
+  const details = await tx.purchaseOrderDetail.findMany({
+    where: { poNumber, isDeleted: false },
+    select: { partCode: true },
+  });
+  return queueDirtyPartCodes(tx, details.map((detail) => detail.partCode), {
+    reason: "PO",
+    sourceNumber: poNumber,
+    notes,
+  });
+}
 
 const PO_STATUS = {
   DRAFT: "Draft",
+  SUBMITTED: "Submitted",
   OPERATIONAL_CHECK: "Checking by Operational Manager",
   ENGINEERING_CHECK: "Checking by Engineering Manager",
   SACHO_CHECK: "Checking by Sacho",
@@ -26,25 +44,16 @@ const PO_STATUS = {
   REJECTED: "Rejected",
 };
 
-const PO_CHECK_FLOW = [
-  {
-    status: PO_STATUS.OPERATIONAL_CHECK,
-    nextStatus: PO_STATUS.SACHO_CHECK,
-    action: "check-operational-manager",
-  },
-  {
-    status: PO_STATUS.ENGINEERING_CHECK,
-    nextStatus: PO_STATUS.SACHO_CHECK,
-    action: "check-engineering-manager",
-  },
-  {
-    status: PO_STATUS.SACHO_CHECK,
-    nextStatus: PO_STATUS.APPROVED,
-    action: "check-sacho",
-  },
-];
-
 const PO_EDITABLE_STATUSES = new Set([PO_STATUS.DRAFT, PO_STATUS.REVISING]);
+const PO_LEGACY_APPROVAL_STATUSES = new Set([
+  PO_STATUS.OPERATIONAL_CHECK,
+  PO_STATUS.ENGINEERING_CHECK,
+  PO_STATUS.SACHO_CHECK,
+]);
+const PO_APPROVAL_PENDING_STATUSES = new Set([
+  PO_STATUS.SUBMITTED,
+  ...PO_LEGACY_APPROVAL_STATUSES,
+]);
 
 const parseJsonField = (value, fallback = null) => {
   if (typeof value !== "string") return value ?? fallback;
@@ -103,84 +112,6 @@ const resolveQuotationFiles = (dbFiles = [], existingQuotationFiles, uploadedFil
     ...currentFiles.filter((f) => keptUrls.includes(f.fileUrl)),
     ...uploadedFiles.map(toQuotationFileRecord),
   ];
-};
-
-const PO_SUBMIT_CHECKER_OPTIONS = [
-  {
-    status: PO_STATUS.OPERATIONAL_CHECK,
-    action: "check-operational-manager",
-    aliases: [
-      "operational-manager",
-      "operational manager",
-      "operational",
-      "operation",
-      "om",
-      PO_STATUS.OPERATIONAL_CHECK.toLowerCase(),
-    ],
-  },
-  {
-    status: PO_STATUS.ENGINEERING_CHECK,
-    action: "check-engineering-manager",
-    aliases: [
-      "engineering-manager",
-      "engineering manager",
-      "engineering",
-      "engineer",
-      "em",
-      PO_STATUS.ENGINEERING_CHECK.toLowerCase(),
-    ],
-  },
-  {
-    status: PO_STATUS.SACHO_CHECK,
-    action: "check-sacho",
-    aliases: [
-      "sacho",
-      "president-director",
-      "president director",
-      PO_STATUS.SACHO_CHECK.toLowerCase(),
-    ],
-  },
-];
-
-const normalizePOCheckerInput = (body = {}) => {
-  const requestedChecker =
-    body.checker ??
-    body.checkBy ??
-    body.checkerRole ??
-    body.requestedChecker ??
-    body.requestedCheckBy ??
-    body.targetChecker ??
-    body.status;
-
-  if (!requestedChecker) return PO_SUBMIT_CHECKER_OPTIONS[0];
-
-  const normalized = String(requestedChecker)
-    .trim()
-    .toLowerCase()
-    .replace(/_/g, "-");
-
-  return PO_SUBMIT_CHECKER_OPTIONS.find((option) =>
-    option.aliases.some((alias) => alias.replace(/_/g, "-") === normalized),
-  );
-};
-
-const hasPOPermission = (user, action) => {
-  if (!user || user.isDeleted) return false;
-  if (user.isSuperAdmin) return true;
-
-  const listMenu = Array.isArray(user.listMenu) ? user.listMenu : [];
-  const requiredAction = String(action).toLowerCase();
-
-  return listMenu.some((entry) => {
-    if (!entry || typeof entry !== "object" || !entry.resource) return false;
-    if (String(entry.resource).toLowerCase() !== "purchaseorder") return false;
-
-    const actions = Array.isArray(entry.actions)
-      ? entry.actions.map((x) => String(x).toLowerCase())
-      : [];
-
-    return actions.includes("*") || actions.includes(requiredAction);
-  });
 };
 
 const getPONotificationUserIds = async (action) => {
@@ -556,6 +487,76 @@ const mapPODetail = (d, idx, defaultDeliveryDate) => {
       parseDate(c.deliveryDate) ?? parseDate(defaultDeliveryDate) ?? null,
   };
 };
+
+const normalizePurchaseConversionDetail = (detail, index) => {
+  const converted = convertPODetailNumericFields(detail);
+  if (!converted.materialCode) return converted;
+  const purchasePackageUomCode = String(
+    converted.purchasePackageUomCode || converted.uomCode || "",
+  ).trim().toUpperCase();
+  const purchasePackageQty = Number(
+    converted.purchasePackageQty ?? converted.qty,
+  );
+  const conversionFactor = Number(converted.conversionFactor);
+  if (!["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
+    throw Object.assign(
+      new Error(`PO baris ${index + 1}: raw material wajib memakai SHEET, COIL, atau PCS.`),
+      { statusCode: 400 },
+    );
+  }
+  if (!Number.isInteger(purchasePackageQty) || purchasePackageQty <= 0 || !(conversionFactor > 0)) {
+    throw Object.assign(
+      new Error(`PO baris ${index + 1}: qty bentuk harus bilangan bulat positif dan KG per bentuk harus lebih dari 0.`),
+      { statusCode: 400 },
+    );
+  }
+  return {
+    ...converted,
+    qty: purchasePackageQty,
+    uomCode: purchasePackageUomCode,
+    purchasePackageQty,
+    purchasePackageUomCode,
+    conversionUomCode: "KG",
+    conversionFactor,
+    convertedPurchaseQty: purchasePackageQty * conversionFactor,
+  };
+};
+
+async function validatePODetailIdentities(client, details) {
+  const materialCodes = [...new Set(details.map((detail) => detail.materialCode).filter(Boolean))];
+  const partCodes = [...new Set(details.map((detail) => detail.partCode).filter(Boolean))];
+  const [materials, parts] = await Promise.all([
+    materialCodes.length
+      ? client.material.findMany({
+          where: { materialCode: { in: materialCodes }, isDeleted: false },
+          select: { materialCode: true },
+        })
+      : [],
+    partCodes.length
+      ? client.part.findMany({
+          where: { partCode: { in: partCodes }, isDeleted: false },
+          select: { partCode: true },
+        })
+      : [],
+  ]);
+  const validMaterials = new Set(materials.map((row) => row.materialCode));
+  const validParts = new Set(parts.map((row) => row.partCode));
+  const unknownMaterial = materialCodes.find((code) => !validMaterials.has(code));
+  const unknownPart = partCodes.find((code) => !validParts.has(code));
+  if (unknownMaterial) {
+    throw Object.assign(new Error(`Material ${unknownMaterial} tidak ditemukan di Material Master.`), { statusCode: 400 });
+  }
+  if (unknownPart) {
+    throw Object.assign(new Error(`Part ${unknownPart} tidak ditemukan di Part Master.`), { statusCode: 400 });
+  }
+  const invalid = details.find(
+    (detail) => !(Number(detail.qty) > 0)
+      || (!detail.materialCode && !detail.partCode && !String(detail.description || "").trim()),
+  );
+  if (invalid) {
+    throw Object.assign(new Error("Setiap detail PO wajib memiliki qty positif dan identitas part/material/deskripsi."), { statusCode: 400 });
+  }
+}
 
 // Khusus nested create Prisma: relasi harus pakai connect, bukan FK scalar langsung
 const mapPODetailForNestedCreate = (d, idx, defaultDeliveryDate) => {
@@ -973,21 +974,31 @@ exports.create = async (req, res, next) => {
     header = parseJsonField(header, header) || {};
     details = parseJsonField(details, details) || [];
     details = await normalizeDetailUomCodes(prisma, details);
+    details = details.map(normalizePurchaseConversionDetail);
+    if (!details.length) {
+      cleanupUploadedQuotationFiles(req);
+      return res.status(400).json({ message: "Minimal satu detail Purchase Order wajib diisi." });
+    }
+    if (!parseDate(header.deliveryDate)) {
+      cleanupUploadedQuotationFiles(req);
+      return res.status(400).json({ message: "deliveryDate wajib diisi dan valid." });
+    }
+    await validatePODetailIdentities(prisma, details);
     const resolvedCurrencyCode = header.currencyCode || "IDR";
     const uploadedQuotationFiles = req.files?.quotationFiles ?? [];
 
     // Validate supplier OR vendor exists (read-only, aman di luar transaction)
     if (header.supplierCode) {
-      const supplier = await prisma.supplier.findUnique({
-        where: { supplierCode: header.supplierCode },
+      const supplier = await prisma.supplier.findFirst({
+        where: { supplierCode: header.supplierCode, isDeleted: false },
       });
       if (!supplier) {
         cleanupUploadedQuotationFiles(req);
         return res.status(404).json({ message: "Supplier tidak ditemukan" });
       }
     } else if (header.vendorCode) {
-      const vendor = await prisma.vendor.findUnique({
-        where: { vendorCode: header.vendorCode },
+      const vendor = await prisma.vendor.findFirst({
+        where: { vendorCode: header.vendorCode, isDeleted: false },
       });
       if (!vendor) {
         cleanupUploadedQuotationFiles(req);
@@ -1010,6 +1021,13 @@ exports.create = async (req, res, next) => {
     }
 
     const prNumbers = header.prNumbers ?? [];
+    if (prNumbers.length || details.some((detail) => detail.prDetailId)) {
+      cleanupUploadedQuotationFiles(req);
+      return res.status(409).json({
+        message:
+          "PO dari Purchase Requisition wajib dibuat melalui konsolidasi PR agar supplier, konversi UOM, dan ordered quantity tetap konsisten.",
+      });
+    }
 
     const po = await prisma.$transaction(async (tx) => {
       // Lock baris PR agar tidak ada concurrent PO yang mengubah orderedQty bersamaan
@@ -1053,13 +1071,11 @@ exports.create = async (req, res, next) => {
           ],
           poType: resolvedPoType,
           currency: { connect: { currencyCode: resolvedCurrencyCode } },
-          status: PO_STATUS.APPROVED,
+          status: PO_STATUS.DRAFT,
           totalAmount: calcTotal(details),
           notes: header.notes || null,
           createdBy:
             header.createdBy || req.user?.username || req.user?.email || null,
-          approvedBy: header.createdBy || req.user?.username || req.user?.email || null,
-          approvedDate: new Date(),
           ...(prNumbers.length && {
             purchaseRequisitions: {
               create: prNumbers.map((prNum) => ({ prNumber: prNum })),
@@ -1082,57 +1098,7 @@ exports.create = async (req, res, next) => {
         include: PO_INCLUDE,
       });
 
-      // Update PR status & orderedQty jika dibuat dari PR
-      // Gunakan prDetailId yang dikirim frontend untuk link eksplisit
-      if (prNumbers.length) {
-        const prDetailIds = created.details
-          .filter((pd) => pd.prDetailId)
-          .map((pd) => ({ id: pd.id, prDetailId: pd.prDetailId, qty: pd.qty }));
-
-        for (const { prDetailId, qty } of prDetailIds) {
-          const prDetail = await tx.purchaseRequisitionDetail.findUnique({
-            where: { id: prDetailId },
-            select: { id: true, qty: true, orderedQty: true, prNumber: true },
-          });
-          if (!prDetail) continue;
-          const addQty = Math.min(
-            qty,
-            Math.max(0, (prDetail.qty || 0) - (prDetail.orderedQty || 0)),
-          );
-          if (addQty > 0) {
-            await tx.purchaseRequisitionDetail.update({
-              where: { id: prDetailId },
-              data: { orderedQty: { increment: addQty } },
-            });
-          }
-        }
-
-        // Recalculate status per PR
-        for (const prNum of prNumbers) {
-          const updatedDetails = await tx.purchaseRequisitionDetail.findMany({
-            where: { prNumber: prNum, isDeleted: false },
-            select: { qty: true, orderedQty: true },
-          });
-          const allFullyOrdered = updatedDetails.every(
-            (d) => (d.orderedQty || 0) >= (d.qty || 0),
-          );
-          const anyOrdered = updatedDetails.some(
-            (d) => (d.orderedQty || 0) > 0,
-          );
-          await tx.purchaseRequisition.update({
-            where: { prNumber: prNum },
-            data: {
-              status: allFullyOrdered
-                ? "Completed"
-                : anyOrdered
-                  ? "Partially Ordered"
-                  : "Approved",
-              convertedToPO: created.poNumber,
-            },
-          });
-        }
-      }
-
+      await queuePoDirtyParts(tx, created.poNumber, "Purchase Order dibuat; supply MRP berubah.");
       return created;
     });
 
@@ -1153,6 +1119,10 @@ exports.update = async (req, res, next) => {
     header = parseJsonField(header, header) || {};
     details = parseJsonField(details, details);
     details = await normalizeDetailUomCodes(prisma, details);
+    if (Array.isArray(details)) {
+      details = details.map(normalizePurchaseConversionDetail);
+      await validatePODetailIdentities(prisma, details);
+    }
 
     // Exclude immutable fields
     const {
@@ -1189,8 +1159,8 @@ exports.update = async (req, res, next) => {
     }
 
     if (supplierCode) {
-      const supplier = await prisma.supplier.findUnique({
-        where: { supplierCode },
+      const supplier = await prisma.supplier.findFirst({
+        where: { supplierCode, isDeleted: false },
         select: { supplierCode: true },
       });
 
@@ -1201,8 +1171,8 @@ exports.update = async (req, res, next) => {
     }
 
     if (vendorCode) {
-      const vendor = await prisma.vendor.findUnique({
-        where: { vendorCode },
+      const vendor = await prisma.vendor.findFirst({
+        where: { vendorCode, isDeleted: false },
         select: { vendorCode: true },
       });
 
@@ -1239,6 +1209,7 @@ exports.update = async (req, res, next) => {
           status: true,
           isDeleted: true,
           quotationFiles: true,
+          _count: { select: { purchaseRequisitions: true } },
         },
       });
 
@@ -1412,10 +1383,12 @@ exports.update = async (req, res, next) => {
         }
       }
 
-      return tx.purchaseOrder.findUnique({
+      const updated = await tx.purchaseOrder.findUnique({
         where: { id },
         include: PO_INCLUDE,
       });
+      await queuePoDirtyParts(tx, updated.poNumber, "Purchase Order diubah; supply MRP berubah.");
+      return updated;
     });
 
     // Send notification untuk PO update
@@ -1493,6 +1466,8 @@ exports.confirm = async (req, res, next) => {
     const { poNumber: poNumberRaw } = req.params;
     const existing = await findPOBasicByNumber(poNumberRaw, {
       poNumber: true,
+      status: true,
+      isDeleted: true,
       approvedBy: true,
       approvedDate: true,
     });
@@ -1501,18 +1476,30 @@ exports.confirm = async (req, res, next) => {
         .status(404)
         .json({ message: "Purchase Order tidak ditemukan" });
     }
+    if (existing.isDeleted) {
+      return res.status(400).json({ message: "Purchase Order sudah dihapus" });
+    }
+    if (existing.status !== "Sent") {
+      return res.status(409).json({
+        message: `PO berstatus ${existing.status} tidak dapat dikonfirmasi. PO harus berstatus Sent.`,
+      });
+    }
 
-    const po = await prisma.purchaseOrder.update({
-      where: { poNumber: existing.poNumber },
-      data: {
-        status: "Confirmed",
-        approvedBy:
-          existing.approvedBy ||
-          req.user?.username ||
-          req.user?.email ||
-          "System",
-        approvedDate: existing.approvedDate || new Date(),
-      },
+    const po = await prisma.$transaction(async (tx) => {
+      const updated = await tx.purchaseOrder.update({
+        where: { poNumber: existing.poNumber },
+        data: {
+          status: "Confirmed",
+          approvedBy:
+            existing.approvedBy ||
+            req.user?.username ||
+            req.user?.email ||
+            "System",
+          approvedDate: existing.approvedDate || new Date(),
+        },
+      });
+      await queuePoDirtyParts(tx, existing.poNumber, "Purchase Order dikonfirmasi; supply MRP berubah.");
+      return updated;
     });
 
     await emitPOStatusUpdate(
@@ -1555,22 +1542,37 @@ exports.submitChecking = async (req, res, next) => {
       });
     }
 
-    const checkerOption = normalizePOCheckerInput(req.body);
-    if (!checkerOption) {
-      return res.status(400).json({
-        message: "Checker PO tidak valid",
-        allowedCheckers: PO_SUBMIT_CHECKER_OPTIONS.map(
-          (option) => option.status,
-        ),
-      });
-    }
-
     const actionBy = req.user?.username || req.user?.email || "System";
     const po = await prisma.purchaseOrder.update({
       where: { poNumber: existing.poNumber },
-      data: { status: checkerOption.status },
+      data: { status: PO_STATUS.SUBMITTED },
       include: PO_INCLUDE,
     });
+    const approvalRule = await resolveApprovalRule({
+      moduleCode: "purchasing",
+      pageCode: "purchase-order",
+      actionCode: "approve",
+      documentType: "PurchaseOrder",
+      amount: po.totalAmount,
+      currencyCode: po.currencyCode,
+      context: po,
+    });
+    const approvalRequest = approvalRule
+      ? await createApprovalRequest({
+          rule: approvalRule,
+          moduleCode: "purchasing",
+          pageCode: "purchase-order",
+          actionCode: "approve",
+          documentType: "PurchaseOrder",
+          documentId: po.id,
+          documentNumber: po.poNumber,
+          amount: po.totalAmount,
+          currencyCode: po.currencyCode,
+          context: po,
+          requestedByUserId: req.user?.id,
+          requestedBy: actionBy,
+        })
+      : null;
 
     try {
       await notificationHelper.notifyPurchaseOrder(
@@ -1578,7 +1580,7 @@ exports.submitChecking = async (req, res, next) => {
         po,
         actionBy,
         {
-          userIds: await getPONotificationUserIds(checkerOption.action),
+          userIds: await getPONotificationUserIds("approve"),
         },
       );
     } catch (notifErr) {
@@ -1587,7 +1589,7 @@ exports.submitChecking = async (req, res, next) => {
 
     await emitPOStatusUpdate(po, "submit-checking", actionBy);
 
-    res.json(await mapPOResponse(po));
+    res.json({ ...(await mapPOResponse(po)), approvalRequest });
   } catch (e) {
     next(e);
   }
@@ -1619,90 +1621,29 @@ exports.approve = async (req, res, next) => {
       return res.status(400).json({ message: "PO sudah disetujui" });
     }
 
-    const flowStep = PO_CHECK_FLOW.find(
-      (step) => step.status === existing.status,
-    );
-    if (!flowStep) {
+    if (!PO_APPROVAL_PENDING_STATUSES.has(existing.status)) {
       return res.status(400).json({
         message: `PO dengan status ${existing.status} tidak dapat di-check/approve`,
       });
     }
 
-    if (
-      !hasPOPermission(req.user, flowStep.action) &&
-      !hasPOPermission(req.user, "approve")
-    ) {
-      return res.status(403).json({
-        message: `Forbidden: No ${flowStep.action} access to purchaseOrder`,
-      });
-    }
-
     const actionBy = req.user?.username || req.user?.email || "System";
-    const isFinalApproval = flowStep.nextStatus === PO_STATUS.APPROVED;
-    const revisionReason = String(
-      req.body?.revisionReason || req.body?.message || req.body?.comment || "",
-    ).trim();
-
-    if (revisionReason && isFinalApproval) {
-      return res.status(400).json({
-        message:
-          "Pesan revisi hanya dapat dikirim pada tahap checking Operational/Engineering",
-      });
-    }
 
     const po = await prisma.purchaseOrder.update({
       where: { poNumber: existing.poNumber },
       data: {
-        status: flowStep.nextStatus,
-        ...(isFinalApproval
-          ? {
-              approvedBy: actionBy,
-              approvedDate: new Date(),
-            }
-          : {
-              checkedBy: actionBy,
-              checkedDate: new Date(),
-            }),
+        status: PO_STATUS.APPROVED,
+        approvedBy: actionBy,
+        approvedDate: new Date(),
+        checkedBy: actionBy,
+        checkedDate: new Date(),
       },
       include: PO_INCLUDE,
     });
 
-    if (revisionReason) {
-      const comment = await prisma.purchaseOrderComment.create({
-        data: {
-          poNumber: po.poNumber,
-          type: "revision",
-          message: revisionReason,
-          fromStatus: existing.status,
-          toStatus: flowStep.nextStatus,
-          createdBy: actionBy,
-          userId: req.user?.id || null,
-        },
-      });
-
-      emitPORevisionComment({
-        action: "created",
-        poNumber: po.poNumber,
-        parentId: null,
-        comment: { ...comment, replies: [] },
-        actionBy,
-      });
-    }
-
-    try {
-      const nextStep = PO_CHECK_FLOW.find((step) => step.status === po.status);
-      if (nextStep) {
-        await notificationHelper.notifyPurchaseOrder("check", po, actionBy, {
-          userIds: await getPONotificationUserIds(nextStep.action),
-        });
-      }
-    } catch (notifErr) {
-      console.error("Failed to send notification:", notifErr);
-    }
-
     await emitPOStatusUpdate(
       po,
-      isFinalApproval ? "approve" : "check",
+      "approve",
       actionBy,
     );
 
@@ -1742,21 +1683,9 @@ exports.revise = async (req, res, next) => {
       return res.status(400).json({ message: "Purchase Order sudah dihapus" });
     }
 
-    const flowStep = PO_CHECK_FLOW.find(
-      (step) => step.status === existing.status,
-    );
-    if (!flowStep) {
+    if (!PO_APPROVAL_PENDING_STATUSES.has(existing.status)) {
       return res.status(400).json({
         message: `PO dengan status ${existing.status} tidak dapat direvisi`,
-      });
-    }
-
-    if (
-      !hasPOPermission(req.user, flowStep.action) &&
-      !hasPOPermission(req.user, "approve")
-    ) {
-      return res.status(403).json({
-        message: `Forbidden: No ${flowStep.action} access to purchaseOrder`,
       });
     }
 
@@ -1834,21 +1763,9 @@ exports.reject = async (req, res, next) => {
       return res.status(400).json({ message: "PO sudah ditolak" });
     }
 
-    const flowStep = PO_CHECK_FLOW.find(
-      (step) => step.status === existing.status,
-    );
-    if (!flowStep) {
+    if (!PO_APPROVAL_PENDING_STATUSES.has(existing.status)) {
       return res.status(400).json({
         message: `PO dengan status ${existing.status} tidak dapat di-reject`,
-      });
-    }
-
-    if (
-      !hasPOPermission(req.user, flowStep.action) &&
-      !hasPOPermission(req.user, "approve")
-    ) {
-      return res.status(403).json({
-        message: `Forbidden: No ${flowStep.action} access to purchaseOrder`,
       });
     }
 
@@ -1879,7 +1796,14 @@ exports.reject = async (req, res, next) => {
       for (const prNumber of affectedPRNumbers) {
         await recalculatePRStatus(tx, prNumber);
       }
+      if (details && po._count.purchaseRequisitions > 0) {
+        throw Object.assign(
+          new Error("Detail PO yang berasal dari PR dikunci. Ubah kebutuhan melalui konsolidasi PR agar orderedQty tetap dalam UOM sumber."),
+          { statusCode: 409 },
+        );
+      }
 
+      await queuePoDirtyParts(tx, existing.poNumber, "Purchase Order dibatalkan; supply MRP berubah.");
       return updatedPO;
     });
 
@@ -1906,8 +1830,11 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
   if (!warehouse) throw Object.assign(new Error("Warehouse tujuan tidak valid atau tidak aktif"), { statusCode: 400 });
 
   if (rackCode) {
-    const rack = await tx.rack.findFirst({ where: { rackCode, isActive: true, isDeleted: false }, select: { rackCode: true } });
+    const rack = await tx.rack.findFirst({ where: { rackCode, isActive: true, isDeleted: false }, select: { rackCode: true, warehouseCode: true } });
     if (!rack) throw Object.assign(new Error("Rack tujuan tidak valid atau tidak aktif"), { statusCode: 400 });
+    if (rack.warehouseCode && rack.warehouseCode !== warehouseCode) {
+      throw Object.assign(new Error(`Rack ${rackCode} bukan milik warehouse ${warehouseCode}`), { statusCode: 409 });
+    }
   }
 
   const movementDate = new Date();
@@ -1929,13 +1856,17 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
     const qtyReserved = Number(existing?.qtyReserved || 0);
     const qtyQC = Number(existing?.qtyQC || 0);
     const qtyAfter = qtyBefore + qty;
-    const stockType = getDirectStockType(po.poType);
+    const usesMaterialMaster = Boolean(identity.materialId || identity.materialCode);
+    const stockType = usesMaterialMaster ? "Material" : getDirectStockType(po.poType);
 
     await tx.stockMovement.create({
       data: {
         movementNumber: await generateMovementNumber("IN", tx), movementDate,
         movementType: "IN", direction: "IN", transactionType: "PURCHASE_RECEIVE",
         warehouseCode, rackCode: rackCode || null, lotNumber: null,
+        materialId: identity.materialId || null, materialCode: identity.materialCode || null,
+        materialName: identity.materialName || detail.materialName || null,
+        materialType: identity.materialType || detail.materialType || null,
         partCode: identity.partCode || null, partNumber: identity.partNumber || null,
         partName: normalizeText(detail.partName) || identity.partName || null,
         productId: identity.productId || null, description: identity.description || null,
@@ -1948,6 +1879,9 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
     });
 
     const balanceData = {
+      materialId: identity.materialId || null, materialCode: identity.materialCode || null,
+      materialName: identity.materialName || detail.materialName || null,
+      materialType: identity.materialType || detail.materialType || null,
       partNumber: identity.partNumber || null, partName: normalizeText(detail.partName) || identity.partName || null,
       productId: identity.productId || null, description: identity.description || null, spec: identity.spec || null,
       thickness: identity.thickness ?? null, width: identity.width ?? null, CSP: identity.CSP || null,
@@ -2118,6 +2052,7 @@ exports.remove = async (req, res, next) => {
     }
 
     await prisma.$transaction(async (tx) => {
+      await queuePoDirtyParts(tx, existing.poNumber, "Purchase Order dihapus; supply MRP berubah.");
       let restoredPRs = [];
       if (existing.status !== "Cancelled") {
         restoredPRs = await restorePRQtyFromPO(tx, existing.poNumber);

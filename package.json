@@ -15,6 +15,13 @@
     "db:backfill:production-runtime": "node scripts/backfill-production-runtime-fields.js",
     "db:verify:prefixed-codes": "node scripts/verify-prefixed-master-codes.js",
     "test:revision-contracts": "node scripts/verify-revision-contracts.js",
+    "test:p0-contracts": "node scripts/verify-p0-contracts.js",
+    "test:p1-contracts": "node scripts/verify-p1-contracts.js",
+    "test:p2-contracts": "node scripts/verify-p2-contracts.js",
+    "test:p3-contracts": "node scripts/verify-encoding.js",
+    "test:purchasing-p0-p2": "node scripts/verify-purchasing-p0-p2.js",
+    "test:page-context": "node scripts/verify-page-context.js",
+    "test:encoding": "node scripts/verify-encoding.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -36,7 +43,8 @@
     "pg": "^8.16.3",
     "prisma": "^7.0.1",
     "slugify": "^1.6.6",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "xlsx": "0.18.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

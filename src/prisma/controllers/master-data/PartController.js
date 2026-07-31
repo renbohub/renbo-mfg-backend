@@ -198,7 +198,7 @@ const stripPartCodeTransientFields = (data = {}) => {
   const {
     noRevisi, noRevision, revision, rev, processOrder, isInsertion,
     parentBranchCode, siblingBranchCodes, siblingPartIds, usedProcessSequences, reserveBranchAlpha,
-    sequenceSourcePartCode,
+    sequenceSourcePartCode, fixedProcessSequence,
     branchReconcile,
     ...rest
   } = data;
@@ -354,9 +354,9 @@ const buildCustomerPartCode = async (data) => {
   throw Object.assign(new Error("Tidak dapat membuat Part Code unik dari aturan penomoran."), { statusCode: 409 });
 };
 
-const buildChildPartCode = async (data = {}, forcedPartType) => {
+const buildChildPartCode = async (data = {}) => {
   const customerCode = getPartCustomerCode(data);
-  const partType = forcedPartType || (normalizePartCode(data.partType) === "COMP" ? "COMP" : "STANDARD");
+  const partType = normalizePartCode(data.partType) === "COMP" ? "COMP" : "STANDARD";
   const ruleKey = partType === "COMP" ? "PART_CHILD_COMPONENT" : "PART_CHILD_NON_COMPONENT";
   const inheritedFamilySequence = getCustomerFamilySequence(data.sequenceSourcePartCode);
   const rule = inheritedFamilySequence ? await getRule(ruleKey) : null;
@@ -428,7 +428,7 @@ const buildPartCode = async (data = {}) => {
     data.parentBranchCode = "";
     data.siblingBranchCodes = [];
     data.siblingPartIds = [];
-    return buildChildPartCode(data, "STANDARD");
+    return buildChildPartCode(data);
   }
   return buildCustomerPartCode(data);
 };
@@ -634,6 +634,28 @@ const updatePartCodeReferences = async (tx, mapping) => {
       mapping.normalizedOldPartCode,
     );
   }
+};
+
+const getMbomSequenceUsage = async (mbom, db = prisma) => {
+  const [salesOrders, forecasts, mps] = await Promise.all([
+    db.salesOrderDetail.count({
+      where: { mbomHeaderId: mbom.id, isDeleted: false, status: { not: "Cancelled" } },
+    }),
+    mbom.partId
+      ? db.forecastDetail.count({
+        where: {
+          partId: mbom.partId,
+          isDeleted: false,
+          forecast: { is: { isDeleted: false, status: { not: "Obsolete" } } },
+          OR: [{ M1Qty: { gt: 0 } }, { M2Qty: { gt: 0 } }, { M3Qty: { gt: 0 } }],
+        },
+      })
+      : 0,
+    db.mPSDetail.count({
+      where: { mbomHeaderId: mbom.id, isDeleted: false, status: { not: "Cancelled" } },
+    }),
+  ]);
+  return { salesOrders, forecasts, mps, locked: salesOrders > 0 || forecasts > 0 || mps > 0 };
 };
 
 const reconcileConditionalSiblingBranches = async ({ siblingPartIds, bomLevel, branchReconcile }) => {
@@ -843,6 +865,7 @@ exports.list = async (req, res, next) => {
       isDeleted,
       customerCode,
       itemType,
+      rawType,
       includeEmptyItemType,
       category,
       status,
@@ -856,6 +879,7 @@ exports.list = async (req, res, next) => {
       where.OR = [{ customerCode }, { customerCodes: { has: customerCode } }];
     }
     if (category) where.category = category;
+    if (rawType) where.rawType = String(rawType).trim().toUpperCase();
     const itemTypes = normalizeItemTypeFilter(itemType);
     const shouldIncludeEmptyItemType = parseBoolean(includeEmptyItemType);
     if (itemTypes.length > 0 || shouldIncludeEmptyItemType) {
@@ -929,6 +953,99 @@ exports.getCompatibilityProfile = async (req, res, next) => {
     });
     if (!doc) return res.status(404).json({ message: "Part not found" });
     res.json(resolveItemCompatibility(doc));
+  } catch (e) { next(e); }
+};
+
+exports.shiftProcessSequences = async (req, res, next) => {
+  try {
+    const mbomHeaderId = String(req.body?.mbomHeaderId || "").trim();
+    const partIds = [...new Set((Array.isArray(req.body?.partIds) ? req.body.partIds : []).map(String).filter(Boolean))];
+    const fromSequence = Number(req.body?.fromSequence);
+    const shiftBy = Number(req.body?.shiftBy);
+    if (!mbomHeaderId || !partIds.length || !Number.isInteger(fromSequence) || fromSequence < 1 || !Number.isInteger(shiftBy) || shiftBy === 0) {
+      return res.status(400).json({ message: "MBOM, part yang digeser, sequence awal, dan nilai pergeseran wajib valid." });
+    }
+
+    const mbom = await prisma.mBOMHeader.findFirst({
+      where: { id: mbomHeaderId, isDeleted: false },
+      select: {
+        id: true,
+        partId: true,
+        details: { where: { isDeleted: false }, select: { partId: true } },
+      },
+    });
+    if (!mbom) return res.status(404).json({ message: "MBOM tidak ditemukan." });
+
+    const detailPartIds = new Set(mbom.details.map((detail) => detail.partId).filter(Boolean));
+    const outsideBom = partIds.filter((id) => !detailPartIds.has(id));
+    if (outsideBom.length) return res.status(400).json({ message: "Ada part yang bukan detail dari MBOM ini." });
+
+    const usage = await getMbomSequenceUsage(mbom);
+    if (usage.locked) {
+      return res.status(409).json({
+        message: "Sequence utama tidak dapat digeser karena BOM sudah dipakai Forecast, Sales Order, atau MPS. Gunakan slot sisipan.",
+        usage,
+      });
+    }
+
+    const parts = await prisma.part.findMany({
+      where: {
+        id: { in: partIds },
+        isDeleted: false,
+        processSequence: shiftBy > 0 ? { gte: fromSequence } : { gte: fromSequence },
+        OR: [{ itemType: "WIP" }, { itemType: "RAW", rawType: "MATERIAL" }],
+      },
+      select: { id: true, partCode: true, processSequence: true, componentLevel: true },
+    });
+    if (!parts.length) return res.status(400).json({ message: "Tidak ada part process yang memenuhi sequence pergeseran." });
+
+    const mappings = parts.map((part) => {
+      const processSequence = Number(part.processSequence) + shiftBy;
+      if (processSequence < 1) throw Object.assign(new Error("Hasil sequence tidak boleh kurang dari 001."), { statusCode: 400 });
+      return {
+        id: part.id,
+        oldPartCode: part.partCode,
+        normalizedOldPartCode: normalizePartCode(part.partCode),
+        newPartCode: buildProcessPartCode(part.partCode, processSequence),
+        oldProcessSequence: Number(part.processSequence),
+        processSequence,
+        componentLevel: Math.max(1, Math.floor(processSequence / PROCESS_PART_SEQUENCE_STEP)),
+      };
+    }).sort((a, b) => shiftBy > 0 ? b.oldProcessSequence - a.oldProcessSequence : a.oldProcessSequence - b.oldProcessSequence);
+
+    const conflicts = await prisma.part.findMany({
+      where: {
+        partCode: { in: mappings.map((mapping) => mapping.newPartCode) },
+        id: { notIn: mappings.map((mapping) => mapping.id) },
+        isDeleted: false,
+      },
+      select: { partCode: true },
+    });
+    if (conflicts.length) {
+      return res.status(409).json({ message: `Kode tujuan sudah digunakan: ${conflicts.map((item) => item.partCode).join(", ")}.` });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      for (const mapping of mappings) {
+        await updatePartCodeReferences(tx, mapping);
+        await tx.part.update({
+          where: { id: mapping.id },
+          data: { processSequence: mapping.processSequence, componentLevel: mapping.componentLevel },
+        });
+      }
+    }, { timeout: 60000 });
+
+    res.json({
+      message: "Sequence part berhasil digeser.",
+      items: mappings.map((mapping) => ({
+        id: mapping.id,
+        oldPartCode: mapping.oldPartCode,
+        partCode: mapping.newPartCode,
+        oldProcessSequence: mapping.oldProcessSequence,
+        processSequence: mapping.processSequence,
+        componentLevel: mapping.componentLevel,
+      })),
+    });
   } catch (e) { next(e); }
 };
 

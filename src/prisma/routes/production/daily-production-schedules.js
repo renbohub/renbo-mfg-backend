@@ -5,6 +5,7 @@ const { logger } = require("../../middleware/logger");
 
 router.get("/generate-number", authorize("dailyProductionSchedules", "create"), ctrl.generateNumber);
 router.post("/dispatch-from-work-orders", authorize("dailyProductionSchedules", "dispatch"), logger("dailyProductionSchedules", "dispatch"), ctrl.dispatchFromWorkOrders);
+router.post("/:scheduleNumber/consume", authorize("dailyProductionSchedules", "release"), logger("dailyProductionSchedules", "consume"), ctrl.consume);
 router.post("/:scheduleNumber/release", authorize("dailyProductionSchedules", "release"), logger("dailyProductionSchedules", "release"), ctrl.release);
 router.post("/:scheduleNumber/start", authorize("dailyProductionSchedules", "start"), logger("dailyProductionSchedules", "start"), ctrl.start);
 router.post("/:scheduleNumber/complete", authorize("dailyProductionSchedules", "complete"), logger("dailyProductionSchedules", "complete"), ctrl.complete);

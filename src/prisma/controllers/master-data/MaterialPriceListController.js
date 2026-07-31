@@ -6,6 +6,8 @@ const { convertPriceListFields } = require("../../utils/numericConverter");
 // Include config untuk materialpricelist
 const includeMaterialPriceList = {
   material: true,
+  materialSubstance: true,
+  materialGrade: { include: { density: true, substance: true } },
   currency: true,
   supplier: {
     select: {
@@ -14,6 +16,58 @@ const includeMaterialPriceList = {
     },
   },
 };
+const mapMaterialPrice = (doc) => {
+  const mapped = mapDoc(doc);
+  if (mapped?.materialGrade) {
+    mapped.materialGrade.displayName = `${mapped.materialGrade.gradeCode} — ${mapped.materialGrade.thickness == null ? "Thickness belum diisi" : `${Number(mapped.materialGrade.thickness).toLocaleString("id-ID")} mm`}`;
+  }
+  return mapped;
+};
+
+async function normalizeMaterialPriceData(input) {
+  const data = convertPriceListFields(input);
+  if (data.thickness !== undefined && data.thickness !== null && data.thickness !== "") {
+    data.thickness = Number(data.thickness);
+  }
+
+  let material = null;
+  if (data.materialId) {
+    material = await prisma.material.findFirst({
+      where: { id: data.materialId, isDeleted: false },
+      select: {
+        materialSubstanceId: true,
+        materialGradeId: true,
+        thickness: true,
+        CSP: true,
+      },
+    });
+    if (!material) throw Object.assign(new Error("Material tidak ditemukan."), { status: 400 });
+    data.materialSubstanceId ??= material.materialSubstanceId;
+    data.materialGradeId ??= material.materialGradeId;
+    data.thickness ??= material.thickness;
+    data.CSP ??= material.CSP;
+  }
+
+  if (data.materialGradeId) {
+    const grade = await prisma.materialGrade.findFirst({
+      where: { id: data.materialGradeId, isDeleted: false },
+      select: { substanceId: true, thickness: true },
+    });
+    if (!grade) throw Object.assign(new Error("Material grade tidak ditemukan."), { status: 400 });
+    if (data.materialSubstanceId && data.materialSubstanceId !== grade.substanceId) {
+      throw Object.assign(new Error("Material grade harus sesuai dengan bahan material."), { status: 400 });
+    }
+    data.materialSubstanceId = grade.substanceId;
+    data.thickness = grade.thickness;
+  }
+
+  if (!data.materialId && (!data.materialSubstanceId || !data.materialGradeId || !(Number(data.thickness) > 0))) {
+    throw Object.assign(new Error("Harga material wajib memiliki bahan material, grade, dan thickness."), { status: 400 });
+  }
+  delete data.materialCode;
+  delete data.supplierCode;
+  return data;
+}
 
 exports.list = async (req, res, next) => {
   try {
@@ -23,6 +77,8 @@ exports.list = async (req, res, next) => {
       partId,
       partCode,
       materialId,
+      materialSubstanceId,
+      materialGradeId,
       supplierId,
       supplierCode,
       pricingYear,
@@ -41,6 +97,8 @@ exports.list = async (req, res, next) => {
     if (partId) where.partId = partId;
     if (partCode) where.partCode = partCode;
     if (materialId) where.materialId = materialId;
+    if (materialSubstanceId) where.materialSubstanceId = materialSubstanceId;
+    if (materialGradeId) where.materialGradeId = materialGradeId;
     if (supplierId) where.supplierId = supplierId;
     if (supplierCode) where.supplier = { supplierCode };
     if (pricingYear) where.pricingYear = Number(pricingYear);
@@ -57,6 +115,8 @@ exports.list = async (req, res, next) => {
         { material: { materialCode: { contains: q, mode: "insensitive" } } },
         { material: { materialType: { contains: q, mode: "insensitive" } } },
         { material: { spec: { contains: q, mode: "insensitive" } } },
+        { materialSubstance: { substanceName: { contains: q, mode: "insensitive" } } },
+        { materialGrade: { gradeName: { contains: q, mode: "insensitive" } } },
         { supplier: { supplierName: { contains: q, mode: "insensitive" } } },
         { supplier: { supplierCode: { contains: q, mode: "insensitive" } } },
         { notes: { contains: q, mode: "insensitive" } },
@@ -85,7 +145,7 @@ exports.list = async (req, res, next) => {
     ]);
 
     res.json({
-      items: items.map(mapDoc),
+      items: items.map(mapMaterialPrice),
       total,
       page: Number(page),
       limit: Number(limit),
@@ -103,7 +163,7 @@ exports.get = async (req, res, next) => {
     });
     if (!doc)
       return res.status(404).json({ message: "MaterialPriceList not found" });
-    res.json(doc);
+    res.json(mapMaterialPrice(doc));
   } catch (e) {
     next(e);
   }
@@ -111,13 +171,13 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const convertedData = convertPriceListFields(req.body);
+    const convertedData = await normalizeMaterialPriceData(req.body);
     const doc = await prisma.materialPriceList.create({
       data: convertedData,
       include: includeMaterialPriceList,
     });
 
-    res.status(201).json(mapDoc(doc));
+    res.status(201).json(mapMaterialPrice(doc));
   } catch (e) {
     next(e);
   }
@@ -125,14 +185,16 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const convertedData = convertPriceListFields(req.body);
+    const current = await prisma.materialPriceList.findUnique({ where: { id: req.params.id } });
+    if (!current) return res.status(404).json({ message: "MaterialPriceList not found" });
+    const convertedData = await normalizeMaterialPriceData({ ...current, ...req.body, id: undefined, createdAt: undefined, updatedAt: undefined });
     const doc = await prisma.materialPriceList.update({
       where: { id: req.params.id },
       data: convertedData,
       include: includeMaterialPriceList,
     });
 
-    res.json(mapDoc(doc));
+    res.json(mapMaterialPrice(doc));
   } catch (e) {
     next(e);
   }
@@ -220,14 +282,15 @@ exports.bulkCreate = async (req, res, next) => {
             convertedData.materialId = material.id;
           }
         }
+        const normalizedData = await normalizeMaterialPriceData(convertedData);
 
         // Create material price list baru
         const doc = await prisma.materialPriceList.create({
-          data: convertedData,
+          data: normalizedData,
           include: includeMaterialPriceList,
         });
 
-        results.success.push(mapDoc(doc));
+        results.success.push(mapMaterialPrice(doc));
       } catch (error) {
         results.failed.push({
           data: priceListData,

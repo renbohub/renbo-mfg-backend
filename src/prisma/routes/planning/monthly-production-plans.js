@@ -8,7 +8,17 @@ const capacityOverrideApproval = approvalGate({ moduleCode: "planning-ppic", pag
 router.post("/from-mps", authorize("monthlyProductionPlan", "create"), logger("monthlyProductionPlan", "create-from-mps"), ctrl.createFromMps);
 router.post("/:planNumber/confirm", authorize("monthlyProductionPlan", "approve"), monthlyPlanApproval, logger("monthlyProductionPlan", "confirm"), ctrl.confirm);
 router.post("/:planNumber/release", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "release"), ctrl.release);
+router.post("/:planNumber/daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "convert-to-daily-plans"), ctrl.convertToDailyPlans);
+router.post("/:planNumber/manual-daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "manual-daily-plan"), ctrl.createManualDailyPlan);
+router.post("/:planNumber/manual-allocations", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "manual-allocation"), ctrl.createManualDailyPlan);
+router.patch("/:planNumber/manual-allocations/:allocationId/remove", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "remove-manual-allocation"), ctrl.removeManualAllocation);
 router.post("/:planNumber/capacity-override", authorize("monthlyProductionPlan", "approve"), capacityOverrideApproval, logger("monthlyProductionPlan", "capacity-override"), ctrl.capacityOverride);
+router.post("/:planNumber/capacity-machine-override", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-machine-override"), ctrl.assignCapacityMachine);
+router.post("/capacity-day", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-day-global"), ctrl.setGlobalCapacityDay);
+router.get("/daily-plans", authorize("monthlyProductionPlan", "read"), ctrl.listDailyPlans);
+router.get("/daily-plans/:scheduleNumber", authorize("monthlyProductionPlan", "read"), ctrl.getDailyPlan);
+router.post("/:planNumber/capacity-day", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-day"), ctrl.setCapacityDay);
+router.get("/:planNumber/material-readiness", authorize("monthlyProductionPlan", "read"), ctrl.materialReadiness);
 router.get("/", authorize("monthlyProductionPlan", "read"), ctrl.list);
 router.get("/:planNumber", authorize("monthlyProductionPlan", "read"), ctrl.get);
 module.exports = router;

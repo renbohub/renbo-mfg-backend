@@ -5,6 +5,12 @@ const { logger } = require("../../middleware/logger");
 
 router.get("/generate-number", authorize("mrp", "create"), ctrl.generateNumber);
 router.get("/general-summary", authorize("mrp", "read"), ctrl.generalSummary);
+router.get("/planned-orders", authorize("mrp", "read"), ctrl.listPlannedOrders);
+router.get("/planned-orders/:orderNumber", authorize("mrp", "read"), ctrl.getPlannedOrder);
+router.get("/net-change/dirty-items", authorize("mrp", "read"), ctrl.listNetChangeDirtyItems);
+router.get("/net-change/snapshots/latest", authorize("mrp", "read"), ctrl.getLatestNetChangeSnapshot);
+router.get("/net-change/snapshots", authorize("mrp", "read"), ctrl.listNetChangeSnapshots);
+router.post("/net-change/run", authorize("mrp", "release"), logger("mrp", "run-net-change"), ctrl.runNetChange);
 router.get("/", authorize("mrp", "read"), ctrl.list);
 router.post("/run", authorize("mrp", "create"), logger("mrp", "run"), ctrl.runMRP);
 router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);

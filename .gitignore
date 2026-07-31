@@ -120,3 +120,6 @@ profiles.json
 
 # Prisma migration backup: ignore all files inside backup folder
 prisma/backup/**
+
+# Local transactional data-cleanup backups (may contain business data)
+backups/

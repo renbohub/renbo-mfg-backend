@@ -27,6 +27,8 @@ const {
 const {
   emitManufacturingOrderUpdate,
 } = require("./services/productionRealtimeService");
+const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 const QUANTITY_TOLERANCE = 0.000001;
 
@@ -85,9 +87,53 @@ async function consumeReservedSubAssembliesForProductionLog(tx, log, performedBy
     (item) => item.isSubAssembly && item.parentDetailId === log.workOrder.mbomDetailId,
   );
   if (subAssemblies.length === 0) return [];
+  const issuedAssemblyDetails = await tx.materialIssueDetail.findMany({
+    where: {
+      isDeleted: false,
+      partCode: { in: subAssemblies.map((item) => item.partCode).filter(Boolean) },
+      materialIssue: {
+        woId: log.workOrder.id,
+        isDeleted: false,
+        status: { in: ["Issued", "Partially Returned", "Closed"] },
+      },
+    },
+    select: {
+      partCode: true,
+      qtyIssued: true,
+      qtyReturned: true,
+    },
+  });
+  const materialIssuedByPart = new Map();
+  for (const detail of issuedAssemblyDetails) {
+    const netIssued = Math.max(0, toNumber(detail.qtyIssued) - toNumber(detail.qtyReturned));
+    materialIssuedByPart.set(
+      detail.partCode,
+      toNumber(materialIssuedByPart.get(detail.partCode)) + netIssued,
+    );
+  }
 
   const producedQty = toNumber(log.qtyProduced);
   if (producedQty <= QUANTITY_TOLERANCE) return [];
+  const approvedOutput = await tx.productionLog.aggregate({
+    where: {
+      woId: log.workOrder.id,
+      status: "Approved",
+      isDeleted: false,
+    },
+    _sum: { qtyProduced: true },
+  });
+  const cumulativeApprovedQty = Math.max(
+    producedQty,
+    toNumber(approvedOutput._sum?.qtyProduced),
+  );
+  const approvedLogNumbers = await tx.productionLog.findMany({
+    where: {
+      woId: log.workOrder.id,
+      status: "Approved",
+      isDeleted: false,
+    },
+    select: { logNumber: true },
+  });
 
   const reservations = await tx.stockReservation.findMany({
     where: {
@@ -101,7 +147,30 @@ async function consumeReservedSubAssembliesForProductionLog(tx, log, performedBy
   const movementNumbers = [];
 
   for (const item of subAssemblies) {
-    let remaining = Math.round(toNumber(item.qtyPer) * producedQty * 1000000) / 1000000;
+    const requiredForOutput =
+      Math.round(toNumber(item.qtyPer) * cumulativeApprovedQty * 1000000) / 1000000;
+    const previouslyConsumed = await tx.stockMovement.aggregate({
+      where: {
+        movementType: "OUT",
+        qualityBucket: "SUB_ASSEMBLY",
+        referenceType: "PRODUCTION_LOG",
+        referenceNumber: {
+          in: approvedLogNumbers.map((item) => item.logNumber),
+        },
+        partCode: item.partCode,
+        isDeleted: false,
+      },
+      _sum: { qty: true },
+    });
+    // A sub-assembly explicitly posted through Material Issue has already
+    // left inventory. Production Log approval must not deduct it a second time.
+    let remaining = Math.max(
+      0,
+      requiredForOutput
+        - toNumber(materialIssuedByPart.get(item.partCode))
+        - toNumber(previouslyConsumed._sum?.qty),
+    );
+    if (remaining <= QUANTITY_TOLERANCE) continue;
     const lineReservations = reservations.filter(
       (reservation) => getReservationLineNumber(reservation.referenceNumber) === item.lineNumber,
     );
@@ -329,6 +398,60 @@ async function findDailyProductionSchedule(tx, { dpsId, scheduleNumber } = {}) {
   return schedule;
 }
 
+async function findRelatedDailyProductionSchedule(
+  tx,
+  { woId, moId, logDate, shift, processCode, machineCode } = {},
+) {
+  if (!woId && !moId) return null;
+  const workOrder = woId
+    ? await tx.workOrder.findFirst({
+        where: { id: woId, isDeleted: false },
+        select: {
+          woNumber: true,
+          outputPartCode: true,
+          processId: true,
+          machineId: true,
+          process: { select: { processCode: true } },
+          machine: { select: { machineCode: true } },
+        },
+      })
+    : null;
+  const candidates = await tx.dailyProductionSchedule.findMany({
+    where: {
+      isDeleted: false,
+      status: { in: ["Draft", "Released", "In Progress"] },
+      OR: [
+        ...(woId ? [{ woId }] : []),
+        ...(moId ? [{ moId }] : []),
+      ],
+    },
+    orderBy: [{ scheduleDate: "asc" }, { createdAt: "asc" }],
+    take: 100,
+  });
+  const eligibleCandidates = candidates.filter((row) => !row.woId || row.woId === woId);
+  if (!eligibleCandidates.length) return null;
+  const wantedDay = logDate ? new Date(logDate).toISOString().slice(0, 10) : null;
+  const wantedShift = String(shift || "").trim().toUpperCase();
+  return [...eligibleCandidates].sort((left, right) => {
+    const score = (row) => {
+      let value = 0;
+      if (woId && row.woId === woId) value += 100;
+      if (moId && row.moId === moId) value += 20;
+      if (workOrder?.outputPartCode && row.partCode === workOrder.outputPartCode) value += 60;
+      if (workOrder?.processId && row.processId === workOrder.processId) value += 50;
+      if (workOrder?.machineId && row.machineId === workOrder.machineId) value += 30;
+      if (processCode && workOrder?.process?.processCode === processCode) value += 5;
+      if (machineCode && workOrder?.machine?.machineCode === machineCode) value += 3;
+      if (wantedDay && new Date(row.scheduleDate).toISOString().slice(0, 10) === wantedDay) value += 10;
+      if (wantedShift && String(row.shift || "").trim().toUpperCase() === wantedShift) value += 5;
+      if (row.status === "Released") value += 2;
+      if (row.status === "In Progress") value += 1;
+      return value;
+    };
+    return score(right) - score(left);
+  })[0];
+}
+
 function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
   const startTime = entry.startTime || entry.start_time || null;
   const endTime = entry.endTime || entry.end_time || null;
@@ -336,6 +459,7 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
     entry.durationMinutes ?? entry.duration_minutes ?? entry.duration;
   const downtimeDate = parentLog.logDate || new Date();
   const durationFromTime = calculateDurationMinutes(startTime, endTime, downtimeDate);
+  const durationMinutes = toNumber(duration ?? durationFromTime ?? 0);
   const reason = entry.reason || entry.downtimeReason || entry.downtime_reason;
 
   if (!reason) {
@@ -343,7 +467,6 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
       statusCode: 400,
     });
   }
-
   return {
     moId: parentLog.moId,
     woId: parentLog.woId || null,
@@ -354,7 +477,7 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
     operatorName: entry.operatorName || entry.operator_name || parentLog.operatorName || null,
     startTime: toDateTime(startTime, downtimeDate),
     endTime: toDateTime(endTime, downtimeDate),
-    durationMinutes: toNumber(duration ?? durationFromTime ?? 0),
+    durationMinutes,
     reason,
     category: entry.category || null,
     notes: entry.notes || null,
@@ -362,11 +485,28 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
   };
 }
 
-function validateProductionLogQty(data = {}) {
+function summarizeDowntimeEntries(entries = [], parentLog = {}) {
+  const normalizedEntries = entries.map((entry) => normalizeDowntimeEntry(entry, parentLog));
+  return {
+    normalizedEntries,
+    downtime: normalizedEntries.reduce(
+      (total, entry) => total + toNumber(entry.durationMinutes),
+      0,
+    ),
+    downtimeReason: normalizedEntries
+      .map((entry) => [entry.category, entry.reason].filter(Boolean).join(": "))
+      .filter(Boolean)
+      .join("; ") || null,
+  };
+}
+
+function validateProductionLogQty(data = {}, formulas = null) {
   const qtyProduced = Number(data.qtyProduced || 0);
   const qtyGood = Number(data.qtyGood || 0);
   const qtyReject = Number(data.qtyReject || 0);
-  const allocatedQty = qtyGood + qtyReject;
+  const allocatedQty = formulas
+    ? evaluateFromSet(formulas, "PRODUCTION_ALLOCATED_QTY", { qtyGood, qtyReject })
+    : qtyGood + qtyReject;
 
   if (allocatedQty > qtyProduced) {
     throw Object.assign(
@@ -430,6 +570,9 @@ function normalizeApprovalQtyPayload(log = {}, body = {}) {
 
   const normalized = { qtyProduced, qtyGood, qtyReject, qtyRework };
   validateProductionLogQty(normalized);
+  if (Number(normalized.qtyReject || 0) > 0 && !hasText(normalized.rejectReason)) {
+    throw Object.assign(new Error("Reject reason wajib diisi jika qty reject lebih dari 0."), { statusCode: 400 });
+  }
   return normalized;
 }
 
@@ -1129,8 +1272,9 @@ function normalizeProductionLogAliases(data = {}) {
 }
 
 async function normalizeProductionLogInput(tx, data = {}, options = {}) {
+  const formulas = await getFormulaSet(tx, "production");
   const input = normalizeProductionLogAliases(data);
-  const schedule = await findDailyProductionSchedule(tx, {
+  let schedule = await findDailyProductionSchedule(tx, {
     dpsId: input.dpsId,
     scheduleNumber: input.scheduleNumber,
   });
@@ -1154,7 +1298,38 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
     copyPlannedQty: true,
     defaultShiftFromWorkOrder: true,
     requireWorkOrderInProgress: true,
+    autoStartAfterMaterialIssue: true,
   });
+  if (!schedule) {
+    schedule = await findRelatedDailyProductionSchedule(tx, {
+      woId: normalized.woId,
+      moId: normalized.moId,
+      logDate: normalized.logDate || input.logDate,
+      shift: normalized.shift || input.shift,
+      processCode: normalized.processCode || input.processCode,
+      machineCode: normalized.machineCode || input.machineCode,
+    });
+    if (schedule) {
+      if (normalized.woId && !schedule.woId) {
+        await tx.dailyProductionSchedule.update({
+          where: { id: schedule.id },
+          data: {
+            woId: normalized.woId,
+            woNumber: input.woNumber || null,
+          },
+        });
+        schedule.woId = normalized.woId;
+        schedule.woNumber = input.woNumber || schedule.woNumber;
+      }
+      normalized.dpsId = schedule.id;
+      normalized.logDate = normalized.logDate || schedule.scheduleDate || null;
+      normalized.shift = normalized.shift || schedule.shift || null;
+      normalized.qtyPlanned =
+        input.qtyPlanned !== undefined && input.qtyPlanned !== null
+          ? toNumber(input.qtyPlanned)
+          : toNumber(schedule.plannedQty);
+    }
+  }
   if (schedule && input.qtyPlanned !== undefined && input.qtyPlanned !== null) {
     normalized.qtyPlanned = toNumber(input.qtyPlanned);
   }
@@ -1198,7 +1373,12 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
     });
   }
 
-  validateProductionLogQty(normalized);
+  for (const field of ["qtyPlanned", "qtyProduced", "qtyGood", "qtyReject"]) {
+    if (normalized[field] !== undefined && normalized[field] !== null && normalized[field] !== "") {
+      assertQuantity(normalized[field], normalized.uomCode, field);
+    }
+  }
+  validateProductionLogQty(normalized, formulas);
   return normalized;
 }
 
@@ -1975,6 +2155,7 @@ exports.list = async (req, res, next) => {
       moNumber,
       woId,
       woNumber,
+      scheduleNumber,
       shift,
       machineCode,
       status,
@@ -1995,6 +2176,7 @@ exports.list = async (req, res, next) => {
     if (moNumber) where.manufacturingOrder = { moNumber };
     if (woId) where.woId = woId;
     if (woNumber) where.workOrder = { woNumber };
+    if (scheduleNumber) where.dailyProductionSchedule = { scheduleNumber };
     if (shift) where.shift = assertProductionShift(shift);
     if (machineCode)
       where.machineCode = { contains: machineCode, mode: "insensitive" };
@@ -2219,13 +2401,28 @@ exports.create = async (req, res, next) => {
       if (hasText(normalized.hmiTopic)) {
         normalized.status = "Submitted";
       }
+      const downtimeSummary = Array.isArray(req.body.downtimes)
+        ? summarizeDowntimeEntries(downtimes, {
+            ...normalized,
+            logDate: logDate ? new Date(logDate) : normalized.logDate || new Date(),
+          })
+        : null;
+      if (downtimeSummary) {
+        normalized.downtime = downtimeSummary.downtime;
+        normalized.downtimeReason = downtimeSummary.downtimeReason;
+      }
       const calculatedRunningMinutes = getDurationFromInput(startTime, endTime);
       if (normalized.runningMinutes === undefined && calculatedRunningMinutes !== null) {
         normalized.runningMinutes = calculatedRunningMinutes;
       }
+      // uomCode is a transient planning/validation value on a production log;
+      // the legacy production-log table has no persisted UOM column. Keep it
+      // available for quantity validation above, but never pass it to Prisma.
+      const persisted = { ...normalized };
+      delete persisted.uomCode;
       const productionLog = await tx.productionLog.create({
         data: {
-          ...normalized,
+          ...persisted,
           logNumber,
           logDate: logDate ? new Date(logDate) : normalized.logDate || new Date(),
           startTime: startTime ? new Date(startTime) : null,
@@ -2375,10 +2572,15 @@ exports.update = async (req, res, next) => {
       startTime,
       endTime,
       logDate,
+      downtimes,
       status: _status,
       logNumber: _logNumber,
       ...data
     } = req.body;
+    const downtimePayloadSupplied = Object.prototype.hasOwnProperty.call(
+      req.body,
+      "downtimes",
+    );
 
     const existing = await prisma.productionLog.findFirst({
       where: { logNumber: req.params.logNumber, isDeleted: false },
@@ -2396,65 +2598,98 @@ exports.update = async (req, res, next) => {
         });
     }
 
-    const updateData = await prisma.$transaction(async (tx) =>
-      normalizeProductionLogInput(tx, data),
-    );
-    if (logDate !== undefined)
-      updateData.logDate = logDate ? new Date(logDate) : null;
-    if (startTime !== undefined)
-      updateData.startTime = startTime ? new Date(startTime) : null;
-    if (endTime !== undefined)
-      updateData.endTime = endTime ? new Date(endTime) : null;
-    if (
-      updateData.runningMinutes === undefined &&
-      (startTime !== undefined || endTime !== undefined)
-    ) {
-      const calculatedRunningMinutes = getDurationFromInput(
-        startTime !== undefined ? startTime : updateData.startTime,
-        endTime !== undefined ? endTime : updateData.endTime,
-      );
-      if (calculatedRunningMinutes !== null) updateData.runningMinutes = calculatedRunningMinutes;
-    }
+    const doc = await prisma.$transaction(async (tx) => {
+      const updateData = await normalizeProductionLogInput(tx, data);
+      if (logDate !== undefined)
+        updateData.logDate = logDate ? new Date(logDate) : null;
+      if (startTime !== undefined)
+        updateData.startTime = startTime ? new Date(startTime) : null;
+      if (endTime !== undefined)
+        updateData.endTime = endTime ? new Date(endTime) : null;
+      if (
+        updateData.runningMinutes === undefined &&
+        (startTime !== undefined || endTime !== undefined)
+      ) {
+        const calculatedRunningMinutes = getDurationFromInput(startTime, endTime);
+        if (calculatedRunningMinutes !== null) updateData.runningMinutes = calculatedRunningMinutes;
+      }
+      if (downtimePayloadSupplied) {
+        const summary = summarizeDowntimeEntries(
+          Array.isArray(downtimes) ? downtimes : [],
+          {
+            ...updateData,
+            id: existing.id,
+            logDate: updateData.logDate || new Date(),
+          },
+        );
+        updateData.downtime = summary.downtime;
+        updateData.downtimeReason = summary.downtimeReason;
+      }
 
-    const doc = await prisma.productionLog.update({
-      where: { id: existing.id },
-      data: updateData,
-      include: {
-        dailyProductionSchedule: { select: { scheduleNumber: true } },
-        manufacturingOrder: {
-          select: {
-            moNumber: true,
-            part: {
-              select: { partCode: true, partNumber: true, partName: true },
+      const updated = await tx.productionLog.update({
+        where: { id: existing.id },
+        data: updateData,
+      });
+
+      if (downtimePayloadSupplied) {
+        await tx.downtimeLog.updateMany({
+          where: { productionLogId: existing.id, isDeleted: false },
+          data: { isDeleted: true, status: "Replaced" },
+        });
+        for (const entry of Array.isArray(downtimes) ? downtimes : []) {
+          const downtimeNumber = await generateDowntimeNumber(tx);
+          await tx.downtimeLog.create({
+            data: {
+              ...normalizeDowntimeEntry(entry, updated),
+              downtimeNumber,
+            },
+          });
+        }
+      }
+
+      return tx.productionLog.findUnique({
+        where: { id: existing.id },
+        include: {
+          dailyProductionSchedule: { select: { scheduleNumber: true } },
+          manufacturingOrder: {
+            select: {
+              moNumber: true,
+              part: {
+                select: { partCode: true, partNumber: true, partName: true },
+              },
             },
           },
-        },
-        workOrder: {
-          select: {
-            woNumber: true,
-            moId: true,
-            sequence: true,
-            notes: true,
-            mbomDetail: {
-              select: {
-                levelComponent: true,
-                part: {
-                  select: {
-                    partCode: true,
-                    partNumber: true,
-                    partName: true,
-                    material: { select: { spec: true } },
-                    partBases: {
-                      orderBy: { createdAt: "asc" },
-                      select: { baseOn: true, thickness: true, width: true, CSP: true },
+          workOrder: {
+            select: {
+              woNumber: true,
+              moId: true,
+              sequence: true,
+              notes: true,
+              mbomDetail: {
+                select: {
+                  levelComponent: true,
+                  part: {
+                    select: {
+                      partCode: true,
+                      partNumber: true,
+                      partName: true,
+                      material: { select: { spec: true } },
+                      partBases: {
+                        orderBy: { createdAt: "asc" },
+                        select: { baseOn: true, thickness: true, width: true, CSP: true },
+                      },
                     },
                   },
                 },
               },
             },
           },
+          downtimeLogs: {
+            where: { isDeleted: false },
+            orderBy: { startTime: "asc" },
+          },
         },
-      },
+      });
     });
 
     res.json(mapProductionLogDoc(await attachProductionOutputParts(doc)));
@@ -2630,7 +2865,16 @@ exports.submit = async (req, res, next) => {
   try {
     const existing = await prisma.productionLog.findUnique({
       where: { logNumber: req.params.logNumber },
-      select: { id: true, isDeleted: true, status: true },
+      select: {
+        id: true,
+        isDeleted: true,
+        status: true,
+        dpsId: true,
+        woId: true,
+        moId: true,
+        logDate: true,
+        shift: true,
+      },
     });
     if (!existing || existing.isDeleted)
       return res
@@ -2643,14 +2887,88 @@ exports.submit = async (req, res, next) => {
           message: `Log tidak bisa disubmit dari status "${existing.status}".`,
         });
     }
-    const doc = await prisma.productionLog.update({
-      where: { id: existing.id },
-      data: { status: "Submitted" },
+    const doc = await prisma.$transaction(async (tx) => {
+      const schedule = existing.dpsId
+        ? await tx.dailyProductionSchedule.findFirst({
+            where: { id: existing.dpsId, isDeleted: false },
+          })
+        : await findRelatedDailyProductionSchedule(tx, existing);
+      const relatedIssues = await tx.materialIssue.findMany({
+        where: {
+          isDeleted: false,
+          OR: [
+            ...(schedule?.scheduleNumber
+              ? [{ notes: { contains: `[DPS-CONSUME:${schedule.scheduleNumber}]` } }]
+              : []),
+            ...(existing.woId ? [{ woId: existing.woId }] : []),
+            ...(!existing.woId && existing.moId ? [{ moId: existing.moId }] : []),
+          ],
+        },
+        select: {
+          issueNumber: true,
+          status: true,
+          details: {
+            where: { isDeleted: false },
+            select: { id: true },
+            take: 1,
+          },
+        },
+      });
+      const materialBlockers = relatedIssues
+        .filter((issue) => issue.details.length > 0)
+        .filter((issue) => !["Issued", "Partially Returned", "Closed"].includes(issue.status))
+        .map((issue) => ({
+          severity: "BLOCKING",
+          code: "MATERIAL_ISSUE_NOT_POSTED",
+          title: issue.issueNumber,
+          message: `Material Issue ${issue.issueNumber} masih ${issue.status}; Inventory harus melakukan Consume / Issue terlebih dahulu.`,
+          issueNumber: issue.issueNumber,
+          href: `/modules/inventory/material-issues/${encodeURIComponent(issue.issueNumber)}`,
+        }));
+      if (materialBlockers.length) {
+        throw Object.assign(
+          new Error(`${materialBlockers.length} Material Issue belum diposting oleh Inventory.`),
+          { statusCode: 409, blockers: materialBlockers },
+        );
+      }
+
+      if (existing.woId) {
+        await tx.workOrder.updateMany({
+          where: {
+            id: existing.woId,
+            isDeleted: false,
+            status: { in: ["Released", "Material Issued"] },
+          },
+          data: { status: "In Production", startTime: new Date() },
+        });
+      }
+      if (schedule) {
+        await tx.dailyProductionSchedule.updateMany({
+          where: {
+            id: schedule.id,
+            isDeleted: false,
+            status: { in: ["Draft", "Released"] },
+          },
+          data: {
+            status: "In Progress",
+            ...(!schedule.woId && existing.woId
+              ? { woId: existing.woId }
+              : {}),
+          },
+        });
+      }
+      return tx.productionLog.update({
+        where: { id: existing.id },
+        data: {
+          status: "Submitted",
+          ...(schedule ? { dpsId: schedule.id } : {}),
+        },
+      });
     });
     res.json(mapDoc(doc));
   } catch (e) {
     if (e.statusCode)
-      return res.status(e.statusCode).json({ message: e.message });
+      return res.status(e.statusCode).json({ message: e.message, blockers: e.blockers || [] });
     next(e);
   }
 };
@@ -2668,7 +2986,16 @@ exports.approve = async (req, res, next) => {
       req.body?.failedDestination || req.body?.rejectDestination || legacyStockTarget;
     const existing = await prisma.productionLog.findUnique({
       where: { logNumber: req.params.logNumber },
-      select: { id: true, isDeleted: true, status: true, woId: true, dpsId: true },
+      select: {
+        id: true,
+        isDeleted: true,
+        status: true,
+        woId: true,
+        moId: true,
+        dpsId: true,
+        logDate: true,
+        shift: true,
+      },
     });
     if (!existing || existing.isDeleted)
       return res
@@ -2683,6 +3010,12 @@ exports.approve = async (req, res, next) => {
     }
 
     const doc = await prisma.$transaction(async (tx) => {
+      const relatedSchedule = existing.dpsId
+        ? await tx.dailyProductionSchedule.findFirst({
+            where: { id: existing.dpsId, isDeleted: false },
+          })
+        : await findRelatedDailyProductionSchedule(tx, existing);
+      if (relatedSchedule && !existing.dpsId) existing.dpsId = relatedSchedule.id;
       const currentLog = await tx.productionLog.findUnique({
         where: { id: existing.id },
         select: {
@@ -2696,7 +3029,11 @@ exports.approve = async (req, res, next) => {
 
       const updated = await tx.productionLog.update({
         where: { id: existing.id },
-        data: { ...approvedQty, status: "Approved" },
+        data: {
+          ...approvedQty,
+          status: "Approved",
+          ...(relatedSchedule ? { dpsId: relatedSchedule.id } : {}),
+        },
         include: {
           manufacturingOrder: {
             select: {

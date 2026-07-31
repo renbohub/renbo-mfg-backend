@@ -47,7 +47,8 @@ exports.list = async (req, res, next) => {
   try {
     const page = Math.max(number(req.query.page) || 1, 1); const limit = Math.min(Math.max(number(req.query.limit) || 20, 1), 500);
     const q = text(req.query.q || req.query.search);
-    const where = { isDeleted: false, ...(q ? { OR: [
+    const status = text(req.query.status);
+    const where = { isDeleted: false, ...(status ? { status } : {}), ...(q ? { OR: [
       { quotationNumber: { contains: q, mode: "insensitive" } }, { customerName: { contains: q, mode: "insensitive" } },
       { customerCode: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } },
     ] } : {}) };

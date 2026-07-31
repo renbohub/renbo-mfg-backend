@@ -29,6 +29,7 @@ const {
   generateVendorProcessOrdersFromRouting,
   getVendorRoutingOperations,
 } = require("./VendorProcessOrderController");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 // Pesan error standar
 const PO_NUMBER_CONFLICT = "Nomor Manufacturing Order sudah digunakan.";
@@ -72,6 +73,12 @@ const sourceWipAllocationSelect = {
 function normalizeMoReferenceInput(data = {}) {
   const {
     soNumber: _soNumber,
+    // Display-only fields are accepted by the UI payload but are represented
+    // by the normalized partId relation in the MO schema. Never pass these
+    // denormalized labels into Prisma create/update data.
+    partCode: _partCode,
+    partNumber: _partNumber,
+    partName: _partName,
     monthlyProductionPlanNumber: _monthlyProductionPlanNumber,
     monthlyProductionPlanLineNumber: _monthlyProductionPlanLineNumber,
     ...rest
@@ -1264,6 +1271,21 @@ async function prepareMonthlyProductionPlanMoData(client, rawData, rawDates = {}
   if (!monthlyProductionPlanDetail) {
     throw Object.assign(new Error("Line monthly production plan tidak ditemukan."), { status: 404 });
   }
+  // Process/WIP/child-FG rows in a monthly plan are routing outputs, not
+  // standalone manufacturing orders. Only the non-generated FG parent line
+  // may become an MO; WO and Daily Plan execute every child process below it.
+  const partWhere = monthlyProductionPlanDetail.partId
+    ? { id: monthlyProductionPlanDetail.partId }
+    : { partCode: monthlyProductionPlanDetail.partCode };
+  const detailPart = await client.part.findFirst({
+    where: { ...partWhere, isDeleted: false },
+    select: { itemType: true },
+  });
+  const isParentFgLine = String(detailPart?.itemType || "").toUpperCase() === "FG"
+    && !String(monthlyProductionPlanDetail.notes || "").includes("[MRP-PRODUCTION]");
+  if (!isParentFgLine) {
+    throw Object.assign(new Error(`MPP line ${lineNumber} (${monthlyProductionPlanDetail.partCode}) adalah child/process; MO hanya dibuat untuk FG parent.`), { status: 409, code: "CHILD_MO_NOT_ALLOWED" });
+  }
   if (monthlyProductionPlanDetail.status === "Converted") {
     throw Object.assign(new Error("Line monthly production plan sudah fully released ke MO."), { status: 409 });
   }
@@ -1711,6 +1733,15 @@ exports.create = async (req, res, next) => {
       if (!monthlyProductionPlanDetail) {
         return res.status(404).json({ message: "Line monthly production plan tidak ditemukan." });
       }
+      const detailPart = await prisma.part.findFirst({
+        where: { ...(monthlyProductionPlanDetail.partId ? { id: monthlyProductionPlanDetail.partId } : { partCode: monthlyProductionPlanDetail.partCode }), isDeleted: false },
+        select: { itemType: true },
+      });
+      const isParentFgLine = String(detailPart?.itemType || "").toUpperCase() === "FG"
+        && !String(monthlyProductionPlanDetail.notes || "").includes("[MRP-PRODUCTION]");
+      if (!isParentFgLine) {
+        return res.status(409).json({ message: `MPP line ${lineNumber} (${monthlyProductionPlanDetail.partCode}) adalah child/process; MO hanya dibuat untuk FG parent.`, code: "CHILD_MO_NOT_ALLOWED" });
+      }
       if (monthlyProductionPlanDetail.status === "Converted") {
         return res.status(409).json({ message: "Line monthly production plan sudah fully released ke MO." });
       }
@@ -1806,6 +1837,9 @@ exports.create = async (req, res, next) => {
       data.partId = data.partId ?? po.partId ?? null;
     }
 
+    if (data.qtyPlanned !== undefined && data.qtyPlanned !== null) {
+      assertQuantity(data.qtyPlanned, data.uomCode, "Qty MO");
+    }
     const moNumber = await generateMoNumber();
 
 	    const doc = await prisma.$transaction(async (tx) => {
@@ -1879,11 +1913,82 @@ exports.create = async (req, res, next) => {
   }
 };
 
+async function filterBulkMonthlyPlanMoItems(client, items) {
+  const monthlyItems = items.filter((item) =>
+    normalizeMoReferenceInput(item).referenceType === "MonthlyProductionPlan"
+    && item.monthlyProductionPlanNumber
+    && Number.isFinite(Number(item.monthlyProductionPlanLineNumber)));
+  if (!monthlyItems.length) return { eligibleItems: items, skippedItems: [] };
+
+  const planNumbers = [...new Set(monthlyItems.map((item) => item.monthlyProductionPlanNumber))];
+  const lineNumbers = [...new Set(monthlyItems.map((item) => Number(item.monthlyProductionPlanLineNumber)))];
+  const details = await client.monthlyProductionPlanDetail.findMany({
+    where: {
+      isDeleted: false,
+      lineNumber: { in: lineNumbers },
+      plan: { planNumber: { in: planNumbers }, isDeleted: false },
+    },
+    select: {
+      lineNumber: true,
+      partId: true,
+      partCode: true,
+      notes: true,
+      plan: { select: { planNumber: true } },
+    },
+  });
+  const partIds = [...new Set(details.map((detail) => detail.partId).filter(Boolean))];
+  const partCodes = [...new Set(details.map((detail) => detail.partCode).filter(Boolean))];
+  const parts = partIds.length || partCodes.length ? await client.part.findMany({
+    where: {
+      isDeleted: false,
+      OR: [
+        ...(partIds.length ? [{ id: { in: partIds } }] : []),
+        ...(partCodes.length ? [{ partCode: { in: partCodes } }] : []),
+      ],
+    },
+    select: { id: true, partCode: true, partName: true, itemType: true },
+  }) : [];
+  const detailByReference = new Map(details.map((detail) => [
+    `${detail.plan.planNumber}|${detail.lineNumber}`,
+    detail,
+  ]));
+  const partById = new Map(parts.map((part) => [part.id, part]));
+  const partByCode = new Map(parts.map((part) => [part.partCode, part]));
+  const skippedItems = [];
+  const eligibleItems = items.filter((item) => {
+    const normalized = normalizeMoReferenceInput(item);
+    if (normalized.referenceType !== "MonthlyProductionPlan") return true;
+    const detail = detailByReference.get(`${item.monthlyProductionPlanNumber}|${Number(item.monthlyProductionPlanLineNumber)}`);
+    if (!detail) return true;
+    const part = partById.get(detail.partId) || partByCode.get(detail.partCode) || null;
+    const isParentFgLine = String(part?.itemType || "").toUpperCase() === "FG"
+      && !String(detail.notes || "").includes("[MRP-PRODUCTION]");
+    if (isParentFgLine) return true;
+    skippedItems.push({
+      monthlyProductionPlanNumber: item.monthlyProductionPlanNumber,
+      monthlyProductionPlanLineNumber: Number(item.monthlyProductionPlanLineNumber),
+      partCode: detail.partCode,
+      partName: part?.partName || null,
+      reason: "CHILD_PROCESS_EXECUTED_BY_PARENT_MO",
+    });
+    return false;
+  });
+  return { eligibleItems, skippedItems };
+}
+
 exports.bulkCreate = async (req, res, next) => {
   try {
-    const { items } = req.body;
-    if (!Array.isArray(items) || items.length === 0) {
+    const rawItems = req.body?.items;
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
       return res.status(400).json({ message: "items array required" });
+    }
+    const { eligibleItems: items, skippedItems } = await filterBulkMonthlyPlanMoItems(prisma, rawItems);
+    if (!items.length) {
+      return res.status(409).json({
+        message: "Tidak ada FG parent yang dapat dibuat menjadi MO. Child/process akan dieksekusi melalui routing, WO, dan Daily Plan dari MO parent.",
+        code: "FG_PARENT_MO_REQUIRED",
+        skippedItems,
+      });
     }
 
     const created = await prisma.$transaction(async (tx) => {
@@ -2051,7 +2156,15 @@ exports.bulkCreate = async (req, res, next) => {
     });
 
     emitManufacturingOrderBulkUpdate(created, "create", req.user?.username || "system");
-    res.status(201).json({ items: created.map(mapDoc), total: created.length });
+    res.status(201).json({
+      items: created.map(mapDoc),
+      total: created.length,
+      skippedItems,
+      skippedCount: skippedItems.length,
+      message: skippedItems.length
+        ? `${created.length} MO FG parent dibuat; ${skippedItems.length} line child/process dijalankan melalui routing parent.`
+        : `${created.length} MO FG parent dibuat.`,
+    });
   } catch (e) {
     if (e.status) return res.status(e.status).json({ message: e.message });
     if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {

@@ -6,7 +6,8 @@ router.get("/generate-number", authorize("salesOrder", "create"), ctrl.generateN
 router.get("/", authorize("salesOrder", "read"), ctrl.list);
 router.get("/:soNumber", authorize("salesOrder", "read"), ctrl.get);
 router.post("/", authorize("salesOrder", "create"), logger("salesOrder", "create"), ctrl.create);
+router.post("/:soNumber/revise", authorize("salesOrder", "update"), logger("salesOrder", "revise"), ctrl.revise);
+router.patch("/:soNumber/confirm", authorize("salesOrder", "approve"), logger("salesOrder", "confirm"), ctrl.confirm);
 router.patch("/:soNumber", authorize("salesOrder", "update"), logger("salesOrder", "update", { modelName: "salesOrderHeader", paramKey: "soNumber", whereKey: "soNumber" }), ctrl.update);
 router.delete("/:soNumber", authorize("salesOrder", "delete"), logger("salesOrder", "delete", { paramKey: "soNumber", entityField: "soNumber" }), ctrl.remove);
 module.exports = router;
-

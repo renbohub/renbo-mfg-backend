@@ -20,10 +20,26 @@ const parseBoolean = (value) => {
 
 const normalizeRackPayload = (payload = {}) => {
   const normalized = convertNumericFields(payload, ["capacity"]);
+  if (Object.prototype.hasOwnProperty.call(normalized, "warehouseCode")) {
+    normalized.warehouseCode = String(normalized.warehouseCode || "").trim() || null;
+  }
   if (normalized.isActive !== undefined) {
     normalized.isActive = parseBoolean(normalized.isActive);
   }
   return normalized;
+};
+
+const assertWarehouse = async (warehouseCode) => {
+  if (!warehouseCode) return;
+  const warehouse = await prisma.warehouse.findFirst({
+    where: { warehouseCode, isDeleted: false },
+    select: { warehouseCode: true },
+  });
+  if (!warehouse) {
+    const error = new Error("Warehouse rack tidak ditemukan atau sudah dihapus.");
+    error.statusCode = 400;
+    throw error;
+  }
 };
 
 const normalizeExcludeRackCodes = (excludeFilter) => {
@@ -196,6 +212,7 @@ exports.list = async (req, res, next) => {
       isDeleted,
       isActive,
       zone,
+      warehouseCode,
       page = 1,
       limit = 20,
       includeSpecial,
@@ -217,6 +234,9 @@ exports.list = async (req, res, next) => {
     if (zone) {
       where.zone = zone;
     }
+    if (warehouseCode) {
+      where.warehouseCode = String(warehouseCode);
+    }
 
     if (q) {
       where.OR = [
@@ -235,6 +255,7 @@ exports.list = async (req, res, next) => {
     const [items, total] = await Promise.all([
       prisma.rack.findMany({
         where,
+        include: { warehouse: { select: { warehouseCode: true, warehouseName: true } } },
         orderBy,
         skip,
         take: limitNumber,
@@ -330,6 +351,7 @@ exports.get = async (req, res, next) => {
 
     const rack = await prisma.rack.findUnique({
       where: { rackCode: code },
+      include: { warehouse: { select: { warehouseCode: true, warehouseName: true } } },
     });
 
     if (!rack) {
@@ -348,9 +370,11 @@ exports.get = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const data = normalizeRackPayload(req.body);
+    await assertWarehouse(data.warehouseCode);
 
     const rack = await prisma.rack.create({
       data,
+      include: { warehouse: { select: { warehouseCode: true, warehouseName: true } } },
     });
 
     res.status(201).json(mapDoc(rack));
@@ -366,10 +390,12 @@ exports.update = async (req, res, next) => {
   try {
     const { code } = req.params;
     const data = normalizeRackPayload(req.body);
+    await assertWarehouse(data.warehouseCode);
 
     const rack = await prisma.rack.update({
       where: { rackCode: code },
       data,
+      include: { warehouse: { select: { warehouseCode: true, warehouseName: true } } },
     });
 
     res.json(mapDoc(rack));

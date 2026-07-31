@@ -4,6 +4,67 @@ const { mapDoc } = require("../../utils/mapDoc");
 const { convertNumericFields } = require("../../utils/numericConverter");
 
 const MATERIAL_NUMERIC_FIELDS = ["density", "thickness", "width"];
+const MATERIAL_INCLUDE = {
+  materialSubstance: true,
+  materialGradeRef: { include: { density: true, substance: true } },
+  materialFormRef: true,
+  materialDensityRef: true,
+};
+
+async function applyMaterialMasterLookups(data, current = {}) {
+  const merged = { ...current, ...data };
+  const result = { ...data };
+  let grade = null;
+
+  if (merged.materialGradeId) {
+    grade = await prisma.materialGrade.findFirst({
+      where: { id: merged.materialGradeId, isDeleted: false },
+      include: { substance: true, density: true },
+    });
+    if (!grade) throw Object.assign(new Error("Material grade tidak ditemukan."), { status: 400 });
+    result.materialSubstanceId = grade.substanceId;
+    result.materialGrade = grade.gradeCode;
+    result.spec = grade.spec || grade.gradeCode;
+    result.thickness = grade.thickness;
+    if (grade.density) {
+      result.materialDensityId = grade.densityId;
+      result.density = grade.density.densityKgMm3;
+    }
+  }
+
+  const substanceId = result.materialSubstanceId ?? merged.materialSubstanceId;
+  if (substanceId) {
+    const substance = grade?.substance || await prisma.materialSubstance.findFirst({
+      where: { id: substanceId, isDeleted: false },
+    });
+    if (!substance) throw Object.assign(new Error("Bahan material tidak ditemukan."), { status: 400 });
+    result.materialSubstanceId = substance.id;
+    result.materialType = substance.substanceName;
+  }
+
+  if (merged.materialDensityId && !grade?.density) {
+    const density = await prisma.materialDensity.findFirst({
+      where: { id: merged.materialDensityId, isDeleted: false },
+    });
+    if (!density) throw Object.assign(new Error("Berat jenis material tidak ditemukan."), { status: 400 });
+    if (substanceId && density.substanceId !== substanceId) {
+      throw Object.assign(new Error("Berat jenis harus mengikuti bahan material yang dipilih."), { status: 400 });
+    }
+    result.density = density.densityKgMm3;
+  }
+
+  // Coil/Sheet/Pieces (C/S/P) is a manufacturing/purchasing form, not part of
+  // Material Master identity. It is selected per default/alternative BOM.
+  return {
+    ...result,
+    materialFormId: null,
+    materialForm: null,
+    CSP: null,
+    defaultPurchaseUomCode: null,
+    defaultConversionUomCode: null,
+    defaultConversionFactor: null,
+  };
+}
 
 const formatMaterialCodePart = (value) => {
   if (value === null || value === undefined || value === "") return "";
@@ -20,11 +81,37 @@ const buildMaterialCode = (data) => {
   const spec = formatMaterialCodePart(data.spec);
   const thickness = formatMaterialCodePart(data.thickness);
   const width = formatMaterialCodePart(data.width);
-  const csp = formatMaterialCodePart(data.CSP);
 
   if (!spec) return "";
-  return [spec, thickness, width, csp].filter(Boolean).join("-");
+  return [spec, thickness, width].filter(Boolean).join("-");
 };
+
+const materialIdentityWhere = (data, excludeId = null) => ({
+  isDeleted: false,
+  materialSubstanceId: data.materialSubstanceId || null,
+  materialGradeId: data.materialGradeId || null,
+  width: Number(data.width),
+  ...(excludeId ? { id: { not: excludeId } } : {}),
+});
+
+async function assertUniqueMaterialIdentity(data, excludeId = null) {
+  if (!data.materialSubstanceId || !data.materialGradeId || !Number.isFinite(Number(data.width))) {
+    throw Object.assign(
+      new Error("Material Grade dan Width wajib diisi. Bahan serta thickness mengikuti Material Grade."),
+      { status: 400 },
+    );
+  }
+  const duplicate = await prisma.material.findFirst({
+    where: materialIdentityWhere(data, excludeId),
+    select: { materialCode: true },
+  });
+  if (duplicate) {
+    throw Object.assign(
+      new Error(`Material dengan bahan, grade/thickness, dan width yang sama sudah ada: ${duplicate.materialCode}. Form C/S/P dipilih di BOM.`),
+      { status: 409 },
+    );
+  }
+}
 
 const applyMaterialCode = (data) => {
   const materialCode = buildMaterialCode(data);
@@ -93,7 +180,7 @@ exports.list = async (req, res, next) => {
     }
 
     if (category) {
-      where.category = category;
+      where.itemCategory = category;
     }
 
     if (materialCode) {
@@ -155,6 +242,7 @@ exports.list = async (req, res, next) => {
     const [items, total] = await Promise.all([
       prisma.material.findMany({
         where,
+        include: MATERIAL_INCLUDE,
         orderBy,
         skip,
         take: Number(limit),
@@ -177,6 +265,7 @@ exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.material.findFirst({
       where: { materialCode: req.params.materialCode, isDeleted: false },
+      include: MATERIAL_INCLUDE,
     });
     if (!doc) return res.status(404).json({ message: "Material not found" });
     res.json(mapDoc(doc));
@@ -187,7 +276,9 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const convertedData = applyMaterialCode(convertNumericFields(req.body, MATERIAL_NUMERIC_FIELDS));
+    const lookupData = await applyMaterialMasterLookups(convertNumericFields(req.body, MATERIAL_NUMERIC_FIELDS));
+    const convertedData = applyMaterialCode(lookupData);
+    await assertUniqueMaterialIdentity(convertedData);
 
     // Cek apakah material dengan materialCode yang sama sudah ada dan soft deleted
     const existing = await prisma.material.findUnique({
@@ -200,10 +291,12 @@ exports.create = async (req, res, next) => {
       doc = await prisma.material.update({
         where: { id: existing.id },
         data: { ...convertedData, isDeleted: false },
+        include: MATERIAL_INCLUDE,
       });
     } else {
       doc = await prisma.material.create({
         data: convertedData,
+        include: MATERIAL_INCLUDE,
       });
     }
 
@@ -226,11 +319,14 @@ exports.update = async (req, res, next) => {
       return res.status(404).json({ message: "Material not found" });
     }
 
-    const materialCode = buildMaterialCode({ ...currentMaterial, ...convertedData });
+    const lookupData = await applyMaterialMasterLookups(convertedData, currentMaterial);
+    const normalizedData = lookupData;
+    const materialCode = buildMaterialCode({ ...currentMaterial, ...normalizedData });
     if (!materialCode) {
       return res.status(400).json({ message: "Spec is required to generate material code" });
     }
-    const updateData = { ...convertedData, materialCode };
+    const updateData = { ...normalizedData, materialCode };
+    await assertUniqueMaterialIdentity({ ...currentMaterial, ...updateData }, currentMaterial.id);
 
     // Jika materialCode berubah, cek apakah ada material soft deleted dengan code yang sama
     if (
@@ -256,6 +352,7 @@ exports.update = async (req, res, next) => {
     const doc = await prisma.material.update({
       where: { id: req.params.id },
       data: updateData,
+      include: MATERIAL_INCLUDE,
     });
 
     res.json(mapDoc(doc));
@@ -310,7 +407,9 @@ exports.bulkCreate = async (req, res, next) => {
     // Process setiap material
     for (const materialData of materials) {
       try {
-        const processedData = applyMaterialCode(convertNumericFields(materialData, MATERIAL_NUMERIC_FIELDS));
+        const lookupData = await applyMaterialMasterLookups(convertNumericFields(materialData, MATERIAL_NUMERIC_FIELDS));
+        const processedData = applyMaterialCode(lookupData);
+        await assertUniqueMaterialIdentity(processedData);
 
         // Cek existing material
         const existing = await prisma.material.findUnique({
@@ -335,11 +434,13 @@ exports.bulkCreate = async (req, res, next) => {
               ...processedData,
               isDeleted: false,
             },
+            include: MATERIAL_INCLUDE,
           });
         } else {
           // Create material baru
           doc = await prisma.material.create({
             data: processedData,
+            include: MATERIAL_INCLUDE,
           });
         }
 
@@ -386,7 +487,18 @@ exports.autocomplete = async (req, res, next) => {
         thickness: true,
         width: true,
         CSP: true,
-        density: true,
+         density: true,
+        defaultPurchaseUomCode: true,
+        defaultConversionUomCode: true,
+        defaultConversionFactor: true,
+        materialSubstanceId: true,
+        materialGradeId: true,
+        materialFormId: true,
+        materialDensityId: true,
+        materialSubstance: true,
+        materialGradeRef: { include: { density: true, substance: true } },
+        materialFormRef: true,
+        materialDensityRef: true,
       },
       take: Number(limit),
       orderBy: { materialCode: "asc" },

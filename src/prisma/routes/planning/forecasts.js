@@ -1,12 +1,18 @@
 const router = require("express").Router();
 const ctrl = require("../../controllers/planning/ForecastController");
+const planningTool = require("../../controllers/planning/ForecastPlanningToolController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 router.get("/generate-number", authorize("forecast", "create"), ctrl.generateNumber);
+router.get("/planning-tool", authorize("forecast", "read"), planningTool.status);
+router.get("/demand-summary", authorize("forecast", "read"), ctrl.demandSummary);
 router.get("/", authorize("forecast", "read"), ctrl.list);
 router.get("/:forecastNumber", authorize("forecast", "read"), ctrl.get);
 router.post("/", authorize("forecast", "create"), logger("forecast", "create"), ctrl.create);
+router.post("/:forecastNumber/revise", authorize("forecast", "update"), logger("forecast", "revise"), ctrl.revise);
+router.post("/:forecastNumber/submit", authorize("forecast", "update"), logger("forecast", "submit"), ctrl.submit);
+router.post("/:forecastNumber/close", authorize("forecast", "update"), logger("forecast", "close"), ctrl.close);
+router.post("/:forecastNumber/planning-tool/sync", authorize("forecast", "update"), logger("forecast", "planning-tool-sync"), planningTool.sync);
 router.patch("/:forecastNumber", authorize("forecast", "update"), logger("forecast", "update", { modelName: "forecast", paramKey: "forecastNumber", whereKey: "forecastNumber" }), ctrl.update);
 router.delete("/:forecastNumber", authorize("forecast", "delete"), logger("forecast", "delete", { paramKey: "forecastNumber", entityField: "forecastNumber" }), ctrl.remove);
 module.exports = router;
-

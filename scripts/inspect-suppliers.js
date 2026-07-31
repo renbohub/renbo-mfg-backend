@@ -1,0 +1,2 @@
+require("dotenv").config({ quiet: true }); const { prisma } = require("../src/prisma");
+(async()=>{console.log(JSON.stringify({suppliers:await prisma.supplier.findMany({where:{isDeleted:false},select:{supplierCode:true,supplierName:true,leadTimeDays:true,status:true}}),items:await prisma.supplierItem.findMany({where:{isActive:true},select:{partId:true,supplierId:true,leadTimeDays:true,isPreferred:true,priority:true,supplier:{select:{supplierCode:true,supplierName:true,leadTimeDays:true}}}})},null,2))})().finally(()=>prisma.$disconnect());

@@ -111,6 +111,7 @@ async function findWorkOrder(tx, { woId, woNumber } = {}) {
     where,
     include: {
       machine: { select: { machineCode: true } },
+      process: { select: { processCode: true, processName: true } },
       manufacturingOrder: { select: { id: true, moNumber: true } },
     },
   });
@@ -120,17 +121,38 @@ async function findWorkOrder(tx, { woId, woNumber } = {}) {
 
 async function resolveProductionRefs(tx, data = {}, options = {}) {
   const normalized = { ...data };
-  const wo = await findWorkOrder(tx, {
+  let wo = await findWorkOrder(tx, {
     woId: normalized.woId,
     woNumber: normalized.woNumber,
   });
 
   if (wo) {
     if (options.requireWorkOrderInProgress && !isWorkOrderProductionStatus(wo.status)) {
-      throw httpError(
-        `Production Log hanya bisa dibuat untuk WO In Production. Status WO sekarang "${wo.status}".`,
-        409,
-      );
+      if (options.autoStartAfterMaterialIssue && wo.status === "Material Issued") {
+        const issuedMaterial = await tx.materialIssue.count({
+          where: {
+            woId: wo.id,
+            isDeleted: false,
+            status: { in: ["Issued", "Partially Returned", "Closed"] },
+          },
+        });
+        if (!issuedMaterial) {
+          throw httpError(
+            `WO ${wo.woNumber} berstatus Material Issued tetapi dokumen Material Issue belum diposting oleh Inventory.`,
+            409,
+          );
+        }
+        await tx.workOrder.update({
+          where: { id: wo.id },
+          data: { status: "In Production", startTime: wo.startTime || new Date() },
+        });
+        wo = { ...wo, status: "In Production", startTime: wo.startTime || new Date() };
+      } else {
+        throw httpError(
+          `Production Log hanya bisa dibuat untuk WO In Production. Status WO sekarang "${wo.status}".`,
+          409,
+        );
+      }
     }
     if (normalized.moNumber && wo.manufacturingOrder?.moNumber !== normalized.moNumber) {
       throw httpError(
@@ -143,7 +165,9 @@ async function resolveProductionRefs(tx, data = {}, options = {}) {
     normalized.moId = wo.moId;
     normalized.shift = wo.shift || normalized.shift || (options.defaultShiftFromWorkOrder ? "1A" : null);
     normalized.machineCode = wo.machine?.machineCode || normalized.machineCode || null;
+    normalized.processCode = wo.process?.processCode || normalized.processCode || null;
     normalized.operatorName = wo.operatorName || normalized.operatorName || null;
+    normalized.uomCode = normalized.uomCode || wo.uomCode || wo.manufacturingOrder?.uomCode || null;
 
     if (options.copyPlannedQty) normalized.qtyPlanned = wo.plannedQty ?? 0;
   }

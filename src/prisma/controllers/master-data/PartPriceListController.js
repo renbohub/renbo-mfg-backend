@@ -9,6 +9,30 @@ const includePartPriceList = {
   supplier: true,
 };
 
+async function assertPurchasePart(partId) {
+  if (!partId) {
+    const error = new Error("Part wajib dipilih.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const part = await prisma.part.findFirst({
+    where: { id: partId, isDeleted: false },
+    select: { id: true, itemType: true, rawType: true },
+  });
+  if (!part) {
+    const error = new Error("Part tidak ditemukan atau sudah tidak aktif.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (String(part.itemType || "").toUpperCase() !== "RAW" || String(part.rawType || "").toUpperCase() !== "PURCHASE_PART") {
+    const error = new Error("Part Price List hanya dapat dibuat untuk Purchase Part (RAW / PURCHASE_PART).");
+    error.statusCode = 400;
+    throw error;
+  }
+  return part;
+}
+
 exports.list = async (req, res, next) => {
   try {
     const { q, isDeleted, page = 1, limit = 20 } = req.query;
@@ -76,6 +100,7 @@ exports.get = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const convertedData = convertPriceListFields(req.body);
+    await assertPurchasePart(convertedData.partId);
     const doc = await prisma.partPriceList.create({
       data: convertedData,
       include: includePartPriceList,
@@ -90,6 +115,12 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const convertedData = convertPriceListFields(req.body);
+    const existing = await prisma.partPriceList.findFirst({
+      where: { id: req.params.id, isDeleted: false },
+      select: { partId: true },
+    });
+    if (!existing) return res.status(404).json({ message: "PartPriceList not found" });
+    await assertPurchasePart(convertedData.partId || existing.partId);
     const doc = await prisma.partPriceList.update({
       where: { id: req.params.id },
       data: convertedData,
@@ -171,6 +202,8 @@ exports.bulkCreate = async (req, res, next) => {
             convertedData.partId = part.id;
           }
         }
+
+        await assertPurchasePart(convertedData.partId);
 
         // Create part price list baru
         const doc = await prisma.partPriceList.create({

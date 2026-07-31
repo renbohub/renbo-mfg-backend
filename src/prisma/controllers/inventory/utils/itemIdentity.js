@@ -1,5 +1,5 @@
 const IDENTITY_REQUIRED_MESSAGE =
-  "Isi minimal salah satu identitas item: part(partId/partCode/partNumber), product(productId/productCode), description, atau kombinasi spec+thickness+width+CSP";
+  "Isi minimal salah satu identitas item: material(materialId/materialCode), part(partId/partCode/partNumber), product(productId/productCode), description, atau kombinasi spec+thickness+width+CSP";
 
 const normalizeText = (value) => {
   if (typeof value !== "string") return null;
@@ -106,6 +106,10 @@ const sanitizeItemIdentityFields = (item = {}) => {
 };
 
 const resolveIdentityCore = (source = {}) => {
+  const materialId = normalizeText(source.materialId) || normalizeText(source.material?.id);
+  const materialCode = normalizeText(source.materialCode) || normalizeText(source.material?.materialCode);
+  const materialName = normalizeText(source.materialName) || normalizeText(source.material?.materialName);
+  const materialType = normalizeText(source.materialType) || normalizeText(source.material?.materialType);
   const partCode = normalizeText(source.partCode) || normalizeText(source.part?.partCode);
   const partId = normalizeText(source.partId) || normalizeText(source.part?.id);
   const partNumber = normalizeText(source.partNumber) || normalizeText(source.part?.partNumber);
@@ -132,6 +136,10 @@ const resolveIdentityCore = (source = {}) => {
   const resolvedCsp = csp || legacyIdentity?.CSP || null;
 
   return {
+    materialId,
+    materialCode,
+    materialName,
+    materialType,
     partCode,
     partId,
     partNumber,
@@ -148,7 +156,9 @@ const resolveIdentityCore = (source = {}) => {
 
 const hasItemIdentity = (identity = {}) =>
   Boolean(
-    identity.partCode ||
+    identity.materialCode ||
+      identity.materialId ||
+      identity.partCode ||
       identity.partNumber ||
       identity.productId ||
       identity.description ||
@@ -159,6 +169,17 @@ const hasItemIdentity = (identity = {}) =>
   );
 
 const buildIdentityWhere = (identity = {}) => {
+  if (identity.materialCode || identity.materialId) {
+    return {
+      materialCode: identity.materialCode || null,
+      ...(identity.materialId ? { materialId: identity.materialId } : {}),
+      partCode: null,
+      productId: null,
+      description: null,
+      partNumber: null,
+      ...buildSpecIdentityWhere(identity),
+    };
+  }
   if (identity.partCode) {
     return {
       partCode: identity.partCode,
@@ -219,6 +240,8 @@ const buildIdentityWhere = (identity = {}) => {
 
 const buildIdentityKey = (identity = {}) =>
   [
+    normalizeText(identity.materialCode) || "",
+    normalizeText(identity.materialId) || "",
     normalizeText(identity.partCode) || "",
     normalizeText(identity.partNumber) || "",
     normalizeText(identity.productId) || "",
@@ -238,6 +261,38 @@ const resolveItemIdentity = (source = {}) => resolveIdentityCore(source);
 const resolveItemIdentityInput = async (db, source = {}, options = {}) => {
   let identity = resolveIdentityCore(source);
   const shouldEnrichPartSnapshot = options.enrichPartSnapshot === true;
+
+  if (identity.materialId || identity.materialCode) {
+    const material = await db.material.findFirst({
+      where: {
+        isDeleted: false,
+        ...(identity.materialId ? { id: identity.materialId } : { materialCode: identity.materialCode }),
+      },
+      select: {
+        id: true,
+        materialCode: true,
+        materialName: true,
+        materialType: true,
+        spec: true,
+        thickness: true,
+        width: true,
+        CSP: true,
+      },
+    });
+    if (material) {
+      identity = {
+        ...identity,
+        materialId: material.id,
+        materialCode: material.materialCode,
+        materialName: identity.materialName || material.materialName || null,
+        materialType: identity.materialType || material.materialType || null,
+        spec: identity.spec || material.spec || null,
+        thickness: identity.thickness ?? material.thickness ?? null,
+        width: identity.width ?? material.width ?? null,
+        CSP: identity.CSP || material.CSP || null,
+      };
+    }
+  }
 
   if (!identity.partCode && identity.partId) {
     const part = await db.part.findFirst({

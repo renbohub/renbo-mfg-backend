@@ -1,0 +1,62 @@
+const fs = require("fs");
+const path = require("path");
+
+const root = path.resolve(__dirname, "..");
+const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
+const po = read("src/prisma/controllers/purchasing/PurchaseOrderController.js");
+const pr = read("src/prisma/controllers/purchasing/PurchaseRequisitionController.js");
+const poRoutes = read("src/prisma/routes/purchasing/purchase-orders.js");
+const invoiceRoutes = read("src/prisma/routes/purchasing/purchase-invoices.js");
+const reports = read("src/prisma/controllers/reporting/P2ReportingController.js");
+const frontendDetail = read("../frontend/public/js/operations-detail.js");
+const frontendPrForm = read("../frontend/public/js/purchasing-pr-form.js");
+const frontendModuleRoutes = read("../frontend/src/routes/modules.js");
+const frontendSupplyForm = read("../frontend/public/js/supply-chain-form.js");
+const frontendInventoryForm = read("../frontend/public/js/inventory-form.js");
+const frontendInventoryView = read("../frontend/views/inventory/form.ejs");
+const incoming = read("src/prisma/controllers/incoming/IncomingTransactionController.js");
+const inventoryMovement = read("src/prisma/controllers/inventory/StockMovementController.js");
+const rackController = read("src/prisma/controllers/inventory/RackController.js");
+const schema = read("prisma/schema.prisma");
+const frontendMasterRegistry = read("../frontend/src/masterDataRegistry.js");
+
+const contracts = [
+  ["Direct PO is Draft", /status:\s*PO_STATUS\.DRAFT/.test(po)],
+  ["Direct PO from PR is blocked", po.includes("PO dari Purchase Requisition wajib dibuat melalui konsolidasi PR")],
+  ["PO approval has explicit authorization", poRoutes.includes('authorize("purchaseOrder", "approve"), purchaseOrderApproval')],
+  ["PO approval no longer uses static check flow", !po.includes("PO_CHECK_FLOW")],
+  ["PO confirmation requires Sent", po.includes('existing.status !== "Sent"')],
+  ["Linked PR PO details are locked", po.includes("Detail PO yang berasal dari PR dikunci")],
+  ["Legacy conversion delegates to safe consolidation", pr.includes("return exports.consolidateToPO(req, res, next)")],
+  ["Raw material only allows supplier forms", pr.includes('["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)')],
+  ["Supplier conversion is persisted atomically", pr.includes('supplierProposalSource: "PURCHASING"')],
+  ["PR delete checks linked PO", pr.includes("PR sudah terhubung ke Purchase Order")],
+  ["PR summary is grouped by UOM", pr.includes("qtyByUom") && pr.includes("mixedUom")],
+  ["Purchase Invoice CRUD/workflow route exists", invoiceRoutes.includes("/:invoiceNumber/approve") && invoiceRoutes.includes("/:invoiceNumber/pay")],
+  ["Purchasing report is analytical", reports.includes("exports.purchasing") && reports.includes("receiptCoveragePercent")],
+  ["Supplier conversion uses structured modal", frontendDetail.includes("ops-purchase-conversion-form")],
+  ["PR to PO is one frontend transaction", !frontendDetail.includes('/confirm-suppliers`, { method: "PATCH"')],
+  ["Draft MRP PR remains editable", frontendDetail.includes('prEditLink.classList.toggle("d-none", !editableStatus)')],
+  ["MRP PR edit preserves source and planned-order trace", frontendPrForm.includes('sourceType: state.record?.sourceType || "MANUAL"') && frontendPrForm.includes("plannedOrderNumber: source.plannedOrderNumber || null")],
+  ["PR editor supports Coil Sheet Pcs conversion", frontendPrForm.includes('option value="COIL"') && frontendPrForm.includes('option value="SHEET"') && frontendPrForm.includes('option value="PCS"') && frontendPrForm.includes("line-conversion-factor")],
+  ["PR demand remains separate from purchase conversion", pr.includes("const qty = requestedQty") && pr.includes("tidak mengubah demand awal")],
+  ["PR quantity accepts integer and decimal values", frontendPrForm.includes('class="form-control line-qty" type="number" min="0.000001" step="any"')],
+  ["PR category filter does not hide Purchase Orders", frontendModuleRoutes.includes('const purchaseCategory = isPurchaseRequisition') && frontendModuleRoutes.includes(": null;")],
+  ["Sent PO can open a preselected Goods Receipt", frontendDetail.includes("data-create-goods-receipt") && frontendSupplyForm.includes('new URLSearchParams(location.search).get("poNumber")') && frontendSupplyForm.includes("await loadSource()")],
+  ["Goods Receipt accepts only receiving PO statuses", incoming.includes('["Sent", "Confirmed", "Partial Receipt"].includes(po.status)') && incoming.includes("Warehouse penerimaan tidak aktif")],
+  ["Manual Complete uses warehouse and rack dropdowns", frontendDetail.includes("collectManualCompleteLocation") && frontendDetail.includes("data-manual-warehouse") && frontendDetail.includes("data-manual-rack") && !frontendDetail.includes('window.prompt("Warehouse tujuan untuk sisa penerimaan:')],
+  ["Stock Movement uses master-backed dropdowns", frontendInventoryView.includes('<select id="warehouseCode" required>') && frontendInventoryView.includes('<select id="itemCode" required>') && frontendInventoryView.includes('<select id="lotNumber">') && frontendInventoryForm.includes("/master-data/api/parts?start=0&length=500") && frontendInventoryForm.includes("/master-data/api/uom?start=0&length=500")],
+  ["Rack master belongs to Warehouse", schema.includes('warehouseCode String? @map("warehouse_code")') && rackController.includes("where.warehouseCode") && frontendMasterRegistry.includes('label: "Rack Warehouse"')],
+  ["Material Stock Movement uses Material Master", frontendInventoryForm.includes("/master-data/api/materials?start=0&length=500") && frontendInventoryForm.includes('stockType === "Material"') && inventoryMovement.includes("Master Material wajib dipilih")],
+  ["Goods Receipt carries rack and material identity to inventory", frontendSupplyForm.includes("rackCode: row.rack") && incoming.includes("materialCode: identity.materialCode") && incoming.includes("tx.lotMaster.upsert")],
+];
+
+let failed = 0;
+for (const [name, ok] of contracts) {
+  console.log(`${ok ? "PASS" : "FAIL"} ${name}`);
+  if (!ok) failed += 1;
+}
+if (failed) {
+  console.error(`${failed} Purchasing contract(s) failed.`);
+  process.exit(1);
+}

@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const { prisma } = require("../index");
+const { attachContextAudit } = require("../utils/pageContext");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret-key";
 const EXPORT_TOKEN_SECRET = process.env.EXPORT_TOKEN_SECRET || JWT_SECRET;
@@ -40,6 +41,7 @@ exports.auth = async (req, res, next) => {
         roleName: assignment.role.roleName,
         isPrimary: assignment.isPrimary,
       }));
+    attachContextAudit(req, res);
     next();
   } catch (err) {
     if (["ECONNREFUSED", "P1001", "P1017"].includes(err?.code)) {

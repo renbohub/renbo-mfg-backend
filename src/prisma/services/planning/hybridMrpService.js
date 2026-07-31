@@ -12,6 +12,10 @@ const {
 } = require("../../controllers/planning/services/planningRealtimeService");
 const { isSubAssemblyDetail } = require("../../utils/assemblyPolicy");
 const { durationToWorkingDays } = require("../../utils/duration");
+const {
+  queueDirtyItem,
+} = require("../../utils/mrpDirtyQueue");
+const { normalizeQuantity } = require("../../utils/uomQuantity");
 
 function createRequirementIdentity(parentRequirementId = null, rootRequirementId = null) {
   const id = randomUUID();
@@ -1330,44 +1334,6 @@ async function createPlannedOrderSequencer(tx = prisma, date = new Date()) {
   };
 }
 
-async function queueDirtyItem(tx = prisma, data) {
-  const { itemId, reason, sourceNumber = null, notes = null } = data || {};
-  if (!itemId || !reason) {
-    throw new Error("itemId dan reason wajib diisi");
-  }
-
-  const existing = await tx.mRPDirtyItem.findFirst({
-    where: {
-      itemId,
-      reason,
-      sourceNumber,
-      status: { in: ["Pending", "Processing"] },
-    },
-    orderBy: { createdAt: "desc" },
-  });
-
-  if (existing) {
-    return tx.mRPDirtyItem.update({
-      where: { id: existing.id },
-      data: {
-        status: "Pending",
-        processedAt: null,
-        notes,
-      },
-    });
-  }
-
-  return tx.mRPDirtyItem.create({
-    data: {
-      itemId,
-      reason,
-      sourceNumber,
-      notes,
-      status: "Pending",
-    },
-  });
-}
-
 async function expandImpactedItemIds(tx = prisma, dirtyItemIds = []) {
   const queue = [...new Set(dirtyItemIds.filter(Boolean))];
   const impacted = new Set(queue);
@@ -1976,6 +1942,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
         mbomLevelComponent: 0,
         partCode,
         partId: detail.part?.id || null,
+        uomCode: detail.uomCode || detail.part?.uomCode || "pcs",
         requirementType: "Independent",
         sourceType: "SO",
         sourceNumber: `${soNumber}#${detail.lineNumber}`,
@@ -2037,6 +2004,10 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
 
       const sourceParts = String(requirement.sourceNumber || "").split("#");
       const demandLineNumber = sourceParts[1] ? Number(sourceParts[1]) : null;
+      const plannedOrderUomCode = orderType === "Purchase"
+        ? (requirement.uomCode || "pcs")
+        : activeMbom?.uomCode || requirement.uomCode || null;
+      const plannedOrderQty = normalizeQuantity(requirement.plannedOrderQty, plannedOrderUomCode);
 
       plannedOrders.push({
         orderNumber: nextPlannedOrderNumber(orderType),
@@ -2044,8 +2015,8 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
         orderType,
         partCode: requirement.partCode,
         partId: requirement.partId || null,
-        qty: requirement.plannedOrderQty,
-        uomCode: orderType === "Purchase" ? "pcs" : activeMbom?.uomCode || null,
+        qty: plannedOrderQty,
+        uomCode: plannedOrderUomCode,
         requiredDate: requirement.requiredDate,
         orderDate: requirement.orderDate || requirement.requiredDate,
         mbomHeaderId: orderType === "Production" ? activeMbom?.id || null : null,
@@ -2066,7 +2037,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
                 supplyNumber: null,
                 supplyLineNumber: null,
                 itemId: requirement.partId,
-                qtyPegged: requirement.plannedOrderQty,
+                qtyPegged: plannedOrderQty,
                 notes: `MRP ${planIdentity.planNumber || runNumber} pegging ${requirement.sourceNumber}`,
               }]
             : [],
@@ -2074,7 +2045,20 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
     }
 
     if (requirements.length > 0) {
-      await tx.mRPRequirement.createMany({ data: requirements });
+      await tx.mRPRequirement.createMany({ data: requirements.map((requirement) => {
+        const uomCode = requirement.uomCode || "pcs";
+        const { uomCode: _uomCode, ...persistedRequirement } = requirement;
+        return {
+          ...persistedRequirement,
+          grossRequirement: normalizeQuantity(persistedRequirement.grossRequirement, uomCode),
+          soConsumedQty: normalizeQuantity(persistedRequirement.soConsumedQty, uomCode),
+          effectiveDemandQty: normalizeQuantity(persistedRequirement.effectiveDemandQty, uomCode),
+          onHandQty: normalizeQuantity(persistedRequirement.onHandQty, uomCode),
+          allocatedQty: normalizeQuantity(persistedRequirement.allocatedQty, uomCode),
+          netRequirement: normalizeQuantity(persistedRequirement.netRequirement, uomCode),
+          plannedOrderQty: normalizeQuantity(persistedRequirement.plannedOrderQty, uomCode),
+        };
+      }) });
     }
     let createdPlannedOrders = [];
     if (plannedOrders.length > 0) {
@@ -2361,7 +2345,7 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
   const soOnlyPartCodesByNumber = new Map();
 
   for (const dirtyItem of dirtyItems) {
-    if (dirtyItem.reason !== "sales-order-demand" || !dirtyItem.sourceNumber) continue;
+    if (String(dirtyItem.reason || "").toLowerCase() !== "sales-order-demand" || !dirtyItem.sourceNumber) continue;
     const partCode = normalizePartCode(partMap.get(dirtyItem.itemId)?.partCode);
     if (!partCode) continue;
     if (!soOnlyPartCodesByNumber.has(dirtyItem.sourceNumber)) {

@@ -28,6 +28,7 @@ const {
   buildIdentityKey,
 } = require("./utils/itemIdentity");
 const { assertStockBalanceNotFrozen } = require("./utils/stockOpnameFreezeGuard");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 const SPECIAL_RACK_PREFIXES = ["RACK-SCRAP", "RACK-REJECT", "RACK-REWORK"];
 
@@ -1000,6 +1001,7 @@ exports.list = async (req, res, next) => {
       rackCode,
       rackCodePrefix,
       lotNumber,
+      materialCode,
       partCode,
       productId,
       description,
@@ -1052,6 +1054,9 @@ exports.list = async (req, res, next) => {
     if (partCode) {
       where.partCode = { contains: partCode, mode: "insensitive" };
     }
+    if (materialCode) {
+      where.materialCode = { contains: materialCode, mode: "insensitive" };
+    }
 
     if (productId) {
       where.productId = productId;
@@ -1072,6 +1077,9 @@ exports.list = async (req, res, next) => {
 
     if (q) {
       where.OR = [
+        { materialCode: { contains: q, mode: "insensitive" } },
+        { materialName: { contains: q, mode: "insensitive" } },
+        { materialType: { contains: q, mode: "insensitive" } },
         { partCode: { contains: q, mode: "insensitive" } },
         { partNumber: { contains: q, mode: "insensitive" } },
         { partName: { contains: q, mode: "insensitive" } },
@@ -1109,6 +1117,9 @@ exports.list = async (req, res, next) => {
           },
           product: {
             select: { productCode: true, productName: true, description: true },
+          },
+          material: {
+            select: { materialCode: true, materialName: true, materialType: true },
           },
         },
         orderBy,
@@ -1403,6 +1414,7 @@ exports.upsert = async (req, res, next) => {
     });
     const normalizedRackCode = normalizeText(rackCode);
     const normalizedLotNumber = normalizeText(lotNumber);
+    const uomCode = normalizeText(data.uomCode);
 
     if (!warehouseCode) {
       return res.status(400).json({
@@ -1415,6 +1427,10 @@ exports.upsert = async (req, res, next) => {
         message: IDENTITY_REQUIRED_MESSAGE,
       });
     }
+
+    if (data.qtyOnHand != null) assertQuantity(data.qtyOnHand, uomCode, "Qty On Hand");
+    if (data.qtyReserved != null) assertQuantity(data.qtyReserved, uomCode, "Qty Reserved");
+    if (data.qtyQC != null) assertQuantity(data.qtyQC, uomCode, "Qty QC");
 
     const stockPolicyError = validateStockPolicy(data);
     if (stockPolicyError) {
@@ -1531,6 +1547,7 @@ exports.adjust = async (req, res, next) => {
     });
     const normalizedRackCode = normalizeText(rackCode);
     const normalizedLotNumber = normalizeText(lotNumber);
+    const uomCode = normalizeText(data.uomCode);
 
     if (!warehouseCode || qtyOnHand === undefined) {
       return res.status(400).json({
@@ -1543,6 +1560,8 @@ exports.adjust = async (req, res, next) => {
         message: IDENTITY_REQUIRED_MESSAGE,
       });
     }
+
+    assertQuantity(qtyOnHand, uomCode, "Qty On Hand");
 
     const existing = await prisma.stockBalance.findFirst({
       where: {

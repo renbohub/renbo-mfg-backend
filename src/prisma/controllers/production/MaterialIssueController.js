@@ -16,6 +16,7 @@ const {
   isSpecialRackCode,
 } = require("../inventory/utils/stockReservationHelpers");
 const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 // Generate nomor Material Issue otomatis: MI-YYYYMMDD-001
 async function generateIssueNumber() {
@@ -105,7 +106,11 @@ function assertWorkOrderReleasedForMaterialIssue(workOrder) {
   if (!workOrder) {
     throw Object.assign(new Error("Work Order tidak ditemukan."), { statusCode: 404 });
   }
-  if (workOrder.status !== "Released") {
+  // A single WO can have multiple Material Issue documents (one per DPP
+  // schedule/material bucket). After the first issue is published the WO is
+  // moved to `Material Issued`, but remaining draft issues still need to be
+  // edited/issued. Keep both states writable until production starts.
+  if (!["Released", "Material Issued"].includes(workOrder.status)) {
     throw Object.assign(
       new Error(
         `Material Issue hanya bisa dibuat untuk WO Released. Status WO ${workOrder.woNumber || ""} sekarang "${workOrder.status}".`,
@@ -520,6 +525,7 @@ exports.issue = async (req, res, next) => {
       for (const detail of existing.details) {
         const qtyToIssue = Number(detail.qtyIssued || 0);
         if (qtyToIssue <= 0) continue;
+        assertQuantity(qtyToIssue, detail.uomCode, "Qty Issue");
 
         const identity = await resolveMaterialIssueIdentity(tx, detail);
 

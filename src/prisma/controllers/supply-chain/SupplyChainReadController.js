@@ -136,9 +136,16 @@ exports.listPutaway = (req, res, next) => sendList(req, res, next, { delegate: p
 exports.getPutaway = (req, res, next) => sendDetail(req, res, next, { delegate: prisma.stockMovement, key: "movementNumber", param: "movementNumber", label: "Putaway", notDeleted: true, include: { warehouse: true, rack: true, destinationRack: true } });
 
 const deliveryOrderWhere = (req) => {
-  const where = statusFilter(req, { isDeleted: false, status: { notIn: ["Draft", "Cancelled"] } });
+  // A Delivery Order is represented by an SO that has an active delivery
+  // schedule. Keep legacy non-draft SOs visible, but also surface schedules
+  // created before the SO workflow hardening so the operational document is
+  // never hidden from the Delivery Orders menu.
+  const where = statusFilter(req, { isDeleted: false, OR: [
+    { status: { notIn: ["Draft", "Cancelled"] } },
+    { deliverySchedules: { some: { isDeleted: false, status: { notIn: ["Cancelled", "Failed"] } } } },
+  ] });
   const q = text(req.query.q || req.query.search);
-  if (q) where.OR = ["soNumber", "customerCode", "customerName", "shippingAddress"].map((key) => ({ [key]: { contains: q, mode: "insensitive" } }));
+  if (q) where.AND = [{ OR: ["soNumber", "customerCode", "customerName", "shippingAddress"].map((key) => ({ [key]: { contains: q, mode: "insensitive" } })) }];
   return where;
 };
 const deliveryOrderMap = (row) => ({ ...row, deliveryOrderNumber: row.soNumber, plannedQty: totalQty(row.details, "qty"), deliveredQty: totalQty(row.details, "qtyDelivered"), scheduleCount: row.deliverySchedules.length });

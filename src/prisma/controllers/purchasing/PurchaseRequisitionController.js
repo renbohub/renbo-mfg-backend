@@ -1,14 +1,33 @@
 const { prisma } = require("../../index");
 const { generateDocNumber, generatePONumber } = require("./utils/purchasingHelpers");
 const { resolveApprovalRule, createApprovalRequest } = require("../../services/approvalRuleService");
+const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 
+// Keep sourcing allocations in every PR read so the UI and PO conversion use
+// the same persisted supplier/form/delivery decisions.
 const include = {
   department: true,
-  details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { product: true } },
+  details: {
+    where: { isDeleted: false },
+    orderBy: { lineNumber: "asc" },
+    include: {
+      product: true,
+      sources: { where: { isDeleted: false }, orderBy: [{ demandMonth: "asc" }, { createdAt: "asc" }] },
+      sourcingAllocations: { where: { isDeleted: false }, orderBy: [{ deliveryDate: "asc" }, { createdAt: "asc" }] },
+    },
+  },
   purchaseOrders: { include: { po: { select: { poNumber: true, status: true, supplierName: true, vendorName: true } } } },
 };
 const date = (v) => v ? new Date(v) : undefined;
-const num = (v, d = 0) => Number.isFinite(Number(v)) ? Number(v) : d;
+const num = (v, d = 0) => {
+  if (typeof v === "number") return Number.isFinite(v) ? v : d;
+  let normalized = String(v ?? "").trim().replace(/\s+/g, "");
+  if (!normalized) return d;
+  if (normalized.includes(",") && normalized.includes(".")) normalized = normalized.replace(/\./g, "").replace(",", ".");
+  else if (normalized.includes(",")) normalized = normalized.replace(",", ".");
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : d;
+};
 const bodyObject = (v) => typeof v === "string" ? JSON.parse(v) : (v || {});
 const normalize = (v) => String(v || "").trim().toUpperCase();
 const clean = (v) => {
@@ -21,15 +40,28 @@ const dayKey = (value) => {
   return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : null;
 };
 const isKg = (v) => ["KG", "KGS", "KILOGRAM", "KILOGRAMS"].includes(normalize(v));
+const materialPackageUom = (material) => {
+  const configured = normalize(material?.defaultPurchaseUomCode);
+  if (configured) return configured;
+  const form = normalize(material?.materialForm);
+  if (form === "SHEET") return "SHEET";
+  if (form === "COIL") return "COIL";
+  if (["PIECES", "PIECE", "PCS"].includes(form)) return "PCS";
+  return form || "LOT";
+};
 const classifyPart = (part) => {
-  if (normalize(part?.rawType) === "PURCHASE_PART") return "PURCHASE_PART";
-  if (normalize(part?.rawType) === "MATERIAL") return "RAW_MATERIAL";
-  return "OTHER";
+  if (normalize(part?.rawType) === "MATERIAL") return "MATERIAL";
+  if (normalize(part?.rawType) === "PURCHASE_PART") {
+    return part?.hasDrawing ? "PURCHASE_PART" : "UNIVERSAL_PURCHASE_PART";
+  }
+  return "NON_PRODUCTION";
 };
 const normalizeCategory = (value) => {
   const category = normalize(value).replace(/[\s-]+/g, "_");
-  if (["RAW", "MATERIAL", "RAW_MATERIAL"].includes(category)) return "RAW_MATERIAL";
+  if (["RAW", "MATERIAL", "RAW_MATERIAL"].includes(category)) return "MATERIAL";
   if (["PURCHASE", "PURCHASED", "PURCHASE_PART"].includes(category)) return "PURCHASE_PART";
+  if (["UNIVERSAL", "UNIVERSAL_PART", "UNIVERSAL_PURCHASE", "UNIVERSAL_PURCHASE_PART", "NO_DRAWING"].includes(category)) return "UNIVERSAL_PURCHASE_PART";
+  if (["OTHER", "NON_PRODUCTION", "NON_PRODUCTION_ITEM", "GENERAL"].includes(category)) return "NON_PRODUCTION";
   return category || null;
 };
 const normalizeSourceType = (value) => {
@@ -48,23 +80,58 @@ const preferredPartBase = (part) => {
 };
 const classifyRequisition = (details = []) => {
   const categories = [...new Set(details.map((detail) => detail.procurementCategory).filter(Boolean))];
-  return categories.length === 1 ? categories[0] : categories.length > 1 ? "MIXED" : "OTHER";
+  return categories.length === 1 ? categories[0] : categories.length > 1 ? "MIXED" : "NON_PRODUCTION";
 };
 async function attachProcurementClassification(rows, client = prisma) {
   const list = Array.isArray(rows) ? rows : [rows];
   const partCodes = [...new Set(list.flatMap((row) => row?.details || []).map((detail) => detail.partCode).filter(Boolean))];
   const parts = partCodes.length ? await client.part.findMany({
     where: { partCode: { in: partCodes }, isDeleted: false },
-    select: { partCode: true, itemType: true, rawType: true, procurementType: true, baseUomCode: true, purchaseUomCode: true },
+    select: { partCode: true, itemType: true, rawType: true, hasDrawing: true, procurementType: true, baseUomCode: true, purchaseUomCode: true },
   }) : [];
   const partByCode = new Map(parts.map((part) => [normalize(part.partCode), part]));
   const classified = list.map((row) => {
     const details = (row?.details || []).map((detail) => {
       const part = partByCode.get(normalize(detail.partCode));
-      const procurementCategory = detail.materialCode ? "RAW_MATERIAL" : classifyPart(part);
-      return { ...detail, procurementCategory, partClassification: part || null };
+      const procurementCategory = normalizeCategory(detail.procurementCategory)
+        || (detail.materialCode ? "MATERIAL" : classifyPart(part));
+      const sources = Array.isArray(detail.sources) ? detail.sources : [];
+      const sourcingAllocations = Array.isArray(detail.sourcingAllocations) ? detail.sourcingAllocations : [];
+      const activeSourcingAllocations = sourcingAllocations.filter((allocation) => normalize(allocation.status) !== "CANCELLED");
+      const joined = (key) => [...new Set(sources.map((source) => source[key]).filter(Boolean))].join(", ") || null;
+      const allocationJoined = (key) => [...new Set(activeSourcingAllocations.map((allocation) => allocation[key]).filter(Boolean))].join(", ") || null;
+      const allocatedDemandQty = activeSourcingAllocations
+        .reduce((sum, allocation) => sum + num(allocation.demandCoveredQty), 0);
+      const supplierAllocationVariance = allocatedDemandQty - num(detail.qty);
+      const supplierAllocationStatus = Math.abs(supplierAllocationVariance) <= 0.000001
+        ? "EXACT"
+        : supplierAllocationVariance < 0 ? "UNDER" : "OVER";
+      const orderVariance = num(detail.orderedQty) - num(detail.qty);
+      const orderControlStatus = Math.abs(orderVariance) <= 0.000001
+        ? "EXACT"
+        : orderVariance < 0 ? "UNDER" : "OVER";
+      return {
+        ...detail,
+        procurementCategory,
+        sourceCount: sources.length,
+        sourceMrpNumbers: joined("mrpRunNumber"),
+        sourceMpsNumbers: joined("mpsNumber"),
+        sourceForecastNumbers: joined("forecastNumber"),
+        sourceSONumbers: joined("soNumber"),
+        sourceDemandMonths: [...new Set(sources.map((source) => dayKey(source.demandMonth)?.slice(0, 7)).filter(Boolean))].join(", ") || null,
+        sourcingAllocationCount: activeSourcingAllocations.length,
+        sourcingSuppliers: allocationJoined("supplierCode"),
+        sourcingForms: allocationJoined("purchasePackageUomCode"),
+        sourcingDeliveryDates: [...new Set(activeSourcingAllocations.map((allocation) => dayKey(allocation.deliveryDate)).filter(Boolean))].join(", ") || null,
+        allocatedDemandQty,
+        supplierAllocationVariance,
+        supplierAllocationStatus,
+        orderVariance,
+        orderControlStatus,
+        partClassification: part || null,
+      };
     });
-    const procurementCategory = classifyRequisition(details);
+    const procurementCategory = normalizeCategory(row.procurementGroup) || classifyRequisition(details);
     return {
       ...row,
       details,
@@ -93,7 +160,7 @@ async function normalizeRequisitionDetails(details, client) {
   const materialIds = [...new Set(details.map((row) => clean(row.materialId)).filter(Boolean))];
   const materialCodes = [...new Set(details.map((row) => clean(row.materialCode)).filter(Boolean))];
 
-  const [parts, explicitMaterials] = await Promise.all([
+  const [parts, explicitMaterials, formulas] = await Promise.all([
     (partIds.length || partCodes.length || partNumbers.length) ? client.part.findMany({
       where: {
         isDeleted: false,
@@ -105,7 +172,7 @@ async function normalizeRequisitionDetails(details, client) {
       },
       select: {
         id: true, partCode: true, partNumber: true, partName: true, itemType: true,
-        rawType: true, materialId: true, baseUomCode: true, purchaseUomCode: true,
+        rawType: true, hasDrawing: true, materialId: true, baseUomCode: true, purchaseUomCode: true,
       },
     }) : [],
     (materialIds.length || materialCodes.length) ? client.material.findMany({
@@ -116,14 +183,15 @@ async function normalizeRequisitionDetails(details, client) {
           ...(materialCodes.length ? [{ materialCode: { in: materialCodes } }] : []),
         ],
       },
-      select: { id: true, materialCode: true, materialName: true, materialType: true, spec: true, thickness: true, width: true, CSP: true },
+      select: { id: true, materialCode: true, materialName: true, materialType: true, materialForm: true, spec: true, thickness: true, width: true, CSP: true, defaultPurchaseUomCode: true, defaultConversionUomCode: true, defaultConversionFactor: true },
     }) : [],
+    getFormulaSet(client, "purchasing"),
   ]);
 
   const linkedMaterialIds = [...new Set(parts.map((part) => part.materialId).filter(Boolean))];
   const linkedMaterials = linkedMaterialIds.length ? await client.material.findMany({
     where: { id: { in: linkedMaterialIds }, isDeleted: false },
-    select: { id: true, materialCode: true, materialName: true, materialType: true, spec: true, thickness: true, width: true, CSP: true },
+    select: { id: true, materialCode: true, materialName: true, materialType: true, materialForm: true, spec: true, thickness: true, width: true, CSP: true, defaultPurchaseUomCode: true, defaultConversionUomCode: true, defaultConversionFactor: true },
   }) : [];
   const materials = [...explicitMaterials, ...linkedMaterials.filter((material) => !explicitMaterials.some((row) => row.id === material.id))];
   const partById = new Map(parts.map((part) => [part.id, part]));
@@ -153,22 +221,29 @@ async function normalizeRequisitionDetails(details, client) {
       || (part?.materialId ? materialById.get(part.materialId) : null)
       || null;
     const categoryHint = normalizeCategory(detail.procurementCategory || detail.prCategory || detail.itemCategory || detail.rawType);
-    const category = categoryHint || (material ? "RAW_MATERIAL" : classifyPart(part));
-    if (categoryHint === "RAW_MATERIAL" && part && classifyPart(part) === "PURCHASE_PART") {
+    const category = categoryHint || (material ? "MATERIAL" : classifyPart(part));
+    if (categoryHint === "MATERIAL" && part && ["PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(classifyPart(part))) {
       throw Object.assign(new Error(`Baris ${line}: Purchase Part tidak dapat dicatat sebagai Raw Material.`), { statusCode: 400 });
     }
-    if (categoryHint === "PURCHASE_PART" && part && classifyPart(part) === "RAW_MATERIAL") {
+    if (["PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(categoryHint) && part && classifyPart(part) === "MATERIAL") {
       throw Object.assign(new Error(`Baris ${line}: Part Material tidak dapat dicatat sebagai Purchase Part.`), { statusCode: 400 });
     }
 
-    if (category === "RAW_MATERIAL" && !material) {
+    if (category === "MATERIAL" && !material) {
       throw Object.assign(new Error(`Baris ${line}: Raw Material wajib dipilih dari Material Master (contoh SPHC), atau Part Material harus memiliki relasi Material Master.`), { statusCode: 400 });
     }
+    const isPieceMaterial = category === "MATERIAL" && normalize(material?.materialForm) === "PIECES";
     if (category === "PURCHASE_PART" && !part) {
       throw Object.assign(new Error(`Baris ${line}: Purchase Part wajib dipilih dari Part Master.`), { statusCode: 400 });
     }
     if (category === "PURCHASE_PART" && !clean(part.partNumber)) {
       throw Object.assign(new Error(`Baris ${line}: Purchase Part ${part.partCode} belum memiliki Part Number/drawing code di Part Master.`), { statusCode: 409 });
+    }
+    if (category === "UNIVERSAL_PURCHASE_PART" && !part) {
+      throw Object.assign(new Error(`Baris ${line}: Universal Purchase Part wajib dipilih dari Part Master.`), { statusCode: 400 });
+    }
+    if (category === "UNIVERSAL_PURCHASE_PART" && clean(part.partNumber)) {
+      throw Object.assign(new Error(`Baris ${line}: ${part.partCode} memiliki drawing/Part Number dan harus masuk kelompok Purchase Part.`), { statusCode: 409 });
     }
 
     const requestedQty = num(detail.qty, Number.NaN);
@@ -177,7 +252,7 @@ async function normalizeRequisitionDetails(details, client) {
     }
     const lotCount = detail.lotCount == null ? null : num(detail.lotCount, Number.NaN);
     const kgPerLot = detail.kgPerLot == null ? null : num(detail.kgPerLot, Number.NaN);
-    if ((lotCount != null || kgPerLot != null) && category !== "RAW_MATERIAL") {
+    if ((lotCount != null || kgPerLot != null) && category !== "MATERIAL") {
       throw Object.assign(new Error(`Baris ${line}: pengaturan lot hanya berlaku untuk Raw Material.`), { statusCode: 400 });
     }
     if ((lotCount != null || kgPerLot != null) && (!(lotCount > 0) || !(kgPerLot > 0))) {
@@ -192,48 +267,163 @@ async function normalizeRequisitionDetails(details, client) {
       throw Object.assign(new Error(`Baris ${line}: purchaseQtyKg harus sama dengan lotCount × kgPerLot (${calculatedLotKg} KG).`), { statusCode: 400 });
     }
     const purchaseQtyKg = calculatedLotKg ?? requestedPurchaseQtyKg;
-    // UI manual raw-material may express qty as number of lots. PR demand is
-    // normalized to KG; lotCount/kgPerLot remain as the commercial PO basis.
-    const qty = category === "RAW_MATERIAL" && purchaseQtyKg != null ? purchaseQtyKg : requestedQty;
+    const hasGenericConversion = [
+      detail.purchasePackageQty,
+      detail.purchasePackageUomCode,
+      detail.conversionUomCode,
+      detail.conversionFactor,
+      detail.convertedPurchaseQty,
+    ].some((value) => value != null && value !== "");
+    const hasLegacyConversion = lotCount != null || kgPerLot != null;
+    const usesPurchaseConversion = category === "MATERIAL" && (hasGenericConversion || hasLegacyConversion);
+    const purchasePackageQty = usesPurchaseConversion
+      ? num(detail.purchasePackageQty ?? lotCount ?? (isPieceMaterial ? requestedQty : 0), 0)
+      : null;
+    const purchasePackageUomCode = usesPurchaseConversion
+      ? normalize(detail.purchasePackageUomCode || materialPackageUom(material))
+      : null;
+    const conversionUomCode = usesPurchaseConversion
+      ? normalize(detail.conversionUomCode || material?.defaultConversionUomCode || (purchaseQtyKg != null ? "KG" : isPieceMaterial ? "PCS" : detail.uomCode))
+      : null;
+    const conversionFactor = usesPurchaseConversion
+      ? num(detail.conversionFactor ?? kgPerLot ?? material?.defaultConversionFactor ?? (isPieceMaterial ? 1 : 0), 0)
+      : null;
+    const calculatedConvertedQty = purchasePackageQty > 0 && conversionFactor > 0
+      ? purchasePackageQty * conversionFactor
+      : 0;
+    const convertedPurchaseQty = usesPurchaseConversion
+      ? num(detail.convertedPurchaseQty ?? purchaseQtyKg ?? (hasGenericConversion ? calculatedConvertedQty : isPieceMaterial ? requestedQty : 0), 0)
+      : null;
+    if (hasGenericConversion && !["COIL", "SHEET", "PCS"].includes(purchasePackageUomCode)) {
+      throw Object.assign(new Error(`Baris ${line}: bentuk pembelian wajib C/COIL, S/SHEET, atau P/PCS; bukan ${purchasePackageUomCode || "-"}.`), { statusCode: 400 });
+    }
+    if (hasGenericConversion && (
+      !Number.isInteger(purchasePackageQty)
+      || purchasePackageQty <= 0
+      || !purchasePackageUomCode
+      || !conversionUomCode
+      || !(conversionFactor > 0)
+    )) {
+      throw Object.assign(new Error(`Baris ${line}: qty form harus bilangan bulat positif, form/UOM hasil wajib diisi, dan faktor konversi harus lebih dari 0.`), { statusCode: 400 });
+    }
+    if (hasGenericConversion && Math.abs(calculatedConvertedQty - convertedPurchaseQty) > 1e-6) {
+      throw Object.assign(new Error(`Baris ${line}: convertedPurchaseQty harus sama dengan qty form × faktor (${calculatedConvertedQty} ${conversionUomCode}).`), { statusCode: 400 });
+    }
+    // Qty PR tetap merupakan kebutuhan PPIC/MRP. Pembulatan bentuk beli disimpan
+    // terpisah agar Sheet/Coil/Pcs tidak mengubah demand awal. Selisih kurang
+    // atau lebih adalah indikator kontrol, bukan blocker transaksi.
+    const qty = requestedQty;
     const estimatedPrice = num(detail.estimatedPrice ?? detail.unitPrice);
+    const uomCode = category === "MATERIAL" ? (conversionUomCode || clean(detail.uomCode) || "KG") : (clean(detail.uomCode) || part?.purchaseUomCode || part?.baseUomCode || null);
+    const sourcingAllocations = (Array.isArray(detail.sourcingAllocations) ? detail.sourcingAllocations : [])
+      .map((allocation, allocationIndex) => {
+        const demandCoveredQty = num(allocation.demandCoveredQty ?? allocation.sourceQty ?? allocation.qty);
+        if (!(demandCoveredQty > 0)) {
+          throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: qty alokasi harus lebih dari 0.`), { statusCode: 400 });
+        }
+        const allocationSupplierCode = clean(allocation.supplierCode);
+        if (!allocationSupplierCode) {
+          throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: supplier wajib dipilih.`), { statusCode: 400 });
+        }
+        const allocationForm = normalize(allocation.purchasePackageUomCode || allocation.orderUomCode);
+        const allocationPackageQty = num(allocation.purchasePackageQty ?? allocation.orderQty, 0);
+        const allocationFactor = num(allocation.conversionFactor ?? allocation.kgPerLot, 0);
+        const allocationConversionUom = normalize(allocation.conversionUomCode || uomCode);
+        const hasAllocationConversion = [allocationForm, allocationPackageQty, allocationFactor].some(Boolean);
+        if (category === "MATERIAL" && hasAllocationConversion) {
+          if (!["SHEET", "COIL", "PCS"].includes(allocationForm)) {
+            throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: pilih bentuk SHEET, COIL, atau PCS.`), { statusCode: 400 });
+          }
+          if (!Number.isInteger(allocationPackageQty) || allocationPackageQty <= 0 || allocationFactor <= 0) {
+            throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: qty bentuk harus bilangan bulat positif dan isi per bentuk harus lebih dari 0.`), { statusCode: 400 });
+          }
+          if (!["KG", "PCS"].includes(allocationConversionUom) || allocationConversionUom !== normalize(uomCode)) {
+            throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: UOM hasil harus sama dengan UOM kebutuhan ${uomCode}.`), { statusCode: 400 });
+          }
+        }
+        const allocationDate = date(allocation.deliveryDate);
+        if (allocation.deliveryDate && (!allocationDate || Number.isNaN(allocationDate.getTime()))) {
+          throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: delivery date tidak valid.`), { statusCode: 400 });
+        }
+        const unitPrice = allocation.unitPrice == null || allocation.unitPrice === "" ? null : num(allocation.unitPrice);
+        const convertedQty = category === "MATERIAL" && hasAllocationConversion
+          ? allocationPackageQty * allocationFactor
+          : null;
+        return {
+          supplierCode: allocationSupplierCode,
+          vendorCode: clean(allocation.vendorCode),
+          demandCoveredQty,
+          demandUomCode: uomCode,
+          purchasePackageQty: category === "MATERIAL" && hasAllocationConversion ? allocationPackageQty : null,
+          purchasePackageUomCode: category === "MATERIAL" && hasAllocationConversion ? allocationForm : null,
+          conversionFactor: category === "MATERIAL" && hasAllocationConversion ? allocationFactor : null,
+          conversionUomCode: category === "MATERIAL" && hasAllocationConversion ? allocationConversionUom : null,
+          convertedPurchaseQty: convertedQty,
+          deliveryDate: allocationDate || null,
+          currencyCode: normalize(allocation.currencyCode || "IDR"),
+          unitPrice,
+          totalAmount: unitPrice == null ? null : unitPrice * num(allocationPackageQty || demandCoveredQty),
+          status: "Draft",
+          notes: clean(allocation.notes),
+        };
+      });
     return {
       lineNumber: line,
       // For direct Material selection, do not misuse materialCode as partCode.
       // partCode remains an optional, validated trace back to the consuming part.
-      partCode: category === "RAW_MATERIAL" ? (part?.partCode || null) : (part?.partCode || clean(detail.partCode)),
-      partNumber: category === "RAW_MATERIAL" ? (part?.partNumber || null) : (part?.partNumber || clean(detail.partNumber)),
-      partName: category === "RAW_MATERIAL" ? (part?.partName || null) : (part?.partName || clean(detail.partName)),
+      procurementCategory: category,
+      partCode: category === "MATERIAL" ? (part?.partCode || null) : (part?.partCode || clean(detail.partCode)),
+      partNumber: category === "MATERIAL" ? (part?.partNumber || null) : (part?.partNumber || clean(detail.partNumber)),
+      partName: category === "MATERIAL" ? (part?.partName || null) : (part?.partName || clean(detail.partName)),
       materialId: material?.id || null,
       materialCode: material?.materialCode || null,
       materialName: material?.materialName || null,
       materialType: material?.materialType || null,
       // Product and Part use different tables/IDs. Never write Part.id into
       // productId for Material/Purchase Part lines (it would violate the FK).
-      productId: ["RAW_MATERIAL", "PURCHASE_PART"].includes(category) ? null : clean(detail.productId),
+      productId: ["MATERIAL", "PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(category) ? null : clean(detail.productId),
       description: clean(detail.description),
-      spec: category === "RAW_MATERIAL" ? (material?.spec || clean(detail.spec)) : clean(detail.spec),
-      thickness: category === "RAW_MATERIAL" && material?.thickness != null ? num(material.thickness) : (detail.thickness == null ? null : num(detail.thickness)),
-      width: category === "RAW_MATERIAL" && material?.width != null ? num(material.width) : (detail.width == null ? null : num(detail.width)),
-      CSP: category === "RAW_MATERIAL" ? (material?.CSP || clean(detail.CSP)) : clean(detail.CSP),
+      spec: category === "MATERIAL" ? (material?.spec || clean(detail.spec)) : clean(detail.spec),
+      thickness: category === "MATERIAL" && material?.thickness != null ? num(material.thickness) : (detail.thickness == null ? null : num(detail.thickness)),
+      width: category === "MATERIAL" && material?.width != null ? num(material.width) : (detail.width == null ? null : num(detail.width)),
+      CSP: category === "MATERIAL"
+        ? ({ COIL: "C", SHEET: "S", PCS: "P" }[purchasePackageUomCode] || null)
+        : clean(detail.CSP),
       qty,
-      uomCode: category === "RAW_MATERIAL" ? "KG" : (clean(detail.uomCode) || part?.purchaseUomCode || part?.baseUomCode || null),
+      uomCode,
       estimatedPrice,
-      totalAmount: num(detail.totalAmount, qty * estimatedPrice),
+      totalAmount: detail.totalAmount == null || detail.totalAmount === ""
+        ? evaluateFromSet(formulas, "PR_LINE_TOTAL", { qty, estimatedPrice })
+        : num(detail.totalAmount),
       preferredSupplier: clean(detail.preferredSupplier),
       proposedSupplierCode: clean(detail.proposedSupplierCode || detail.supplierCode),
       supplierProposalSource: clean(detail.supplierProposalSource) || (detail.proposedSupplierCode || detail.supplierCode ? "PURCHASING" : null),
-      lotCount,
-      kgPerLot,
-      purchaseQtyKg,
+      purchasePackageQty: purchasePackageQty > 0 ? purchasePackageQty : null,
+      purchasePackageUomCode,
+      conversionUomCode,
+      conversionFactor: conversionFactor > 0 ? conversionFactor : null,
+      convertedPurchaseQty: convertedPurchaseQty > 0 ? convertedPurchaseQty : null,
+      recommendedPurchaseForms: Array.isArray(detail.recommendedPurchaseForms)
+        ? detail.recommendedPurchaseForms
+        : null,
+      lotCount: isKg(conversionUomCode) ? (purchasePackageQty || lotCount) : null,
+      kgPerLot: isKg(conversionUomCode) ? (conversionFactor || kgPerLot) : null,
+      purchaseQtyKg: isKg(conversionUomCode)
+        ? (convertedPurchaseQty || purchaseQtyKg)
+        : category === "MATERIAL" && isKg(detail.uomCode || "KG") ? (purchaseQtyKg || requestedQty) : null,
       lotAllocations: detail.lotAllocations || null,
       preferredVendor: clean(detail.preferredVendor),
       plannedOrderNumber: clean(detail.plannedOrderNumber),
       sourcePlannedOrderNumbers: detail.sourcePlannedOrderNumbers || null,
+      ...(sourcingAllocations.length ? { sourcingAllocations: { create: sourcingAllocations } } : {}),
       notes: clean(detail.notes),
     };
   });
 
-  const supplierCodes = [...new Set(rows.map((row) => row.proposedSupplierCode).filter(Boolean))];
+  const supplierCodes = [...new Set(rows.flatMap((row) => [
+    row.proposedSupplierCode,
+    ...(row.sourcingAllocations?.create || []).map((allocation) => allocation.supplierCode),
+  ]).filter(Boolean))];
   if (supplierCodes.length) {
     const suppliers = await client.supplier.findMany({
       where: { supplierCode: { in: supplierCodes }, isDeleted: false },
@@ -266,12 +456,55 @@ async function rawMaterialConversion(part, sourceUomCode, client) {
   if (grossWeight > 0) return { factor: grossWeight, uomCode: targetUomCode, source: "Part Base gross weight" };
   throw Object.assign(new Error(`Konversi ${part?.partCode || "raw material"} dari ${sourceUomCode || "UOM kosong"} ke KG belum tersedia. Isi UOM Conversion Master atau gross weight Part Base.`), { statusCode: 409 });
 }
-const withSummary = (row) => ({
-  ...row,
-  requestedQty: (row.details || []).reduce((sum, detail) => sum + num(detail.qty), 0),
-  orderedQty: (row.details || []).reduce((sum, detail) => sum + num(detail.orderedQty), 0),
-  lineCount: (row.details || []).length,
-});
+const withSummary = (row) => {
+  const grouped = new Map();
+  for (const detail of row.details || []) {
+    const uomCode = normalize(detail.uomCode) || "UNIT";
+    const current = grouped.get(uomCode) || { uomCode, requestedQty: 0, orderedQty: 0 };
+    current.requestedQty += num(detail.qty);
+    current.orderedQty += num(detail.orderedQty);
+    grouped.set(uomCode, current);
+  }
+  const qtyByUom = [...grouped.values()];
+  const singleUom = qtyByUom.length === 1 ? qtyByUom[0] : null;
+  return {
+    ...row,
+    requestedQty: singleUom?.requestedQty ?? null,
+    orderedQty: singleUom?.orderedQty ?? null,
+    qtyByUom,
+    mixedUom: qtyByUom.length > 1,
+    requestedQtyLabel: qtyByUom.map((item) => `${item.requestedQty} ${item.uomCode}`).join(" + "),
+    orderedQtyLabel: qtyByUom.map((item) => `${item.orderedQty} ${item.uomCode}`).join(" + "),
+    lineCount: (row.details || []).length,
+  };
+};
+
+const materialHeaderSnapshot = (rows, requiredDate) => {
+  const materials = [...new Map(rows
+    .filter((row) => row.procurementCategory === "MATERIAL" && row.materialId)
+    .map((row) => [row.materialId, row])).values()];
+  if (!materials.length) {
+    return {
+      headerMaterialId: null,
+      headerMaterialCode: null,
+      headerMaterialName: null,
+      demandBucket: null,
+    };
+  }
+  if (materials.length > 1) {
+    throw Object.assign(
+      new Error("Satu header PR Raw Material hanya boleh untuk satu Material Master. Buat header PR terpisah untuk material lainnya."),
+      { statusCode: 400 },
+    );
+  }
+  const material = materials[0];
+  return {
+    headerMaterialId: material.materialId,
+    headerMaterialCode: material.materialCode,
+    headerMaterialName: material.materialName,
+    demandBucket: dayKey(requiredDate || new Date())?.slice(0, 7) || null,
+  };
+};
 
 exports.list = async (req, res, next) => {
   try {
@@ -282,29 +515,46 @@ exports.list = async (req, res, next) => {
       ...(req.query.status ? { status: String(req.query.status) } : {}),
       ...(req.query.sourceType || req.query.source ? { sourceType: normalizeSourceType(req.query.sourceType || req.query.source) } : {}),
     };
-    const category = normalize(req.query.category || req.query.procurementCategory || req.query.prType).replace(/[\s-]+/g, "_");
-    if (["PURCHASE_PART", "RAW_MATERIAL"].includes(category)) {
-      const rawType = category === "PURCHASE_PART" ? "PURCHASE_PART" : "MATERIAL";
-      const matchingParts = await prisma.part.findMany({ where: { rawType, isDeleted: false }, select: { partCode: true } });
-      where.details = category === "RAW_MATERIAL"
-        ? { some: { isDeleted: false, OR: [{ materialCode: { not: null } }, { partCode: { in: matchingParts.map((part) => part.partCode) } }] } }
-        : { some: { isDeleted: false, partCode: { in: matchingParts.map((part) => part.partCode) } } };
-    } else if (category === "OTHER") {
-      const purchaseParts = await prisma.part.findMany({ where: { rawType: "PURCHASE_PART", isDeleted: false }, select: { partCode: true } });
-      where.details = {
-        some: {
-          isDeleted: false,
-          OR: [
-            { partCode: null },
-            { partCode: { notIn: purchaseParts.map((part) => part.partCode) } },
-          ],
+    const category = normalizeCategory(req.query.category || req.query.procurementCategory || req.query.prType);
+    if (category) {
+      const masterPartWhere = category === "MATERIAL"
+        ? { rawType: "MATERIAL" }
+        : category === "PURCHASE_PART"
+          ? { rawType: "PURCHASE_PART", hasDrawing: true }
+          : category === "UNIVERSAL_PURCHASE_PART"
+            ? { rawType: "PURCHASE_PART", hasDrawing: false }
+            : null;
+      const matchingParts = masterPartWhere
+        ? await prisma.part.findMany({ where: { ...masterPartWhere, isDeleted: false }, select: { partCode: true } })
+        : [];
+      const legacyDetailFilter = category === "MATERIAL"
+        ? { OR: [{ materialCode: { not: null } }, { partCode: { in: matchingParts.map((part) => part.partCode) } }] }
+        : ["PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(category)
+          ? { partCode: { in: matchingParts.map((part) => part.partCode) } }
+          : { partCode: null, materialCode: null };
+      where.OR = [
+        { procurementGroup: category },
+        {
+          procurementGroup: null,
+          details: {
+            some: {
+              isDeleted: false,
+              OR: [
+                { procurementCategory: category },
+                { procurementCategory: null, ...legacyDetailFilter },
+              ],
+            },
+          },
         },
-      };
+      ];
     }
-    if (q) where.OR = [
-      ...["prNumber", "requestedBy", "priority", "poType", "sourceType", "notes"].map((k) => ({ [k]: { contains: q, mode: "insensitive" } })),
-      { details: { some: { isDeleted: false, OR: ["partCode", "partNumber", "partName", "materialCode", "materialName", "materialType", "description"].map((k) => ({ [k]: { contains: q, mode: "insensitive" } })) } } },
-    ];
+    if (q) {
+      const search = [
+        ...["prNumber", "requestedBy", "priority", "poType", "sourceType", "headerMaterialCode", "headerMaterialName", "demandBucket", "notes"].map((k) => ({ [k]: { contains: q, mode: "insensitive" } })),
+        { details: { some: { isDeleted: false, OR: ["partCode", "partNumber", "partName", "materialCode", "materialName", "materialType", "description"].map((k) => ({ [k]: { contains: q, mode: "insensitive" } })) } } },
+      ];
+      where.AND = [...(where.AND || []), { OR: search }];
+    }
     const [items, total] = await Promise.all([
       prisma.purchaseRequisition.findMany({ where, include, orderBy: { prDate: "desc" }, skip: (page - 1) * limit, take: limit }),
       prisma.purchaseRequisition.count({ where }),
@@ -330,17 +580,49 @@ exports.create = async (req, res, next) => {
       }
       const prNumber = await generateDocNumber("purchaseRequisition", "PR", "prNumber", tx);
       const rows = await normalizeRequisitionDetails(details, tx);
+      const procurementGroup = normalizeCategory(header.procurementGroup || input.procurementGroup) || classifyRequisition(rows);
+      if (procurementGroup === "MIXED") {
+        throw Object.assign(new Error("Satu header PR hanya boleh berisi satu kelompok: Material, Purchase Part, Universal Purchase Part, atau Non Produksi."), { statusCode: 400 });
+      }
+      if (rows.some((row) => row.procurementCategory !== procurementGroup)) {
+        throw Object.assign(new Error(`Semua detail PR harus berada pada kelompok ${procurementGroup}.`), { statusCode: 400 });
+      }
+      const materialHeader = procurementGroup === "MATERIAL"
+        ? materialHeaderSnapshot(rows, requiredDate || new Date())
+        : materialHeaderSnapshot([], null);
       const totalAmount = rows.reduce((s, d) => s + d.totalAmount, 0);
-      return tx.purchaseRequisition.create({ data: { prNumber, prDate: prDate || new Date(), requestedBy: header.requestedBy || req.user?.username || req.user?.email || null, departmentId: header.departmentId || null, requiredDate: requiredDate || new Date(), priority: header.priority || "Normal", poType: header.poType || "Other", sourceType: normalizeSourceType(header.sourceType || input.sourceType || "MANUAL"), totalAmount, notes: header.notes || null, details: { create: rows } }, include });
+      return tx.purchaseRequisition.create({ data: { prNumber, prDate: prDate || new Date(), requestedBy: header.requestedBy || req.user?.username || req.user?.email || null, departmentId: header.departmentId || null, requiredDate: requiredDate || new Date(), priority: header.priority || "Normal", poType: header.poType || (procurementGroup === "MATERIAL" ? "Material" : "Other"), procurementGroup, ...materialHeader, sourceType: normalizeSourceType(header.sourceType || input.sourceType || "MANUAL"), totalAmount, notes: header.notes || null, details: { create: rows } }, include });
     });
     res.status(201).json(await attachProcurementClassification(result));
   } catch (e) { if (e.statusCode) return res.status(e.statusCode).json({ message: e.message }); next(e); }
 };
 exports.update = async (req, res, next) => {
   try {
-    const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } });
+    const current = await prisma.purchaseRequisition.findFirst({
+      where: { prNumber: req.params.prNumber, isDeleted: false },
+      include: {
+        details: {
+          where: { isDeleted: false },
+          select: {
+            id: true,
+            orderedQty: true,
+            procurementCategory: true,
+            plannedOrderNumber: true,
+            sourcePlannedOrderNumbers: true,
+            lotAllocations: true,
+            notes: true,
+            sources: { where: { isDeleted: false } },
+            sourcingAllocations: { where: { isDeleted: false } },
+          },
+        },
+        purchaseOrders: { select: { poNumber: true } },
+      },
+    });
     if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
-    if (!["Draft", "Revision Required", "Rejected"].includes(current.status)) return res.status(409).json({ message: "PR hanya dapat diedit saat Draft/Revision Required." });
+    if (!["Draft", "Revision Required", "Rejected"].includes(current.status)) return res.status(409).json({ message: "PR hanya dapat diedit saat Draft, Revision Required, atau Rejected." });
+    if (current.purchaseOrders.length || current.details.some((row) => num(row.orderedQty) > 0)) {
+      return res.status(409).json({ message: "PR yang sudah terhubung ke PO atau memiliki qty ordered tidak dapat diedit." });
+    }
     const input = bodyObject(req.body), header = bodyObject(input.header || input);
     const data = {}; ["requestedBy", "departmentId", "priority", "poType", "notes"].forEach((k) => { if (header[k] !== undefined) data[k] = header[k]; });
     if (header.departmentId !== undefined) data.departmentId = clean(header.departmentId);
@@ -353,7 +635,20 @@ exports.update = async (req, res, next) => {
       data.requiredDate = date(header.requiredDate);
       if (!data.requiredDate || Number.isNaN(data.requiredDate.getTime())) return res.status(400).json({ message: "requiredDate tidak valid." });
     }
-    const details = Array.isArray(input.details) ? input.details : null;
+    const currentDetailById = new Map(current.details.map((row) => [row.id, row]));
+    const details = Array.isArray(input.details) ? input.details.map((row) => {
+      const existing = currentDetailById.get(clean(row.id));
+      if (!existing || !["MRP", "SYSTEM"].includes(current.sourceType)) return row;
+      return {
+        ...row,
+        plannedOrderNumber: row.plannedOrderNumber || existing.plannedOrderNumber,
+        sourcePlannedOrderNumbers: row.sourcePlannedOrderNumbers || existing.sourcePlannedOrderNumbers,
+        lotAllocations: row.lotAllocations || existing.lotAllocations,
+        notes: row.notes || existing.notes,
+        sources: Array.isArray(row.sources) && row.sources.length ? row.sources : existing.sources,
+        sourcingAllocations: Array.isArray(row.sourcingAllocations) ? row.sourcingAllocations : existing.sourcingAllocations,
+      };
+    }) : null;
     const result = await prisma.$transaction(async (tx) => {
       if (data.departmentId) {
         const department = await tx.department.findFirst({ where: { id: data.departmentId, isDeleted: false }, select: { id: true } });
@@ -361,9 +656,56 @@ exports.update = async (req, res, next) => {
       }
       if (details) {
         const rows = (await normalizeRequisitionDetails(details, tx)).map((row) => ({ ...row, prNumber: current.prNumber }));
+        const procurementGroup = normalizeCategory(current.procurementGroup) || classifyRequisition(rows);
+        if (classifyRequisition(rows) === "MIXED" || rows.some((row) => row.procurementCategory !== procurementGroup)) {
+          throw Object.assign(new Error(`Semua detail PR harus berada pada kelompok ${procurementGroup}.`), { statusCode: 400 });
+        }
+        data.procurementGroup = procurementGroup;
+        Object.assign(
+          data,
+          procurementGroup === "MATERIAL"
+            ? materialHeaderSnapshot(rows, data.requiredDate || current.requiredDate)
+            : materialHeaderSnapshot([], null),
+        );
+        const oldDetailIds = current.details.map((row) => row.id);
+        if (oldDetailIds.length) {
+          await tx.purchaseRequisitionSourcingAllocation.updateMany({
+            where: { prDetailId: { in: oldDetailIds }, isDeleted: false },
+            data: { isDeleted: true },
+          });
+        }
         await tx.purchaseRequisitionDetail.updateMany({ where: { prNumber: current.prNumber }, data: { isDeleted: true } });
         data.totalAmount = rows.reduce((s, r) => s + r.totalAmount, 0);
-        await tx.purchaseRequisitionDetail.createMany({ data: rows });
+        for (let index = 0; index < rows.length; index += 1) {
+          const sourceRows = Array.isArray(details[index]?.sources) ? details[index].sources : [];
+          await tx.purchaseRequisitionDetail.create({
+            data: {
+              ...rows[index],
+              ...(sourceRows.length ? {
+                sources: {
+                  create: sourceRows.map((source) => ({
+                    plannedOrderNumber: clean(source.plannedOrderNumber),
+                    mrpRunNumber: clean(source.mrpRunNumber),
+                    mpsNumber: clean(source.mpsNumber),
+                    mpsDetailId: clean(source.mpsDetailId),
+                    forecastNumber: clean(source.forecastNumber),
+                    forecastDetailId: clean(source.forecastDetailId),
+                    soNumber: clean(source.soNumber),
+                    sourceType: clean(source.sourceType),
+                    sourceNumber: clean(source.sourceNumber),
+                    demandMonth: date(source.demandMonth),
+                    requiredDate: date(source.requiredDate),
+                    partCode: clean(source.partCode),
+                    fgPartCode: clean(source.fgPartCode),
+                    qty: num(source.qty),
+                    uomCode: clean(source.uomCode),
+                    metadata: source.metadata || null,
+                  })),
+                },
+              } : {}),
+            },
+          });
+        }
       }
       return tx.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data, include });
     });
@@ -384,7 +726,41 @@ exports.submit = async (req, res, next) => {
 };
 exports.approve = async (req, res, next) => { try { const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat di-approve.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Approved", approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date(), rejectedBy: null, rejectedDate: null, rejectionReason: null }, include }); res.json(pr); } catch (e) { next(e); } };
 exports.reject = async (req, res, next) => { try { const reason = String(req.body?.reason || req.body?.rejectionReason || req.body?.notes || "").trim(); if (!reason) return res.status(400).json({ message: "Alasan penolakan wajib diisi." }); const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat ditolak.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Rejected", rejectedBy: req.user?.username || req.user?.email || "system", rejectedDate: new Date(), rejectionReason: reason }, include }); res.json(pr); } catch (e) { next(e); } };
-exports.remove = async (req, res, next) => { try { await prisma.purchaseRequisition.update({ where: { prNumber: req.params.prNumber }, data: { isDeleted: true } }); res.json({ ok: true }); } catch (e) { next(e); } };
+exports.remove = async (req, res, next) => {
+  try {
+    const pr = await prisma.purchaseRequisition.findFirst({
+      where: { prNumber: req.params.prNumber, isDeleted: false },
+      include: {
+        details: { where: { isDeleted: false }, select: { orderedQty: true } },
+        purchaseOrders: { select: { poNumber: true } },
+      },
+    });
+    if (!pr) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
+    if (!["Draft", "Revision Required", "Rejected"].includes(pr.status)) {
+      return res.status(409).json({
+        message: `PR berstatus ${pr.status} tidak dapat dihapus. Batalkan proses turunannya terlebih dahulu.`,
+      });
+    }
+    if (pr.purchaseOrders.length || pr.details.some((detail) => num(detail.orderedQty) > 0)) {
+      return res.status(409).json({
+        message: "PR sudah terhubung ke Purchase Order dan tidak dapat dihapus.",
+      });
+    }
+    await prisma.$transaction([
+      prisma.purchaseRequisitionDetail.updateMany({
+        where: { prNumber: pr.prNumber, isDeleted: false },
+        data: { isDeleted: true },
+      }),
+      prisma.purchaseRequisition.update({
+        where: { prNumber: pr.prNumber },
+        data: { isDeleted: true },
+      }),
+    ]);
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+};
 
 /**
  * Purchasing supplier confirmation is deliberately separate from the supplier
@@ -409,11 +785,54 @@ exports.confirmSuppliers = async (req, res, next) => {
     const normalizedLines = lines.map((line) => {
       const detail = byId.get(String(line?.prDetailId || line?.id || ""));
       if (!detail) throw Object.assign(new Error("Detail PR yang akan dikonfirmasi tidak ditemukan."), { statusCode: 400 });
-      if (num(detail.orderedQty) >= num(detail.qty)) throw Object.assign(new Error(`Baris ${detail.lineNumber} sudah seluruhnya masuk PO.`), { statusCode: 409 });
       const supplierCode = String(line?.supplierCode || line?.confirmedSupplierCode || "").trim();
       if (!supplierCode) throw Object.assign(new Error(`Supplier baris ${detail.lineNumber} wajib diisi.`), { statusCode: 400 });
-      return { detail, supplierCode };
+      const rawMaterial = Boolean(detail.materialCode);
+      const outstandingQty = Math.max(num(detail.qty) - num(detail.orderedQty), 0);
+      const sourceQty = line?.sourceQty == null ? outstandingQty : num(line.sourceQty);
+      const purchasePackageUomCode = normalize(line?.purchasePackageUomCode || line?.orderUomCode);
+      const purchasePackageQty = num(line?.purchasePackageQty ?? line?.orderQty, 0);
+      const conversionFactor = num(line?.conversionFactor ?? line?.kgPerLot, 0);
+      const conversionUomCode = normalize(line?.conversionUomCode || detail.conversionUomCode || detail.uomCode);
+      const requestUomCode = normalize(detail.uomCode);
+      const convertedPurchaseQty = purchasePackageQty * conversionFactor;
+      if (rawMaterial) {
+        if (!["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
+          throw Object.assign(new Error(`Baris ${detail.lineNumber}: Purchasing wajib memilih bentuk SHEET, COIL, atau PCS.`), { statusCode: 400 });
+        }
+        if (!Number.isInteger(purchasePackageQty) || purchasePackageQty <= 0 || conversionFactor <= 0) {
+          throw Object.assign(new Error(`Baris ${detail.lineNumber}: qty bentuk harus bilangan bulat positif dan isi KG/PCS per bentuk harus lebih dari 0.`), { statusCode: 400 });
+        }
+        if (!["KG", "PCS"].includes(conversionUomCode) || conversionUomCode !== requestUomCode) {
+          throw Object.assign(new Error(`Baris ${detail.lineNumber}: satuan hasil konversi harus KG atau PCS dan sama dengan UOM kebutuhan ${requestUomCode}.`), { statusCode: 400 });
+        }
+      }
+      if (sourceQty <= 0) {
+        throw Object.assign(new Error(`Baris ${detail.lineNumber}: qty alokasi supplier harus lebih dari 0.`), { statusCode: 400 });
+      }
+      return {
+        detail,
+        supplierCode,
+        sourceQty,
+        demandUomCode: requestUomCode || null,
+        rawMaterial,
+        purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
+        purchasePackageQty: rawMaterial ? purchasePackageQty : null,
+        conversionUomCode: rawMaterial ? conversionUomCode : null,
+        conversionFactor: rawMaterial ? conversionFactor : null,
+        convertedPurchaseQty: rawMaterial ? convertedPurchaseQty : null,
+        deliveryDate: date(line?.deliveryDate || pr.requiredDate),
+        currencyCode: normalize(line?.currencyCode || "IDR"),
+        unitPrice: line?.unitPrice == null ? null : num(line.unitPrice),
+        notes: clean(line?.notes),
+      };
     });
+    const coverageByDetail = new Map();
+    for (const row of normalizedLines) {
+      coverageByDetail.set(row.detail.id, num(coverageByDetail.get(row.detail.id)) + row.sourceQty);
+    }
+    // Total split supplier boleh UNDER, EXACT, atau OVER terhadap kebutuhan PR.
+    // Status selisih dihitung saat response/detail ditampilkan.
     const supplierCodes = [...new Set(normalizedLines.map((row) => row.supplierCode))];
     const suppliers = await prisma.supplier.findMany({
       where: { supplierCode: { in: supplierCodes }, isDeleted: false },
@@ -426,13 +845,58 @@ exports.confirmSuppliers = async (req, res, next) => {
     const confirmedAt = new Date();
     const confirmedBy = actor(req);
     const result = await prisma.$transaction(async (tx) => {
+      const touchedIds = [...coverageByDetail.keys()];
+      await tx.purchaseRequisitionSourcingAllocation.updateMany({
+        where: {
+          prDetailId: { in: touchedIds },
+          status: { in: ["Draft", "Confirmed"] },
+          isDeleted: false,
+        },
+        data: { isDeleted: true },
+      });
       for (const row of normalizedLines) {
-        await tx.purchaseRequisitionDetail.update({
-          where: { id: row.detail.id },
+        await tx.purchaseRequisitionSourcingAllocation.create({
           data: {
-            confirmedSupplierCode: row.supplierCode,
+            prDetailId: row.detail.id,
+            supplierCode: row.supplierCode,
+            demandCoveredQty: row.sourceQty,
+            demandUomCode: row.demandUomCode,
+            purchasePackageQty: row.purchasePackageQty,
+            purchasePackageUomCode: row.purchasePackageUomCode,
+            conversionUomCode: row.conversionUomCode,
+            conversionFactor: row.conversionFactor,
+            convertedPurchaseQty: row.convertedPurchaseQty,
+            deliveryDate: row.deliveryDate,
+            currencyCode: row.currencyCode,
+            unitPrice: row.unitPrice,
+            totalAmount: row.unitPrice == null
+              ? null
+              : row.unitPrice * num(row.purchasePackageQty || row.sourceQty),
+            status: "Confirmed",
+            confirmedBy,
+            confirmedAt,
+            notes: row.notes,
+          },
+        });
+      }
+      for (const detailId of touchedIds) {
+        const detailRows = normalizedLines.filter((row) => row.detail.id === detailId);
+        const single = detailRows.length === 1 ? detailRows[0] : null;
+        await tx.purchaseRequisitionDetail.update({
+          where: { id: detailId },
+          data: {
+            confirmedSupplierCode: single?.supplierCode || null,
             supplierConfirmedBy: confirmedBy,
             supplierConfirmedAt: confirmedAt,
+            purchasePackageQty: single?.purchasePackageQty || null,
+            purchasePackageUomCode: single?.purchasePackageUomCode || null,
+            conversionUomCode: single?.conversionUomCode || null,
+            conversionFactor: single?.conversionFactor || null,
+            convertedPurchaseQty: single?.convertedPurchaseQty || null,
+            // Legacy fields are mirrored for existing reports/integrations.
+            lotCount: single?.rawMaterial && single.conversionUomCode === "KG" ? single.purchasePackageQty : null,
+            kgPerLot: single?.rawMaterial && single.conversionUomCode === "KG" ? single.conversionFactor : null,
+            purchaseQtyKg: single?.rawMaterial && single.conversionUomCode === "KG" ? single.convertedPurchaseQty : null,
           },
         });
       }
@@ -463,7 +927,10 @@ exports.consolidateToPO = async (req, res, next) => {
 
     const detailRows = await prisma.purchaseRequisitionDetail.findMany({
       where: { id: { in: ids }, isDeleted: false },
-      include: { pr: true },
+      include: {
+        pr: true,
+        sourcingAllocations: { where: { isDeleted: false } },
+      },
     });
     const detailById = new Map(detailRows.map((row) => [row.id, row]));
     if (detailRows.length !== ids.length) return res.status(400).json({ message: "Sebagian detail PR tidak ditemukan." });
@@ -476,8 +943,8 @@ exports.consolidateToPO = async (req, res, next) => {
       const sourceQty = requestLine.sourceQty == null && requestLine.qty == null
         ? outstanding
         : num(requestLine.sourceQty ?? requestLine.qty);
-      if (sourceQty <= 0 || sourceQty > outstanding + 1e-9) {
-        throw Object.assign(new Error(`Qty baris ${detail.prNumber}/${detail.lineNumber} melebihi outstanding ${outstanding}.`), { statusCode: 409 });
+      if (sourceQty <= 0) {
+        throw Object.assign(new Error(`Qty baris ${detail.prNumber}/${detail.lineNumber} harus lebih dari 0.`), { statusCode: 400 });
       }
       const supplierCode = String(requestLine.supplierCode || detail.confirmedSupplierCode || "").trim();
       const vendorCode = String(requestLine.vendorCode || detail.preferredVendor || "").trim();
@@ -490,9 +957,76 @@ exports.consolidateToPO = async (req, res, next) => {
       const currencyCode = String(requestLine.currencyCode || input.currencyCode || "IDR").trim().toUpperCase();
       const deliveryDate = dayKey(requestLine.deliveryDate || input.deliveryDate || detail.pr.requiredDate);
       const targetPoNumber = String(requestLine.targetPoNumber || input.targetPoNumber || "").trim() || null;
-      return { requestLine, detail, sourceQty, supplierCode: supplierCode || null, vendorCode: vendorCode || null, currencyCode, deliveryDate, targetPoNumber };
+      const rawMaterial = Boolean(detail.materialCode);
+      const purchasePackageUomCode = normalize(
+        requestLine.purchasePackageUomCode
+          || requestLine.orderUomCode
+          || detail.purchasePackageUomCode,
+      );
+      const conversionFactor = num(
+        requestLine.conversionFactor
+          ?? requestLine.kgPerLot
+          ?? detail.conversionFactor,
+      );
+      const requestedPackageQty = num(
+        requestLine.purchasePackageQty
+          ?? requestLine.orderQty
+          ?? detail.purchasePackageQty,
+      );
+      const conversionUomCode = normalize(
+        requestLine.conversionUomCode
+          || detail.conversionUomCode
+          || detail.uomCode,
+      );
+      const requestUomCode = normalize(detail.uomCode);
+      if (rawMaterial) {
+        if (!["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
+          throw Object.assign(
+            new Error(`${detail.prNumber}/${detail.lineNumber}: Purchasing wajib memilih bentuk SHEET, COIL, atau PCS.`),
+            { statusCode: 400 },
+          );
+        }
+        if (!Number.isInteger(requestedPackageQty) || requestedPackageQty <= 0 || conversionFactor <= 0) {
+          throw Object.assign(
+            new Error(`${detail.prNumber}/${detail.lineNumber}: qty bentuk harus bilangan bulat positif dan isi KG/PCS per bentuk harus lebih dari 0.`),
+            { statusCode: 400 },
+          );
+        }
+        if (!["KG", "PCS"].includes(conversionUomCode) || conversionUomCode !== requestUomCode) {
+          throw Object.assign(
+            new Error(`${detail.prNumber}/${detail.lineNumber}: satuan hasil konversi harus KG atau PCS dan sama dengan UOM kebutuhan ${requestUomCode}.`),
+            { statusCode: 400 },
+          );
+        }
+      }
+      return {
+        requestLine,
+        detail,
+        sourceQty,
+        supplierCode: supplierCode || null,
+        vendorCode: vendorCode || null,
+        currencyCode,
+        deliveryDate,
+        targetPoNumber,
+        rawMaterial,
+        purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
+        purchasePackageQty: rawMaterial ? requestedPackageQty : null,
+        conversionUomCode: rawMaterial ? conversionUomCode : null,
+        conversionFactor: rawMaterial ? conversionFactor : null,
+        convertedPurchaseQty: rawMaterial ? requestedPackageQty * conversionFactor : null,
+        sourcingAllocationId: clean(requestLine.sourcingAllocationId || requestLine.allocationId),
+        unitPrice: requestLine.unitPrice == null ? null : num(requestLine.unitPrice),
+        notes: clean(requestLine.notes),
+      };
     });
 
+    // A PR detail may appear multiple times when its demand is split across
+    // suppliers/forms. Aggregate is retained for updates and variance status,
+    // but it deliberately does not block UNDER or OVER orders.
+    const coverageByDetail = new Map();
+    for (const row of normalizedLines) {
+      coverageByDetail.set(row.detail.id, num(coverageByDetail.get(row.detail.id)) + row.sourceQty);
+    }
     const supplierCodes = [...new Set(normalizedLines.map((row) => row.supplierCode).filter(Boolean))];
     const vendorCodes = [...new Set(normalizedLines.map((row) => row.vendorCode).filter(Boolean))];
     const [suppliers, vendors] = await Promise.all([
@@ -505,6 +1039,70 @@ exports.consolidateToPO = async (req, res, next) => {
     if (unknownPartner) return res.status(400).json({ message: `Supplier/vendor tidak ditemukan: ${unknownPartner.supplierCode || unknownPartner.vendorCode}` });
 
     const result = await prisma.$transaction(async (tx) => {
+      const confirmedAt = new Date();
+      const confirmedBy = actor(req);
+      for (const row of normalizedLines) {
+        const allocationData = {
+          supplierCode: row.supplierCode,
+          vendorCode: row.vendorCode,
+          demandCoveredQty: row.sourceQty,
+          demandUomCode: row.detail.uomCode,
+          purchasePackageUomCode: row.purchasePackageUomCode,
+          purchasePackageQty: row.purchasePackageQty,
+          conversionUomCode: row.conversionUomCode,
+          conversionFactor: row.conversionFactor,
+          convertedPurchaseQty: row.convertedPurchaseQty,
+          deliveryDate: date(row.deliveryDate),
+          currencyCode: row.currencyCode,
+          unitPrice: row.unitPrice,
+          totalAmount: row.unitPrice == null
+            ? null
+            : row.unitPrice * num(row.purchasePackageQty || row.sourceQty),
+          status: "Confirmed",
+          confirmedBy,
+          confirmedAt,
+          notes: row.notes,
+        };
+        if (row.sourcingAllocationId) {
+          const existingAllocation = row.detail.sourcingAllocations.find(
+            (allocation) => allocation.id === row.sourcingAllocationId && !["Ordered", "Cancelled"].includes(allocation.status),
+          );
+          if (!existingAllocation) {
+            throw Object.assign(new Error(`Sourcing allocation ${row.sourcingAllocationId} tidak tersedia untuk diproses.`), { statusCode: 409 });
+          }
+          await tx.purchaseRequisitionSourcingAllocation.update({
+            where: { id: existingAllocation.id },
+            data: allocationData,
+          });
+        } else {
+          const allocation = await tx.purchaseRequisitionSourcingAllocation.create({
+            data: { prDetailId: row.detail.id, ...allocationData },
+            select: { id: true },
+          });
+          row.sourcingAllocationId = allocation.id;
+        }
+      }
+      for (const detailId of coverageByDetail.keys()) {
+        const detailAllocations = normalizedLines.filter((row) => row.detail.id === detailId);
+        const single = detailAllocations.length === 1 ? detailAllocations[0] : null;
+        await tx.purchaseRequisitionDetail.update({
+          where: { id: detailId },
+          data: {
+            confirmedSupplierCode: single?.supplierCode || null,
+            supplierConfirmedBy: confirmedBy,
+            supplierConfirmedAt: confirmedAt,
+            supplierProposalSource: "PURCHASING",
+            purchasePackageUomCode: single?.purchasePackageUomCode || null,
+            purchasePackageQty: single?.purchasePackageQty || null,
+            conversionUomCode: single?.conversionUomCode || null,
+            conversionFactor: single?.conversionFactor || null,
+            convertedPurchaseQty: single?.convertedPurchaseQty || null,
+            lotCount: single?.rawMaterial && single.conversionUomCode === "KG" ? single.purchasePackageQty : null,
+            kgPerLot: single?.rawMaterial && single.conversionUomCode === "KG" ? single.conversionFactor : null,
+            purchaseQtyKg: single?.rawMaterial && single.conversionUomCode === "KG" ? single.convertedPurchaseQty : null,
+          },
+        });
+      }
       const groups = new Map();
       for (const row of normalizedLines) {
         // Explicit PO targets form their own group; otherwise use compatible
@@ -542,26 +1140,25 @@ exports.consolidateToPO = async (req, res, next) => {
           const detail = row.detail;
           const explicitOrderUom = row.requestLine.orderUomCode || row.requestLine.poUomCode;
           const explicitOrderQty = num(row.requestLine.orderQty ?? row.requestLine.poQty, 0);
-          let poQty = row.sourceQty;
-          let poUom = detail.uomCode;
+          let poQty = row.rawMaterial ? row.purchasePackageQty : (explicitOrderQty || row.sourceQty);
+          let poUom = row.rawMaterial
+            ? row.purchasePackageUomCode
+            : (explicitOrderUom || detail.uomCode);
           let conversionSource = null;
-          if (explicitOrderUom && explicitOrderQty > 0) {
-            poQty = explicitOrderQty;
-            poUom = explicitOrderUom;
+          if (row.rawMaterial) {
+            conversionSource = `${row.conversionFactor} ${row.conversionUomCode}/${row.purchasePackageUomCode}; Purchasing confirmation`;
+          } else if (explicitOrderUom && explicitOrderQty > 0) {
             conversionSource = "Purchasing confirmation";
-          } else if (num(detail.lotCount) > 0 && num(detail.kgPerLot) > 0) {
-            // PR outstanding is tracked in KG. Derive PO lots from the actual
-            // selected KG so partial consolidation cannot duplicate all lots.
-            poQty = row.sourceQty / num(detail.kgPerLot);
-            poUom = "LOT";
-            conversionSource = `${num(detail.kgPerLot)} KG/LOT`;
           }
-          const totalAmount = row.sourceQty >= num(detail.qty) - num(detail.orderedQty) - 1e-9
-            ? num(detail.estimatedPrice) * row.sourceQty
+          const totalAmount = row.unitPrice != null
+            ? row.unitPrice * poQty
             : num(detail.estimatedPrice) * row.sourceQty;
-          const unitPrice = poQty > 0 ? totalAmount / poQty : 0;
+          const unitPrice = row.unitPrice != null
+            ? row.unitPrice
+            : poQty > 0 ? totalAmount / poQty : 0;
           prepared.push({
             sourceQty: row.sourceQty,
+            sourcingAllocationId: row.sourcingAllocationId,
             detail,
             data: {
               prDetailId: detail.id,
@@ -578,8 +1175,13 @@ exports.consolidateToPO = async (req, res, next) => {
               thickness: detail.thickness,
               width: detail.width,
               CSP: detail.CSP,
-              qty: poQty,
-              uomCode: poUom,
+               qty: poQty,
+               uomCode: poUom,
+              purchasePackageQty: row.purchasePackageQty,
+              purchasePackageUomCode: row.purchasePackageUomCode,
+              conversionUomCode: row.conversionUomCode,
+              conversionFactor: row.conversionFactor,
+              convertedPurchaseQty: row.convertedPurchaseQty,
               unitPrice,
               totalAmount,
               deliveryDate: date(row.deliveryDate),
@@ -624,12 +1226,18 @@ exports.consolidateToPO = async (req, res, next) => {
           });
         }
 
+        const allocationIds = prepared.map((row) => row.sourcingAllocationId).filter(Boolean);
+        if (allocationIds.length) {
+          await tx.purchaseRequisitionSourcingAllocation.updateMany({
+            where: { id: { in: allocationIds }, isDeleted: false },
+            data: { status: "Ordered", poNumber: po.poNumber },
+          });
+        }
         for (const row of prepared) {
           await tx.purchaseRequisitionDetail.update({
             where: { id: row.detail.id },
             data: {
               orderedQty: { increment: row.sourceQty },
-              confirmedSupplierCode: first.supplierCode,
               supplierConfirmedBy: actor(req),
               supplierConfirmedAt: new Date(),
             },
@@ -662,6 +1270,67 @@ exports.consolidateToPO = async (req, res, next) => {
 
 exports.convertToPO = async (req, res, next) => {
   try {
+    const input = bodyObject(req.body);
+    const pr = await prisma.purchaseRequisition.findFirst({
+      where: { prNumber: req.params.prNumber, isDeleted: false },
+      include: { details: { where: { isDeleted: false } } },
+    });
+    if (!pr) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
+    if (!["Approved", "Partially Ordered"].includes(pr.status)) {
+      return res.status(409).json({ message: "PR harus Approved sebelum dipindahkan ke PO." });
+    }
+    const suppliedLines = Array.isArray(input.lines) ? input.lines : [];
+    const requestedIds = new Set([
+      ...(Array.isArray(input.detailIds) ? input.detailIds : []),
+      ...(Array.isArray(input.prDetailIds) ? input.prDetailIds : []),
+      ...suppliedLines.map((line) => line?.prDetailId || line?.id),
+    ].filter(Boolean).map(String));
+    const outstanding = pr.details.filter(
+      (detail) => num(detail.qty) > num(detail.orderedQty)
+        && (!requestedIds.size || requestedIds.has(detail.id)),
+    );
+    if (!outstanding.length) {
+      return res.status(409).json({ message: "Tidak ada detail PR outstanding yang dapat diproses." });
+    }
+    const suppliedById = new Map(
+      suppliedLines
+        .map((line) => [String(line?.prDetailId || line?.id || ""), line])
+        .filter(([id]) => id),
+    );
+    req.body = {
+      ...input,
+      targetPoNumber: input.targetPoNumber || input.existingPoNumber || input.poNumber || null,
+      lines: outstanding.map((detail) => {
+        const supplied = suppliedById.get(detail.id) || {};
+        return {
+          ...supplied,
+          prDetailId: detail.id,
+          sourceQty: supplied.sourceQty ?? supplied.qty ?? (num(detail.qty) - num(detail.orderedQty)),
+          supplierCode: supplied.supplierCode || input.supplierCode || detail.confirmedSupplierCode || null,
+          vendorCode: supplied.vendorCode || input.vendorCode || detail.preferredVendor || null,
+          purchasePackageUomCode:
+            supplied.purchasePackageUomCode
+            || supplied.orderUomCode
+            || detail.purchasePackageUomCode,
+          purchasePackageQty:
+            supplied.purchasePackageQty
+            ?? supplied.orderQty
+            ?? detail.purchasePackageQty,
+          conversionFactor:
+            supplied.conversionFactor
+            ?? supplied.kgPerLot
+            ?? detail.conversionFactor,
+        };
+      }),
+    };
+    return exports.consolidateToPO(req, res, next);
+  } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
+    return next(e);
+  }
+
+  /* istanbul ignore next -- retained temporarily as unreachable legacy source */
+  try {
     const input = bodyObject(req.body), pr = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false }, include: { details: { where: { isDeleted: false } } } });
     if (!pr) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
     if (!["Approved", "Partially Ordered"].includes(pr.status)) return res.status(409).json({ message: "PR harus Approved sebelum dipindahkan ke PO." });
@@ -692,11 +1361,18 @@ exports.convertToPO = async (req, res, next) => {
       for (const detail of outstanding) {
         const sourceQty = num(detail.qty) - num(detail.orderedQty);
         const part = partByCode.get(normalize(detail.partCode));
-        const category = detail.materialCode ? "RAW_MATERIAL" : classifyPart(part);
-        const hasLotPlan = category === "RAW_MATERIAL" && num(detail.kgPerLot) > 0;
-        const conversion = hasLotPlan
-          ? { factor: 1 / num(detail.kgPerLot), uomCode: "LOT", source: `${num(detail.kgPerLot)} KG/LOT` }
-          : category === "RAW_MATERIAL"
+        const category = normalizeCategory(detail.procurementCategory) || (detail.materialCode ? "MATERIAL" : classifyPart(part));
+        const hasPackagePlan = category === "MATERIAL"
+          && num(detail.conversionFactor ?? detail.kgPerLot) > 0
+          && Boolean(detail.purchasePackageUomCode || detail.lotCount);
+        const packageFactor = num(detail.conversionFactor ?? detail.kgPerLot);
+        const conversion = hasPackagePlan
+          ? {
+              factor: 1 / packageFactor,
+              uomCode: detail.purchasePackageUomCode || "LOT",
+              source: `${packageFactor} ${detail.conversionUomCode || detail.uomCode || "KG"}/${detail.purchasePackageUomCode || "LOT"}`,
+            }
+          : category === "MATERIAL"
             ? await rawMaterialConversion(part, detail.uomCode, tx)
             : { factor: 1, uomCode: detail.uomCode, source: null };
         const poQty = sourceQty * conversion.factor;
@@ -720,12 +1396,17 @@ exports.convertToPO = async (req, res, next) => {
             thickness: detail.thickness,
             width: detail.width,
             CSP: detail.CSP,
-            qty: poQty,
-            uomCode: conversion.uomCode,
+             qty: poQty,
+             uomCode: conversion.uomCode,
+            purchasePackageQty: hasPackagePlan ? poQty : null,
+            purchasePackageUomCode: hasPackagePlan ? conversion.uomCode : null,
+            conversionUomCode: hasPackagePlan ? (detail.conversionUomCode || detail.uomCode) : null,
+            conversionFactor: hasPackagePlan ? packageFactor : null,
+            convertedPurchaseQty: hasPackagePlan ? poQty * packageFactor : null,
             unitPrice,
             totalAmount: sourceAmount,
             deliveryDate: date(input.deliveryDate) || pr.requiredDate,
-            notes: conversion.source ? `${detail.notes || ""}${detail.notes ? "; " : ""}${hasLotPlan ? "Purchased by lot" : "Converted to KG"} via ${conversion.source}; source ${sourceQty} ${detail.uomCode || "unit"}` : detail.notes,
+            notes: conversion.source ? `${detail.notes || ""}${detail.notes ? "; " : ""}${hasPackagePlan ? "Purchased by material form" : "Converted to KG"} via ${conversion.source}; source ${sourceQty} ${detail.uomCode || "unit"}` : detail.notes,
           },
         });
       }

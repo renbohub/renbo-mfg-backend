@@ -21,6 +21,9 @@ const convertPODetailNumericFields = (detail) => {
   return convertNumericFields(detail, [
     "lineNumber",
     "qty",
+    "purchasePackageQty",
+    "conversionFactor",
+    "convertedPurchaseQty",
     "unitPrice",
     "discount",
     "tax",

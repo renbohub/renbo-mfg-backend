@@ -1,0 +1,5 @@
+require("dotenv").config({ quiet: true });
+const { prisma } = require("../src/prisma");
+const ctrl = require("../src/prisma/controllers/planning/MRPController");
+function invoke(runNumber) { return new Promise((resolve, reject) => { const req = { params: { runNumber }, body: {}, user: { username: "real-test" } }; const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(v) { resolve({ statusCode: this.statusCode, body: v }); } }; Promise.resolve(ctrl.createPurchaseRequestOutput(req, res, (e) => reject(e))).catch(reject); }); }
+(async () => { const runs = await prisma.mRPRun.findMany({ where: { isDeleted: false, status: "Completed" }, select: { runNumber: true }, orderBy: { runNumber: "asc" } }); const out = []; for (const run of runs) { const r = await invoke(run.runNumber); out.push({ runNumber: run.runNumber, statusCode: r.statusCode, message: r.body?.message, prNumbers: r.body?.purchaseRequisitions?.map((x) => x.prNumber), total: r.body?.total }); } console.log(JSON.stringify(out, null, 2)); })().catch((e) => { console.error(e); process.exitCode = 1; }).finally(() => prisma.$disconnect());

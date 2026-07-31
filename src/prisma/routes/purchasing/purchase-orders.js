@@ -43,15 +43,15 @@ router.patch("/:poNumber/submit-checking", authorize("purchaseOrder", "update"),
   paramKey: 'poNumber',
   entityField: 'poNumber',
 }), ctrl.submitChecking);
-router.patch("/:poNumber/approve", purchaseOrderApproval, logger("purchaseOrder", "approve", {
+router.patch("/:poNumber/approve", authorize("purchaseOrder", "approve"), purchaseOrderApproval, logger("purchaseOrder", "approve", {
   paramKey: 'poNumber',
   entityField: 'poNumber',
 }), ctrl.approve);
-router.patch("/:poNumber/revise", logger("purchaseOrder", "revise", {
+router.patch("/:poNumber/revise", authorize("purchaseOrder", "approve"), logger("purchaseOrder", "revise", {
   paramKey: 'poNumber',
   entityField: 'poNumber',
 }), ctrl.revise);
-router.patch("/:poNumber/reject", purchaseOrderRejection, logger("purchaseOrder", "reject", {
+router.patch("/:poNumber/reject", authorize("purchaseOrder", "approve"), purchaseOrderRejection, logger("purchaseOrder", "reject", {
   paramKey: 'poNumber',
   entityField: 'poNumber',
 }), ctrl.reject);

@@ -32,6 +32,58 @@ const includeSupplierMainBusinesses = {
   },
 };
 
+function mainBusinessTokens(value) {
+  let rows = value;
+  if (typeof rows === "string") {
+    const trimmed = rows.trim();
+    if (!trimmed) return [];
+    try {
+      rows = JSON.parse(trimmed);
+    } catch {
+      rows = [trimmed];
+    }
+  }
+  if (!Array.isArray(rows)) rows = rows == null ? [] : [rows];
+  return [...new Set(rows
+    .map((item) => typeof item === "object" && item
+      ? item.id || item.mainBusinessId || item.mainBusinessCode
+      : item)
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean))];
+}
+
+async function resolveMainBusinessIds(db, value) {
+  const tokens = mainBusinessTokens(value);
+  if (!tokens.length) return [];
+  const rows = await db.mainBusiness.findMany({
+    where: {
+      isDeleted: false,
+      OR: [
+        { id: { in: tokens } },
+        { mainBusinessCode: { in: tokens } },
+      ],
+    },
+    select: { id: true, mainBusinessCode: true },
+  });
+  const byToken = new Map();
+  rows.forEach((row) => {
+    byToken.set(row.id, row.id);
+    byToken.set(row.mainBusinessCode, row.id);
+  });
+  const invalid = tokens.filter((token) => !byToken.has(token));
+  if (invalid.length) {
+    throw Object.assign(
+      new Error(`Bidang Usaha tidak ditemukan atau sudah nonaktif: ${invalid.join(", ")}`),
+      { statusCode: 400 },
+    );
+  }
+  return [...new Set(tokens.map((token) => byToken.get(token)))];
+}
+
+const mainBusinessRelation = (ids) => ({
+  create: ids.map((mainBusinessId) => ({ mainBusinessId })),
+});
+
 exports.generateCode = async (req, res, next) => {
   try {
     // Ambil semua supplier codes
@@ -146,6 +198,7 @@ exports.create = async (req, res, next) => {
   try {
     // Extract mainBusiness dari request body
     const { mainBusiness, ...supplierData } = req.body;
+    const mainBusinessIds = await resolveMainBusinessIds(prisma, mainBusiness);
 
     // Cek apakah supplier dengan supplierCode yang sama sudah ada dan soft deleted
     const existing = await prisma.supplier.findUnique({
@@ -162,11 +215,7 @@ exports.create = async (req, res, next) => {
           isDeleted: false,
           mainBusinesses: {
             deleteMany: {}, // Hapus relasi lama
-            create: Array.isArray(mainBusiness)
-              ? mainBusiness.map((mainBusinessId) => ({
-                  mainBusinessId,
-                }))
-              : [],
+            ...mainBusinessRelation(mainBusinessIds),
           },
         },
         include: includeSupplierMainBusinesses,
@@ -175,13 +224,7 @@ exports.create = async (req, res, next) => {
       doc = await prisma.supplier.create({
         data: {
           ...supplierData,
-          mainBusinesses: {
-            create: Array.isArray(mainBusiness)
-              ? mainBusiness.map((mainBusinessId) => ({
-                  mainBusinessId,
-                }))
-              : [],
-          },
+          mainBusinesses: mainBusinessRelation(mainBusinessIds),
         },
         include: includeSupplierMainBusinesses,
       });
@@ -189,6 +232,10 @@ exports.create = async (req, res, next) => {
 
     res.status(201).json(formatSupplierWithMainBusiness(doc));
   } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
+    if (e.code === "P2003") {
+      return res.status(400).json({ message: "Relasi Bidang Usaha Supplier tidak valid. Muat ulang pilihan lalu coba kembali." });
+    }
     next(e);
   }
 };
@@ -197,6 +244,9 @@ exports.update = async (req, res, next) => {
   try {
     // Extract mainBusiness dari request body
     const { mainBusiness, ...supplierData } = req.body;
+    const mainBusinessIds = mainBusiness === undefined
+      ? null
+      : await resolveMainBusinessIds(prisma, mainBusiness);
 
     // Cek current supplier
     const currentSupplier = await prisma.supplier.findUnique({
@@ -234,11 +284,7 @@ exports.update = async (req, res, next) => {
     if (mainBusiness !== undefined) {
       updateData.mainBusinesses = {
         deleteMany: {}, // Hapus semua relasi lama
-        create: Array.isArray(mainBusiness)
-          ? mainBusiness.map((mainBusinessId) => ({
-              mainBusinessId,
-            }))
-          : [],
+        ...mainBusinessRelation(mainBusinessIds),
       };
     }
 
@@ -251,6 +297,10 @@ exports.update = async (req, res, next) => {
 
     res.json(formatSupplierWithMainBusiness(doc));
   } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
+    if (e.code === "P2003") {
+      return res.status(400).json({ message: "Relasi Bidang Usaha Supplier tidak valid. Muat ulang pilihan lalu coba kembali." });
+    }
     next(e);
   }
 };
@@ -303,6 +353,7 @@ exports.bulkCreate = async (req, res, next) => {
       try {
         // Extract mainBusiness dari supplier data
         const { mainBusiness, ...dataWithoutMainBusiness } = supplierData;
+        const mainBusinessIds = await resolveMainBusinessIds(prisma, mainBusiness);
 
         // Cek existing supplier
         const existing = await prisma.supplier.findUnique({
@@ -328,11 +379,7 @@ exports.bulkCreate = async (req, res, next) => {
               isDeleted: false,
               mainBusinesses: {
                 deleteMany: {},
-                create: Array.isArray(mainBusiness)
-                  ? mainBusiness.map((mainBusinessId) => ({
-                      mainBusinessId,
-                    }))
-                  : [],
+                ...mainBusinessRelation(mainBusinessIds),
               },
             },
             include: includeSupplierMainBusinesses,
@@ -342,13 +389,7 @@ exports.bulkCreate = async (req, res, next) => {
           doc = await prisma.supplier.create({
             data: {
               ...dataWithoutMainBusiness,
-              mainBusinesses: {
-                create: Array.isArray(mainBusiness)
-                  ? mainBusiness.map((mainBusinessId) => ({
-                      mainBusinessId,
-                    }))
-                  : [],
-              },
+              mainBusinesses: mainBusinessRelation(mainBusinessIds),
             },
             include: includeSupplierMainBusinesses,
           });

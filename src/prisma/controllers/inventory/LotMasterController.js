@@ -23,6 +23,7 @@ exports.list = async (req, res, next) => {
     const {
       q,
       isDeleted,
+      materialCode,
       partCode,
       productId,
       description,
@@ -42,6 +43,9 @@ exports.list = async (req, res, next) => {
 
     if (partCode) {
       where.partCode = partCode;
+    }
+    if (materialCode) {
+      where.materialCode = materialCode;
     }
 
     if (productId) {
@@ -71,6 +75,8 @@ exports.list = async (req, res, next) => {
     if (q) {
       where.OR = [
         { lotNumber: { contains: q, mode: "insensitive" } },
+        { materialCode: { contains: q, mode: "insensitive" } },
+        { materialName: { contains: q, mode: "insensitive" } },
         { partCode: { contains: q, mode: "insensitive" } },
         { description: { contains: q, mode: "insensitive" } },
         { supplierBatch: { contains: q, mode: "insensitive" } },
@@ -87,6 +93,9 @@ exports.list = async (req, res, next) => {
         include: {
           product: {
             select: { productCode: true, productName: true },
+          },
+          material: {
+            select: { materialCode: true, materialName: true, materialType: true },
           },
         },
         orderBy,
@@ -119,6 +128,9 @@ exports.get = async (req, res, next) => {
       include: {
         product: {
           select: { productCode: true, productName: true },
+        },
+        material: {
+          select: { materialCode: true, materialName: true, materialType: true },
         },
       },
     });

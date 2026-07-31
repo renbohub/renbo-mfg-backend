@@ -7,6 +7,7 @@ const { logger } = require("../../middleware/logger");
 router.get("/generate-number", authorize("qualityInspections", "create"), ctrl.generateNumber);
 router.get("/fg-receipts/pending", authorize("qualityInspections", "read"), ctrl.pendingFgReceipts);
 router.get("/fg-receipts/history", authorize("qualityInspections", "read"), ctrl.fgReceiptHistory);
+router.get("/fg-receipts/history/:movementNumber", authorize("qualityInspections", "read"), ctrl.fgReceiptDetail);
 router.patch("/fg-receipts/:movementNumber/rollback", authorize("qualityInspections", "complete"), logger("qualityInspections", "rollback-fg-receipt", { modelName: "QualityInspection" }), ctrl.rollbackFgReceipt);
 router.patch("/bulk-remove", authorize("qualityInspections", "delete"), logger("qualityInspections", "bulk-remove", { modelName: "QualityInspection" }), ctrl.bulkRemove);
 

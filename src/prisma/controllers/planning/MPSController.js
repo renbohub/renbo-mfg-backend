@@ -1,5 +1,13 @@
 const { prisma } = require("../../index");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
+const { normalizeQuantity } = require("../../utils/uomQuantity");
+const {
+  planningMonthKey: monthKey,
+  utcMonthStart,
+  utcMonthEnd,
+  nextPlanningMonthKey,
+} = require("../../utils/planningMonth");
+const { compareRoutingOperations } = require("../../utils/routingSequence");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
@@ -8,6 +16,192 @@ const include = { details: { where: { isDeleted: false }, orderBy: [{ startDate:
 const GENERATED_PROCESS_PREFIX = "[MRP-PRODUCTION]";
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith(GENERATED_PROCESS_PREFIX);
+function evaluateMpsBuffer(formulas, variables) {
+  const formula = formulas?.get?.("MPS_BUFFER_QTY");
+  const result = evaluateFromSet(formulas, "MPS_BUFFER_QTY", variables);
+  // Older database-seeded formulas predate stock netting. Keep them
+  // backward-compatible while enforcing the current rule transparently.
+  return String(formula?.expression || "").includes("stockAvailableQty")
+    ? Math.max(result, 0)
+    : Math.max(result - number(variables.stockAvailableQty), 0);
+}
+const sourceKeyFor = (forecastNumber, periodKey, attempt = 0) => `FORECAST:${forecastNumber}:${periodKey}${attempt > 0 ? `:PARTIAL-${attempt}` : ""}`;
+const sourcePeriodKey = (forecastNumber, sourceKey, fallback) => {
+  const prefix = `FORECAST:${forecastNumber}:`;
+  if (!String(sourceKey || "").startsWith(prefix)) return fallback;
+  return String(sourceKey).slice(prefix.length).split(":")[0] || fallback;
+};
+
+function preferredExistingMps(left, right) {
+  const rank = { Released: 5, Completed: 4, Confirmed: 3, Draft: 2, Cancelled: 1 };
+  const difference = number(rank[right?.status]) - number(rank[left?.status]);
+  if (difference) return difference > 0 ? right : left;
+  return new Date(left?.createdAt || 0) <= new Date(right?.createdAt || 0) ? left : right;
+}
+
+async function existingMpsByMonth(tx, forecastNumber, periodKeys) {
+  const wanted = new Set(periodKeys);
+  const rows = await tx.mPS.findMany({
+    where: { forecastNumber, isDeleted: false },
+    include,
+    orderBy: { createdAt: "asc" },
+  });
+  const result = new Map();
+  for (const row of rows) {
+    const key = sourcePeriodKey(forecastNumber, row.sourceKey, monthKey(row.periodStart));
+    if (!wanted.has(key)) continue;
+    result.set(key, result.has(key) ? preferredExistingMps(result.get(key), row) : row);
+  }
+  return result;
+}
+
+async function allMpsByMonth(tx, forecastNumber, periodKeys) {
+  const wanted = new Set(periodKeys);
+  const rows = await tx.mPS.findMany({
+    where: { forecastNumber, isDeleted: false },
+    include,
+    orderBy: { createdAt: "asc" },
+  });
+  const result = new Map();
+  for (const row of rows) {
+    const key = sourcePeriodKey(forecastNumber, row.sourceKey, monthKey(row.periodStart));
+    if (!wanted.has(key)) continue;
+    if (!result.has(key)) result.set(key, []);
+    result.get(key).push(row);
+  }
+  return result;
+}
+
+function mpsResponse(docs, options = {}) {
+  return {
+    ...docs[0],
+    items: docs,
+    mpsNumbers: docs.map((doc) => doc.mpsNumber),
+    idempotent: options.idempotent === true,
+    createdCount: number(options.createdCount),
+    message: options.idempotent
+      ? `${docs.length} MPS bulanan sudah tersedia; tidak ada dokumen duplikat yang dibuat`
+      : `${number(options.createdCount) || docs.length} MPS bulanan berhasil dibuat`,
+  };
+}
+
+async function buildMpsReadiness(tx, doc) {
+  const sourceDetails = (doc?.details || []).filter((row) => !isGeneratedProcess(row));
+  const partIds = [...new Set(sourceDetails.map((row) => row.partId).filter(Boolean))];
+  const headers = partIds.length ? await tx.mBOMHeader.findMany({
+    where: { partId: { in: partIds }, isDeleted: false },
+    orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
+    include: {
+      part: { select: { partCode: true, partName: true, baseUomCode: true, productionUomCode: true } },
+      details: {
+        where: { isDeleted: false },
+        include: {
+          part: {
+            select: {
+              partCode: true, partName: true, baseUomCode: true, purchaseUomCode: true,
+              productionUomCode: true, supplierId: true, itemType: true, partType: true,
+              supplierItems: { where: { isActive: true }, select: { id: true }, take: 1 },
+              mbomHeaders: {
+                where: { isDeleted: false },
+                orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
+                take: 1,
+                select: {
+                  noReg: true,
+                  details: {
+                    where: { isDeleted: false },
+                    select: { id: true },
+                    take: 1,
+                  },
+                },
+              },
+            },
+          },
+          children: {
+            where: { isDeleted: false },
+            select: { id: true },
+          },
+          mbomProcesses: {
+            where: { isDeleted: false },
+            include: {
+              process: { select: { processCode: true, processName: true } },
+              machine: { select: { machineCode: true, status: true } },
+              vendor: { select: { vendorCode: true, status: true } },
+            },
+            orderBy: { sequence: "asc" },
+          },
+        },
+        orderBy: [{ levelComponent: "asc" }, { createdAt: "asc" }],
+      },
+    },
+  }) : [];
+  const headerByPartId = new Map();
+  headers.forEach((header) => { if (!headerByPartId.has(header.partId)) headerByPartId.set(header.partId, header); });
+  const issues = [];
+  const seen = new Set();
+  const add = (severity, code, message, context = {}) => {
+    const key = `${code}|${context.partCode || ""}|${context.processCode || ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    issues.push({ severity, code, message, ...context });
+  };
+  for (const row of sourceDetails) {
+    const partCode = row.partCode || row.part?.partCode || "-";
+    const header = headerByPartId.get(row.partId);
+    const receiptUom = row.uomCode || row.part?.productionUomCode || row.part?.baseUomCode;
+    if (!receiptUom) add("BLOCKING", "FG_UOM_MISSING", `${partCode} belum memiliki Production/Base UOM untuk MPS.`, { partCode });
+    if (!header) {
+      add("BLOCKING", "FG_MBOM_MISSING", `${partCode} belum memiliki mBOM aktif untuk proses produksi.`, { partCode });
+      continue;
+    }
+    const bomContext = { bomNumber: header.noReg };
+    if (!header.uomCode && !header.part?.productionUomCode && !header.part?.baseUomCode) {
+      add("BLOCKING", "MBOM_UOM_MISSING", `${partCode} belum memiliki UOM pada header mBOM atau Part Master.`, { partCode, ...bomContext });
+    }
+    for (const detail of header.details || []) {
+      const detailCode = detail.part?.partCode || `BOM line ${detail.id}`;
+      const category = String(detail.category || "").toUpperCase();
+      const detailUom = detail.uomCode
+        || (category === "PURCHASE" ? detail.part?.purchaseUomCode : detail.part?.productionUomCode)
+        || detail.part?.baseUomCode;
+      if (!detailUom) add("BLOCKING", "BOM_DETAIL_UOM_MISSING", `${detailCode} belum memiliki UOM yang dapat dipakai planning.`, { partCode: detailCode, parentPartCode: partCode, ...bomContext });
+      if (category === "PURCHASE" && !detail.part?.supplierId && !(detail.part?.supplierItems || []).length) {
+        add("WARNING", "PURCHASE_SUPPLIER_MISSING", `${detailCode} belum memiliki supplier default/preferred; PPIC/Purchasing wajib memilih supplier sebelum PR/PO.`, { partCode: detailCode, parentPartCode: partCode, ...bomContext });
+      }
+      const hasChildStructure = (detail.children || []).length > 0
+        || (detail.part?.mbomHeaders || []).some((childBom) => (childBom.details || []).length > 0);
+      const isFgReceiptOnly = String(detail.part?.itemType || "").toUpperCase() === "FG"
+        && (
+          String(detail.part?.partType || "STANDARD").toUpperCase() !== "COMP"
+          || hasChildStructure
+        );
+      if (category !== "PURCHASE" && !(detail.mbomProcesses || []).length && !isFgReceiptOnly) {
+        add("BLOCKING", "ROUTING_MISSING", `${detailCode} belum memiliki routing process pada mBOM.`, { partCode: detailCode, parentPartCode: partCode, ...bomContext });
+      }
+      for (const route of detail.mbomProcesses || []) {
+        const processCode = route.process?.processCode || route.process?.processName || `sequence ${route.sequence}`;
+        if (String(route.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
+          if (!route.vendorId || !route.vendor || String(route.vendor.status || "Active").toUpperCase() !== "ACTIVE") {
+            add("BLOCKING", "ROUTING_VENDOR_MISSING", `${detailCode} · ${processCode} memakai routing vendor tetapi vendor aktif belum dipilih.`, { partCode: detailCode, parentPartCode: partCode, processCode, ...bomContext });
+          }
+        } else {
+          if (!route.machineId || !route.machine || String(route.machine.status || "Active").toUpperCase() !== "ACTIVE") {
+            add("BLOCKING", "ROUTING_MACHINE_MISSING", `${detailCode} · ${processCode} belum memiliki mesin aktif.`, { partCode: detailCode, parentPartCode: partCode, processCode, ...bomContext });
+          }
+          if (number(route.cycleTime) <= 0) {
+            add("BLOCKING", "ROUTING_CYCLE_TIME_MISSING", `${detailCode} · ${processCode} belum memiliki cycle time.`, { partCode: detailCode, parentPartCode: partCode, processCode, ...bomContext });
+          }
+        }
+      }
+    }
+  }
+  return {
+    ok: !issues.some((issue) => issue.severity === "BLOCKING"),
+    blockingCount: issues.filter((issue) => issue.severity === "BLOCKING").length,
+    warningCount: issues.filter((issue) => issue.severity === "WARNING").length,
+    checkedFgCount: partIds.length,
+    issues,
+  };
+}
 
 async function nextNumber(tx = prisma) {
   const year = new Date().getFullYear(); const prefix = `MPS-${year}-`;
@@ -16,8 +210,6 @@ async function nextNumber(tx = prisma) {
   return `${prefix}${String(max + 1).padStart(3, "0")}`;
 }
 
-function monthEnd(value) { const d = new Date(value); return new Date(d.getFullYear(), d.getMonth() + 1, 0); }
-function monthKey(value) { const d = new Date(value); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
 function forecastPeriods(row) {
   return [[row.M1Forecast, row.M1Qty, 1], [row.M2Forecast, row.M2Qty, 2], [row.M3Forecast, row.M3Qty, 3]]
     .filter(([month, qty]) => month && number(qty) > 0)
@@ -26,7 +218,9 @@ function forecastPeriods(row) {
 
 const OPEN_SO_HEADER_STATUSES = ["Confirmed", "In Progress", "In Production", "Ready to Deliver"];
 const OPEN_SO_DETAIL_STATUSES = ["Pending", "In Planning", "In Production"];
-const mpsBucketKey = (partCode, customerCode, bucketDate) => `${String(partCode || "").trim()}|${String(customerCode || "Tanpa Customer").trim() || "Tanpa Customer"}|${monthKey(bucketDate)}`;
+// SO is pegged to the planning bucket by part code and due month.  It must
+// not depend on the Forecast ID (or customer stored on that Forecast).
+const mpsBucketKey = (partCode, _customerCode, bucketDate) => `${String(partCode || "").trim()}|${monthKey(bucketDate)}`;
 
 async function buildActualSalesOrderByMpsBucket(tx, details = []) {
   const receiptDetails = details.filter((row) => !isGeneratedProcess(row) && row.partCode && row.startDate);
@@ -109,7 +303,11 @@ exports.monthlySummary = async (req, res, next) => {
       const itemType = String(row.part?.itemType || "UNKNOWN").toUpperCase();
       const partType = String(row.part?.partType || "STANDARD").toUpperCase();
       const itemScope = itemType === "FG" && partType !== "COMP" ? "FG NON-COMP" : partType !== "COMP" ? "NON-COMP" : "COMP";
-      const scheduleType = isGeneratedProcess(row) ? "CHILD / PROCESS" : "FG RECEIPT";
+      const scheduleType = !isGeneratedProcess(row)
+        ? "FG RECEIPT"
+        : itemType === "FG"
+          ? "CHILD FG RECEIPT"
+          : "CHILD / PROCESS";
       const sourcePart = String(row.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim();
       const parent = isGeneratedProcess(row) ? receiptByMonth.get(`${row.customerCode || ""}|${sourcePart || ""}|${month}`) : null;
       const inherited = (field) => number(row[field]) || number(parent?.[field]);
@@ -133,6 +331,15 @@ exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false }, include });
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
+    // Keep the existing MPS screen readable during a rolling deployment: a
+    // node process may still hold the previous Prisma client until restart.
+    // Delivery phases will appear as soon as the generated client is loaded.
+    const deliveryPlans = typeof prisma.mPSDeliveryPlan?.findMany === "function"
+      ? await prisma.mPSDeliveryPlan.findMany({
+        where: { mpsNumber: doc.mpsNumber, isDeleted: false },
+        orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }],
+      })
+      : [];
     const actualSo = await buildActualSalesOrderByMpsBucket(prisma, doc.details);
     doc.details = doc.details.map((row) => {
       const actual = actualSo.byDetailId.get(row.id);
@@ -143,9 +350,9 @@ exports.get = async (req, res, next) => {
         soNumber: row.soNumber || [...new Set(actual.soNumbers)].join(",") || null,
       };
     });
-    // Resolve the process column from the parent FG mBOM.  Generated SFG rows
-    // do not carry an mbomHeaderId, so use the source FG in their trace note
-    // and build a bottom-up process path (deepest BOM level first).
+    // Resolve the process column from the parent FG mBOM. Generated SFG rows
+    // do not carry an mbomHeaderId, so use the source FG in their trace note.
+    // Keep the same routing-number order used by capacity and WO generation.
     const receiptRows = doc.details.filter((row) => !isGeneratedProcess(row));
     const parentPartIds = [...new Set(receiptRows.map((row) => row.partId).filter(Boolean))];
     const generatedPartIds = [...new Set(doc.details.filter((row) => isGeneratedProcess(row)).map((row) => row.partId).filter(Boolean))];
@@ -175,17 +382,136 @@ exports.get = async (req, res, next) => {
       // Only use routing attached to this part's own BOM detail. Do not walk
       // ancestors: that creates fabricated Finish Goods/Welding chains.
       const path = (child.mbomProcesses || [])
-        .slice()
-        .sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0))
-        .map((process) => ({ name: process.process?.processName || process.process?.processCode || "Process", occurrenceCode: process.occurrenceCode || null, routingNumber: process.routingNumber || null, level: child.levelComponent, sequence: process.sequence }));
+        .map((process) => ({
+          id: process.id,
+          name: process.process?.processName || process.process?.processCode || "Process",
+          occurrenceCode: process.occurrenceCode || null,
+          routingNumber: process.routingNumber || null,
+          levelComponent: child.levelComponent,
+          level: child.levelComponent,
+          sequence: process.sequence,
+        }))
+        .sort(compareRoutingOperations);
       return path.length ? { ...row, processPath: path } : row;
     });
+    // Expose the latest inventory position on every MPS line.  This is a
+    // read-model enrichment only; the persisted MPS quantities remain the
+    // result of the MPS/MRP run.  Child/SFG rows are included so PPIC can see
+    // the stock that was available to net their dependent requirement.
+    const stockPartCodes = [...new Set(doc.details.map((row) => row.partCode).filter(Boolean))];
+    const stockRows = stockPartCodes.length ? await prisma.stockBalance.groupBy({
+      by: ["partCode"],
+      where: {
+        partCode: { in: stockPartCodes },
+        isDeleted: false,
+        warehouse: { isDeleted: false, availableForProduction: true },
+      },
+      _sum: { qtyOnHand: true, qtyAvailable: true, qtyReserved: true, qtyQC: true },
+    }) : [];
+    const stockByPartCode = new Map(stockRows.map((row) => [row.partCode, {
+      stockOnHandQty: Math.max(number(row._sum?.qtyOnHand), 0),
+      stockAvailableQty: Math.max(number(row._sum?.qtyAvailable), 0),
+      stockReservedQty: Math.max(number(row._sum?.qtyReserved), 0),
+      stockQcQty: Math.max(number(row._sum?.qtyQC), 0),
+    }]));
+    doc.details = doc.details.map((row) => ({
+      ...row,
+      ...(stockByPartCode.get(row.partCode) || {
+        stockOnHandQty: 0,
+        stockAvailableQty: 0,
+        stockReservedQty: 0,
+        stockQcQty: 0,
+      }),
+    }));
     const productionPlans = await prisma.monthlyProductionPlan.findMany({
       where: { sourceType: `MPS:${doc.mpsNumber}`, isDeleted: false },
       select: { planNumber: true, planMonth: true, status: true, _count: { select: { details: true } } },
       orderBy: { planMonth: "asc" },
     });
-    res.json({ ...doc, productionPlans });
+    const [readiness, customers, vendors] = await Promise.all([
+      buildMpsReadiness(prisma, doc),
+      prisma.customer.findMany({
+        // Legacy customer rows may predate the optional status field. Treat a
+        // blank status as active so valid customers remain selectable.
+        where: {
+          isDeleted: false,
+          OR: [{ status: "Active" }, { status: null }, { status: "" }],
+        },
+        select: { customerCode: true, customerName: true },
+        orderBy: { customerCode: "asc" },
+      }),
+      prisma.vendor.findMany({
+        where: { isDeleted: false, status: "Active" },
+        select: { vendorCode: true, vendorName: true },
+        orderBy: { vendorCode: "asc" },
+      }),
+    ]);
+    res.json({ ...doc, productionPlans, deliveryPlans, deliveryCatalogs: { customers, vendors }, readiness });
+  } catch (error) { next(error); }
+};
+
+// Delivery planning is intentionally separate from shipment execution.  PPIC
+// can split an FG/COMP into customer phases and can plan a vendor hand-off for
+// any child/SFG whose next routing is outsourced.
+exports.createDeliveryPhase = async (req, res, next) => {
+  try {
+    const mpsNumber = req.params.mpsNumber;
+    const targetType = String(req.body?.targetType || "").trim().toUpperCase();
+    const targetCode = text(req.body?.targetCode);
+    const plannedDate = date(req.body?.plannedDate);
+    const qtyPlanned = number(req.body?.qtyPlanned);
+    const mpsDetailId = text(req.body?.mpsDetailId);
+    if (!['VENDOR', 'CUSTOMER'].includes(targetType) || !targetCode || !plannedDate || Number.isNaN(plannedDate.getTime()) || qtyPlanned <= 0) {
+      return res.status(400).json({ message: 'Tujuan (Vendor/Customer), tanggal, dan qty delivery wajib diisi.' });
+    }
+    const mps = await prisma.mPS.findFirst({ where: { mpsNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, include: { part: true } } } });
+    if (!mps) return res.status(404).json({ message: 'MPS tidak ditemukan.' });
+    if (!['Draft', 'Confirmed'].includes(mps.status)) return res.status(409).json({ message: `Delivery planning tidak dapat diubah pada MPS ${mps.status}.` });
+    const detail = mpsDetailId ? mps.details.find((row) => row.id === mpsDetailId) : mps.details.find((row) => row.partCode === text(req.body?.partCode));
+    if (!detail) return res.status(404).json({ message: 'Baris MPS untuk delivery tidak ditemukan.' });
+    const partner = targetType === 'VENDOR'
+      ? await prisma.vendor.findFirst({ where: { vendorCode: targetCode, isDeleted: false, status: 'Active' }, select: { vendorCode: true, vendorName: true } })
+      : await prisma.customer.findFirst({
+        where: {
+          customerCode: targetCode,
+          isDeleted: false,
+          OR: [{ status: 'Active' }, { status: null }, { status: '' }],
+        },
+        select: { customerCode: true, customerName: true },
+      });
+    if (!partner) return res.status(404).json({ message: `${targetType === 'VENDOR' ? 'Vendor' : 'Customer'} aktif tidak ditemukan.` });
+    const allocated = await prisma.mPSDeliveryPlan.aggregate({
+      where: { mpsNumber, mpsDetailId: detail.id, targetType, isDeleted: false, status: { not: 'Cancelled' } },
+      _sum: { qtyPlanned: true },
+    });
+    if (number(allocated._sum.qtyPlanned) + qtyPlanned > number(detail.qtyPlanned) + 0.000001) {
+      return res.status(409).json({ message: `Total phase delivery ${detail.partCode} melebihi target MPS ${detail.qtyPlanned}.` });
+    }
+    const last = await prisma.mPSDeliveryPlan.aggregate({ where: { mpsNumber }, _max: { phaseNumber: true } });
+    const phase = await prisma.mPSDeliveryPlan.create({ data: {
+      mpsNumber, mpsDetailId: detail.id, phaseNumber: number(last._max.phaseNumber) + 1, targetType,
+      targetCode, targetName: targetType === 'VENDOR' ? partner.vendorName : partner.customerName,
+      partCode: detail.partCode, plannedDate, qtyPlanned, uomCode: detail.part?.productionUomCode || detail.part?.baseUomCode || null,
+      notes: text(req.body?.notes), createdBy: req.user?.username || req.user?.email || null,
+    } });
+    res.status(201).json(phase);
+  } catch (error) { next(error); }
+};
+
+exports.removeDeliveryPhase = async (req, res, next) => {
+  try {
+    const phase = await prisma.mPSDeliveryPlan.findFirst({ where: { id: req.params.phaseId, mpsNumber: req.params.mpsNumber, isDeleted: false } });
+    if (!phase) return res.status(404).json({ message: 'Phase delivery tidak ditemukan.' });
+    await prisma.mPSDeliveryPlan.update({ where: { id: phase.id }, data: { isDeleted: true, status: 'Cancelled' } });
+    res.json({ message: 'Phase delivery dibatalkan.' });
+  } catch (error) { next(error); }
+};
+
+exports.readiness = async (req, res, next) => {
+  try {
+    const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false }, include });
+    if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
+    res.json(await buildMpsReadiness(prisma, doc));
   } catch (error) { next(error); }
 };
 
@@ -213,50 +539,131 @@ exports.createFromForecast = async (req, res, next) => {
       },
     });
     if (!forecast) return res.status(404).json({ message: "Forecast tidak ditemukan" });
-    if (forecast.status !== "Confirmed") return res.status(409).json({ message: "Forecast harus berstatus Confirmed sebelum dibuat menjadi MPS" });
-    const periods = forecast.details.flatMap((row) => forecastPeriods(row).map((period) => ({ row, ...period })));
+    // Forecast adalah demand finished good. Data legacy yang pernah salah masuk
+    // sebagai child/WIP/RAW tidak boleh ikut diturunkan ke MPS.
+    const fgDetails = forecast.details.filter((row) => String(row.part?.itemType || "").toUpperCase() === "FG");
+    const requestedMonths = Array.isArray(req.body.months)
+      ? new Set(req.body.months.map((value) => String(value || "").slice(0, 7)).filter(Boolean))
+      : null;
+    const allPeriods = fgDetails.flatMap((row) => forecastPeriods(row).map((period) => ({ row, ...period })));
+    const periods = requestedMonths
+      ? allPeriods.filter((period) => requestedMonths.has(monthKey(period.month)))
+      : allPeriods;
+    if (forecast.details.length && !fgDetails.length) return res.status(400).json({ message: "Forecast hanya boleh berisi Part dengan item type FG" });
     if (!periods.length) return res.status(400).json({ message: "Forecast belum memiliki demand bulanan dengan qty lebih dari nol" });
+    const periodKeys = [...new Set(periods.map((period) => monthKey(period.month)))].sort();
+    const allowedStatuses = new Set(["Confirmed", "Consumed", "Partial Product"]);
+    if (!allowedStatuses.has(forecast.status)) return res.status(409).json({ message: `Forecast harus berstatus Confirmed atau Partial Product sebelum dibuat menjadi MPS. Status saat ini ${forecast.status}.` });
     const formulas = await getFormulaSet(prisma, "planning");
-    const docs = await prisma.$transaction(async (tx) => {
-      const periodsByMonth = new Map();
-      for (const period of periods) {
-        const key = monthKey(period.month);
-        if (!periodsByMonth.has(key)) periodsByMonth.set(key, []);
-        periodsByMonth.get(key).push(period);
-      }
-      if (text(req.body.mpsNumber) && periodsByMonth.size > 1) throw Object.assign(new Error("Nomor MPS manual hanya dapat dipakai bila forecast mencakup satu bulan"), { statusCode: 400 });
-      const forecastByPartMonth = new Map(periods.map((item) => [`${item.row.partCode}|${monthKey(item.month)}`, number(item.qty)]));
-      const created = [];
-      for (const [periodKey, monthlyPeriods] of [...periodsByMonth.entries()].sort(([left], [right]) => left.localeCompare(right))) {
-        const periodStart = new Date(monthlyPeriods[0].month.getFullYear(), monthlyPeriods[0].month.getMonth(), 1);
-        const mpsNumber = text(req.body.mpsNumber) || await nextNumber(tx);
-        const details = monthlyPeriods.map(({ row, month, qty, offset }, index) => {
-          const nextMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1);
-          const forecastQty = number(qty);
-          const bufferBaseQty = number(forecastByPartMonth.get(`${row.partCode}|${monthKey(nextMonth)}`));
-          const bufferPercent = Math.max(number(row.part?.bufferStock), 0);
-          const bufferQty = evaluateFromSet(formulas, "MPS_BUFFER_QTY", { bufferBaseQty, bufferPercent });
-          const effectiveDemandQty = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty, bufferQty });
-          return {
-            lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
-            forecastQty, actualSalesOrderQty: 0, bufferBaseQty, bufferPercent, bufferQty, effectiveDemandQty, productionPercent: 100,
-            qtyPlanned: effectiveDemandQty, startDate: periodStart, endDate: monthEnd(periodStart), priority: 1, status: "Planned", customerCode: forecast.customerCode,
-            forecastDetailId: row.id, forecastPeriodOffset: offset, notes: `${FG_RECEIPT_PREFIX} Generated from forecast ${forecast.forecastNumber}`,
-          };
-        });
-        const actualSo = await buildActualSalesOrderByMpsBucket(tx, details);
-        for (const detail of details) {
-          const actual = actualSo.byBucket.get(mpsBucketKey(detail.partCode, detail.customerCode, detail.startDate)) || { qty: 0, soNumbers: [] };
-          detail.actualSalesOrderQty = number(actual.qty);
-          detail.soNumber = [...new Set(actual.soNumbers)].join(",") || null;
-          detail.qtyPlanned = evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty: detail.effectiveDemandQty, productionPercent: detail.productionPercent, actualSalesOrderQty: detail.actualSalesOrderQty });
+    let transactionResult;
+    try {
+      transactionResult = await prisma.$transaction(async (tx) => {
+        const periodsByMonth = new Map();
+        for (const period of periods) {
+          const key = monthKey(period.month);
+          if (!periodsByMonth.has(key)) periodsByMonth.set(key, []);
+          periodsByMonth.get(key).push(period);
         }
-        created.push(await tx.mPS.create({ data: { mpsNumber, mpsName: text(req.body.mpsName) ? `${text(req.body.mpsName)} - ${periodKey}` : `MPS ${forecast.forecastNumber} - ${periodKey}`, periodStart, periodEnd: monthEnd(periodStart), forecastNumber: forecast.forecastNumber, status: "Draft", notes: text(req.body.notes) || `Generated from confirmed forecast ${forecast.forecastNumber} for ${periodKey}`, createdBy: req.user?.username || req.user?.email || null, details: { create: details } }, include }));
-      }
-      await tx.forecast.update({ where: { forecastNumber: forecast.forecastNumber }, data: { status: "Consumed" } });
-      return created;
-    });
-    res.status(201).json({ ...docs[0], items: docs, mpsNumbers: docs.map((doc) => doc.mpsNumber), message: `${docs.length} MPS bulanan berhasil dibuat` });
+        if (text(req.body.mpsNumber) && periodsByMonth.size > 1) throw Object.assign(new Error("Nomor MPS manual hanya dapat dipakai bila forecast mencakup satu bulan"), { statusCode: 400 });
+        // Buffer bulan berjalan selalu membaca seluruh horizon Forecast (bukan
+        // hanya bulan yang dipilih pada eksekusi ini), sehingga M2 tetap dapat
+        // memakai forecast M3 sebagai buffer walaupun M3 belum dibuatkan MPS.
+        const forecastByPartMonth = new Map(allPeriods.map((item) => [`${item.row.partCode}|${monthKey(item.month)}`, number(item.qty)]));
+        const allPeriodKeys = [...new Set(allPeriods.map((item) => monthKey(item.month)))].sort();
+        const existingByMonth = await allMpsByMonth(tx, forecast.forecastNumber, allPeriodKeys);
+        const stockCodes = [...new Set(allPeriods.map((item) => item.row.partCode).filter(Boolean))];
+        const stockRows = stockCodes.length ? await tx.stockBalance.groupBy({
+          by: ["partCode"],
+          where: { partCode: { in: stockCodes }, isDeleted: false, warehouse: { isDeleted: false, availableForProduction: true } },
+          _sum: { qtyAvailable: true },
+        }) : [];
+        const stockByPartCode = new Map(stockRows.map((row) => [row.partCode, Math.max(number(row._sum?.qtyAvailable), 0)]));
+        const productionPercent = req.body?.productionPercent == null ? 100 : Number(req.body.productionPercent);
+        if (!Number.isFinite(productionPercent) || productionPercent < 0 || productionPercent > 100) throw Object.assign(new Error("Persentase produksi forecast harus antara 0 sampai 100"), { statusCode: 400 });
+        const docs = [];
+        let createdCount = 0;
+        for (const [periodKey, monthlyPeriods] of [...periodsByMonth.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+          const periodStart = utcMonthStart(monthlyPeriods[0].month);
+          const existingRows = existingByMonth.get(periodKey) || [];
+          const alreadyByPart = new Map();
+          existingRows.flatMap((item) => item.details || []).filter((item) => !isGeneratedProcess(item)).forEach((item) => {
+            alreadyByPart.set(item.partCode, (alreadyByPart.get(item.partCode) || 0) + number(item.qtyPlanned));
+          });
+          const probe = monthlyPeriods.map(({ row, month }) => ({ partCode: row.partCode, customerCode: forecast.customerCode, startDate: periodStart, endDate: utcMonthEnd(periodStart) }));
+          const actualSo = await buildActualSalesOrderByMpsBucket(tx, probe);
+          const details = monthlyPeriods.map(({ row, month, qty, offset }, index) => {
+            const fullForecastQty = number(qty);
+            const bufferBaseQty = number(forecastByPartMonth.get(`${row.partCode}|${nextPlanningMonthKey(month)}`));
+            const bufferPercent = Math.max(number(row.part?.bufferStock), 0);
+            const stockAvailableQty = stockByPartCode.get(row.partCode) || 0;
+            const fullBufferQty = evaluateMpsBuffer(formulas, { bufferBaseQty, bufferPercent, stockAvailableQty });
+            const fullEffectiveDemandQty = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty: fullForecastQty, bufferQty: fullBufferQty });
+            const alreadyPlannedQty = alreadyByPart.get(row.partCode) || 0;
+            const remainingDemandQty = Math.max(fullEffectiveDemandQty - alreadyPlannedQty, 0);
+            const forecastQty = Math.min(fullForecastQty, remainingDemandQty);
+            const bufferQty = Math.max(remainingDemandQty - forecastQty, 0);
+            const effectiveDemandQty = forecastQty + bufferQty;
+            const actual = actualSo.byBucket.get(mpsBucketKey(row.partCode, forecast.customerCode, periodStart)) || { qty: 0, soNumbers: [] };
+          const outstandingSoQty = Math.max(number(actual.qty) - alreadyPlannedQty, 0);
+            const uomCode = row.uomCode || row.part?.uomCode || "pcs";
+            const normalizedForecastQty = normalizeQuantity(forecastQty, uomCode);
+            const normalizedBufferQty = normalizeQuantity(bufferQty, uomCode);
+            const normalizedEffectiveDemandQty = normalizeQuantity(normalizedForecastQty + normalizedBufferQty, uomCode);
+            const normalizedSoQty = normalizeQuantity(outstandingSoQty, uomCode);
+            return {
+              lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
+              forecastQty: normalizedForecastQty, actualSalesOrderQty: normalizedSoQty, bufferBaseQty: normalizeQuantity(bufferBaseQty, uomCode), bufferPercent, bufferQty: normalizedBufferQty, effectiveDemandQty: normalizedEffectiveDemandQty, productionPercent,
+              qtyPlanned: normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty: normalizedEffectiveDemandQty, productionPercent, actualSalesOrderQty: normalizedSoQty }), uomCode), uomCode, startDate: periodStart, endDate: utcMonthEnd(periodStart), priority: 1, status: "Planned", customerCode: forecast.customerCode,
+              forecastDetailId: row.id, forecastPeriodOffset: offset, notes: `${FG_RECEIPT_PREFIX} Generated from forecast ${forecast.forecastNumber}`,
+            };
+          }).filter((detail) => detail.qtyPlanned > 0);
+          if (!details.length) {
+            if (existingRows[0]) docs.push(existingRows[0]);
+            continue;
+          }
+          details.forEach((detail) => {
+            const actual = actualSo.byBucket.get(mpsBucketKey(detail.partCode, detail.customerCode, detail.startDate)) || { qty: 0, soNumbers: [] };
+            detail.soNumber = [...new Set(actual.soNumbers)].join(",") || null;
+          });
+          const mpsNumber = text(req.body.mpsNumber) || await nextNumber(tx);
+          const mpsAttempt = existingRows.length;
+          // MPSDetail is created through the nested MPS relation. Prisma's
+          // checked nested input does not accept raw FK fields (partId,
+          // mbomHeaderId, forecastDetailId), and MPSDetail has no persisted
+          // uomCode column. Convert those references to relation connects and
+          // keep uomCode transient for the calculation/UI only.
+          const nestedDetails = details.map(({ partId, mbomHeaderId, forecastDetailId, uomCode, ...detail }) => ({
+            ...detail,
+            ...(partId ? { part: { connect: { id: partId } } } : {}),
+            ...(mbomHeaderId ? { mbom: { connect: { id: mbomHeaderId } } } : {}),
+            ...(forecastDetailId ? { forecastDetail: { connect: { id: forecastDetailId } } } : {}),
+          }));
+          docs.push(await tx.mPS.create({ data: { mpsNumber, sourceKey: sourceKeyFor(forecast.forecastNumber, periodKey, mpsAttempt), mpsName: text(req.body.mpsName) ? `${text(req.body.mpsName)} - ${periodKey}` : `MPS ${forecast.forecastNumber} - ${periodKey}${mpsAttempt ? ` (Partial ${mpsAttempt})` : ""}`, periodStart, periodEnd: utcMonthEnd(periodStart), forecastNumber: forecast.forecastNumber, status: "Draft", notes: text(req.body.notes) || `Generated from forecast ${forecast.forecastNumber} for ${periodKey}; production ${productionPercent}%`, createdBy: req.user?.username || req.user?.email || null, details: { create: nestedDetails } }, include }));
+          createdCount += 1;
+          existingByMonth.set(periodKey, [...existingRows, docs[docs.length - 1]]);
+        }
+        const finalByMonth = await allMpsByMonth(tx, forecast.forecastNumber, allPeriodKeys);
+        let hasRemaining = false;
+        for (const period of allPeriods) {
+          const key = monthKey(period.month);
+          const planned = (finalByMonth.get(key) || []).flatMap((item) => item.details || []).filter((item) => !isGeneratedProcess(item) && item.partCode === period.row.partCode).reduce((sum, item) => sum + number(item.qtyPlanned), 0);
+          const bufferBaseQty = number(forecastByPartMonth.get(`${period.row.partCode}|${nextPlanningMonthKey(period.month)}`));
+          const stockAvailableQty = stockByPartCode.get(period.row.partCode) || 0;
+          const bufferQty = evaluateMpsBuffer(formulas, { bufferBaseQty, bufferPercent: Math.max(number(period.row.part?.bufferStock), 0), stockAvailableQty });
+          const effective = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty: number(period.qty), bufferQty });
+          if (planned + 0.000001 < effective) { hasRemaining = true; break; }
+        }
+        await tx.forecast.update({ where: { forecastNumber: forecast.forecastNumber }, data: { status: hasRemaining ? "Partial Product" : "Consumed" } });
+        return { docs, createdCount };
+      });
+    } catch (error) {
+      if (error?.code !== "P2002") throw error;
+      const concurrent = await existingMpsByMonth(prisma, forecast.forecastNumber, periodKeys);
+      if (concurrent.size !== periodKeys.length) throw error;
+      const docs = periodKeys.map((key) => concurrent.get(key));
+      return res.status(200).json(mpsResponse(docs, { idempotent: true, createdCount: 0 }));
+    }
+    res.status(transactionResult.createdCount ? 201 : 200).json(mpsResponse(transactionResult.docs, { idempotent: transactionResult.createdCount === 0, createdCount: transactionResult.createdCount }));
   } catch (error) { next(error); }
 };
 
@@ -286,14 +693,20 @@ exports.updateAdjustments = async (req, res, next) => {
       });
       targetDetails = allParentRows.filter((row) => !isGeneratedProcess(row));
     }
+    const stockRows = await prisma.stockBalance.groupBy({
+      by: ["partCode"],
+      where: { partCode: { in: [...new Set(targetDetails.map((row) => row.partCode).filter(Boolean))] }, isDeleted: false, warehouse: { isDeleted: false, availableForProduction: true } },
+      _sum: { qtyAvailable: true },
+    });
+    const stockByPartCode = new Map(stockRows.map((row) => [row.partCode, Math.max(number(row._sum?.qtyAvailable), 0)]));
     const actualSo = await buildActualSalesOrderByMpsBucket(prisma, targetDetails);
     const formulas = await getFormulaSet(prisma, "planning");
     await prisma.$transaction(targetDetails.map((row) => {
       const actual = actualSo.byDetailId.get(row.id) || { qty: 0, soNumbers: [] };
-      const bufferQty = evaluateFromSet(formulas, "MPS_BUFFER_QTY", { bufferBaseQty: number(row.bufferBaseQty), bufferPercent });
+      const bufferQty = evaluateMpsBuffer(formulas, { bufferBaseQty: number(row.bufferBaseQty), bufferPercent, stockAvailableQty: stockByPartCode.get(row.partCode) || 0 });
       const effectiveDemandQty = evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", { forecastQty: number(row.forecastQty), bufferQty });
       const actualSalesOrderQty = Math.max(number(row.actualSalesOrderQty), number(actual.qty));
-      const qtyPlanned = evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty, productionPercent, actualSalesOrderQty });
+      const qtyPlanned = normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty, productionPercent, actualSalesOrderQty }), row.uomCode || row.part?.uomCode || "pcs");
       return prisma.mPSDetail.update({
         where: { id: row.id },
         data: { bufferPercent, bufferQty, bufferOverridden: true, bufferReferenceScope: scope, effectiveDemandQty, productionPercent, productionOverridden: true, actualSalesOrderQty, soNumber: [...new Set(actual.soNumbers)].join(",") || row.soNumber || null, qtyPlanned },
@@ -306,10 +719,16 @@ exports.updateAdjustments = async (req, res, next) => {
 
 exports.confirm = async (req, res, next) => {
   try {
-    const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { id: true } } } });
+    const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false }, include });
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
     if (!doc.details.length) return res.status(400).json({ message: "MPS tanpa detail tidak dapat dikonfirmasi" });
     if (doc.status !== "Draft") return res.status(409).json({ message: `MPS tidak dapat dikonfirmasi dari status ${doc.status}` });
+    const readiness = await buildMpsReadiness(prisma, doc);
+    if (!readiness.ok) return res.status(409).json({
+      message: `MPS belum siap dikonfirmasi: ${readiness.blockingCount} blocker routing/UOM harus diperbaiki.`,
+      code: "MPS_READINESS_BLOCKED",
+      readiness,
+    });
     const updated = await prisma.mPS.update({ where: { mpsNumber: doc.mpsNumber }, data: { status: "Confirmed", approvedBy: req.user?.username || req.user?.email || null, approvedDate: new Date() }, include });
     res.json(updated);
   } catch (error) { next(error); }

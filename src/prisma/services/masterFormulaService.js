@@ -1,5 +1,7 @@
 const DEFAULT_FORMULAS = Object.freeze({
-  MPS_BUFFER_QTY: "round(bufferBaseQty * bufferPercent / 100, 6)",
+  // Safety buffer is based on next-month forecast, net of currently available
+  // FG stock.  A custom Master Formula can still override this rule.
+  MPS_BUFFER_QTY: "max(round(bufferBaseQty * bufferPercent / 100, 6) - stockAvailableQty, 0)",
   MPS_EFFECTIVE_DEMAND: "forecastQty + bufferQty",
   MPS_TARGET_QTY: "max(effectiveDemandQty * productionPercent / 100, actualSalesOrderQty)",
   MRP_NET_REQUIREMENT: "max(grossRequirement - projectedAvailable, 0)",
@@ -7,6 +9,12 @@ const DEFAULT_FORMULAS = Object.freeze({
   LINE_AFTER_DISCOUNT: "qty * unitPrice * (1 - discount / 100)",
   LINE_TOTAL: "afterDiscount * (1 + tax / 100)",
   LOAD_MINUTES: "qty * cycleTimeMinutes / max(efficiencyPercent / 100, 0.000001)",
+  CAPACITY_BASE_MINUTES: "(shiftHours * shiftsPerDay * 60 + overtimeMinutes) * efficiencyPercent / 100",
+  CAPACITY_AVAILABLE_MINUTES: "max(baseAvailableMinutes - downtimeMinutes, 0)",
+  CAPACITY_UTILIZATION_PERCENT: "loadMinutes / max(availableMinutes, 0.000001) * 100",
+  PR_LINE_TOTAL: "qty * estimatedPrice",
+  INVENTORY_AVAILABLE_QTY: "max(qtyOnHand - qtyReserved - qtyQC, 0)",
+  PRODUCTION_ALLOCATED_QTY: "qtyGood + qtyReject",
 });
 
 const FUNCTIONS = {

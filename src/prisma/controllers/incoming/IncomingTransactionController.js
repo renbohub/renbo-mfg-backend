@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const { prisma } = require("../../index");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
+const { assertQuantity } = require("../../utils/uomQuantity");
 
 const number = (prefix) => `${prefix}-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -11,12 +12,32 @@ exports.receivePurchaseOrder = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const po = await tx.purchaseOrder.findFirst({ where: { poNumber, isDeleted: false }, include: { details: { where: { isDeleted: false } } } });
       if (!po) throw Object.assign(new Error("Purchase Order not found"), { statusCode: 404 });
+      if (!["Sent", "Confirmed", "Partial Receipt"].includes(po.status)) {
+        throw Object.assign(new Error("Purchase Order harus berstatus Sent, Confirmed, atau Partial Receipt sebelum dibuatkan Goods Receipt"), { statusCode: 409 });
+      }
+      const warehouse = await tx.warehouse.findFirst({ where: { warehouseCode, isDeleted: false, isActive: true }, select: { warehouseCode: true } });
+      if (!warehouse) throw Object.assign(new Error("Warehouse penerimaan tidak aktif atau tidak ditemukan"), { statusCode: 400 });
+      const requestedRackCodes = [...new Set(details.map((line) => String(line.rackCode || "").trim()).filter(Boolean))];
+      const requestedRacks = requestedRackCodes.length
+        ? await tx.rack.findMany({
+            where: { rackCode: { in: requestedRackCodes }, isDeleted: false, isActive: true },
+            select: { rackCode: true, warehouseCode: true },
+          })
+        : [];
+      for (const rackCode of requestedRackCodes) {
+        const rack = requestedRacks.find((item) => item.rackCode === rackCode);
+        if (!rack) throw Object.assign(new Error(`Rack ${rackCode} tidak aktif atau tidak ditemukan`), { statusCode: 400 });
+        if (rack.warehouseCode && rack.warehouseCode !== warehouseCode) {
+          throw Object.assign(new Error(`Rack ${rackCode} bukan milik warehouse ${warehouseCode}`), { statusCode: 409 });
+        }
+      }
       const grNumber = number("GR");
       const receiptDetails = details.map((line, index) => {
         const poDetail = po.details.find((item) => item.id === line.poDetailId);
         if (!poDetail || Number(line.qtyReceived) <= 0) throw Object.assign(new Error(`Invalid receipt detail at line ${index + 1}`), { statusCode: 400 });
+        assertQuantity(line.qtyReceived, poDetail.uomCode, `Qty receipt line ${index + 1}`);
         if (Number(poDetail.qtyReceived || 0) + Number(line.qtyReceived) > Number(poDetail.qty || 0)) throw Object.assign(new Error(`Receipt quantity exceeds the outstanding PO on line ${index + 1}`), { statusCode: 409 });
-        return { lineNumber: index + 1, poDetailId: poDetail.id, qtyOrdered: poDetail.qty, qtyReceived: Number(line.qtyReceived), deliveryNoteNumber: line.deliveryNoteNumber || deliveryNoteNumber || null, lotNumber: line.lotNumber || null, supplierLotNumber: line.supplierLotNumber || null, rackCode: line.rackCode || null, uomCode: poDetail.uomCode, unitPrice: poDetail.unitPrice, totalPrice: Number(line.qtyReceived) * Number(poDetail.unitPrice || 0), notes: line.notes || null };
+        return { lineNumber: index + 1, poDetailId: poDetail.id, qtyOrdered: poDetail.qty, qtyReceived: Number(line.qtyReceived), deliveryNoteNumber: line.deliveryNoteNumber || deliveryNoteNumber || null, lotNumber: line.lotNumber || null, supplierLotNumber: line.supplierLotNumber || null, rackCode: String(line.rackCode || "").trim() || null, uomCode: poDetail.uomCode, unitPrice: poDetail.unitPrice, totalPrice: Number(line.qtyReceived) * Number(poDetail.unitPrice || 0), notes: line.notes || null };
       });
       const gr = await tx.goodsReceipt.create({ data: { grNumber, poNumber, poType: po.poType, stockType: po.poType, warehouseCode, deliveryNoteNumber: deliveryNoteNumber || null, receivedBy: req.user?.username || req.user?.email || null, receivedDate: new Date(), status: "Received Pending Inspection", notes: notes || null, details: { create: receiptDetails } }, include: { details: true } });
       await Promise.all(receiptDetails.map((detail) => tx.purchaseOrderDetail.update({ where: { id: detail.poDetailId }, data: { qtyReceived: { increment: detail.qtyReceived } } })));
@@ -51,6 +72,7 @@ exports.completeInspection = async (req, res, next) => {
         const grDetail = inspection.gr.details.find((item) => item.id === decision.grDetailId);
         if (!line || !grDetail) throw Object.assign(new Error("Invalid inspection detail"), { statusCode: 400 });
         const accepted = Number(decision.qtyAccepted || 0); const rejected = Number(decision.qtyRejected || 0);
+        assertQuantity(accepted || rejected || 1, grDetail.uomCode, `Qty inspection line ${line.lineNumber}`);
         if (accepted < 0 || rejected < 0 || accepted + rejected > Number(grDetail.qtyReceived)) throw Object.assign(new Error("Inspection quantity is invalid"), { statusCode: 400 });
         acceptedTotal += accepted; rejectedTotal += rejected;
         await tx.incomingInspectionDetail.update({ where: { id: line.id }, data: { qtyInspected: accepted + rejected, qtyAccepted: accepted, qtyRejected: rejected, disposition: rejected > 0 ? (accepted > 0 ? "PARTIAL_ACCEPT" : "REJECT") : "ACCEPT" } });
@@ -76,13 +98,66 @@ exports.putawayAccepted = async (req, res, next) => {
       const movements = [];
       for (const detail of inspection.gr.details) {
         const accepted = detail.incomingInspectionDetails.reduce((sum, item) => sum + Number(item.qtyAccepted || 0), 0);
-        if (accepted <= 0 || !detail.poDetail.partCode) continue;
-        const identity = { warehouseCode: inspection.gr.warehouseCode, rackCode: detail.rackCode || null, lotNumber: detail.lotNumber || null, partCode: detail.poDetail.partCode, productId: null, description: null, spec: detail.poDetail.spec || null, thickness: detail.poDetail.thickness || null, width: detail.poDetail.width || null, CSP: detail.poDetail.CSP || null, partNumber: detail.poDetail.partNumber || null, uomCode: detail.uomCode || null, isDeleted: false };
+        if (accepted > 0) assertQuantity(accepted, detail.uomCode, `Qty putaway line ${detail.lineNumber}`);
+        if (accepted <= 0 || !(detail.poDetail.materialCode || detail.poDetail.partCode || detail.poDetail.productId || detail.poDetail.description)) continue;
+        const usesMaterialMaster = Boolean(detail.poDetail.materialId || detail.poDetail.materialCode);
+        const materialMaster = usesMaterialMaster
+          ? await tx.material.findFirst({
+              where: {
+                isDeleted: false,
+                ...(detail.poDetail.materialId ? { id: detail.poDetail.materialId } : { materialCode: detail.poDetail.materialCode }),
+              },
+              select: { id: true, materialCode: true, materialName: true, materialType: true },
+            })
+          : null;
+        const materialId = materialMaster?.id || detail.poDetail.materialId || null;
+        const materialCode = materialMaster?.materialCode || detail.poDetail.materialCode || null;
+        const materialName = materialMaster?.materialName || detail.poDetail.materialName || null;
+        const materialType = materialMaster?.materialType || detail.poDetail.materialType || null;
+        const identity = {
+          warehouseCode: inspection.gr.warehouseCode,
+          rackCode: detail.rackCode || null,
+          lotNumber: detail.lotNumber || null,
+          materialId,
+          materialCode,
+          partCode: usesMaterialMaster ? null : detail.poDetail.partCode,
+          productId: detail.poDetail.productId || null,
+          description: usesMaterialMaster ? null : detail.poDetail.description || null,
+          spec: detail.poDetail.spec || null,
+          thickness: detail.poDetail.thickness || null,
+          width: detail.poDetail.width || null,
+          CSP: detail.poDetail.CSP || null,
+          partNumber: usesMaterialMaster ? null : detail.poDetail.partNumber || null,
+          uomCode: detail.uomCode || null,
+          isDeleted: false,
+        };
+        if (detail.lotNumber) {
+          await tx.lotMaster.upsert({
+            where: { lotNumber: detail.lotNumber },
+            create: {
+              lotNumber: detail.lotNumber,
+              materialId,
+              materialCode,
+              materialName,
+              partCode: usesMaterialMaster ? null : detail.poDetail.partCode,
+              productId: detail.poDetail.productId || null,
+              description: usesMaterialMaster ? null : detail.poDetail.description || null,
+              supplierBatch: detail.supplierLotNumber || null,
+            },
+            update: {
+              materialId: materialId || undefined,
+              materialCode: materialCode || undefined,
+              materialName: materialName || undefined,
+              partCode: usesMaterialMaster ? undefined : detail.poDetail.partCode || undefined,
+              supplierBatch: detail.supplierLotNumber || undefined,
+            },
+          });
+        }
         const balance = await tx.stockBalance.findFirst({ where: identity }); const before = Number(balance?.qtyOnHand || 0); const after = before + accepted;
         const movementNumber = await generateMovementNumber("IN", tx);
-        await tx.stockMovement.create({ data: { movementNumber, movementType: "IN", direction: "IN", transactionType: "QUALITY_RELEASE", warehouseCode: identity.warehouseCode, rackCode: identity.rackCode, lotNumber: identity.lotNumber, partCode: identity.partCode, partNumber: detail.poDetail.partNumber || null, partName: detail.poDetail.partName || null, spec: identity.spec, thickness: identity.thickness, width: identity.width, CSP: identity.CSP, stockType: inspection.gr.stockType, qty: accepted, deltaQty: accepted, qtyBefore: before, qtyAfter: after, uomCode: identity.uomCode, qualityBucket: "AVAILABLE", referenceType: "INCOMING_INSPECTION", referenceNumber: inspection.inspectionNumber, performedBy: req.user?.username || req.user?.email || null } });
+        await tx.stockMovement.create({ data: { movementNumber, movementType: "IN", direction: "IN", transactionType: "QUALITY_RELEASE", warehouseCode: identity.warehouseCode, rackCode: identity.rackCode, lotNumber: identity.lotNumber, materialId: identity.materialId, materialCode: identity.materialCode, materialName, materialType, partCode: identity.partCode, partNumber: identity.partNumber, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, productId: identity.productId, description: identity.description, spec: identity.spec, thickness: identity.thickness, width: identity.width, CSP: identity.CSP, stockType: usesMaterialMaster ? "Material" : inspection.gr.stockType, qty: accepted, deltaQty: accepted, qtyBefore: before, qtyAfter: after, uomCode: identity.uomCode, qualityBucket: "AVAILABLE", referenceType: "INCOMING_INSPECTION", referenceNumber: inspection.inspectionNumber, performedBy: req.user?.username || req.user?.email || null } });
         if (balance) await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: after, qtyAvailable: after - Number(balance.qtyReserved || 0) - Number(balance.qtyQC || 0), lastMovement: new Date() } });
-        else await tx.stockBalance.create({ data: { ...identity, isDeleted: false, partName: detail.poDetail.partName || null, stockType: inspection.gr.stockType, qtyOnHand: accepted, qtyAvailable: accepted, qtyQC: 0, lastMovement: new Date() } });
+        else await tx.stockBalance.create({ data: { ...identity, isDeleted: false, materialName, materialType, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, stockType: usesMaterialMaster ? "Material" : inspection.gr.stockType, qtyOnHand: accepted, qtyAvailable: accepted, qtyQC: 0, lastMovement: new Date() } });
         movements.push(movementNumber);
       }
       await tx.goodsReceipt.update({ where: { grNumber: inspection.grNumber }, data: { status: "Completed" } });

@@ -1,4 +1,10 @@
 const { prisma } = require("../index");
+const {
+  activityEvent,
+  classifyAlarm,
+  resolvePageContext,
+  safeLogDetails,
+} = require("../utils/pageContext");
 
 function lowerFirst(value) {
   if (!value || typeof value !== "string") return value;
@@ -66,6 +72,7 @@ function getClientIp(req) {
  */
 const logger = (nameRoute, action = "read", options = {}) => {
   return async (req, res, next) => {
+    req.activityLoggerAttached = true;
     const startTime = Date.now();
 
     // Untuk UPDATE: fetch old data sekali dan attach ke req (avoid double fetch di controller)
@@ -198,10 +205,21 @@ const logger = (nameRoute, action = "read", options = {}) => {
             console.log("📊 Changes result:", changes);
           }
 
+          const alarmType = classifyAlarm(res.statusCode, data);
+          const event = activityEvent(action, req.method, req.originalUrl || req.url, data, res.statusCode);
+          const responseDetails = safeLogDetails(data);
+          if (responseDetails && (alarmType || event === "NEED_APPROVAL")) {
+            changes = {
+              ...(changes || {}),
+              [alarmType ? "errorDetails" : "workflowDetails"]: responseDetails,
+              attemptedAction: action,
+            };
+          }
+
           // Prepare log data (optimized for CUD operations only)
           const logData = {
             nameRoute,
-            action,
+            action: alarmType ? (alarmType === "ALARM" ? "BLOCKER" : "ERROR") : (event || action),
             method: req.method,
             url: req.originalUrl || req.url,
             statusCode: res.statusCode,
@@ -216,6 +234,8 @@ const logger = (nameRoute, action = "read", options = {}) => {
             changes,
             errorMessage:
               res.statusCode >= 400 ? data?.message || "Error occurred" : null,
+            ...resolvePageContext(req, entityId),
+            logType: alarmType || "ACTIVITY",
           };
 
           await prisma.log.create({ data: logData });
