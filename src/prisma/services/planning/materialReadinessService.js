@@ -26,11 +26,22 @@ function sourceNumbers(detail) {
     ...(Array.isArray(detail?.sourcePlannedOrderNumbers)
       ? detail.sourcePlannedOrderNumbers
       : []),
+    ...(Array.isArray(detail?.sources)
+      ? detail.sources.map((item) => item?.plannedOrderNumber)
+      : []),
   ];
   return new Set(values.filter(Boolean).map(String));
 }
 
 function allocatedDetailQty(detail, orderNumber) {
+  const structuredSources = Array.isArray(detail?.sources)
+    ? detail.sources.filter((item) => !item?.isDeleted)
+    : [];
+  if (structuredSources.length > 0) {
+    return structuredSources
+      .filter((item) => String(item?.plannedOrderNumber || "") === orderNumber)
+      .reduce((sum, item) => sum + number(item?.qty), 0);
+  }
   const allocations = Array.isArray(detail?.lotAllocations)
     ? detail.lotAllocations
     : [];
@@ -91,7 +102,7 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
         status: "Completed",
       },
       orderBy: { createdAt: "desc" },
-      select: { runNumber: true, runDate: true },
+      select: { runNumber: true, runDate: true, planNumber: true },
     })
     : null;
   if (!run) {
@@ -110,9 +121,52 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
     };
   }
 
+  // A monthly MRP rerun can net an already released PR/PO to zero and therefore
+  // create no PlannedOrder rows in the current revision.  The procurement is
+  // still part of this MPS and must remain in the release-readiness check.
+  // Follow the structured PR pegging across MRP revisions instead of looking at
+  // the current run alone; otherwise an empty rerun incorrectly reports READY.
+  const planRevisionRuns = run.planNumber
+    ? await prisma.mRPRun.findMany({
+      where: { planNumber: run.planNumber, status: "Completed" },
+      select: { runNumber: true },
+    })
+    : [{ runNumber: run.runNumber }];
+  const planRevisionRunNumbers = planRevisionRuns.map((row) => row.runNumber);
+  const carriedProcurementSources = mpsNumber
+    ? await prisma.purchaseRequisitionSource.findMany({
+      where: {
+        mpsNumber,
+        mrpRunNumber: { in: planRevisionRunNumbers },
+        isDeleted: false,
+        plannedOrderNumber: { not: null },
+        prDetail: {
+          is: {
+            isDeleted: false,
+            pr: {
+              is: {
+                isDeleted: false,
+                status: { notIn: ["Cancelled", "Rejected"] },
+              },
+            },
+          },
+        },
+      },
+      select: { plannedOrderNumber: true },
+    })
+    : [];
+  const carriedOrderNumbers = [...new Set(
+    carriedProcurementSources.map((row) => row.plannedOrderNumber).filter(Boolean),
+  )];
+
   const orders = await prisma.plannedOrder.findMany({
     where: {
-      runNumber: run.runNumber,
+      OR: [
+        { runNumber: run.runNumber },
+        ...(carriedOrderNumbers.length
+          ? [{ orderNumber: { in: carriedOrderNumbers } }]
+          : []),
+      ],
       orderType: "Purchase",
       isDeleted: false,
       status: { notIn: ["Cancelled"] },
@@ -164,10 +218,22 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
           isDeleted: false,
           OR: [
             { plannedOrderNumber: { in: orderNumbers } },
+            {
+              sources: {
+                some: {
+                  plannedOrderNumber: { in: orderNumbers },
+                  isDeleted: false,
+                },
+              },
+            },
             { pr: { notes: { contains: run.runNumber }, isDeleted: false } },
           ],
         },
         include: {
+          sources: {
+            where: { isDeleted: false },
+            select: { plannedOrderNumber: true, qty: true, isDeleted: true },
+          },
           pr: {
             select: {
               prNumber: true,
@@ -184,6 +250,7 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
                   poNumber: true,
                   status: true,
                   deliveryDate: true,
+                  supplierCode: true,
                   isDeleted: true,
                 },
               },
@@ -208,15 +275,47 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
   const stockByPartCode = new Map(
     stockRows.map((row) => [row.partCode, number(row._sum?.qtyAvailable)]),
   );
+  const procurementSupplierCodes = [...new Set(prDetails.flatMap((detail) => [
+    detail.confirmedSupplierCode,
+    detail.proposedSupplierCode,
+    detail.preferredSupplier,
+    ...(detail.poDetails || []).map((poDetail) => poDetail.po?.supplierCode),
+  ]).filter(Boolean))];
+  const procurementSuppliers = procurementSupplierCodes.length
+    ? await prisma.supplier.findMany({
+      where: { supplierCode: { in: procurementSupplierCodes }, isDeleted: false },
+      select: { supplierCode: true, supplierName: true, leadTimeDays: true },
+    })
+    : [];
+  const procurementSupplierByCode = new Map(
+    procurementSuppliers.map((supplier) => [supplier.supplierCode, supplier]),
+  );
   const today = day(new Date());
   const issues = [];
   const items = orders.map((order) => {
-    const supplier = supplierContext(order);
+    const linkedDetails = prDetails.filter((detail) => sourceNumbers(detail).has(order.orderNumber));
+    const masterSupplier = supplierContext(order);
+    const procurementSupplierCode = linkedDetails.flatMap((detail) => [
+      ...(detail.poDetails || []).map((poDetail) => poDetail.po?.supplierCode),
+      detail.confirmedSupplierCode,
+      detail.proposedSupplierCode,
+      detail.preferredSupplier,
+    ]).find(Boolean);
+    const procurementSupplier = procurementSupplierByCode.get(procurementSupplierCode);
+    const supplier = masterSupplier.supplierCode
+      ? masterSupplier
+      : procurementSupplier
+        ? {
+          supplierCode: procurementSupplier.supplierCode,
+          supplierName: procurementSupplier.supplierName,
+          leadTimeDays: number(procurementSupplier.leadTimeDays),
+          source: "PURCHASING",
+        }
+        : masterSupplier;
     const requiredDate = day(order.requiredDate);
     const calculatedOrderDate = supplier.leadTimeDays > 0
       ? addDays(requiredDate, -supplier.leadTimeDays)
       : day(order.orderDate);
-    const linkedDetails = prDetails.filter((detail) => sourceNumbers(detail).has(order.orderNumber));
     let prQty = 0;
     let poQty = 0;
     let receivedQty = 0;
@@ -232,8 +331,17 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
       for (const poDetail of detail.poDetails || []) {
         if (!poDetail.po || poDetail.po.isDeleted || !ACTIVE_PO_STATUSES.has(poDetail.po.status)) continue;
         const ratio = detailQty > 0 ? detailShare / detailQty : 0;
-        poQty += number(poDetail.qty) * ratio;
-        receivedQty += number(poDetail.qtyReceived) * ratio;
+        const usesConvertedDemandQty = poDetail.convertedPurchaseQty != null
+          && String(poDetail.conversionUomCode || "").toUpperCase()
+            === String(detail.uomCode || "").toUpperCase();
+        const orderedInDemandUom = usesConvertedDemandQty
+          ? number(poDetail.convertedPurchaseQty)
+          : number(poDetail.qty);
+        const receivedInDemandUom = usesConvertedDemandQty
+          ? number(poDetail.qtyReceived) * number(poDetail.conversionFactor)
+          : number(poDetail.qtyReceived);
+        poQty += orderedInDemandUom * ratio;
+        receivedQty += receivedInDemandUom * ratio;
         poNumbers.add(poDetail.po.poNumber);
         const delivery = day(poDetail.deliveryDate || poDetail.po.deliveryDate);
         if (delivery && (!latestDeliveryDate || delivery > latestDeliveryDate)) latestDeliveryDate = delivery;

@@ -1,10 +1,11 @@
 const { prisma } = require("../../index");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { syncReservationsForConfirmedSO } = require("../../services/production/sales-order/soReservationService");
+const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
 
 const include = {
   customer: true, currency: true, quotation: true,
-  details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { part: true, uom: true } },
+  details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { part: true, uom: true, deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } },
   attachments: { where: { isDeleted: false } }, deliverySchedules: { where: { isDeleted: false } },
 };
 const text = (value) => String(value ?? "").trim() || null;
@@ -44,9 +45,10 @@ exports.createFromQuotation = async (quotation, options = {}, user) => prisma.$t
   const details = quotation.details.map((row, index) => detailData(row, index, soNumber));
   const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0);
   const so = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData({ ...quotation, ...options, quotationNumber: quotation.quotationNumber, soDate: options.soDate || new Date(), deliveryDate: options.deliveryDate || quotation.details[0]?.deliveryDate, status: "Draft" }, user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include });
+  await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(options.customerCode || quotation.customerCode), lines: so.details, inputRows: quotation.details, headerDeliveryDate: options.deliveryDate || quotation.details[0]?.deliveryDate, user: user?.username || user?.email });
   await tx.quotationHeader.update({ where: { quotationNumber: quotation.quotationNumber }, data: { convertedToSO: soNumber, status: "Converted" } });
   await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dari quotation mengubah demand." });
-  return so;
+  return tx.salesOrderHeader.findUnique({ where: { soNumber }, include });
 });
 
 exports.create = async (req, res, next) => {
@@ -60,17 +62,17 @@ exports.create = async (req, res, next) => {
     }
     const rows = Array.isArray(req.body.details) ? req.body.details : [];
     if (!rows.length) return res.status(400).json({ message: "Minimal satu item Sales Order wajib diisi" });
-    const doc = await prisma.$transaction(async (tx) => { const soNumber = text(req.body.soNumber) || await nextNumber(tx); const details = rows.map((row, index) => detailData(row, index, soNumber)); const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); const created = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData(req.body, req.user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include }); await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dibuat; net-change MRP dijadwalkan." }); return created; });
+    const doc = await prisma.$transaction(async (tx) => { const soNumber = text(req.body.soNumber) || await nextNumber(tx); const details = rows.map((row, index) => detailData(row, index, soNumber)); const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); const created = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData(req.body, req.user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(req.body.customerCode), lines: created.details, inputRows: rows, headerDeliveryDate: req.body.deliveryDate, user: req.user?.username || req.user?.email }); await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dibuat; net-change MRP dijadwalkan." }); return tx.salesOrderHeader.findUnique({ where: { soNumber }, include }); });
     res.status(201).json(doc);
   } catch (error) { next(error); }
 };
 
 exports.update = async (req, res, next) => {
   try {
-    const existing = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } });
+    const existing = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true, deliveryTargets: { where: { isDeleted: false } } } } } });
     if (!existing) return res.status(404).json({ message: "Sales Order tidak ditemukan" });
     if (existing.status !== "Draft") return res.status(409).json({ message: `Sales Order ${existing.soNumber} sudah ${existing.status} dan tidak dapat diedit. Gunakan workflow revisi.` });
-    const doc = await prisma.$transaction(async (tx) => { const rows = Array.isArray(req.body.details) ? req.body.details : null; let totalAmount = existing.totalAmount; let details = null; if (rows) { details = rows.map((row, index) => detailData(row, index, existing.soNumber)); totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); await tx.salesOrderDetail.deleteMany({ where: { soNumber: existing.soNumber } }); if (details.length) await tx.salesOrderDetail.createMany({ data: details }); } const data = headerData({ ...existing, ...req.body }, req.user, totalAmount); delete data.createdBy; const updated = await tx.salesOrderHeader.update({ where: { soNumber: existing.soNumber }, data, include }); await queueDirtyPartCodes(tx, [...existing.details.map((row) => row.partCode), ...(details || []).map((row) => row.partCode)], { reason: "SO", sourceNumber: existing.soNumber, notes: "Sales Order diubah; net-change MRP dijadwalkan." }); return updated; });
+    const doc = await prisma.$transaction(async (tx) => { const rows = Array.isArray(req.body.details) ? req.body.details : null; let totalAmount = existing.totalAmount; let details = null; if (rows) { details = rows.map((row, index) => detailData(row, index, existing.soNumber)); totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); await tx.salesOrderDetail.deleteMany({ where: { soNumber: existing.soNumber } }); if (details.length) await tx.salesOrderDetail.createMany({ data: details }); const createdLines = await tx.salesOrderDetail.findMany({ where: { soNumber: existing.soNumber, isDeleted: false }, orderBy: { lineNumber: "asc" } }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: existing.soNumber, customerCode: text(req.body.customerCode || existing.customerCode), lines: createdLines, inputRows: rows, headerDeliveryDate: req.body.deliveryDate || existing.deliveryDate, user: req.user?.username || req.user?.email, trackChange: true, previousTargets: existing.details.flatMap((row) => row.deliveryTargets || []), impactSourceNumbers: [existing.soNumber, existing.revisionOfSoNumber] }); } const data = headerData({ ...existing, ...req.body }, req.user, totalAmount); delete data.createdBy; const updated = await tx.salesOrderHeader.update({ where: { soNumber: existing.soNumber }, data, include }); await queueDirtyPartCodes(tx, [...existing.details.map((row) => row.partCode), ...(details || []).map((row) => row.partCode)], { reason: "SO", sourceNumber: existing.soNumber, notes: "Sales Order diubah; net-change MRP dijadwalkan." }); return updated; });
     res.json(doc);
   } catch (error) { next(error); }
 };
@@ -86,7 +88,7 @@ exports.revise = async (req, res, next) => {
       const existing = await tx.salesOrderHeader.findFirst({
         where: { soNumber: req.params.soNumber, isDeleted: false },
         include: {
-          details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } },
+          details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } },
           deliverySchedules: { where: { isDeleted: false }, select: { status: true } },
         },
       });
@@ -121,12 +123,21 @@ exports.revise = async (req, res, next) => {
         },
         include,
       });
+      await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: existing.customerCode, lines: created.details, inputRows: existing.details.map((row) => ({ ...row, deliveryTargets: row.deliveryTargets })), headerDeliveryDate: existing.deliveryDate, user: req.user?.username || req.user?.email });
       await tx.salesOrderHeader.update({
         where: { soNumber: existing.soNumber },
         data: { status: "Superseded", notes: [existing.notes, `Digantikan oleh ${soNumber}: ${reason}`].filter(Boolean).join("; ") },
       });
+      await markDownstreamDemandChange(tx, {
+        sourceType: "SALES_ORDER",
+        sourceNumbers: [existing.soNumber],
+        reason: `Sales Order ${existing.soNumber} direvisi menjadi ${soNumber}; MPS, MRP, dan Purchase Suggestion wajib dihitung ulang.`,
+        user: req.user?.username || req.user?.email,
+        changeType: "SALES_ORDER_REVISION",
+      });
       await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: `Revisi ${existing.soNumber} dibuat; net-change MRP dijadwalkan.` });
-      return { ...created, previousSoNumber: existing.soNumber };
+      const revised = await tx.salesOrderHeader.findUnique({ where: { soNumber }, include });
+      return { ...revised, previousSoNumber: existing.soNumber };
     });
     res.status(201).json(result);
   } catch (error) {
@@ -143,6 +154,7 @@ exports.confirm = async (req, res, next) => {
       if (!so) throw Object.assign(new Error("Sales Order tidak ditemukan."), { statusCode: 404 });
       if (so.status !== "Draft") throw Object.assign(new Error(`Sales Order hanya dapat dikonfirmasi dari Draft. Status saat ini ${so.status}.`), { statusCode: 409 });
       if (!so.details.length || so.details.some((row) => Number(row.qty || 0) <= 0 || !row.partCode)) throw Object.assign(new Error("Semua line SO harus memiliki part dan qty lebih dari 0."), { statusCode: 400 });
+      await assertCompleteDeliveryTargets(tx, "SALES_ORDER", so.soNumber, so.details);
       const reservation = await syncReservationsForConfirmedSO(tx, so, so.details);
       const updated = await tx.salesOrderHeader.update({ where: { id: so.id }, data: { status: "Confirmed", approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date() }, include });
       return { ...updated, reservationWarnings: reservation.warnings || [] };

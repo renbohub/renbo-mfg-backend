@@ -6,6 +6,8 @@ const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 const frontendRoot = path.resolve(root, "..", "frontend");
 const readFrontend = (file) =>
   fs.readFileSync(path.join(frontendRoot, file), "utf8");
+const capacityController = read("src/prisma/controllers/planning/CapacityPlanningController.js");
+const capacityRoutes = read("src/prisma/routes/planning/capacity-planning.js");
 
 const checks = [
   [
@@ -46,10 +48,19 @@ const checks = [
       readFrontend("public/js/module-list.js").includes("SharedDataTable"),
   ],
   [
-    "Capacity UI compares Normal and Max scenarios",
-    readFrontend("public/js/ppic-capacity.js").includes(
-      "renderScenarioComparison",
-    ),
+    "Capacity UI compares two persisted custom scenarios with Gantt and calendar",
+    ["renderCustomScenarioComparison", "loadSharedScenarios", "renderGantt", "renderCalendar"].every(
+      (contract) => readFrontend("public/js/ppic-capacity.js").includes(contract),
+    ) && capacityController.includes("prisma.systemSetting.upsert") && capacityRoutes.includes('router.put("/scenarios/:scenarioKey"'),
+  ],
+  [
+    "MPS MRP and MPP use three grouping levels with Parent FG Forecast",
+    readFrontend("public/js/ppic-detail.js").includes('data-ppic-group="3"') &&
+      readFrontend("public/js/ppic-detail.js").includes("Parent FG Forecast") &&
+      readFrontend("public/js/ppic-detail.js").includes("parentFgPartCode") &&
+      readFrontend("public/js/ppic-detail.js").includes(
+        'ppic-grouping:${tab}`) || "[\\"customer\\",\\"month\\",\\"part\\"]"',
+      ),
   ],
   [
     "Report UI renders KPI, chart, detail and CSV",

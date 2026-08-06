@@ -47,10 +47,24 @@ const resolveFileField = (dbArray, keptUrlsRaw, newFiles) => {
 // Sanitasi data dari multipart form (semua nilai datang sebagai string)
 const sanitizeMachineData = (data) => {
   let d = convertNumericFields(data, MACHINE_NUMERIC_FIELDS);
+  if (d.specificationDetails !== undefined) {
+    d.specificationDetails = parseJsonField(d.specificationDetails, {});
+  }
+  ['machineFamily', 'machineSpecificationCode'].forEach((field) => {
+    if (typeof d[field] === 'string') d[field] = d[field].trim().toUpperCase().replace(/\s+/g, '_');
+  });
+  if (typeof d.machineTechnology === 'string') d.machineTechnology = d.machineTechnology.trim().toUpperCase();
   MACHINE_BOOLEAN_FIELDS.forEach((field) => {
     if (d[field] !== undefined) d[field] = d[field] === true || d[field] === 'true';
   });
   return d;
+};
+
+const validateMachineSpecification = (data, current = {}) => {
+  const merged = { ...current, ...data };
+  const missing = ['machineSpecificationCode', 'machineSpecificationName', 'machineFamily'].filter((field) => !String(merged[field] || '').trim());
+  if (!missing.length) return null;
+  return `Machine Specification wajib lengkap: ${missing.join(', ')}.`;
 };
 
 exports.generateCode = async (req, res, next) => {
@@ -113,6 +127,9 @@ exports.list = async (req, res, next) => {
         { machineCode: { contains: q, mode: "insensitive" } },
         { machineName: { contains: q, mode: "insensitive" } },
         { machineType: { contains: q, mode: "insensitive" } },
+        { machineFamily: { contains: q, mode: "insensitive" } },
+        { machineSpecificationCode: { contains: q, mode: "insensitive" } },
+        { machineSpecificationName: { contains: q, mode: "insensitive" } },
         { brand: { contains: q, mode: "insensitive" } },
         { serialNumber: { contains: q, mode: "insensitive" } },
         { location: { contains: q, mode: "insensitive" } },
@@ -160,6 +177,8 @@ exports.create = async (req, res, next) => {
     const { existingPhotos, existingDrawings, ...rawData } = req.body;
     const bodyData = sanitizeMachineData(rawData);
     if (bodyData.machineCode) bodyData.machineCode = bodyData.machineCode.toUpperCase();
+    const specificationError = validateMachineSpecification(bodyData);
+    if (specificationError) return res.status(400).json({ message: specificationError });
 
     // Pasang file uploads ke JSON field masing-masing
     if (req.files?.photos?.length > 0)
@@ -203,6 +222,8 @@ exports.update = async (req, res, next) => {
     if (!currentMachine) {
       return res.status(404).json({ message: "Machine not found" });
     }
+    const specificationError = validateMachineSpecification(bodyData, currentMachine);
+    if (specificationError) return res.status(400).json({ message: specificationError });
 
     // Jika machineCode berubah, cek duplikat soft-deleted
     if (bodyData.machineCode && bodyData.machineCode !== currentMachine.machineCode) {
@@ -304,6 +325,11 @@ exports.autocomplete = async (req, res, next) => {
         machineCode: true,
         machineName: true,
         machineType: true,
+        machineFamily: true,
+        machineTechnology: true,
+        machineSpecificationCode: true,
+        machineSpecificationName: true,
+        specificationDetails: true,
         status: true,
         tonnage: true,
         cycleTime: true,

@@ -22,7 +22,8 @@ const WORK_ORDER_PRODUCTION_STATUSES = ["In Production", "In Progress"];
 
 function normalizeShift(value) {
   if (value === undefined || value === null || value === "") return value;
-  return String(value).trim().toUpperCase();
+  const normalized = String(value).trim().toUpperCase();
+  return ({ "1": "1A", "2": "2A", "3": "3A" })[normalized] || normalized;
 }
 
 function assertProductionShift(value, options = {}) {

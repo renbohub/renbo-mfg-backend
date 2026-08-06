@@ -1,6 +1,6 @@
 const { prisma } = require("../../index");
 const { generateDocNumber, generatePONumber } = require("./utils/purchasingHelpers");
-const { resolveApprovalRule, createApprovalRequest } = require("../../services/approvalRuleService");
+const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 
 // Keep sourcing allocations in every PR read so the UI and PO conversion use
@@ -717,12 +717,13 @@ exports.submit = async (req, res, next) => {
     const pr = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } });
     if (!pr) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
     if (!["Draft", "Revision Required", "Rejected"].includes(pr.status)) return res.status(409).json({ message: `PR berstatus ${pr.status} tidak dapat disubmit.` });
-    const rule = await resolveApprovalRule({ moduleCode: "purchasing", pageCode: "purchase-requisitions", actionCode: "approve", documentType: "PurchaseRequisition", amount: pr.totalAmount, context: pr });
-    let request = null;
-    if (rule) request = await createApprovalRequest({ rule, moduleCode: "purchasing", pageCode: "purchase-requisitions", actionCode: "approve", documentType: "PurchaseRequisition", documentId: pr.id, documentNumber: pr.prNumber, amount: pr.totalAmount, requestedByUserId: req.user?.id, requestedBy: req.user?.username || req.user?.email });
-    const updated = await prisma.purchaseRequisition.update({ where: { prNumber: pr.prNumber }, data: { status: "Submitted" }, include });
-    res.json({ ...updated, approvalRequest: request });
-  } catch (e) { next(e); }
+    const result = await prisma.$transaction(async (tx) => {
+      const approvalRequest = await submitDocumentForApproval({ moduleCode: "purchasing", pageCode: "purchase-requisitions", actionCode: "approve", documentType: "PurchaseRequisition", documentId: pr.id, documentNumber: pr.prNumber, amount: pr.totalAmount, context: pr, requestedByUserId: req.user?.id, requestedBy: req.user?.username || req.user?.email, tx });
+      const updated = await tx.purchaseRequisition.update({ where: { prNumber: pr.prNumber }, data: { status: "Submitted" }, include });
+      return { updated, approvalRequest };
+    });
+    res.json({ ...result.updated, approvalRequest: result.approvalRequest });
+  } catch (e) { if (e.statusCode) return res.status(e.statusCode).json({ message: e.message }); next(e); }
 };
 exports.approve = async (req, res, next) => { try { const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat di-approve.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Approved", approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date(), rejectedBy: null, rejectedDate: null, rejectionReason: null }, include }); res.json(pr); } catch (e) { next(e); } };
 exports.reject = async (req, res, next) => { try { const reason = String(req.body?.reason || req.body?.rejectionReason || req.body?.notes || "").trim(); if (!reason) return res.status(400).json({ message: "Alasan penolakan wajib diisi." }); const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat ditolak.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Rejected", rejectedBy: req.user?.username || req.user?.email || "system", rejectedDate: new Date(), rejectionReason: reason }, include }); res.json(pr); } catch (e) { next(e); } };
@@ -1021,11 +1022,18 @@ exports.consolidateToPO = async (req, res, next) => {
     });
 
     // A PR detail may appear multiple times when its demand is split across
-    // suppliers/forms. Aggregate is retained for updates and variance status,
-    // but it deliberately does not block UNDER or OVER orders.
+    // suppliers/forms. The aggregate may be under the outstanding demand, but
+    // must never claim more demand than the PR actually has.
     const coverageByDetail = new Map();
     for (const row of normalizedLines) {
       coverageByDetail.set(row.detail.id, num(coverageByDetail.get(row.detail.id)) + row.sourceQty);
+    }
+    for (const [detailId, coveredQty] of coverageByDetail) {
+      const detail = detailById.get(detailId);
+      const outstandingQty = Math.max(num(detail.qty) - num(detail.orderedQty), 0);
+      if (coveredQty > outstandingQty + 0.000001) {
+        throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: total qty ${coveredQty} melebihi outstanding PR ${outstandingQty}.`), { statusCode: 409 });
+      }
     }
     const supplierCodes = [...new Set(normalizedLines.map((row) => row.supplierCode).filter(Boolean))];
     const vendorCodes = [...new Set(normalizedLines.map((row) => row.vendorCode).filter(Boolean))];
@@ -1039,6 +1047,24 @@ exports.consolidateToPO = async (req, res, next) => {
     if (unknownPartner) return res.status(400).json({ message: `Supplier/vendor tidak ditemukan: ${unknownPartner.supplierCode || unknownPartner.vendorCode}` });
 
     const result = await prisma.$transaction(async (tx) => {
+      // Serialize all conversions for the same PR details. The rows were read
+      // above for UI validation, but only the locked values are authoritative.
+      for (const detailId of [...coverageByDetail.keys()].sort()) {
+        await tx.$queryRaw`SELECT id FROM "tbl_purchase_requisition_detail" WHERE id = ${detailId} FOR UPDATE`;
+      }
+      const lockedDetails = await tx.purchaseRequisitionDetail.findMany({
+        where: { id: { in: [...coverageByDetail.keys()] }, isDeleted: false },
+        select: { id: true, prNumber: true, lineNumber: true, qty: true, orderedQty: true },
+      });
+      const lockedById = new Map(lockedDetails.map((row) => [row.id, row]));
+      for (const [detailId, coveredQty] of coverageByDetail) {
+        const detail = lockedById.get(detailId);
+        if (!detail) throw Object.assign(new Error("Detail PR berubah atau sudah dihapus. Muat ulang data."), { statusCode: 409 });
+        const outstandingQty = Math.max(num(detail.qty) - num(detail.orderedQty), 0);
+        if (coveredQty > outstandingQty + 0.000001) {
+          throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: outstanding PR berubah menjadi ${outstandingQty}; qty ${coveredQty} tidak dapat diproses.`), { statusCode: 409 });
+        }
+      }
       const confirmedAt = new Date();
       const confirmedBy = actor(req);
       for (const row of normalizedLines) {

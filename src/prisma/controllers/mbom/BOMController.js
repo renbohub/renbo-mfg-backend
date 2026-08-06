@@ -397,9 +397,8 @@ function prepareMBOMProcessData(process, noReg, mbomDetailId) {
     occurrenceCode: process.occurrenceCode || null,
     routingNumber: process.routingNumber || null,
     machineId: process.machineId || null,
-    alternativeMachineIds: Array.isArray(process.alternativeMachineIds)
-      ? [...new Set(process.alternativeMachineIds.filter(Boolean).filter((machineId) => machineId !== process.machineId))]
-      : [],
+    machineSpecificationCode: process.machineSpecificationCode || process.machine?.machineSpecificationCode || null,
+    alternativeMachineIds: [],
     diesId: process.diesId || null,
     routingMode: String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR" ? "VENDOR" : "INHOUSE",
     vendorId: process.vendorId || null,
@@ -430,6 +429,16 @@ async function syncMBOMDetailProcesses(tx, detailId, noReg, processes) {
   }
 
   for (const process of processes) {
+    if (String(process.routingMode || "INHOUSE").toUpperCase() !== "VENDOR" && process.machineSpecificationCode) {
+      const representative = await tx.machine.findFirst({
+        where: { machineSpecificationCode: process.machineSpecificationCode, isDeleted: false },
+        orderBy: [{ status: "asc" }, { machineCode: "asc" }],
+        select: { id: true },
+      });
+      if (!representative) throw badRequest(`Machine Specification ${process.machineSpecificationCode} belum memiliki aset mesin.`);
+      process.machineId = representative.id;
+    }
+    process.alternativeMachineIds = [];
     const processData = prepareMBOMProcessData(process, noReg, detailId);
     if (process.id) {
       await tx.mBOMProcess.update({

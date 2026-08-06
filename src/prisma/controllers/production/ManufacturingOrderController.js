@@ -948,6 +948,7 @@ async function syncMonthlyProductionPlanDetailCompletion(tx, mo, username = null
       status: true,
       qtyPlanned: true,
       qtyReleased: true,
+      mpsDetailId: true,
     },
   });
   if (!detail) return false;
@@ -971,8 +972,25 @@ async function syncMonthlyProductionPlanDetailCompletion(tx, mo, username = null
 
   await tx.monthlyProductionPlanDetail.update({
     where: { id: detail.id },
-    data: { status: "Completed" },
+    data: { status: "Completed", qtyReleased: plannedQty },
   });
+
+  if (detail.mpsDetailId) {
+    const generatedDetails = await tx.monthlyProductionPlanDetail.findMany({
+      where: {
+        plan: { planNumber: mo.monthlyProductionPlanNumber },
+        isDeleted: false,
+        notes: { contains: `[MPS-SOURCE:${detail.mpsDetailId}]` },
+      },
+      select: { id: true, qtyPlanned: true },
+    });
+    for (const generatedDetail of generatedDetails) {
+      await tx.monthlyProductionPlanDetail.update({
+        where: { id: generatedDetail.id },
+        data: { status: "Completed", qtyReleased: Number(generatedDetail.qtyPlanned || 0) },
+      });
+    }
+  }
 
   await closeMonthlyProductionPlanIfAllMosCompleted(
     tx,
@@ -2712,6 +2730,11 @@ exports.complete = async (req, res, next) => {
         stockTarget: { warehouseCode, rackCode, lotNumber },
         performedBy: req.user?.username || "system",
       });
+      await syncMonthlyProductionPlanDetailCompletion(
+        tx,
+        updated,
+        req.user?.username || "system",
+      );
       if (existing.parentMoNumber) {
         const parentMo = await tx.manufacturingOrder.findUnique({
           where: { moNumber: existing.parentMoNumber },

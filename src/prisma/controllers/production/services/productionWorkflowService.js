@@ -71,6 +71,27 @@ function normalizeUomCode(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function buildRequirementStockIdentity(item = {}) {
+  const identities = [];
+  if (item.partCode) identities.push({ partCode: item.partCode });
+
+  // Material stock is intentionally shared by material master identity. A
+  // PURCHASE_PART remains tied to its exact partCode because its dimensions
+  // and discrete quantity cannot safely be substituted by another child part.
+  if (String(item.rawType || "").trim().toUpperCase() === "MATERIAL") {
+    if (item.materialId) identities.push({ materialId: item.materialId });
+    if (item.materialCode) identities.push({ materialCode: item.materialCode });
+  }
+
+  return identities.length > 1 ? { OR: identities } : identities[0] || { partCode: "__NO_PART__" };
+}
+
+function buildRequirementUomCondition(uomCode) {
+  return uomCode
+    ? { uomCode: { equals: uomCode, mode: "insensitive" } }
+    : { uomCode: null };
+}
+
 function normalizeRequirementUomMode(value) {
   const normalized = String(value || "kg").trim().toUpperCase();
   if (normalized === "KG") return "kg";
@@ -94,7 +115,12 @@ function getPreferredPartBase(part = {}) {
   );
 }
 
-function resolveKgPerQty(part = {}) {
+function resolveKgPerQty(part = {}, mbomDetail = {}) {
+  // The approved MBOM stores the frozen production weight even when legacy
+  // Part Base rows are missing. Inventory and MRP already transact material
+  // in KG from this snapshot, so production availability must use it too.
+  const mbomGrossWeight = toNumber(mbomDetail.grossWeight || mbomDetail.defaultGrossWeight);
+  if (mbomGrossWeight > 0) return mbomGrossWeight;
   const base = getPreferredPartBase(part);
   const grossWeight = toNumber(base?.grossWeight);
   return grossWeight > 0 ? grossWeight : null;
@@ -105,7 +131,7 @@ function normalizeMaterialRequirementToKg(rawQtyRequired, detail) {
     return roundQuantity(rawQtyRequired);
   }
 
-  const kgPerQty = resolveKgPerQty(detail.part);
+  const kgPerQty = resolveKgPerQty(detail.part, detail);
   if (!kgPerQty) {
     return roundQuantity(rawQtyRequired);
   }
@@ -510,8 +536,8 @@ async function getAvailableStockSources(tx, item, options = {}) {
     where: {
       AND: [
         {
-          partCode: item.partCode,
-          uomCode: item.uomCode || null,
+          ...buildRequirementStockIdentity(item),
+          ...buildRequirementUomCondition(item.uomCode),
           isDeleted: false,
           qtyAvailable: { gt: 0 },
         },
@@ -535,6 +561,8 @@ async function getAvailableStockSources(tx, item, options = {}) {
       width: true,
       CSP: true,
       uomCode: true,
+      materialId: true,
+      materialCode: true,
     },
   });
 
@@ -564,6 +592,9 @@ async function getAvailableStockSources(tx, item, options = {}) {
       thickness: balance.thickness ?? null,
       width: balance.width ?? null,
       CSP: balance.CSP || null,
+      uomCode: balance.uomCode || item.uomCode || null,
+      materialId: balance.materialId || null,
+      materialCode: balance.materialCode || null,
     });
     remaining = roundQuantity(remaining - qtyCandidate);
   }
@@ -960,7 +991,7 @@ async function getMaterialRequirements(tx, mo, options = {}) {
           itemType: true,
           rawType: true,
           assemblyPolicy: true,
-          material: { select: { spec: true } },
+          material: { select: { id: true, materialCode: true, spec: true } },
           partBases: {
             select: {
               baseOn: true,
@@ -1043,6 +1074,8 @@ async function getMaterialRequirements(tx, mo, options = {}) {
         partCode: detail.part.partCode,
         partNumber: detail.part.partNumber,
         partName: detail.part.partName,
+        materialId: detail.part.material?.id || null,
+        materialCode: detail.part.material?.materialCode || null,
         spec: detail.part.material?.spec || null,
         thickness: partBase?.thickness ?? null,
         width: partBase?.width ?? null,
@@ -1065,7 +1098,7 @@ async function getMaterialRequirements(tx, mo, options = {}) {
         qtyRequiredBeforePlannedCap,
         plannedOrderQtyKg: shouldUsePlannedKgRequirement ? plannedOrderQtyKg : null,
         originalUomCode: detail.uomCode || null,
-        kgPerQty: isAssemblyInput ? null : resolveKgPerQty(detail.part),
+        kgPerQty: isAssemblyInput ? null : resolveKgPerQty(detail.part, detail),
         requirementUomMode: isAssemblyInput ? "ORIGINAL" : requirementUomMode,
         requirementSource: isSubAssembly
           ? "SubAssembly"
@@ -1141,6 +1174,7 @@ async function getRoutingOperations(tx, mo) {
 
     for (const process of detail.mbomProcesses) {
       operations.push({
+        mbomProcessId: process.id,
         mbomDetailId: detail.id,
         parentDetailId: detail.parentDetailId || null,
         levelComponent: detail.levelComponent || 0,
@@ -1349,7 +1383,11 @@ async function buildAvailability(tx, mo, options = {}) {
     const stockAgg = await tx.stockBalance.aggregate({
       where: {
         AND: [
-          { partCode: item.partCode, uomCode: item.uomCode || null, isDeleted: false },
+          {
+            ...buildRequirementStockIdentity(item),
+            ...buildRequirementUomCondition(item.uomCode),
+            isDeleted: false,
+          },
           buildExcludeSpecialRackCondition(),
         ],
       },
@@ -1511,10 +1549,31 @@ async function generateWorkOrdersFromRouting(tx, mo, options = {}) {
     options.startSequence ?? mo?.sourceStartSequence,
     0,
   ) || inferStartSequenceFromSourcePartCode(operations, mo?.sourcePartCode);
+  const capacityVendorAllocations = mo.monthlyProductionPlanNumber && mo.monthlyProductionPlanLineNumber != null
+    ? await tx.productionPlanAllocation.findMany({
+      where: {
+        isDeleted: false,
+        status: { in: ["Draft", "Published"] },
+        routingMode: "VENDOR",
+        lineNumber: mo.monthlyProductionPlanLineNumber,
+        plan: { planNumber: mo.monthlyProductionPlanNumber, isDeleted: false },
+      },
+      select: { mbomProcessId: true },
+    })
+    : [];
+  const capacityVendorProcessIds = new Set(capacityVendorAllocations.map((row) => row.mbomProcessId));
+  const inHouseOperations = operations.filter((operation) => !capacityVendorProcessIds.has(operation.process?.id));
   const scopedOperations = requestedStartSequence > 0
-    ? operations.filter(operation => toNumber(operation.sequence) >= requestedStartSequence)
-    : operations;
+    ? inHouseOperations.filter(operation => toNumber(operation.sequence) >= requestedStartSequence)
+    : inHouseOperations;
   if (scopedOperations.length === 0) {
+    if (capacityVendorAllocations.length > 0) {
+      return {
+        created: [],
+        mbomNoReg: mbomHeader.noReg,
+        skipped: "Seluruh proses in-house pada scope ini dialihkan ke vendor dari Capacity Planning.",
+      };
+    }
     throw new Error("Tidak ada routing process inHouse di MBOM untuk digenerate menjadi Work Order.");
   }
 
@@ -1532,6 +1591,7 @@ async function generateWorkOrdersFromRouting(tx, mo, options = {}) {
         woDate: now,
         moId: mo.id,
         mbomDetailId: operation.mbomDetailId || null,
+        mbomProcessId: operation.mbomProcessId || null,
         outputPartId: operation.componentPartId || null,
         outputPartCode: operation.componentPartCode || null,
         outputPartNumber: operation.componentPartNumber || null,
@@ -2042,13 +2102,96 @@ async function completeManufacturingOrder(tx, mo, options = {}) {
   return updated;
 }
 
+async function syncMonthlyPlanFromCompletedMo(tx, mo) {
+  if (
+    mo?.status !== "Completed"
+    || !mo.monthlyProductionPlanNumber
+    || mo.monthlyProductionPlanLineNumber == null
+  ) return false;
+
+  const rootDetail = await tx.monthlyProductionPlanDetail.findFirst({
+    where: {
+      plan: { planNumber: mo.monthlyProductionPlanNumber },
+      lineNumber: mo.monthlyProductionPlanLineNumber,
+      isDeleted: false,
+    },
+    select: { id: true, mpsDetailId: true, qtyPlanned: true, qtyReleased: true },
+  });
+  if (!rootDetail) return false;
+
+  const incompleteSiblingMos = await tx.manufacturingOrder.count({
+    where: {
+      monthlyProductionPlanNumber: mo.monthlyProductionPlanNumber,
+      monthlyProductionPlanLineNumber: mo.monthlyProductionPlanLineNumber,
+      isDeleted: false,
+      status: { notIn: ["Completed", "Cancelled"] },
+    },
+  });
+  if (incompleteSiblingMos > 0) return false;
+
+  await tx.monthlyProductionPlanDetail.update({
+    where: { id: rootDetail.id },
+    data: { status: "Completed", qtyReleased: Number(rootDetail.qtyPlanned || 0) },
+  });
+
+  // Generated child/process MPP rows are executed inside the root MO through
+  // their linked DPP/WO graph. They do not receive separate MOs, so leaving
+  // them Planned would make an otherwise completed monthly plan impossible to
+  // close.
+  if (rootDetail.mpsDetailId) {
+    const marker = `[MPS-SOURCE:${rootDetail.mpsDetailId}]`;
+    const executedChildren = await tx.monthlyProductionPlanDetail.findMany({
+      where: {
+        plan: { planNumber: mo.monthlyProductionPlanNumber },
+        isDeleted: false,
+        notes: { contains: marker },
+      },
+      select: { id: true, qtyPlanned: true },
+    });
+    for (const detail of executedChildren) {
+      await tx.monthlyProductionPlanDetail.update({
+        where: { id: detail.id },
+        data: { status: "Completed", qtyReleased: Number(detail.qtyPlanned || 0) },
+      });
+    }
+  }
+
+  const [incompleteDetails, incompleteMos] = await Promise.all([
+    tx.monthlyProductionPlanDetail.count({
+      where: { plan: { planNumber: mo.monthlyProductionPlanNumber }, isDeleted: false, status: { not: "Completed" } },
+    }),
+    tx.manufacturingOrder.count({
+      where: { monthlyProductionPlanNumber: mo.monthlyProductionPlanNumber, isDeleted: false, status: { notIn: ["Completed", "Cancelled"] } },
+    }),
+  ]);
+  if (incompleteDetails === 0 && incompleteMos === 0) {
+    await tx.monthlyProductionPlan.updateMany({
+      where: {
+        planNumber: mo.monthlyProductionPlanNumber,
+        isDeleted: false,
+        status: { in: ["Released", "In Progress"] },
+      },
+      data: { status: "Closed", closedBy: "production-auto-sync", closedAt: new Date() },
+    });
+  }
+  return true;
+}
+
 async function syncManufacturingOrderQtyFromWorkOrders(tx, moId) {
   if (!moId) return null;
 
   const [mo, workOrders, vendorProcessOrders, openQcCount, rejectedQcCount, openMaterialIssueCount, completedFinalQcs] = await Promise.all([
     tx.manufacturingOrder.findUnique({
       where: { id: moId },
-      select: { id: true, moNumber: true, parentMoNumber: true, status: true, qtyPlanned: true },
+      select: {
+        id: true,
+        moNumber: true,
+        parentMoNumber: true,
+        status: true,
+        qtyPlanned: true,
+        monthlyProductionPlanNumber: true,
+        monthlyProductionPlanLineNumber: true,
+      },
     }),
     tx.workOrder.findMany({
       where: {
@@ -2260,6 +2403,8 @@ async function syncManufacturingOrderQtyFromWorkOrders(tx, moId) {
     where: { id: moId },
     data: updateData,
   });
+
+  await syncMonthlyPlanFromCompletedMo(tx, updatedMo);
 
   if (mo.parentMoNumber) {
     const parentMo = await tx.manufacturingOrder.findUnique({

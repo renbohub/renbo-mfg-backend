@@ -2,7 +2,7 @@ const { prisma } = require("../../index");
 const readController = require("../supply-chain/SupplyChainReadController");
 const { generateDocNumber } = require("./utils/purchasingHelpers");
 const { convertPurchaseInvoiceDetailNumericFields } = require("./utils/purchasingNumericConverter");
-const { resolveApprovalRule, createApprovalRequest } = require("../../services/approvalRuleService");
+const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const text = (value) => String(value || "").trim();
@@ -235,18 +235,8 @@ exports.submit = async (req, res, next) => {
     if (!["Draft", "Need Review"].includes(invoice.status)) {
       return res.status(409).json({ message: `Invoice berstatus ${invoice.status} tidak dapat disubmit.` });
     }
-    const rule = await resolveApprovalRule({
-      moduleCode: "purchasing",
-      pageCode: "purchase-invoices",
-      actionCode: "approve",
-      documentType: "PurchaseInvoice",
-      amount: invoice.totalAmount,
-      currencyCode: invoice.currencyCode,
-      context: invoice,
-    });
-    const approvalRequest = rule
-      ? await createApprovalRequest({
-          rule,
+    const result = await prisma.$transaction(async (tx) => {
+      const approvalRequest = await submitDocumentForApproval({
           moduleCode: "purchasing",
           pageCode: "purchase-invoices",
           actionCode: "approve",
@@ -258,15 +248,18 @@ exports.submit = async (req, res, next) => {
           context: invoice,
           requestedByUserId: req.user?.id,
           requestedBy: actor(req),
-        })
-      : null;
-    const updated = await prisma.purchaseInvoice.update({
-      where: { invoiceNumber: invoice.invoiceNumber },
-      data: { status: "Submitted", submittedBy: actor(req), submittedDate: new Date() },
-      include: DETAIL_INCLUDE,
+          tx,
+      });
+      const updated = await tx.purchaseInvoice.update({
+        where: { invoiceNumber: invoice.invoiceNumber },
+        data: { status: "Submitted", submittedBy: actor(req), submittedDate: new Date() },
+        include: DETAIL_INCLUDE,
+      });
+      return { updated, approvalRequest };
     });
-    res.json({ ...updated, approvalRequest });
+    res.json({ ...result.updated, approvalRequest: result.approvalRequest });
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     next(error);
   }
 };

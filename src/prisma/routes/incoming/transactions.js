@@ -6,4 +6,5 @@ router.post("/goods-receipts", authorize("purchaseOrder", "create"), logger("goo
 router.post("/incoming-inspections", authorize("purchaseOrder", "create"), logger("incoming-inspection", "create"), ctrl.createInspection);
 router.post("/incoming-inspections/:inspectionNumber/complete", authorize("purchaseOrder", "update"), logger("incoming-inspection", "complete"), ctrl.completeInspection);
 router.post("/incoming-inspections/:inspectionNumber/putaway", authorize("purchaseOrder", "update"), logger("incoming-inspection", "putaway"), ctrl.putawayAccepted);
+router.post("/incoming-inspections/:inspectionNumber/dispose-rejected", authorize("purchaseOrder", "update"), logger("incoming-inspection", "dispose-rejected"), ctrl.disposeRejected);
 module.exports = router;

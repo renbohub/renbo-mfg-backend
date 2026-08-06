@@ -2,7 +2,7 @@ const crypto = require("crypto");
 const path = require("path");
 const XLSX = require("xlsx");
 
-const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_SHEETS = 60;
 const MAX_ROWS = 50000;
 const HEADER_SCAN_ROWS = 40;
@@ -70,6 +70,16 @@ function worksheetRows(sheet, sheetName, hidden) {
     const columnIndex = range.s.c + offset;
     return displayValue(sheet[XLSX.utils.encode_cell({ r: headerIndex, c: columnIndex })]);
   }));
+  const columnYears = {};
+  let activeYear = null;
+  for (let offset = 0; offset < headers.length; offset += 1) {
+    const columnIndex = range.s.c + offset;
+    for (let rowIndex = range.s.r; rowIndex < headerIndex; rowIndex += 1) {
+      const value = displayValue(sheet[XLSX.utils.encode_cell({ r: rowIndex, c: columnIndex })]);
+      if (/^(19|20)\d{2}$/.test(String(value ?? "").trim())) activeYear = Number(value);
+    }
+    if (activeYear) columnYears[headers[offset]] = activeYear;
+  }
   const rows = [];
   let formulaCount = 0;
 
@@ -96,6 +106,7 @@ function worksheetRows(sheet, sheetName, hidden) {
       rowNumber: rowIndex + 1,
       hidden,
       formulas,
+      columnYears,
     };
     rows.push({ sheetName, rowNumber: rowIndex + 1, sourceJson });
     if (rows.length >= MAX_ROWS) break;
@@ -105,7 +116,7 @@ function worksheetRows(sheet, sheetName, hidden) {
 
 function assertFile(file) {
   if (!file?.buffer?.length) throw Object.assign(new Error("File Excel wajib diunggah."), { statusCode: 400 });
-  if (file.size > MAX_FILE_BYTES) throw Object.assign(new Error("Ukuran file maksimal 8 MB."), { statusCode: 413 });
+  if (file.size > MAX_FILE_BYTES) throw Object.assign(new Error("Ukuran file maksimal 20 MB."), { statusCode: 413 });
   const extension = path.extname(file.originalname || "").toLowerCase().replace(".", "");
   if (!['xlsx', 'xls', 'csv'].includes(extension)) throw Object.assign(new Error("Format file harus .xlsx, .xls, atau .csv."), { statusCode: 400 });
   return extension;

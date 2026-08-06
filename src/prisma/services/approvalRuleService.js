@@ -139,6 +139,40 @@ async function createApprovalRequest({ rule, moduleCode, pageCode, actionCode = 
   });
 }
 
+async function submitDocumentForApproval({ moduleCode, pageCode, actionCode = "approve", documentType, documentId, documentNumber, amount, currencyCode, context = {}, requestedByUserId, requestedBy, tx = prisma }) {
+  const rule = await resolveApprovalRule({
+    moduleCode,
+    pageCode,
+    actionCode,
+    documentType,
+    amount,
+    currencyCode,
+    context,
+    tx,
+  });
+  if (!rule) {
+    throw Object.assign(
+      new Error(`Submit diblokir: approval rule aktif untuk ${moduleCode}/${pageCode} belum dikonfigurasi.`),
+      { statusCode: 409 },
+    );
+  }
+  return createApprovalRequest({
+    rule,
+    moduleCode,
+    pageCode,
+    actionCode,
+    documentType,
+    documentId,
+    documentNumber,
+    amount,
+    currencyCode,
+    context,
+    requestedByUserId,
+    requestedBy,
+    tx,
+  });
+}
+
 async function userRoleIds(userId, tx = prisma) {
   if (!userId) return [];
   const rows = await tx.userRole.findMany({
@@ -285,29 +319,44 @@ function approvalGate(config) {
       const documentNumber = document?.[config.numberField || config.lookupField || parameter] || identifier;
       const amount = document?.[config.amountField || "totalAmount"] ?? req.body?.amount;
       const currencyCode = document?.[config.currencyField || "currencyCode"] ?? req.body?.currencyCode;
-      const rule = await resolveApprovalRule({
-        moduleCode: config.moduleCode,
-        pageCode: config.pageCode,
-        actionCode: config.actionCode || "approve",
-        documentType: config.documentType,
-        amount,
-        currencyCode,
-        context,
+      const requestKey = {
+        moduleCode: normalize(config.moduleCode),
+        pageCode: normalize(config.pageCode),
+        actionCode: normalize(config.actionCode || "approve"),
+        documentId: String(documentId),
+      };
+      let request = await prisma.approvalRequest.findFirst({
+        where: { ...requestKey, isDeleted: false, status: { in: ACTIVE_REQUEST_STATUSES } },
+        include: REQUEST_INCLUDE,
       });
-      if (!rule) return next();
-      const request = await createApprovalRequest({
-        rule,
-        moduleCode: config.moduleCode,
-        pageCode: config.pageCode,
-        actionCode: config.actionCode || "approve",
-        documentType: config.documentType,
-        documentId,
-        documentNumber,
-        amount,
-        currencyCode,
-        context,
-        requestedBy: document?.createdBy || document?.requestedBy || null,
-      });
+      if (!request) {
+        if (config.requireExistingRequest) {
+          return res.status(409).json({ message: "Dokumen belum disubmit ke alur approval atau approval request aktif tidak ditemukan." });
+        }
+        const rule = await resolveApprovalRule({
+          moduleCode: config.moduleCode,
+          pageCode: config.pageCode,
+          actionCode: config.actionCode || "approve",
+          documentType: config.documentType,
+          amount,
+          currencyCode,
+          context,
+        });
+        if (!rule) return next();
+        request = await createApprovalRequest({
+          rule,
+          moduleCode: config.moduleCode,
+          pageCode: config.pageCode,
+          actionCode: config.actionCode || "approve",
+          documentType: config.documentType,
+          documentId,
+          documentNumber,
+          amount,
+          currencyCode,
+          context,
+          requestedBy: document?.createdBy || document?.requestedBy || null,
+        });
+      }
       const result = await prisma.$transaction((tx) => processApprovalAction({
         requestId: request.id,
         user: req.user,
@@ -335,6 +384,7 @@ module.exports = {
   REQUEST_INCLUDE,
   resolveApprovalRule,
   createApprovalRequest,
+  submitDocumentForApproval,
   processApprovalAction,
   hasPageAction,
   approvalGate,

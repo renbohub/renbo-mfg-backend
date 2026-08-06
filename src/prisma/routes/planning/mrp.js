@@ -1,5 +1,6 @@
 const router = require("express").Router();
 const ctrl = require("../../controllers/planning/MRPController");
+const purchaseSuggestionCtrl = require("../../controllers/purchasing/PurchaseSuggestionController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
@@ -17,7 +18,7 @@ router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);
 router.get("/:runNumber/requirements", authorize("mrp", "read"), ctrl.getRequirements);
 router.patch("/:runNumber/requirements/buffer", authorize("mrp", "update"), logger("mrp", "update-buffer"), ctrl.updateRequirementBuffer);
 router.patch("/:runNumber/requirements/order-percent", authorize("mrp", "update"), logger("mrp", "update-order-percent"), ctrl.updateRequirementBuffer);
-router.post("/:runNumber/output/purchase-request", authorize("mrp", "release"), logger("mrp", "release-purchase-request"), ctrl.createPurchaseRequestOutput);
+router.post("/:runNumber/output/purchase-suggestions", authorize("mrp", "release"), logger("mrp", "generate-purchase-suggestions"), purchaseSuggestionCtrl.generate);
 router.post("/:runNumber/output/production-plan", authorize("mrp", "release"), logger("mrp", "release-production-plan"), ctrl.createProductionPlanOutput);
 router.patch("/:runNumber/planned-orders/procurement", authorize("mrp", "update"), logger("mrp", "update-procurement-proposal"), ctrl.updatePlannedOrderProcurement);
 router.get("/:runNumber/planned-orders", authorize("mrp", "read"), ctrl.getPlannedOrders);

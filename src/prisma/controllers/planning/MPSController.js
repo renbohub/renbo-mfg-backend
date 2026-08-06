@@ -8,22 +8,20 @@ const {
   nextPlanningMonthKey,
 } = require("../../utils/planningMonth");
 const { compareRoutingOperations } = require("../../utils/routingSequence");
+const { syncMonthlyMps } = require("../../services/planning/monthlyPlanningService");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
 const date = (value) => value ? new Date(value) : null;
-const include = { details: { where: { isDeleted: false }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }], include: { part: { include: { process: true } }, forecastDetail: true, mbom: true } } };
+const include = { details: { where: { isDeleted: false }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }], include: { part: { include: { process: true } }, forecastDetail: true, demandSources: { orderBy: [{ sourceType: "asc" }, { sourceNumber: "asc" }] }, mbom: true } } };
 const GENERATED_PROCESS_PREFIX = "[MRP-PRODUCTION]";
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith(GENERATED_PROCESS_PREFIX);
 function evaluateMpsBuffer(formulas, variables) {
-  const formula = formulas?.get?.("MPS_BUFFER_QTY");
   const result = evaluateFromSet(formulas, "MPS_BUFFER_QTY", variables);
-  // Older database-seeded formulas predate stock netting. Keep them
-  // backward-compatible while enforcing the current rule transparently.
-  return String(formula?.expression || "").includes("stockAvailableQty")
-    ? Math.max(result, 0)
-    : Math.max(result - number(variables.stockAvailableQty), 0);
+  // MPS defines gross demand. Inventory is netted exactly once in MRP; using
+  // FG stock here would reduce the same stock again during MRP explosion.
+  return Math.max(result, 0);
 }
 const sourceKeyFor = (forecastNumber, periodKey, attempt = 0) => `FORECAST:${forecastNumber}:${periodKey}${attempt > 0 ? `:PARTIAL-${attempt}` : ""}`;
 const sourcePeriodKey = (forecastNumber, sourceKey, fallback) => {
@@ -179,9 +177,12 @@ async function buildMpsReadiness(tx, doc) {
       }
       for (const route of detail.mbomProcesses || []) {
         const processCode = route.process?.processCode || route.process?.processName || `sequence ${route.sequence}`;
-        if (String(route.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
+        const effectiveRoutingMode = category === "VENDOR"
+          ? "VENDOR"
+          : String(route.routingMode || "INHOUSE").toUpperCase();
+        if (effectiveRoutingMode === "VENDOR") {
           if (!route.vendorId || !route.vendor || String(route.vendor.status || "Active").toUpperCase() !== "ACTIVE") {
-            add("BLOCKING", "ROUTING_VENDOR_MISSING", `${detailCode} · ${processCode} memakai routing vendor tetapi vendor aktif belum dipilih.`, { partCode: detailCode, parentPartCode: partCode, processCode, ...bomContext });
+            add("WARNING", "ROUTING_VENDOR_SELECTED_AT_CAPACITY", `${detailCode} · ${processCode} bertipe vendor; vendor serta jadwal send/return dipilih saat Capacity Planning.`, { partCode: detailCode, parentPartCode: partCode, processCode, ...bomContext });
           }
         } else {
           if (!route.machineId || !route.machine || String(route.machine.status || "Active").toUpperCase() !== "ACTIVE") {
@@ -261,13 +262,20 @@ exports.generateNumber = async (_req, res, next) => { try { res.json({ mpsNumber
 exports.list = async (req, res, next) => {
   try {
     const page = Math.max(number(req.query.page) || 1, 1); const limit = Math.min(Math.max(number(req.query.limit) || 20, 1), 500); const q = text(req.query.q || req.query.search);
-    const where = { isDeleted: false, ...(q ? { OR: [{ mpsNumber: { contains: q, mode: "insensitive" } }, { mpsName: { contains: q, mode: "insensitive" } }, { forecastNumber: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
+    const where = { isDeleted: false, ...(String(req.query.includeLegacy || "").toLowerCase() === "true" ? {} : { status: { not: "Superseded" } }), ...(q ? { OR: [{ mpsNumber: { contains: q, mode: "insensitive" } }, { mpsName: { contains: q, mode: "insensitive" } }, { forecastNumber: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
     const [items, total] = await Promise.all([prisma.mPS.findMany({ where, include, orderBy: [{ periodStart: "desc" }, { createdAt: "desc" }], skip: (page - 1) * limit, take: limit }), prisma.mPS.count({ where })]);
     res.json({ items: items.map((item) => {
       const receiptLines = item.details.filter((row) => !isGeneratedProcess(row));
       const processLines = item.details.filter((row) => isGeneratedProcess(row) && String(row.part?.itemType || "").toUpperCase() !== "FG");
+      const forecastNumbers = [...new Set(receiptLines.flatMap((row) => {
+        const captured = String(row.notes || "").match(/forecast\s+(.+?);\s*SO/i)?.[1] || "";
+        return captured.split(",").map((value) => value.trim()).filter((value) => value && value !== "-");
+      }))];
+      const soNumbers = [...new Set(receiptLines.flatMap((row) => String(row.soNumber || "").split(",").map((value) => value.trim()).filter(Boolean)))];
       return {
         ...item,
+        forecastNumbers,
+        soNumbers,
         totalPlannedQty: receiptLines.reduce((sum, row) => sum + number(row.qtyPlanned), 0),
         partCount: new Set(receiptLines.map((row) => row.partCode)).size,
         receiptLineCount: receiptLines.length,
@@ -283,7 +291,7 @@ exports.list = async (req, res, next) => {
 exports.monthlySummary = async (req, res, next) => {
   try {
     const details = await prisma.mPSDetail.findMany({
-      where: { isDeleted: false, mps: { isDeleted: false } },
+      where: { isDeleted: false, mps: { isDeleted: false, status: { not: "Superseded" } } },
       select: {
         mpsNumber: true, partCode: true, customerCode: true, startDate: true,
         forecastQty: true, actualSalesOrderQty: true, bufferQty: true, effectiveDemandQty: true, qtyPlanned: true, notes: true,
@@ -299,7 +307,9 @@ exports.monthlySummary = async (req, res, next) => {
       if (!row.startDate) continue;
       const month = monthKey(row.startDate);
       const customerCode = row.customerCode || "Tanpa Customer";
-      const forecastNumber = row.mps?.forecastNumber || "Tanpa Forecast";
+      const forecastNumber = row.mps?.forecastNumber
+        || String(row.notes || "").match(/forecast\s+(.+?);\s*SO/i)?.[1]?.trim()
+        || "Tanpa Forecast";
       const itemType = String(row.part?.itemType || "UNKNOWN").toUpperCase();
       const partType = String(row.part?.partType || "STANDARD").toUpperCase();
       const itemScope = itemType === "FG" && partType !== "COMP" ? "FG NON-COMP" : partType !== "COMP" ? "NON-COMP" : "COMP";
@@ -334,9 +344,15 @@ exports.get = async (req, res, next) => {
     // Keep the existing MPS screen readable during a rolling deployment: a
     // node process may still hold the previous Prisma client until restart.
     // Delivery phases will appear as soon as the generated client is loaded.
+    const forecastReceiptDetailIds = doc.details.filter((row) => !isGeneratedProcess(row)).map((row) => row.id);
     const deliveryPlans = typeof prisma.mPSDeliveryPlan?.findMany === "function"
       ? await prisma.mPSDeliveryPlan.findMany({
-        where: { mpsNumber: doc.mpsNumber, isDeleted: false },
+        where: {
+          mpsNumber: doc.mpsNumber,
+          mpsDetailId: { in: forecastReceiptDetailIds },
+          targetType: "CUSTOMER",
+          isDeleted: false,
+        },
         orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }],
       })
       : [];
@@ -399,21 +415,56 @@ exports.get = async (req, res, next) => {
     // result of the MPS/MRP run.  Child/SFG rows are included so PPIC can see
     // the stock that was available to net their dependent requirement.
     const stockPartCodes = [...new Set(doc.details.map((row) => row.partCode).filter(Boolean))];
-    const stockRows = stockPartCodes.length ? await prisma.stockBalance.groupBy({
-      by: ["partCode"],
+    const stockRows = stockPartCodes.length ? await prisma.stockBalance.findMany({
       where: {
         partCode: { in: stockPartCodes },
         isDeleted: false,
         warehouse: { isDeleted: false, availableForProduction: true },
       },
-      _sum: { qtyOnHand: true, qtyAvailable: true, qtyReserved: true, qtyQC: true },
+      select: {
+        id: true,
+        partCode: true,
+        warehouseCode: true,
+        rackCode: true,
+        lotNumber: true,
+        stockType: true,
+        uomCode: true,
+        qtyOnHand: true,
+        qtyAvailable: true,
+        qtyReserved: true,
+        qtyQC: true,
+        warehouse: { select: { warehouseCode: true, warehouseName: true } },
+      },
+      orderBy: [{ partCode: "asc" }, { warehouseCode: "asc" }, { rackCode: "asc" }, { lotNumber: "asc" }],
     }) : [];
-    const stockByPartCode = new Map(stockRows.map((row) => [row.partCode, {
-      stockOnHandQty: Math.max(number(row._sum?.qtyOnHand), 0),
-      stockAvailableQty: Math.max(number(row._sum?.qtyAvailable), 0),
-      stockReservedQty: Math.max(number(row._sum?.qtyReserved), 0),
-      stockQcQty: Math.max(number(row._sum?.qtyQC), 0),
-    }]));
+    const stockByPartCode = new Map();
+    for (const row of stockRows) {
+      if (!stockByPartCode.has(row.partCode)) stockByPartCode.set(row.partCode, {
+        stockOnHandQty: 0,
+        stockAvailableQty: 0,
+        stockReservedQty: 0,
+        stockQcQty: 0,
+        stockBreakdown: { lines: [] },
+      });
+      const stock = stockByPartCode.get(row.partCode);
+      stock.stockOnHandQty += Math.max(number(row.qtyOnHand), 0);
+      stock.stockAvailableQty += Math.max(number(row.qtyAvailable), 0);
+      stock.stockReservedQty += Math.max(number(row.qtyReserved), 0);
+      stock.stockQcQty += Math.max(number(row.qtyQC), 0);
+      stock.stockBreakdown.lines.push({
+        stockBalanceId: row.id,
+        warehouseCode: row.warehouseCode,
+        warehouseName: row.warehouse?.warehouseName || null,
+        rackCode: row.rackCode,
+        lotNumber: row.lotNumber,
+        stockType: row.stockType,
+        uomCode: row.uomCode,
+        qtyOnHand: Math.max(number(row.qtyOnHand), 0),
+        qtyAvailable: Math.max(number(row.qtyAvailable), 0),
+        qtyReserved: Math.max(number(row.qtyReserved), 0),
+        qtyQC: Math.max(number(row.qtyQC), 0),
+      });
+    }
     doc.details = doc.details.map((row) => ({
       ...row,
       ...(stockByPartCode.get(row.partCode) || {
@@ -421,14 +472,59 @@ exports.get = async (req, res, next) => {
         stockAvailableQty: 0,
         stockReservedQty: 0,
         stockQcQty: 0,
+        stockBreakdown: { lines: [] },
       }),
     }));
+    const generatedRunNumbers = [...new Set(doc.details.map((row) => String(row.notes || "").match(/Generated from ([^;]+)/i)?.[1]?.trim()).filter(Boolean))];
+    const productionTraceRows = generatedRunNumbers.length ? await prisma.mRPRequirement.findMany({
+      where: { runNumber: { in: generatedRunNumbers }, isDeleted: false, orderType: "Production" },
+      select: {
+        id: true,
+        runNumber: true,
+        mpsDetailId: true,
+        parentRequirementId: true,
+        rootRequirementId: true,
+        treePath: true,
+        levelMBOM: true,
+        partCode: true,
+        grossRequirement: true,
+        onHandQty: true,
+        allocatedQty: true,
+        netRequirement: true,
+        plannedOrderQty: true,
+        adjustedOrderQty: true,
+        orderType: true,
+        requiredDate: true,
+        part: { select: { partCode: true, partNumber: true, partName: true } },
+        mbomDetail: { select: { qty: true, uomCode: true, category: true } },
+        parentRequirement: { select: { id: true, partCode: true, grossRequirement: true, netRequirement: true, orderType: true, part: { select: { partName: true } } } },
+      },
+      orderBy: [{ levelMBOM: "asc" }, { requiredDate: "asc" }],
+    }) : [];
+    doc.details = doc.details.map((row) => {
+      const runNumber = String(row.notes || "").match(/Generated from ([^;]+)/i)?.[1]?.trim();
+      const sourceMpsDetailId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      if (!runNumber || !sourceMpsDetailId) return row;
+      const mrpNettingTrace = productionTraceRows.filter((trace) => trace.runNumber === runNumber && trace.mpsDetailId === sourceMpsDetailId && trace.partCode === row.partCode);
+      const hierarchyTrace = mrpNettingTrace.slice().sort((left, right) => Number(left.levelMBOM || 0) - Number(right.levelMBOM || 0) || String(left.treePath || "").localeCompare(String(right.treePath || "")))[0];
+      return {
+        ...row,
+        mrpRunNumber: runNumber,
+        mrpNettingTrace,
+        bomHierarchy: hierarchyTrace ? {
+          level: Number(hierarchyTrace.levelMBOM || 0),
+          treePath: hierarchyTrace.treePath || null,
+          parentPartCode: hierarchyTrace.parentRequirement?.partCode || null,
+          parentPartName: hierarchyTrace.parentRequirement?.part?.partName || null,
+        } : null,
+      };
+    });
     const productionPlans = await prisma.monthlyProductionPlan.findMany({
       where: { sourceType: `MPS:${doc.mpsNumber}`, isDeleted: false },
       select: { planNumber: true, planMonth: true, status: true, _count: { select: { details: true } } },
       orderBy: { planMonth: "asc" },
     });
-    const [readiness, customers, vendors] = await Promise.all([
+    const [readiness, customers] = await Promise.all([
       buildMpsReadiness(prisma, doc),
       prisma.customer.findMany({
         // Legacy customer rows may predate the optional status field. Treat a
@@ -440,46 +536,48 @@ exports.get = async (req, res, next) => {
         select: { customerCode: true, customerName: true },
         orderBy: { customerCode: "asc" },
       }),
-      prisma.vendor.findMany({
-        where: { isDeleted: false, status: "Active" },
-        select: { vendorCode: true, vendorName: true },
-        orderBy: { vendorCode: "asc" },
-      }),
     ]);
-    res.json({ ...doc, productionPlans, deliveryPlans, deliveryCatalogs: { customers, vendors }, readiness });
+    res.json({ ...doc, productionPlans, deliveryPlans, deliveryCatalogs: { customers }, readiness });
   } catch (error) { next(error); }
 };
 
-// Delivery planning is intentionally separate from shipment execution.  PPIC
-// can split an FG/COMP into customer phases and can plan a vendor hand-off for
-// any child/SFG whose next routing is outsourced.
+// MPS only stores the customer delivery commitment. Vendor send/return phases
+// are operational routing decisions and belong to Capacity Planning.
 exports.createDeliveryPhase = async (req, res, next) => {
   try {
+    if (String(req.body?.targetType || "CUSTOMER").trim().toUpperCase() === "CUSTOMER") {
+      return res.status(409).json({ message: "Target delivery customer dimiliki Marketing. Ubah phase pada Forecast atau Sales Order, lalu hitung ulang MPS bulanan." });
+    }
     const mpsNumber = req.params.mpsNumber;
-    const targetType = String(req.body?.targetType || "").trim().toUpperCase();
+    const requestedTargetType = String(req.body?.targetType || "CUSTOMER").trim().toUpperCase();
+    const targetType = "CUSTOMER";
     const targetCode = text(req.body?.targetCode);
     const plannedDate = date(req.body?.plannedDate);
     const qtyPlanned = number(req.body?.qtyPlanned);
     const mpsDetailId = text(req.body?.mpsDetailId);
-    if (!['VENDOR', 'CUSTOMER'].includes(targetType) || !targetCode || !plannedDate || Number.isNaN(plannedDate.getTime()) || qtyPlanned <= 0) {
-      return res.status(400).json({ message: 'Tujuan (Vendor/Customer), tanggal, dan qty delivery wajib diisi.' });
+    if (requestedTargetType !== "CUSTOMER") {
+      return res.status(400).json({ message: "Vendor schedule dikelola melalui Capacity Planning, bukan MPS." });
+    }
+    if (!targetCode || !plannedDate || Number.isNaN(plannedDate.getTime()) || qtyPlanned <= 0) {
+      return res.status(400).json({ message: 'Customer, tanggal, dan qty delivery wajib diisi.' });
     }
     const mps = await prisma.mPS.findFirst({ where: { mpsNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, include: { part: true } } } });
     if (!mps) return res.status(404).json({ message: 'MPS tidak ditemukan.' });
     if (!['Draft', 'Confirmed'].includes(mps.status)) return res.status(409).json({ message: `Delivery planning tidak dapat diubah pada MPS ${mps.status}.` });
     const detail = mpsDetailId ? mps.details.find((row) => row.id === mpsDetailId) : mps.details.find((row) => row.partCode === text(req.body?.partCode));
     if (!detail) return res.status(404).json({ message: 'Baris MPS untuk delivery tidak ditemukan.' });
-    const partner = targetType === 'VENDOR'
-      ? await prisma.vendor.findFirst({ where: { vendorCode: targetCode, isDeleted: false, status: 'Active' }, select: { vendorCode: true, vendorName: true } })
-      : await prisma.customer.findFirst({
-        where: {
-          customerCode: targetCode,
-          isDeleted: false,
-          OR: [{ status: 'Active' }, { status: null }, { status: '' }],
-        },
-        select: { customerCode: true, customerName: true },
-      });
-    if (!partner) return res.status(404).json({ message: `${targetType === 'VENDOR' ? 'Vendor' : 'Customer'} aktif tidak ditemukan.` });
+    if (isGeneratedProcess(detail)) {
+      return res.status(400).json({ message: 'Customer delivery hanya dapat dijadwalkan dari baris forecast/FG Receipt.' });
+    }
+    const partner = await prisma.customer.findFirst({
+      where: {
+        customerCode: targetCode,
+        isDeleted: false,
+        OR: [{ status: 'Active' }, { status: null }, { status: '' }],
+      },
+      select: { customerCode: true, customerName: true },
+    });
+    if (!partner) return res.status(404).json({ message: 'Customer aktif tidak ditemukan.' });
     const allocated = await prisma.mPSDeliveryPlan.aggregate({
       where: { mpsNumber, mpsDetailId: detail.id, targetType, isDeleted: false, status: { not: 'Cancelled' } },
       _sum: { qtyPlanned: true },
@@ -490,7 +588,7 @@ exports.createDeliveryPhase = async (req, res, next) => {
     const last = await prisma.mPSDeliveryPlan.aggregate({ where: { mpsNumber }, _max: { phaseNumber: true } });
     const phase = await prisma.mPSDeliveryPlan.create({ data: {
       mpsNumber, mpsDetailId: detail.id, phaseNumber: number(last._max.phaseNumber) + 1, targetType,
-      targetCode, targetName: targetType === 'VENDOR' ? partner.vendorName : partner.customerName,
+      targetCode, targetName: partner.customerName,
       partCode: detail.partCode, plannedDate, qtyPlanned, uomCode: detail.part?.productionUomCode || detail.part?.baseUomCode || null,
       notes: text(req.body?.notes), createdBy: req.user?.username || req.user?.email || null,
     } });
@@ -502,6 +600,7 @@ exports.removeDeliveryPhase = async (req, res, next) => {
   try {
     const phase = await prisma.mPSDeliveryPlan.findFirst({ where: { id: req.params.phaseId, mpsNumber: req.params.mpsNumber, isDeleted: false } });
     if (!phase) return res.status(404).json({ message: 'Phase delivery tidak ditemukan.' });
+    if (phase.lockedBySource) return res.status(409).json({ message: "Phase ini bersumber dari Forecast/Sales Order. Revisi dilakukan oleh Marketing pada dokumen sumber." });
     await prisma.mPSDeliveryPlan.update({ where: { id: phase.id }, data: { isDeleted: true, status: 'Cancelled' } });
     res.json({ message: 'Phase delivery dibatalkan.' });
   } catch (error) { next(error); }
@@ -515,7 +614,7 @@ exports.readiness = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-exports.createFromForecast = async (req, res, next) => {
+async function createFromForecastLegacy(req, res, next) {
   try {
     const forecastNumber = text(req.body.forecastNumber);
     if (!forecastNumber) return res.status(400).json({ message: "Forecast wajib dipilih" });
@@ -665,7 +764,71 @@ exports.createFromForecast = async (req, res, next) => {
     }
     res.status(transactionResult.createdCount ? 201 : 200).json(mpsResponse(transactionResult.docs, { idempotent: transactionResult.createdCount === 0, createdCount: transactionResult.createdCount }));
   } catch (error) { next(error); }
-};
+}
+
+async function syncMonthlyDemand(req, res, next, requireForecast = false) {
+  try {
+    req.body = req.body || {};
+    const forecastNumber = text(req.body.forecastNumber);
+    if (requireForecast && !forecastNumber) {
+      return res.status(400).json({ message: "Forecast wajib dipilih" });
+    }
+    if (forecastNumber) {
+      const forecast = await prisma.forecast.findFirst({
+        where: { forecastNumber, isDeleted: false, isCurrentVersion: true },
+        select: {
+          forecastNumber: true,
+          status: true,
+          details: {
+            where: { isDeleted: false },
+            select: {
+              M1Forecast: true, M1Qty: true,
+              M2Forecast: true, M2Qty: true,
+              M3Forecast: true, M3Qty: true,
+            },
+          },
+        },
+      });
+      if (!forecast) return res.status(404).json({ message: "Forecast tidak ditemukan" });
+      if (!["Confirmed", "Consumed", "Partial Product"].includes(forecast.status)) {
+        return res.status(409).json({
+          message: `Forecast harus berstatus Confirmed sebelum masuk MPS bulanan. Status saat ini ${forecast.status}.`,
+        });
+      }
+      if (!Array.isArray(req.body.months) || !req.body.months.length) {
+        req.body.months = [...new Set(forecast.details.flatMap((row) => [
+          number(row.M1Qty) > 0 ? monthKey(row.M1Forecast) : null,
+          number(row.M2Qty) > 0 ? monthKey(row.M2Forecast) : null,
+          number(row.M3Qty) > 0 ? monthKey(row.M3Forecast) : null,
+        ]).filter(Boolean))];
+      }
+    }
+    if (!requireForecast && (!Array.isArray(req.body.months) || req.body.months.length !== 1)) {
+      return res.status(400).json({ message: "Pilih satu bulan yang akan dihitung menjadi MPS." });
+    }
+    const result = await prisma.$transaction((tx) => syncMonthlyMps(tx, {
+      months: Array.isArray(req.body.months) ? req.body.months : undefined,
+      runBy: req.user?.username || req.user?.email || "system",
+    }));
+    if (!result.docs.length) {
+      return res.status(400).json({
+        message: "Tidak ada demand Forecast/SO aktif pada bulan yang dipilih",
+      });
+    }
+    return res.status(200).json({
+      ...mpsResponse(result.docs, { idempotent: false, createdCount: 0 }),
+      months: result.months,
+      coveredSoNumbers: result.coveredSoNumbers,
+      consumedForecasts: result.consumedForecasts,
+      message: `${result.docs.length} MPS bulanan berhasil dihitung ulang dari seluruh Forecast dan SO aktif`,
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+exports.createFromForecast = (req, res, next) => syncMonthlyDemand(req, res, next, true);
+exports.syncMonthly = (req, res, next) => syncMonthlyDemand(req, res, next, false);
 
 exports.updateAdjustments = async (req, res, next) => {
   try {
@@ -681,7 +844,7 @@ exports.updateAdjustments = async (req, res, next) => {
       include: { details: { where: { id: { in: detailIds }, isDeleted: false }, include: { part: true } } },
     });
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
-    if (!["Draft", "Confirmed"].includes(doc.status)) return res.status(409).json({ message: `MPS status ${doc.status} tidak dapat disesuaikan` });
+    if (doc.status !== "Draft") return res.status(409).json({ message: `MPS status ${doc.status} tidak dapat disesuaikan. Buat/recalculate revisi Draft agar approval lama tidak berubah.` });
     if (doc.details.length !== detailIds.length) return res.status(404).json({ message: "Sebagian detail MPS tidak ditemukan" });
     if (doc.details.some((row) => isGeneratedProcess(row))) return res.status(400).json({ message: "Buffer dan persentase produksi hanya dapat diatur pada FG receipt" });
     let targetDetails = doc.details;
@@ -722,6 +885,7 @@ exports.confirm = async (req, res, next) => {
     const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false }, include });
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
     if (!doc.details.length) return res.status(400).json({ message: "MPS tanpa detail tidak dapat dikonfirmasi" });
+    if (doc.replanRequired) return res.status(409).json({ message: doc.replanReason || "Target delivery berubah. Hitung ulang MPS bulanan sebelum konfirmasi.", code: "DELIVERY_REPLAN_REQUIRED" });
     if (doc.status !== "Draft") return res.status(409).json({ message: `MPS tidak dapat dikonfirmasi dari status ${doc.status}` });
     const readiness = await buildMpsReadiness(prisma, doc);
     if (!readiness.ok) return res.status(409).json({

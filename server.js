@@ -92,7 +92,6 @@ app.post("/test-body", express.json(), (req, res) => {
 // --- Connect to PostgreSQL with Prisma (replace MongoDB)
 const { connectDatabase } = require("./src/prisma");
 const { refreshLicense, getLicenseStatus } = require("./src/prisma/services/licenseService");
-const { startHybridMrpScheduler } = require("./src/prisma/jobs/hybridMrpScheduler");
 
 // --- Socket.io Authentication & Events
 const jwt = require("jsonwebtoken");
@@ -223,14 +222,12 @@ async function startServer() {
       });
     }
 
-    startHybridMrpScheduler();
-    
     server.listen(PORT, () => {
       console.log("✅ Server is running on port:", PORT);
       console.log("🔗 API Base URL: http://localhost:" + PORT + "/api");
       console.log("🕐 Auto-cleanup scheduled: Every day at 02:00 AM");
       console.log("📦 Forecast expiry scheduled: Every day at 00:05 AM");
-      console.log("🌙 Hybrid MRP scheduled: Full nightly at 00:00 and partial every 15 minutes");
+      console.log("Hybrid MRP scheduler: disabled; MPS/MRP dijalankan manual oleh PPIC");
     });
   } catch (error) {
     console.error("❌ Failed to start server:", error.message);

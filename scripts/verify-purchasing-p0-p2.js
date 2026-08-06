@@ -5,11 +5,13 @@ const root = path.resolve(__dirname, "..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const po = read("src/prisma/controllers/purchasing/PurchaseOrderController.js");
 const pr = read("src/prisma/controllers/purchasing/PurchaseRequisitionController.js");
+const mrp = read("src/prisma/controllers/planning/MRPController.js");
 const poRoutes = read("src/prisma/routes/purchasing/purchase-orders.js");
 const invoiceRoutes = read("src/prisma/routes/purchasing/purchase-invoices.js");
 const reports = read("src/prisma/controllers/reporting/P2ReportingController.js");
 const frontendDetail = read("../frontend/public/js/operations-detail.js");
 const frontendPrForm = read("../frontend/public/js/purchasing-pr-form.js");
+const frontendPrView = read("../frontend/views/purchasing/pr-form.ejs");
 const frontendModuleRoutes = read("../frontend/src/routes/modules.js");
 const frontendSupplyForm = read("../frontend/public/js/supply-chain-form.js");
 const frontendInventoryForm = read("../frontend/public/js/inventory-form.js");
@@ -38,7 +40,10 @@ const contracts = [
   ["PR to PO is one frontend transaction", !frontendDetail.includes('/confirm-suppliers`, { method: "PATCH"')],
   ["Draft MRP PR remains editable", frontendDetail.includes('prEditLink.classList.toggle("d-none", !editableStatus)')],
   ["MRP PR edit preserves source and planned-order trace", frontendPrForm.includes('sourceType: state.record?.sourceType || "MANUAL"') && frontendPrForm.includes("plannedOrderNumber: source.plannedOrderNumber || null")],
+  ["MRP material PR advisory lock does not deserialize PostgreSQL void", mrp.includes("tx.$executeRaw`SELECT pg_advisory_xact_lock") && !mrp.includes("tx.$queryRaw`SELECT pg_advisory_xact_lock")],
+  ["MRP material PR keeps one detail per Planned Order", mrp.includes("part.material.id || part.material.materialCode, order.orderNumber") && mrp.includes('incoming.plannedOrderNumber || ""') && mrp.includes('row.plannedOrderNumber || ""')],
   ["PR editor supports Coil Sheet Pcs conversion", frontendPrForm.includes('option value="COIL"') && frontendPrForm.includes('option value="SHEET"') && frontendPrForm.includes('option value="PCS"') && frontendPrForm.includes("line-conversion-factor")],
+  ["Manual PR category switch rerenders compatible detail form", frontendPrView.includes('id="pr-category"') && frontendPrForm.includes("function applyDocumentCategory") && frontendPrForm.includes("resetLines: true, updateUrl: true") && frontendPrForm.includes("addLine({ procurementCategory: state.currentCategory })")],
   ["PR demand remains separate from purchase conversion", pr.includes("const qty = requestedQty") && pr.includes("tidak mengubah demand awal")],
   ["PR quantity accepts integer and decimal values", frontendPrForm.includes('class="form-control line-qty" type="number" min="0.000001" step="any"')],
   ["PR category filter does not hide Purchase Orders", frontendModuleRoutes.includes('const purchaseCategory = isPurchaseRequisition') && frontendModuleRoutes.includes(": null;")],

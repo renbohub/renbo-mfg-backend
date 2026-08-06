@@ -11,6 +11,9 @@ router.post("/:planNumber/release", authorize("monthlyProductionPlan", "release"
 router.post("/:planNumber/daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "convert-to-daily-plans"), ctrl.convertToDailyPlans);
 router.post("/:planNumber/manual-daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "manual-daily-plan"), ctrl.createManualDailyPlan);
 router.post("/:planNumber/manual-allocations", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "manual-allocation"), ctrl.createManualDailyPlan);
+router.post("/:planNumber/capacity-recommendation", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-recommendation"), ctrl.recommendCapacity);
+router.post("/:planNumber/capacity-adopt-simulation", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-adopt-simulation"), ctrl.adoptCapacitySimulation);
+router.patch("/:planNumber/manual-allocations/:allocationId", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "edit-manual-allocation"), ctrl.updateManualAllocation);
 router.patch("/:planNumber/manual-allocations/:allocationId/remove", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "remove-manual-allocation"), ctrl.removeManualAllocation);
 router.post("/:planNumber/capacity-override", authorize("monthlyProductionPlan", "approve"), capacityOverrideApproval, logger("monthlyProductionPlan", "capacity-override"), ctrl.capacityOverride);
 router.post("/:planNumber/capacity-machine-override", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-machine-override"), ctrl.assignCapacityMachine);

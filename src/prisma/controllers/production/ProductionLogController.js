@@ -28,7 +28,9 @@ const {
   emitManufacturingOrderUpdate,
 } = require("./services/productionRealtimeService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
+const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { assertQuantity } = require("../../utils/uomQuantity");
+const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
 
 const QUANTITY_TOLERANCE = 0.000001;
 
@@ -199,8 +201,10 @@ async function consumeReservedSubAssembliesForProductionLog(tx, log, performedBy
       const consumeQty = Math.min(reservable, remaining);
       if (consumeQty <= QUANTITY_TOLERANCE) continue;
 
+      const reservationBalanceWhere = resolveReservationBalanceWhere(reservation);
+      await lockStockBalanceIdentity(tx, reservationBalanceWhere);
       const stockBalance = await tx.stockBalance.findFirst({
-        where: resolveReservationBalanceWhere(reservation),
+        where: reservationBalanceWhere,
       });
       if (!stockBalance || toNumber(stockBalance.qtyOnHand) + QUANTITY_TOLERANCE < consumeQty) {
         throw Object.assign(
@@ -383,16 +387,23 @@ async function findDailyProductionSchedule(tx, { dpsId, scheduleNumber } = {}) {
   const where = scheduleNumber
     ? { scheduleNumber, isDeleted: false }
     : { id: dpsId, isDeleted: false };
-  const schedule = await tx.dailyProductionSchedule.findFirst({ where });
+  const schedule = await tx.dailyProductionSchedule.findFirst({
+    where,
+    include: {
+      productionPlan: { select: { id: true, planNumber: true, status: true } },
+      productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true, status: true } },
+      mbomProcess: { select: { id: true, processId: true, sequence: true } },
+    },
+  });
   if (!schedule) {
     throw Object.assign(new Error("Daily Production Schedule tidak ditemukan."), {
       statusCode: 404,
     });
   }
-  if (["Completed", "Cancelled"].includes(schedule.status)) {
+  if (schedule.status !== "In Progress") {
     throw Object.assign(
-      new Error(`Production Log tidak bisa dibuat dari DPS status "${schedule.status}".`),
-      { statusCode: 409 },
+      new Error(`Production Log hanya dapat dicatat dari Daily Production Plan berstatus In Progress. Status saat ini "${schedule.status}".`),
+      { statusCode: 409, code: "DAILY_PLAN_NOT_IN_PROGRESS" },
     );
   }
   return schedule;
@@ -1074,7 +1085,7 @@ async function consumePreviousWipForProductionLog(
     previousVendorProcess,
     sourcePartCode: sourcePart.partCode,
   });
-  const balances = await tx.stockBalance.findMany({
+  let balances = await tx.stockBalance.findMany({
     where: {
       AND: [
         {
@@ -1110,6 +1121,22 @@ async function consumePreviousWipForProductionLog(
       uomCode: true,
     },
   });
+  if (balances.length) {
+    const balanceIds = balances.map((row) => row.id).sort();
+    await tx.$queryRaw`SELECT id FROM "tbl_stock_balance" WHERE id IN (${Prisma.join(balanceIds)}) ORDER BY id FOR UPDATE`;
+    const lockedBalances = await tx.stockBalance.findMany({
+      where: { id: { in: balanceIds }, isDeleted: false, qtyAvailable: { gt: 0 } },
+      select: {
+        id: true, warehouseCode: true, rackCode: true, lotNumber: true,
+        partCode: true, partNumber: true, partName: true, productId: true,
+        description: true, spec: true, thickness: true, width: true, CSP: true,
+        stockType: true, qtyOnHand: true, qtyReserved: true, qtyQC: true,
+        qtyAvailable: true, uomCode: true,
+      },
+    });
+    const lockedById = new Map(lockedBalances.map((row) => [row.id, row]));
+    balances = balances.map((row) => lockedById.get(row.id)).filter(Boolean);
+  }
   balances.sort((left, right) => {
     const scoreDiff =
       scoreBalanceAgainstPreferredLocation(right, preferredSourceLocation)
@@ -1279,18 +1306,40 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
     scheduleNumber: input.scheduleNumber,
   });
 
+  if (!schedule) {
+    throw Object.assign(
+      new Error("Daily Production Plan wajib dipilih. Production Log tidak boleh dibuat langsung dari MO/WO."),
+      { statusCode: 409, code: "PRODUCTION_PLAN_REQUIRED" },
+    );
+  }
+  if (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId) {
+    throw Object.assign(
+      new Error("Daily Production Plan belum memiliki trace MPP, allocation, dan routing yang lengkap. Publikasikan ulang dari Capacity Planning."),
+      { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" },
+    );
+  }
+  if (!schedule.moId || !schedule.woId) {
+    throw Object.assign(
+      new Error("Daily Production Plan proses in-house wajib memiliki MO dan WO reference."),
+      { statusCode: 409, code: "DAILY_PLAN_EXECUTION_REFERENCE_INCOMPLETE" },
+    );
+  }
+  if (schedule.productionPlan?.status === "Cancelled") {
+    throw Object.assign(
+      new Error(`Production Plan ${schedule.productionPlan.planNumber} sudah Cancelled.`),
+      { statusCode: 409, code: "PRODUCTION_PLAN_CANCELLED" },
+    );
+  }
+
   if (schedule) {
     input.dpsId = schedule.id;
-    input.woId = input.woId || schedule.woId || null;
-    input.woNumber = input.woNumber || schedule.woNumber || null;
-    input.moId = input.moId || schedule.moId || null;
-    input.moNumber = input.moNumber || schedule.moNumber || null;
-    input.shift = input.shift || schedule.shift || null;
+    input.woId = schedule.woId;
+    input.woNumber = schedule.woNumber || null;
+    input.moId = schedule.moId;
+    input.moNumber = schedule.moNumber || null;
+    input.shift = schedule.shift;
     input.operatorName = input.operatorName || schedule.operatorName || null;
-    input.qtyPlanned =
-      input.qtyPlanned !== undefined && input.qtyPlanned !== null
-        ? input.qtyPlanned
-        : schedule.plannedQty;
+    input.qtyPlanned = Math.max(toNumber(schedule.plannedQty) - toNumber(schedule.actualQty), 0);
     input.logDate = input.logDate || schedule.scheduleDate || null;
   }
 
@@ -1300,38 +1349,15 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
     requireWorkOrderInProgress: true,
     autoStartAfterMaterialIssue: true,
   });
-  if (!schedule) {
-    schedule = await findRelatedDailyProductionSchedule(tx, {
-      woId: normalized.woId,
-      moId: normalized.moId,
-      logDate: normalized.logDate || input.logDate,
-      shift: normalized.shift || input.shift,
-      processCode: normalized.processCode || input.processCode,
-      machineCode: normalized.machineCode || input.machineCode,
-    });
-    if (schedule) {
-      if (normalized.woId && !schedule.woId) {
-        await tx.dailyProductionSchedule.update({
-          where: { id: schedule.id },
-          data: {
-            woId: normalized.woId,
-            woNumber: input.woNumber || null,
-          },
-        });
-        schedule.woId = normalized.woId;
-        schedule.woNumber = input.woNumber || schedule.woNumber;
-      }
-      normalized.dpsId = schedule.id;
-      normalized.logDate = normalized.logDate || schedule.scheduleDate || null;
-      normalized.shift = normalized.shift || schedule.shift || null;
-      normalized.qtyPlanned =
-        input.qtyPlanned !== undefined && input.qtyPlanned !== null
-          ? toNumber(input.qtyPlanned)
-          : toNumber(schedule.plannedQty);
-    }
-  }
-  if (schedule && input.qtyPlanned !== undefined && input.qtyPlanned !== null) {
-    normalized.qtyPlanned = toNumber(input.qtyPlanned);
+  normalized.dpsId = schedule.id;
+  normalized.qtyPlanned = Math.max(toNumber(schedule.plannedQty) - toNumber(schedule.actualQty), 0);
+  const plannedDay = new Date(schedule.scheduleDate).toISOString().slice(0, 10);
+  const actualDay = new Date(normalized.logDate || schedule.scheduleDate).toISOString().slice(0, 10);
+  if (actualDay < plannedDay) {
+    throw Object.assign(
+      new Error(`Tanggal aktual ${actualDay} tidak boleh sebelum Daily Production Plan ${plannedDay}.`),
+      { statusCode: 409, code: "PRODUCTION_BEFORE_PLAN_DATE" },
+    );
   }
 
   if (
@@ -1440,17 +1466,19 @@ function buildBalanceIdentityFromMovement(movement = {}) {
 
 async function findStockBalanceForMovement(tx, movement) {
   if (!movement?.warehouseCode || !movement?.partCode) return null;
+  const where = {
+    warehouseCode: movement.warehouseCode,
+    rackCode: movement.rackCode || null,
+    lotNumber: movement.lotNumber || null,
+    partCode: movement.partCode,
+    ...buildBalanceIdentityFromMovement(movement),
+    uomCode: movement.uomCode || null,
+    stockType: movement.stockType || null,
+    isDeleted: false,
+  };
+  await lockStockBalanceIdentity(tx, where);
   return tx.stockBalance.findFirst({
-    where: {
-      warehouseCode: movement.warehouseCode,
-      rackCode: movement.rackCode || null,
-      lotNumber: movement.lotNumber || null,
-      partCode: movement.partCode,
-      ...buildBalanceIdentityFromMovement(movement),
-      uomCode: movement.uomCode || null,
-      stockType: movement.stockType || null,
-      isDeleted: false,
-    },
+    where,
     select: { id: true, qtyOnHand: true, qtyReserved: true, qtyQC: true },
   });
 }
@@ -1814,12 +1842,18 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
   const qtyQcHold = qtyGood;
   const qtyProduced = toNumber(log.qtyProduced);
   const mo = log.manufacturingOrder;
-  const consumedWipMovementNumbers = await consumePreviousWipForProductionLog(
-    tx,
-    log,
-    qtyProduced,
-    performedBy,
-  );
+  // DPP execution already consumes its exact direct BOM inputs through the
+  // Material Issue created by Daily Plan consume. The legacy sequence-based
+  // fallback is only valid for old logs without DPP lineage; running it again
+  // would double-consume WIP and can choose the wrong parallel predecessor.
+  const consumedWipMovementNumbers = log.dpsId
+    ? []
+    : await consumePreviousWipForProductionLog(
+        tx,
+        log,
+        qtyProduced,
+        performedBy,
+      );
   const { outputPart: part, stockType } = await resolveProductionOutputContext(tx, log);
 
   if (qtyQcHold <= 0) {
@@ -1854,6 +1888,8 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
     stockType,
     isDeleted: false,
   };
+
+  await lockStockBalanceIdentity(tx, balanceWhere);
 
   const existingBalance = await tx.stockBalance.findFirst({
     where: balanceWhere,
@@ -2000,6 +2036,7 @@ async function createProductionRejectDisposition(tx, log, stockTarget, performed
       stockType,
       isDeleted: false,
     };
+    await lockStockBalanceIdentity(tx, balanceWhere);
     const existingBalance = await tx.stockBalance.findFirst({
       where: balanceWhere,
       select: { id: true, qtyOnHand: true, qtyReserved: true, qtyQC: true },
@@ -2212,7 +2249,11 @@ exports.list = async (req, res, next) => {
         ...(filterQcRemaining ? {} : { skip, take: Number(limit) }),
         include: {
           dailyProductionSchedule: {
-            select: { scheduleNumber: true, scheduleDate: true, shift: true, status: true },
+            select: {
+              scheduleNumber: true, scheduleDate: true, shift: true, status: true,
+              productionPlan: { select: { planNumber: true, status: true } },
+              productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true } },
+            },
           },
           manufacturingOrder: {
             select: {
@@ -2297,6 +2338,8 @@ exports.get = async (req, res, next) => {
             status: true,
             plannedQty: true,
             actualQty: true,
+            productionPlan: { select: { planNumber: true, status: true } },
+            productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true } },
           },
         },
         manufacturingOrder: {
@@ -2398,9 +2441,9 @@ exports.create = async (req, res, next) => {
       const normalized = await normalizeProductionLogInput(tx, data, {
         defaultStatus: "Open",
       });
-      if (hasText(normalized.hmiTopic)) {
-        normalized.status = "Submitted";
-      }
+      // HMI telemetry may prefill a log, but material/quantity/approval checks
+      // must still run through the explicit submit transition.
+      normalized.status = "Open";
       const downtimeSummary = Array.isArray(req.body.downtimes)
         ? summarizeDowntimeEntries(downtimes, {
             ...normalized,
@@ -2429,7 +2472,7 @@ exports.create = async (req, res, next) => {
           endTime: endTime ? new Date(endTime) : null,
         },
         include: {
-          dailyProductionSchedule: { select: { scheduleNumber: true } },
+          dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
             select: {
               moNumber: true,
@@ -2485,7 +2528,7 @@ exports.create = async (req, res, next) => {
       const doc = await tx.productionLog.findUnique({
         where: { id: productionLog.id },
         include: {
-          dailyProductionSchedule: { select: { scheduleNumber: true } },
+          dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
             select: {
               id: true,
@@ -2553,7 +2596,7 @@ exports.create = async (req, res, next) => {
     res.status(201).json(mapProductionLogDoc(await attachProductionOutputParts(doc)));
   } catch (e) {
     if (e.statusCode)
-      return res.status(e.statusCode).json({ message: e.message });
+      return res.status(e.statusCode).json({ message: e.message, code: e.code || null, blockers: e.blockers || [] });
     if (
       e instanceof Prisma.PrismaClientKnownRequestError &&
       e.code === "P2002"
@@ -2650,7 +2693,7 @@ exports.update = async (req, res, next) => {
       return tx.productionLog.findUnique({
         where: { id: existing.id },
         include: {
-          dailyProductionSchedule: { select: { scheduleNumber: true } },
+          dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
             select: {
               moNumber: true,
@@ -2703,7 +2746,7 @@ exports.update = async (req, res, next) => {
         .json({ message: "Data Log Produksi tidak ditemukan." });
     }
     if (e.statusCode)
-      return res.status(e.statusCode).json({ message: e.message });
+      return res.status(e.statusCode).json({ message: e.message, code: e.code || null, blockers: e.blockers || [] });
     next(e);
   }
 };
@@ -2874,6 +2917,8 @@ exports.submit = async (req, res, next) => {
         moId: true,
         logDate: true,
         shift: true,
+        logNumber: true,
+        qtyProduced: true,
       },
     });
     if (!existing || existing.isDeleted)
@@ -2932,6 +2977,20 @@ exports.submit = async (req, res, next) => {
         );
       }
 
+      const approvalRequest = await submitDocumentForApproval({
+        moduleCode: "production",
+        pageCode: "production-logs",
+        actionCode: "approve",
+        documentType: "ProductionLog",
+        documentId: existing.id,
+        documentNumber: existing.logNumber,
+        amount: existing.qtyProduced,
+        context: existing,
+        requestedByUserId: req.user?.id,
+        requestedBy: req.user?.username || req.user?.email || "system",
+        tx,
+      });
+
       if (existing.woId) {
         await tx.workOrder.updateMany({
           where: {
@@ -2957,15 +3016,16 @@ exports.submit = async (req, res, next) => {
           },
         });
       }
-      return tx.productionLog.update({
+      const document = await tx.productionLog.update({
         where: { id: existing.id },
         data: {
           status: "Submitted",
           ...(schedule ? { dpsId: schedule.id } : {}),
         },
       });
+      return { document, approvalRequest };
     });
-    res.json(mapDoc(doc));
+    res.json({ ...mapDoc(doc.document), approvalRequest: doc.approvalRequest });
   } catch (e) {
     if (e.statusCode)
       return res.status(e.statusCode).json({ message: e.message, blockers: e.blockers || [] });
@@ -3010,6 +3070,14 @@ exports.approve = async (req, res, next) => {
     }
 
     const doc = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "tbl_production_log" WHERE "id" = ${existing.id} FOR UPDATE`;
+      const lockedLog = await tx.productionLog.findUnique({
+        where: { id: existing.id },
+        select: { status: true, isDeleted: true },
+      });
+      if (!lockedLog || lockedLog.isDeleted || lockedLog.status !== "Submitted") {
+        throw Object.assign(new Error(`Log tidak bisa disetujui dari status "${lockedLog?.status || "Tidak ditemukan"}".`), { statusCode: 409 });
+      }
       const relatedSchedule = existing.dpsId
         ? await tx.dailyProductionSchedule.findFirst({
             where: { id: existing.dpsId, isDeleted: false },

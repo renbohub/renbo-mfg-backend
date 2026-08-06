@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const { prisma } = require("../index");
 const { attachContextAudit } = require("../utils/pageContext");
+const { resolvePageContext } = require("../utils/pageContext");
 
 const JWT_SECRET = process.env.JWT_SECRET || "secret-key";
 const EXPORT_TOKEN_SECRET = process.env.EXPORT_TOKEN_SECRET || JWT_SECRET;
@@ -66,6 +67,9 @@ exports.authorize = (resource, action = "read") => {
     const normalizeKey = (value) => String(value || "").toLowerCase().replace(/[^a-z0-9*]/g, "");
     const requiredAction = String(action).toLowerCase();
     const targetResource = normalizeKey(resource);
+    const pageContext = resolvePageContext(req);
+    const contextModule = normalizeKey(pageContext.moduleCode);
+    const contextPage = normalizeKey(pageContext.pageCode);
     const activeAssignments = (req.user.roleAssignments || []).filter(
       (assignment) => assignment.isActive && assignment.role?.isActive && !assignment.role?.isDeleted,
     );
@@ -74,7 +78,14 @@ exports.authorize = (resource, action = "read") => {
       const hasRoleAccess = activeAssignments.some((assignment) =>
         (assignment.role.permissions || []).some((permission) => {
           const targets = [permission.resourceCode, permission.pageCode, permission.moduleCode].map(normalizeKey);
-          if (!targets.includes("*") && !targets.includes(targetResource)) return false;
+          const moduleMatch = normalizeKey(permission.moduleCode) === "*" || normalizeKey(permission.moduleCode) === contextModule;
+          const pageMatch = normalizeKey(permission.pageCode) === "*" || normalizeKey(permission.pageCode) === contextPage;
+          const resourceMatch = normalizeKey(permission.resourceCode) === "*" || normalizeKey(permission.resourceCode) === targetResource;
+          const explicitlyGlobal = normalizeKey(permission.moduleCode) === "*"
+            && normalizeKey(permission.pageCode) === "*"
+            && normalizeKey(permission.resourceCode) === "*";
+          const legacyMatch = explicitlyGlobal || (normalizeKey(permission.resourceCode) !== "*" && targets.includes(targetResource));
+          if (!(moduleMatch && pageMatch && resourceMatch) && !legacyMatch) return false;
           const actions = Array.isArray(permission.actions)
             ? permission.actions.map((item) => String(item).toLowerCase())
             : [];

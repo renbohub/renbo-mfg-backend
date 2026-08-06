@@ -64,10 +64,24 @@ const PART_CODE_REFERENCE_COLUMNS = [
 ];
 
 // Gunakan fungsi agar attachment orderBy bisa dikustomisasi (list pakai desc, lainnya asc)
-const partInclude = (attachOrder = 'asc') => ({
+const partInclude = (attachOrder = 'asc', includeBomProcesses = true) => ({
   material: true,
   supplier: { select: { id: true, supplierCode: true, supplierName: true } },
   process: { select: { id: true, processCode: true, processName: true } },
+  ...(includeBomProcesses ? {
+    mbomDetails: {
+      where: { isDeleted: false, mbomHeader: { isDeleted: false } },
+      select: {
+        noReg: true,
+        mbomHeader: { select: { revision: true, effectiveDate: true } },
+        mbomProcesses: {
+          where: { isDeleted: false },
+          orderBy: { sequence: "asc" },
+          select: { sequence: true, occurrenceCode: true, process: { select: { processCode: true, processName: true } } },
+        },
+      },
+    },
+  } : {}),
   partBases: true,
   attachments: { where: { isDeleted: false }, orderBy: { createdAt: attachOrder } },
 });
@@ -159,6 +173,29 @@ const normalizePartAssemblyPolicy = (data) => {
   return data;
 };
 const normalizePartCode = (value) => String(value || "").trim().toUpperCase();
+
+// A part cannot safely enter BOM, planning, or inventory with only a
+// transaction-level UOM. On create, use the first supplied operational UOM as
+// the base and fill the role-specific UOMs that apply to the item type.
+function normalizeCreatePartUoms(data) {
+  const itemType = String(data.itemType || "").trim().toUpperCase();
+  const selectedUom = [
+    data.baseUomCode,
+    data.productionUomCode,
+    data.purchaseUomCode,
+    data.stockUomCode,
+    data.salesUomCode,
+    data.uomCode,
+  ].map((value) => String(value || "").trim().toUpperCase()).find(Boolean) || null;
+  delete data.uomCode;
+  if (!selectedUom) return data;
+  data.baseUomCode ||= selectedUom;
+  data.stockUomCode ||= selectedUom;
+  if (["FG", "WIP"].includes(itemType)) data.productionUomCode ||= selectedUom;
+  if (itemType === "FG") data.salesUomCode ||= selectedUom;
+  if (itemType === "RAW" || data.canPurchase) data.purchaseUomCode ||= selectedUom;
+  return data;
+}
 const CUSTOMER_FAMILY_PATTERN = "(?:\\d{3,4}|C\\d{3})";
 const CUSTOMER_FAMILY_BRANCH_PATTERN = `${CUSTOMER_FAMILY_PATTERN}(?:[A-Z]+|-[A-Z]+)?`;
 
@@ -872,6 +909,7 @@ exports.list = async (req, res, next) => {
       supplierId,
       page = 1,
       limit = 20,
+      includeBomProcess,
     } = req.query;
     const where = { isDeleted: isDeleted !== undefined ? isDeleted === "true" : false };
 
@@ -921,12 +959,20 @@ exports.list = async (req, res, next) => {
     const skip = (Number(page) - 1) * Number(limit);
 
     const [items, total] = await Promise.all([
-      prisma.part.findMany({ where, orderBy, skip, take: Number(limit), include: partInclude('desc') }),
+      prisma.part.findMany({ where, orderBy, skip, take: Number(limit), include: partInclude('desc', true) }),
       prisma.part.count({ where }),
     ]);
 
     const itemsWithCustomers = await Promise.all(
-      items.map(async (item) => attachCustomersToPartDoc(mapDoc(item)))
+      items.map(async (item) => {
+        const mapped = await attachCustomersToPartDoc(mapDoc(item));
+        if (includeBomProcess === "true" || item.mbomDetails) {
+          const bomProcesses = (item.mbomDetails || []).flatMap((detail) => (detail.mbomProcesses || []).map((process) => ({ ...process, revision: detail.mbomHeader?.revision || 0 })))
+            .sort((left, right) => Number(right.revision || 0) - Number(left.revision || 0) || Number(left.sequence || 0) - Number(right.sequence || 0));
+          mapped.bomProcessNames = [...new Set(bomProcesses.map((process) => process.occurrenceCode || process.process?.processName).filter(Boolean))];
+        }
+        return mapped;
+      })
     );
     res.json({ items: itemsWithCustomers, total, page: Number(page), limit: Number(limit) });
   } catch (e) { next(e); }
@@ -1055,9 +1101,9 @@ exports.create = async (req, res, next) => {
     partBases = parseJsonField(partBases, []);
     if (!Array.isArray(partBases)) partBases = [];
 
-    const data = normalizePartPermissions(normalizeOptionalSelects(normalizePartType(
+    const data = normalizeCreatePartUoms(normalizePartPermissions(normalizeOptionalSelects(normalizePartType(
       normalizePartAssemblyPolicy(normalizeRawType(normalizeItemType(normalizePlanningPolicy(convertNumericFields(partData, PART_NUMERIC_FIELDS)))))
-    )));
+    ))));
     if (typeof data.customerCodes === 'string') {
       data.customerCodes = parseJsonField(data.customerCodes, data.customerCodes);
     }

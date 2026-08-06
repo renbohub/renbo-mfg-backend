@@ -27,7 +27,10 @@ const {
   buildIdentityWhere,
   buildIdentityKey,
 } = require("./utils/itemIdentity");
-const { assertStockBalanceNotFrozen } = require("./utils/stockOpnameFreezeGuard");
+const {
+  assertStockBalanceNotFrozen,
+  assertWarehouseNotFrozen,
+} = require("./utils/stockOpnameFreezeGuard");
 const { assertQuantity } = require("../../utils/uomQuantity");
 
 const SPECIAL_RACK_PREFIXES = ["RACK-SCRAP", "RACK-REJECT", "RACK-REWORK"];
@@ -136,6 +139,7 @@ async function upsertDispositionTargetBalance(tx, stockBalance, target, qty) {
     return { ...balance, qtyBefore, qtyAfter: qtyOnHand };
   }
 
+  await assertWarehouseNotFrozen(tx, target.warehouseCode);
   const balance = await tx.stockBalance.create({
     data: {
       warehouseCode: target.warehouseCode,
@@ -1149,6 +1153,18 @@ exports.list = async (req, res, next) => {
             partNumber: true,
             partName: true,
             category: true,
+            process: { select: { processName: true } },
+            mbomDetails: {
+              where: { isDeleted: false, mbomHeader: { isDeleted: false } },
+              select: {
+                mbomHeader: { select: { revision: true } },
+                mbomProcesses: {
+                  where: { isDeleted: false },
+                  orderBy: { sequence: "asc" },
+                  select: { sequence: true, occurrenceCode: true, process: { select: { processName: true } } },
+                },
+              },
+            },
           },
         })
       : [];
@@ -1247,11 +1263,14 @@ exports.list = async (req, res, next) => {
     const result = filteredItems.map((b) => {
       const part = partMap.get(b.partCode);
       const identityKey = buildIdentityKey(b);
+      const bomProcesses = (part?.mbomDetails || []).flatMap((detail) => (detail.mbomProcesses || []).map((item) => ({ ...item, revision: detail.mbomHeader?.revision || 0 })))
+        .sort((left, right) => Number(right.revision || 0) - Number(left.revision || 0) || Number(left.sequence || 0) - Number(right.sequence || 0));
       return {
         ...mapStockBalanceDoc(b),
-        partNumber: b.partNumber ?? part?.partNumber ?? null,
+        partNumber: part?.partNumber || b.partNumber || null,
         partName: b.partName ?? part?.partName ?? null,
         category: part?.category ?? b.product?.category ?? null,
+        mbomProcessName: (() => { const process = bomProcesses.find((item) => item.process?.processName || item.occurrenceCode); return process?.occurrenceCode || process?.process?.processName || part?.process?.processName || null; })(),
         qtyIncoming: incomingMap.get(identityKey) ?? 0,
       };
     });
@@ -1290,6 +1309,11 @@ exports.get = async (req, res, next) => {
         product: {
           select: { productCode: true, productName: true, description: true },
         },
+        stockReservations: {
+          where: { isDeleted: false },
+          orderBy: [{ status: "asc" }, { reservationDate: "desc" }],
+          take: 200,
+        },
       },
     });
 
@@ -1297,7 +1321,59 @@ exports.get = async (req, res, next) => {
       return res.status(404).json({ message: "Stock balance tidak ditemukan" });
     }
 
-    res.json(mapStockBalanceDoc(stockBalance));
+    const movementIdentity = {
+      warehouseCode: stockBalance.warehouseCode,
+      rackCode: stockBalance.rackCode,
+      lotNumber: stockBalance.lotNumber,
+      partCode: stockBalance.partCode,
+      partNumber: stockBalance.partNumber,
+      materialCode: stockBalance.materialCode,
+      materialId: stockBalance.materialId,
+      productId: stockBalance.productId,
+      description: stockBalance.description,
+      spec: stockBalance.spec,
+      thickness: stockBalance.thickness,
+      width: stockBalance.width,
+      CSP: stockBalance.CSP,
+      uomCode: stockBalance.uomCode,
+      isDeleted: false,
+    };
+    const currentPart = stockBalance.partCode ? await prisma.part.findFirst({
+      where: { partCode: stockBalance.partCode, isDeleted: false },
+      select: {
+        partNumber: true,
+        process: { select: { processName: true } },
+        mbomDetails: {
+          where: { isDeleted: false, mbomHeader: { isDeleted: false } },
+          select: {
+            mbomHeader: { select: { revision: true } },
+            mbomProcesses: { where: { isDeleted: false }, orderBy: { sequence: "asc" }, select: { sequence: true, occurrenceCode: true, process: { select: { processName: true } } } },
+          },
+        },
+      },
+    }) : null;
+    const currentBomProcesses = (currentPart?.mbomDetails || []).flatMap((detail) => (detail.mbomProcesses || []).map((item) => ({ ...item, revision: detail.mbomHeader?.revision || 0 })))
+      .sort((left, right) => Number(right.revision || 0) - Number(left.revision || 0) || Number(left.sequence || 0) - Number(right.sequence || 0));
+    const currentProcessName = (() => { const process = currentBomProcesses.find((item) => item.process?.processName || item.occurrenceCode); return process?.occurrenceCode || process?.process?.processName || currentPart?.process?.processName || null; })();
+    const stockMovements = await prisma.stockMovement.findMany({
+      where: movementIdentity,
+      orderBy: [{ movementDate: "desc" }, { createdAt: "desc" }],
+      take: 200,
+    });
+    const stockReservations = (stockBalance.stockReservations || []).map((reservation) => {
+      const sourceDocumentNumber = String(reservation.referenceNumber || "").split("#")[0] || null;
+      const referenceType = String(reservation.referenceType || "").toUpperCase();
+      return {
+        ...mapDoc(reservation),
+        sourceDocumentNumber,
+        sourceLineNumber: Number(String(reservation.referenceNumber || "").match(/#(\d+)$/)?.[1] || 0) || null,
+        qtyOpen: Math.max(Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0), 0),
+        ...(referenceType === "SO" ? { soNumber: sourceDocumentNumber } : {}),
+        ...(referenceType === "MANUFACTURING_ORDER" || referenceType === "MO" ? { moNumber: sourceDocumentNumber } : {}),
+        ...(referenceType === "MPS" ? { mpsNumber: sourceDocumentNumber } : {}),
+      };
+    });
+    res.json({ ...mapStockBalanceDoc({ ...stockBalance, stockReservations: undefined, partNumber: currentPart?.partNumber || stockBalance.partNumber }), mbomProcessName: currentProcessName, stockReservations, stockMovements: stockMovements.map((movement) => ({ ...mapDoc(movement), partNumber: currentPart?.partNumber || movement.partNumber || null, mbomProcessName: currentProcessName })) });
   } catch (e) {
     next(e);
   }
@@ -1406,6 +1482,10 @@ exports.upsert = async (req, res, next) => {
       warehouseCode,
       rackCode,
       lotNumber,
+      // Notes belongs to the stock movement/audit trail, not StockBalance.
+      // Ignore it here so API clients can reuse adjustment-shaped payloads
+      // without Prisma receiving an unsupported column.
+      notes: _notes,
       ...rawData
     } = req.body;
     const data = omitIdentityPayloadFields(rawData);
@@ -1487,6 +1567,7 @@ exports.upsert = async (req, res, next) => {
         },
       });
     } else {
+      await assertWarehouseNotFrozen(prisma, warehouseCode);
       stockBalance = await prisma.stockBalance.create({
         data: {
           warehouseCode,
@@ -1617,6 +1698,7 @@ exports.adjust = async (req, res, next) => {
         },
       });
     } else {
+      await assertWarehouseNotFrozen(prisma, warehouseCode);
       stockBalance = await prisma.stockBalance.create({
         data: {
           warehouseCode,

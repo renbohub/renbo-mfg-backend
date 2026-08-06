@@ -24,6 +24,7 @@ const { isSubAssemblyDetail } = require("../../utils/assemblyPolicy");
 const { durationToWorkingDays } = require("../../utils/duration");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const hybridMrpService = require("../../services/planning/hybridMrpService");
+const { generateForRun: generatePurchaseSuggestionForRun } = require("../purchasing/PurchaseSuggestionController");
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const GENERATED_MPS_CHILD_NOTE_PREFIX = "[MRP-PRODUCTION]";
@@ -518,6 +519,14 @@ function isRawMaterialPart(part) {
   return part?.itemType === "RAW" && part?.rawType === "MATERIAL";
 }
 
+function planningStockKey(partCode, part = {}) {
+  if (isRawMaterialPart(part)) {
+    const materialIdentity = part.materialId || part.material?.materialCode;
+    if (materialIdentity) return `MATERIAL:${String(materialIdentity).trim().toUpperCase()}`;
+  }
+  return normalizePartCode(partCode);
+}
+
 function isPieceMaterialPart(part) {
   return isRawMaterialPart(part) && normalizeUomCode(part?.material?.materialForm) === "pcs";
 }
@@ -939,6 +948,9 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
         qty: true,
         qtyReceived: true,
         uomCode: true,
+        convertedPurchaseQty: true,
+        conversionFactor: true,
+        conversionUomCode: true,
         po: {
           select: {
             poNumber: true,
@@ -1045,10 +1057,21 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
   const supplierByPart = new Map();
   for (const row of purchaseOrderRows) {
     const partCode = normalizePartCode(row.partCode);
-    const outstandingOriginalQty = Math.max(Number(row.qty || 0) - Number(row.qtyReceived || 0), 0);
+    const conversionFactor = Number(row.conversionFactor || 0);
+    const usesPurchaseConversion = Number(row.convertedPurchaseQty || 0) > 0
+      && conversionFactor > 0
+      && normalizeUomCode(row.conversionUomCode);
+    const orderedSourceQty = usesPurchaseConversion
+      ? Number(row.convertedPurchaseQty || 0)
+      : Number(row.qty || 0);
+    const receivedSourceQty = usesPurchaseConversion
+      ? Number(row.qtyReceived || 0) * conversionFactor
+      : Number(row.qtyReceived || 0);
+    const sourceUomCode = usesPurchaseConversion ? row.conversionUomCode : row.uomCode;
+    const outstandingOriginalQty = Math.max(orderedSourceQty - receivedSourceQty, 0);
     if (!partCode || outstandingOriginalQty <= 0) continue;
     const outstandingQty = normalizePurchasingSupplyQty(
-      { ...row, qty: outstandingOriginalQty, part: partByCode.get(partCode) },
+      { ...row, qty: outstandingOriginalQty, uomCode: sourceUomCode, part: partByCode.get(partCode) },
       { targetUomCode: planningUomByPartCode[partCode], kgPerQty: kgPerQtyByPartCode[partCode] },
     );
     if (!supplierByPart.has(partCode)) supplierByPart.set(partCode, []);
@@ -1060,11 +1083,11 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
       supplierName: row.po.supplierName || row.po.vendorName || null,
       deliveryDate: row.po.deliveryDate,
       orderedQty: normalizePurchasingSupplyQty(
-        { ...row, qty: Number(row.qty || 0), part: partByCode.get(partCode) },
+        { ...row, qty: orderedSourceQty, uomCode: sourceUomCode, part: partByCode.get(partCode) },
         { targetUomCode: planningUomByPartCode[partCode], kgPerQty: kgPerQtyByPartCode[partCode] },
       ),
       receivedQty: normalizePurchasingSupplyQty(
-        { ...row, qty: Number(row.qtyReceived || 0), part: partByCode.get(partCode) },
+        { ...row, qty: receivedSourceQty, uomCode: sourceUomCode, part: partByCode.get(partCode) },
         { targetUomCode: planningUomByPartCode[partCode], kgPerQty: kgPerQtyByPartCode[partCode] },
       ),
       outstandingQty: roundPlanningQty(outstandingQty),
@@ -1339,6 +1362,64 @@ function roundPlanningQty(value) {
   return Number(qty.toFixed(6));
 }
 
+function normalizeReferencePcs(value) {
+  const qty = Number(value || 0);
+  if (!Number.isFinite(qty) || qty <= 0) return 0;
+  const nearestInteger = Math.round(qty);
+  return Math.abs(qty - nearestInteger) < 0.0001
+    ? nearestInteger
+    : Math.ceil(qty);
+}
+
+function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
+  const plansByDetail = new Map();
+  for (const plan of deliveryPlans) {
+    if (!plan?.mpsDetailId || !plan.plannedDate || Number(plan.qtyPlanned || 0) <= 0) continue;
+    if (!plansByDetail.has(plan.mpsDetailId)) plansByDetail.set(plan.mpsDetailId, []);
+    plansByDetail.get(plan.mpsDetailId).push(plan);
+  }
+
+  return details.flatMap((detail) => {
+    const phases = (plansByDetail.get(detail.id) || [])
+      .sort((left, right) => new Date(left.plannedDate) - new Date(right.plannedDate) || Number(left.phaseNumber || 0) - Number(right.phaseNumber || 0));
+    if (!phases.length) return [{ ...detail, _deliveryPhaseId: null, _deliveryPhaseNumber: null }];
+
+    const phaseTotal = phases.reduce((sum, phase) => sum + Number(phase.qtyPlanned || 0), 0);
+    if (phaseTotal <= 0) return [{ ...detail, _deliveryPhaseId: null, _deliveryPhaseNumber: null }];
+    const originalStart = new Date(detail.startDate);
+    const originalEnd = new Date(detail.endDate);
+    const leadTimeMs = Number.isNaN(originalStart.getTime()) || Number.isNaN(originalEnd.getTime())
+      ? 0
+      : Math.max(originalEnd - originalStart, 0);
+    const proportionalFields = ["forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferQty", "effectiveDemandQty", "qtyPlanned"];
+    const allocated = Object.fromEntries(proportionalFields.map((field) => [field, 0]));
+
+    return phases.map((phase, index) => {
+      const isLast = index === phases.length - 1;
+      const ratio = Number(phase.qtyPlanned || 0) / phaseTotal;
+      const values = {};
+      for (const field of proportionalFields) {
+        const total = Number(detail[field] || 0);
+        const value = isLast ? roundPlanningQty(total - allocated[field]) : roundPlanningQty(total * ratio);
+        allocated[field] = roundPlanningQty(allocated[field] + value);
+        values[field] = value;
+      }
+      const dueDate = new Date(phase.plannedDate);
+      const phaseStart = new Date(dueDate.getTime() - leadTimeMs);
+      return {
+        ...detail,
+        ...values,
+        lineNumber: Number(detail.lineNumber || 0) * 1000 + Number(phase.phaseNumber || index + 1),
+        startDate: phaseStart,
+        endDate: dueDate,
+        _deliveryPhaseId: phase.id,
+        _deliveryPhaseNumber: phase.phaseNumber || index + 1,
+        _deliveryPhaseSourceType: phase.sourceType || null,
+      };
+    });
+  });
+}
+
 async function buildProductionConversionPartMap(tx, requirements = []) {
   const partIds = [...new Set(requirements.map((row) => row.partId).filter(Boolean))];
   const partCodes = [
@@ -1566,6 +1647,7 @@ async function enrichPlannedOrderQtyBreakdown(tx, orders = []) {
       mpsDetailId: true,
       sourceType: true,
       sourceNumber: true,
+      mbomDetail: { select: { grossWeight: true } },
     },
   });
 
@@ -1583,15 +1665,23 @@ async function enrichPlannedOrderQtyBreakdown(tx, orders = []) {
   return orders.map((order) => {
     const requirement = requirementByKey.get(buildPlannedOrderRequirementKey(order));
     const originalUomCode = requirement ? originalUomMap.get(requirement.id) || null : null;
-    const qtyPcs = order.orderType === "Production"
-      ? (requirement ? Number(requirement.plannedOrderQty || 0) : null)
-      : (isPcsUom(order.uomCode) ? Number(order.qty || 0) : null);
-    const originalQty = Number(qtyPcs ?? order.qty ?? 0);
     const ownPart =
       productionConversionPartMap.get(order.partId) ||
       productionConversionPartMap.get(normalizePartCode(order.partCode)) ||
       null;
     const ownKgPerQty = resolveKgPerPcs(ownPart).factor;
+    const referenceKgPerPcs = Number(requirement?.mbomDetail?.grossWeight || 0)
+      || Number(ownKgPerQty || 0);
+    const qtyPcs = order.orderType === "Production"
+      ? (requirement ? normalizeReferencePcs(requirement.plannedOrderQty) : null)
+      : (isPcsUom(order.uomCode)
+        ? normalizeReferencePcs(order.qty)
+        : (requirement && isPcsUom(originalUomCode)
+          ? (isKgUom(order.uomCode) && referenceKgPerPcs > 0
+            ? normalizeReferencePcs(Number(order.qty || 0) / referenceKgPerPcs)
+            : normalizeReferencePcs(requirement.plannedOrderQty))
+          : null));
+    const originalQty = Number(qtyPcs ?? order.qty ?? 0);
     const storedOrderQtyKg = isKgUom(order.uomCode)
       ? Number(order.qty || 0)
       : null;
@@ -1735,11 +1825,24 @@ async function enrichRequirementQtyBreakdown(tx, requirements = []) {
       }
     }
 
+    const referenceDemandQtyPcs = rawMaterial && rawMaterialKgPerQty && isKgUom(uomCode)
+      ? normalizeReferencePcs(Number(requirement.effectiveDemandQty || grossRequirement) / rawMaterialKgPerQty)
+      : isPcsUom(uomCode)
+        ? normalizeReferencePcs(requirement.effectiveDemandQty || grossRequirement)
+        : null;
+    const plannedOrderQtyPcs = rawMaterial && rawMaterialKgPerQty && plannedOrderQtyKg != null
+      ? normalizeReferencePcs(plannedOrderQtyKg / rawMaterialKgPerQty)
+      : isPcsUom(uomCode)
+        ? normalizeReferencePcs(plannedOrderQty)
+        : null;
+
     return {
       ...requirement,
       uomCode,
       scheduledSupplyQty,
       plannedOrderQtyKg,
+      referenceDemandQtyPcs,
+      plannedOrderQtyPcs,
     };
   });
 }
@@ -1815,17 +1918,17 @@ function applyNextMonthPurchaseBuffer(requirements = [], options = {}) {
     }
   }
 
-  const rowsByPart = new Map();
+  const rowsBySupply = new Map();
   for (const row of purchaseRequirements) {
-    const partCode = normalizePartCode(row.partCode);
-    if (!rowsByPart.has(partCode)) rowsByPart.set(partCode, []);
-    rowsByPart.get(partCode).push(row);
+    const supplyKey = row._planningStockKey || normalizePartCode(row.partCode);
+    if (!rowsBySupply.has(supplyKey)) rowsBySupply.set(supplyKey, []);
+    rowsBySupply.get(supplyKey).push(row);
   }
 
-  for (const [partCode, rows] of rowsByPart.entries()) {
-    let projectedAvailable = Number(options.initialAvailableMap?.[partCode] || 0);
-    let projectedActual = Number(options.initialActualAvailableMap?.[partCode] || 0);
-    const allocatedQty = Number(options.initialAllocatedMap?.[partCode] || 0);
+  for (const [supplyKey, rows] of rowsBySupply.entries()) {
+    let projectedAvailable = Number(options.initialAvailableMap?.[supplyKey] || 0);
+    let projectedActual = Number(options.initialActualAvailableMap?.[supplyKey] || 0);
+    const allocatedQty = Number(options.initialAllocatedMap?.[supplyKey] || 0);
     rows.sort((a, b) => new Date(a.requiredDate) - new Date(b.requiredDate) || String(a.treePath || "").localeCompare(String(b.treePath || "")));
     for (const row of rows) {
       row.onHandQty = projectedActual;
@@ -1857,33 +1960,9 @@ function stripRequirementInternals(requirements = []) {
 }
 
 async function syncProductionRequirementsToMps(tx, mps, requirements, mbomHeaderByPartCode, runNumber) {
-  // The source FG target is a net production target. On every recalculation,
-  // synchronize it from the independent requirement after FG stock/open supply
-  // netting, while forecast/effective demand remain unchanged for audit.
-  const sourceTargets = new Map();
-  for (const row of requirements) {
-    if (
-      row.orderType !== "Production"
-      || row.requirementType !== "Independent"
-      || Number(row.levelMBOM || 0) !== 0
-      || !row.mpsDetailId
-    ) continue;
-    sourceTargets.set(
-      row.mpsDetailId,
-      Number(sourceTargets.get(row.mpsDetailId) || 0)
-        + Number(row._productionScheduleQty || 0),
-    );
-  }
-  for (const [detailId, qtyPlanned] of sourceTargets) {
-    await tx.mPSDetail.updateMany({
-      where: {
-        id: detailId,
-        mpsNumber: mps.mpsNumber,
-        isDeleted: false,
-      },
-      data: { qtyPlanned: roundPlanningQty(qtyPlanned) },
-    });
-  }
+  // MPS is an approved demand snapshot. Net production after stock/open-supply
+  // netting belongs to MRPRequirement and must never overwrite the approved
+  // MPS quantity. MPP reads the current MRP root requirement explicitly.
 
   await tx.mPSDetail.updateMany({
     where: {
@@ -2431,6 +2510,7 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   );
   const planningUomByPartCode = options.planningUomByPartCode || {};
   const kgPerQtyByPartCode = options.kgPerQtyByPartCode || {};
+  const excludedSourceMpsNumber = String(options.excludeSourceMpsNumber || "").trim() || null;
 
   const plannedOrderWhere = {
     partCode: { in: normalizedPartCodes },
@@ -2549,6 +2629,7 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       plan: {
         isDeleted: false,
         status: { not: "Cancelled" },
+        ...(excludedSourceMpsNumber ? { sourceType: { not: `MPS:${excludedSourceMpsNumber}` } } : {}),
       },
     },
     select: {
@@ -2596,6 +2677,9 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       qty: true,
       qtyReceived: true,
       uomCode: true,
+      convertedPurchaseQty: true,
+      conversionFactor: true,
+      conversionUomCode: true,
     },
   });
 
@@ -2694,10 +2778,18 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
 
   const poMap = {};
   for (const row of purchaseOrderDetails) {
+    const conversionFactor = Number(row.conversionFactor || 0);
+    const usesPurchaseConversion = Number(row.convertedPurchaseQty || 0) > 0
+      && conversionFactor > 0
+      && normalizeUomCode(row.conversionUomCode);
+    const remainingQty = usesPurchaseConversion
+      ? Number(row.convertedPurchaseQty || 0) - (Number(row.qtyReceived || 0) * conversionFactor)
+      : Number(row.qty || 0) - Number(row.qtyReceived || 0);
     const openQty = Math.max(
       normalizePurchasingSupplyQty({
         ...row,
-        qty: Number(row.qty || 0) - Number(row.qtyReceived || 0),
+        qty: remainingQty,
+        uomCode: usesPurchaseConversion ? row.conversionUomCode : row.uomCode,
         part: supplyPartByCode.get(normalizePartCode(row.partCode)),
       }, {
         targetUomCode: planningUomByPartCode[normalizePartCode(row.partCode)],
@@ -2711,11 +2803,12 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   return mergeQtyMaps(plannedOrderMap, moMap, productionExecutionMap, mppMap, prMap, poMap);
 }
 
-async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate) {
+async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   const normalizedPartCodes = [...new Set((partCodes || []).map(normalizePartCode).filter(Boolean))];
   if (normalizedPartCodes.length === 0) return {};
 
   const whereDate = cutoffDate ? new Date(cutoffDate) : null;
+  const excludedSourceMpsNumber = String(options.excludeSourceMpsNumber || "").trim() || null;
   const monthlyProductionPlanDetails = await tx.monthlyProductionPlanDetail.findMany({
     where: {
       isDeleted: false,
@@ -2729,6 +2822,7 @@ async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate) {
       plan: {
         isDeleted: false,
         status: { not: "Cancelled" },
+        ...(excludedSourceMpsNumber ? { sourceType: { not: `MPS:${excludedSourceMpsNumber}` } } : {}),
       },
     },
     select: {
@@ -2996,6 +3090,142 @@ exports.get = async (req, res, next) => {
       return res.status(404).json({ message: "MRP Run tidak ditemukan" });
     }
 
+    // Flat tree used by the UI formula audit. The main table remains limited
+    // to purchase requirements, while this trace also carries production and
+    // intermediate levels that explain why a lower-level qty was reduced.
+    const requirementTrace = await prisma.mRPRequirement.findMany({
+      where: { runNumber: mrpRun.runNumber, isDeleted: false },
+      orderBy: [{ levelMBOM: "asc" }, { treePath: "asc" }, { requiredDate: "asc" }],
+      select: {
+        id: true,
+        parentRequirementId: true,
+        rootRequirementId: true,
+        treePath: true,
+        levelMBOM: true,
+        partCode: true,
+        requirementType: true,
+        sourceType: true,
+        sourceNumber: true,
+        requiredDate: true,
+        grossRequirement: true,
+        onHandQty: true,
+        allocatedQty: true,
+        netRequirement: true,
+        plannedOrderQty: true,
+        adjustedOrderQty: true,
+        orderType: true,
+        mpsDetailId: true,
+        part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, rawType: true, baseUomCode: true, productionUomCode: true, stockUomCode: true } },
+        mbomDetail: {
+          select: {
+            qty: true,
+            uomCode: true,
+            category: true,
+            grossWeight: true,
+            mbomHeader: {
+              select: {
+                noReg: true,
+                part: { select: { partCode: true, partNumber: true, partName: true } },
+              },
+            },
+            parentDetail: {
+              select: {
+                id: true,
+                part: { select: { partCode: true, partNumber: true, partName: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // Older runs persisted only the root Production requirement. Reconstruct
+    // their intermediate production netting from the generated MPS schedule
+    // and the exact MBOM parent-detail edges, so WIP reductions remain visible
+    // without rewriting historical planning documents.
+    const generatedMpsDetails = await prisma.mPSDetail.findMany({
+      where: {
+        mpsNumber: mrpRun.mpsNumber,
+        isDeleted: false,
+        notes: { contains: `Generated from ${mrpRun.runNumber}` },
+      },
+      select: { id: true, partId: true, partCode: true, qtyPlanned: true, notes: true },
+    });
+    const generatedPartIds = [...new Set(generatedMpsDetails.map((row) => row.partId).filter(Boolean))];
+    const generatedEdges = generatedPartIds.length ? await prisma.mBOMDetail.findMany({
+      where: { partId: { in: generatedPartIds }, isDeleted: false },
+      orderBy: [{ updatedAt: "desc" }],
+      select: {
+        id: true,
+        partId: true,
+        qty: true,
+        uomCode: true,
+        levelComponent: true,
+        noReg: true,
+        parentDetail: { select: { part: { select: { partCode: true, partName: true } } } },
+        mbomHeader: { select: { part: { select: { partCode: true, partName: true } } } },
+      },
+    }) : [];
+    const rootProductionRows = requirementTrace.filter((row) => row.orderType === "Production" && Number(row.levelMBOM || 0) === 0);
+    const scheduleBySourceAndPart = new Map();
+    for (const root of rootProductionRows) {
+      scheduleBySourceAndPart.set(`${root.mpsDetailId}|${root.partCode}`, Number(root.netRequirement || 0));
+    }
+    for (const row of generatedMpsDetails) {
+      const sourceId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      if (!sourceId) continue;
+      const key = `${sourceId}|${row.partCode}`;
+      scheduleBySourceAndPart.set(key, Number(scheduleBySourceAndPart.get(key) || 0) + Number(row.qtyPlanned || 0));
+    }
+    const edgeBySourceAndPart = new Map();
+    for (const row of generatedMpsDetails) {
+      const sourceId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      if (!sourceId) continue;
+      const candidates = generatedEdges.filter((edge) => edge.partId === row.partId);
+      const edge = candidates.find((candidate) => {
+        const parentCode = candidate.parentDetail?.part?.partCode || candidate.mbomHeader?.part?.partCode;
+        return scheduleBySourceAndPart.has(`${sourceId}|${parentCode}`);
+      });
+      if (edge) edgeBySourceAndPart.set(`${sourceId}|${row.partCode}`, edge);
+    }
+    const productionScheduleTrace = generatedMpsDetails.map((row) => {
+      const sourceId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      const edge = edgeBySourceAndPart.get(`${sourceId}|${row.partCode}`);
+      const parentPart = edge?.parentDetail?.part || edge?.mbomHeader?.part || null;
+      const parentQty = parentPart ? Number(scheduleBySourceAndPart.get(`${sourceId}|${parentPart.partCode}`) || 0) : 0;
+      const ratio = Number(edge?.qty || 1);
+      const grossRequirement = parentQty > 0 ? parentQty * ratio : Number(row.qtyPlanned || 0);
+      const netRequirement = Number(row.qtyPlanned || 0);
+      return {
+        id: `mps-trace:${row.id}`,
+        mpsDetailId: sourceId || null,
+        partCode: row.partCode,
+        parentPartCode: parentPart?.partCode || null,
+        parentPartName: parentPart?.partName || null,
+        levelMBOM: Number(edge?.levelComponent || 0),
+        grossRequirement,
+        netRequirement,
+        plannedOrderQty: netRequirement,
+        adjustedOrderQty: netRequirement,
+        orderType: "Production",
+        mbomDetail: edge ? { qty: ratio, uomCode: edge.uomCode, noReg: edge.noReg } : null,
+      };
+    });
+    const absoluteLevelBySourceAndPart = new Map(rootProductionRows.map((row) => [`${row.mpsDetailId}|${row.partCode}`, 0]));
+    for (let pass = 0; pass <= productionScheduleTrace.length; pass += 1) {
+      let changed = false;
+      for (const row of productionScheduleTrace) {
+        const key = `${row.mpsDetailId}|${row.partCode}`;
+        if (absoluteLevelBySourceAndPart.has(key) || !row.parentPartCode) continue;
+        const parentLevel = absoluteLevelBySourceAndPart.get(`${row.mpsDetailId}|${row.parentPartCode}`);
+        if (parentLevel == null) continue;
+        row.levelMBOM = parentLevel + 1;
+        absoluteLevelBySourceAndPart.set(key, row.levelMBOM);
+        changed = true;
+      }
+      if (!changed) break;
+    }
+
     const requirementsWithQtyBreakdown = await enrichRequirementQtyBreakdown(
       prisma,
       mrpRun.requirements,
@@ -3037,8 +3267,16 @@ exports.get = async (req, res, next) => {
         }
       }
     }
+    const purchaseSuggestion = await prisma.purchaseSuggestion.findFirst({
+      where: { runNumber: mrpRun.runNumber, isDeleted: false, status: { not: "Cancelled" } },
+      orderBy: { createdAt: "desc" },
+      select: { suggestionNumber: true, status: true, updatedAt: true },
+    });
     res.json(mapDoc({
       ...mrpRun,
+      purchaseSuggestion,
+      requirementTrace,
+      productionScheduleTrace,
       requirements: groupedRequirements,
       plannedOrders: enrichedPlannedOrders.map((row) => ({ ...row, purchaseRequest: prByPlannedOrder.get(row.orderNumber) || null })),
     }));
@@ -3190,6 +3428,8 @@ exports.runMRP = async (req, res, next) => {
         mpsNumber: true,
         status: true,
         isDeleted: true,
+        replanRequired: true,
+        replanReason: true,
         periodStart: true,
         periodEnd: true,
       },
@@ -3202,6 +3442,13 @@ exports.runMRP = async (req, res, next) => {
     if (!["Confirmed", "Released"].includes(mpsPrecheck.status)) {
       return res.status(409).json({
         message: `MPS harus berstatus Confirmed/Released sebelum run MRP (saat ini: ${mpsPrecheck.status})`,
+      });
+    }
+
+    if (mpsPrecheck.replanRequired) {
+      return res.status(409).json({
+        code: "DEMAND_REPLAN_REQUIRED",
+        message: mpsPrecheck.replanReason || "Forecast atau Sales Order berubah. Hitung ulang MPS sebelum menjalankan MRP.",
       });
     }
 
@@ -3269,6 +3516,10 @@ exports.runMRP = async (req, res, next) => {
         const mps = await tx.mPS.findUnique({
           where: { mpsNumber },
           include: {
+            deliveryPlans: {
+              where: { isDeleted: false, targetType: "CUSTOMER", status: { not: "Cancelled" } },
+              orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }],
+            },
             details: {
               where: { isDeleted: false, status: { not: "Cancelled" } },
               orderBy: { endDate: "asc" },
@@ -3287,9 +3538,10 @@ exports.runMRP = async (req, res, next) => {
 
         // Child production rows hasil MRP ditampilkan di MPS, tetapi bukan demand
         // baru. Hanya row sumber forecast/SO yang boleh diexplode pada run berikutnya.
-        const sourceMpsDetails = mps.details.filter(
+        const rawSourceMpsDetails = mps.details.filter(
           (row) => !String(row.notes || "").startsWith(GENERATED_MPS_CHILD_NOTE_PREFIX),
         );
+        const sourceMpsDetails = expandMpsDetailsByDeliveryPhases(rawSourceMpsDetails, mps.deliveryPlans || []);
 
         const runningRun = await tx.mRPRun.findFirst({
           where: {
@@ -3339,6 +3591,7 @@ exports.runMRP = async (req, res, next) => {
           impactedMpsLines: 0,
           byPart: {},
         };
+        const soConsumedByMpsDetail = new Map();
         const soDemandTimeFence = await getSoDemandTimeFenceSetting(tx);
 
         const mpsPartCodes = [
@@ -3397,12 +3650,14 @@ exports.runMRP = async (req, res, next) => {
           {
             excludeRunNumbers: [runNumber],
             excludePlanNumbers: soOnlyPlanNumbersInScope,
+            excludeSourceMpsNumber: mpsNumber,
           },
         );
         const projectedMppSupplyMap = await buildOpenMppSupplyMap(
           tx,
           allPartCodes,
           resolvedCutoffDate || mps.periodEnd,
+          { excludeSourceMpsNumber: mpsNumber },
         );
         const projectedMoSupplyMap = await buildOpenMoSupplyMap(
           tx,
@@ -3445,7 +3700,9 @@ exports.runMRP = async (req, res, next) => {
               // it must not exclude an SO due inside the MPS month (for
               // example an Aug-31 SO when the fence ends on Aug-27).
               canConsume: (row) => (
-                planningMonthKey(row.dueDate) === planningMonthKey(mpsDetail.endDate)
+                (mpsDetail._deliveryPhaseId
+                  ? new Date(row.dueDate) <= new Date(mpsDetail.endDate)
+                  : planningMonthKey(row.dueDate) === planningMonthKey(mpsDetail.endDate))
                 || isWithinSoDemandTimeFence(row.dueDate, soDemandTimeFence)
               ),
             },
@@ -3482,6 +3739,10 @@ exports.runMRP = async (req, res, next) => {
           // forecast+buffer sebagai baseline, tetapi tidak boleh lebih kecil dari SO aktual.
           const forecastQty = Number(mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0);
           const soQtyInBucket = Number(soConsumption.consumedQty || 0);
+          soConsumedByMpsDetail.set(
+            mpsDetail.id,
+            roundPlanningQty(Number(soConsumedByMpsDetail.get(mpsDetail.id) || 0) + soQtyInBucket),
+          );
           // qtyPlanned is synchronized to the net production target after MRP,
           // so it cannot be reused as gross input on the next run. Rebuild the
           // pre-stock target from effective demand and production policy to
@@ -3491,10 +3752,6 @@ exports.runMRP = async (req, res, next) => {
             productionPercent: Number(mpsDetail.productionPercent ?? 100),
             actualSalesOrderQty: soQtyInBucket,
           });
-          if (Number(mpsDetail.actualSalesOrderQty || 0) !== soQtyInBucket) {
-            await tx.mPSDetail.update({ where: { id: mpsDetail.id }, data: { actualSalesOrderQty: soQtyInBucket } });
-          }
-
           // Pola consumption bergantung policy part:
           // MTO memakai forecast sebagai rencana awal sampai SO masuk; setelah ada SO,
           // qty produksi mengikuti SO aktual agar tidak over forecast.
@@ -3553,7 +3810,9 @@ exports.runMRP = async (req, res, next) => {
             orderType: "Production",
             leadTime: leadTimeDays,
             orderDate,
-            notes: null,
+            notes: mpsDetail._deliveryPhaseId
+              ? `MPS delivery phase ${mpsDetail._deliveryPhaseNumber} (${mpsDetail._deliveryPhaseId})`
+              : null,
             _partBufferPercent: Number(mpsDetail.part?.bufferStock || 0),
             _productionScheduleQty: grossRequirementAfterSo,
           };
@@ -3650,6 +3909,7 @@ exports.runMRP = async (req, res, next) => {
                 uomCodeByPartCode,
                 {
                   excludePlanNumbers: soOnlyPlanNumbersInScope,
+                  excludeSourceMpsNumber: mpsNumber,
                   projectedMppSupplyMap: dependentProjectedMppSupplyMap,
                   projectedMoSupplyMap: dependentProjectedMoSupplyMap,
                   initialAvailableMap: purchaseInitialAvailableMap,
@@ -3679,6 +3939,10 @@ exports.runMRP = async (req, res, next) => {
             }
           }
         }
+
+        // Keep actualSalesOrderQty immutable on the approved monthly MPS.
+        // soConsumedByMpsDetail is persisted on MRPRequirement/pegging and may
+        // include earlier outstanding buckets inside a wider MRP cutoff.
 
         // Sisa SO demand yang tidak tercakup MPS tetap harus masuk MRP.
         // Ini menjaga flow SO -> MRP -> PlannedOrder untuk part make-to-order.
@@ -3823,6 +4087,7 @@ exports.runMRP = async (req, res, next) => {
               uomCodeByPartCode,
               {
                 excludePlanNumbers: soOnlyPlanNumbersInScope,
+                excludeSourceMpsNumber: mpsNumber,
                 projectedMppSupplyMap: dependentProjectedMppSupplyMap,
                 projectedMoSupplyMap: dependentProjectedMoSupplyMap,
                 initialAvailableMap: purchaseInitialAvailableMap,
@@ -3874,12 +4139,23 @@ exports.runMRP = async (req, res, next) => {
           supplierOrderDate.setDate(supplierOrderDate.getDate() - supplierLeadTime);
           requirement.orderDate = supplierOrderDate;
         }
-        const persistedPurchaseRequirements = stripRequirementInternals(purchaseRequirements);
+        // Persist the complete Production -> Purchase requirement tree.  The
+        // generated MPS rows remain the executable production schedule, while
+        // these rows preserve the netting provenance (parent, BOM ratio, WIP
+        // coverage and resulting child demand) used by the formula inspector.
+        // Previously only the root Production row was stored, which severed
+        // parentRequirementId on every lower-level Purchase requirement.
+        const productionRequirements = requirements.filter(
+          (requirement) => requirement.orderType === "Production",
+        );
+        const persistedRequirements = stripRequirementInternals([
+          ...productionRequirements,
+          ...purchaseRequirements,
+        ]);
 
-        // Create purchase-only requirements
-        if (persistedPurchaseRequirements.length > 0) {
+        if (persistedRequirements.length > 0) {
           await tx.mRPRequirement.createMany({
-            data: persistedPurchaseRequirements,
+            data: persistedRequirements,
           });
         }
 
@@ -4102,8 +4378,13 @@ exports.runMRP = async (req, res, next) => {
           await syncOperationalSalesOrderStatus(tx, soNumber);
         }
 
+        const purchaseSuggestion = plannedOrders.some((order) => order.orderType === "Purchase" && Number(order.qty || 0) > 0)
+          ? await generatePurchaseSuggestionForRun(tx, runNumber, req.user?.username || req.user?.email || "system")
+          : null;
+
         return {
           ...completedRun,
+          purchaseSuggestionNumber: purchaseSuggestion?.suggestionNumber || null,
           soDemandConsumption: {
             ...nettingRunSummary,
             byPart: Object.entries(soDemandConsumptionSummary.byPart).map(
@@ -4204,48 +4485,25 @@ async function explodeMBOM(
   );
   if (validDetails.length === 0) return { requirements };
   const materialPlanningRules = buildMaterialPlanningRules(validDetails);
-  // A raw-material line can sit inside a nested MBOM. Carry the complete
-  // production path from the parent MBOM so stock at every completed stage
-  // (FG/WIP/SFG) can cover the raw-material demand after conversion by GW.
-  const materialSourceCodesByPart = new Map();
-  const inheritedProductionSourceCodes = Array.isArray(options.productionSourcePartCodes)
-    ? options.productionSourcePartCodes
-    : [];
-  for (const detail of validDetails) {
-    if (!isRawMaterialPart(detail.part)) continue;
-    materialSourceCodesByPart.set(
-      normalizePartCode(detail.part.partCode),
-      new Set(collectProductionPathCodes(
-        mbomHeader,
-        validDetails,
-        detail,
-        inheritedProductionSourceCodes,
-      )),
-    );
-  }
   const requirementIdByMbomDetailId = new Map();
   // Net output of a parent process becomes the gross driver of its direct
   // children. This produces a true level-by-level cascade:
   // parent target -> subtract parent stock -> child gross target.
   const netOutputQtyByMbomDetailId = new Map();
-  const grossOutputQtyByMbomDetailId = new Map();
   const childSequenceByParentId = new Map();
   const projectedMppSupplyMap = options.projectedMppSupplyMap || {};
   const projectedMoSupplyMap = options.projectedMoSupplyMap || {};
 
   // Batch fetch stock balances untuk semua part sekaligus (hindari N+1 query)
   const allPartCodes = [...new Set(validDetails.map((d) => d.part.partCode))];
+  const partByCode = new Map(validDetails.map((detail) => [normalizePartCode(detail.part.partCode), detail.part]));
   const unresolvedPartCodes = allPartCodes.filter(
-    (code) => projectedAvailableMap[code] === undefined,
+    (code) => projectedAvailableMap[planningStockKey(code, partByCode.get(normalizePartCode(code)))] === undefined,
   );
   if (unresolvedPartCodes.length > 0) {
-    const partByCode = new Map(validDetails.map((detail) => [normalizePartCode(detail.part.partCode), detail.part]));
     const materialIds = [...new Set(unresolvedPartCodes.map((code) => partByCode.get(code)?.materialId).filter(Boolean))];
     const materialCodes = [...new Set(unresolvedPartCodes.map((code) => partByCode.get(code)?.material?.materialCode).filter(Boolean))];
-    const stockLookupPartCodes = [...new Set([
-      ...unresolvedPartCodes,
-      ...[...materialSourceCodesByPart.values()].flatMap((codes) => [...codes]),
-    ])];
+    const stockLookupPartCodes = unresolvedPartCodes;
     const stockBalances = await tx.stockBalance.findMany({
       where: {
         AND: [
@@ -4292,28 +4550,31 @@ async function explodeMBOM(
       {
         excludeRunNumbers: [runNumber],
         excludePlanNumbers: options.excludePlanNumbers || [],
+        excludeSourceMpsNumber: options.excludeSourceMpsNumber,
         ...materialPlanningRules,
       },
     );
-    const mppSupplyMap = await buildOpenMppSupplyMap(tx, unresolvedPartCodes, requiredDate);
+    const mppSupplyMap = await buildOpenMppSupplyMap(tx, unresolvedPartCodes, requiredDate, {
+      excludeSourceMpsNumber: options.excludeSourceMpsNumber,
+    });
     const moSupplyMap = await buildOpenMoSupplyMap(tx, unresolvedPartCodes, requiredDate);
     for (const partCode of unresolvedPartCodes) {
       const part = partByCode.get(partCode);
+      const stockKey = planningStockKey(partCode, part);
       const materialId = part?.materialId || null;
       const materialCode = String(part?.material?.materialCode || "").trim().toUpperCase();
-      const relatedSourceCodes = materialSourceCodesByPart.get(partCode) || new Set();
       const rowsForPart = stockBalances.filter((row) => {
         const sourceCode = normalizePartCode(row.partCode);
         const sourcePart = stockPartByCode.get(sourceCode);
         const sourceMaterialId = sourcePart?.materialId || row.materialId;
         const sourceMaterialCode = String(sourcePart?.material?.materialCode || row.materialCode || "").trim().toUpperCase();
         return sourceCode === partCode
-          || relatedSourceCodes.has(sourceCode)
           || (materialId && sourceMaterialId === materialId)
           || (materialCode && sourceMaterialCode === materialCode);
       }).map((row) => ({
-        // Normalize using the source WIP/FG part's gross weight, then remap
-        // the balance to the dependent requirement key for netting.
+        // Normalize the physical stock identity of this requirement. WIP/FG
+        // coverage is already cascaded through each production level and must
+        // not be counted again as raw-material stock here.
         ...normalizeStockRowForRequirement(
           row,
           part,
@@ -4339,11 +4600,11 @@ async function explodeMBOM(
         : isProductionPart
           ? Number(stockForPart.onHand[partCode] || 0)
           : Number(stockForPart.available[partCode] || 0);
-      projectedAvailableMap[partCode] = stockQty + Number(supplyMap[partCode] || 0);
-      projectedActualAvailableMap[partCode] = rawMaterialPlanning
+      projectedAvailableMap[stockKey] = stockQty + Number(supplyMap[partCode] || 0);
+      projectedActualAvailableMap[stockKey] = rawMaterialPlanning
         ? rowsForPart.reduce((sum, row) => sum + Number(row.qtyOnHand || 0), 0)
         : stockQty;
-      projectedAllocatedMap[partCode] = Number(stockForPart.allocated[partCode] || 0);
+      projectedAllocatedMap[stockKey] = Number(stockForPart.allocated[partCode] || 0);
       projectedMppSupplyMap[partCode] = Number(mppSupplyMap[partCode] || 0);
       projectedMoSupplyMap[partCode] = Number(moSupplyMap[partCode] || 0);
     }
@@ -4352,18 +4613,16 @@ async function explodeMBOM(
   for (const detail of validDetails) {
     const partCode = detail.part.partCode;
     const normalizedPartCode = normalizePartCode(partCode);
+    const stockKey = planningStockKey(normalizedPartCode, detail.part);
     const kgPerQty = Number(materialPlanningRules.kgPerQtyByPartCode[normalizedPartCode] || 0);
     const planRawMaterialInKg = materialPlanningRules.planningUomByPartCode[normalizedPartCode] === "kg";
-    const rawMaterialDetail = isRawMaterialPart(detail.part);
-    const parentOutputMap = rawMaterialDetail
-      ? grossOutputQtyByMbomDetailId
-      : netOutputQtyByMbomDetailId;
+    const parentOutputMap = netOutputQtyByMbomDetailId;
     const parentOutputQty = detail.parentDetailId && parentOutputMap.has(detail.parentDetailId)
       ? Number(parentOutputMap.get(detail.parentDetailId) || 0)
       : Number(quantity || 0);
-    // Raw-material gross demand stays before WIP coverage so the breakdown can
-    // show WIP pcs x gross weight explicitly. Other production children use
-    // the parent's net output to preserve cascading MPS targets.
+    // Every direct child follows the parent's net production driver. Using a
+    // gross parent for raw material while also netting WIP at prior levels
+    // double-counts WIP coverage and understates purchasing.
     const effectiveDemandQty = Number(detail.qty || 0) * parentOutputQty * (planRawMaterialInKg ? kgPerQty : 1);
     const forecastQty = Number(detail.qty || 0)
       * Number(options.forecastDemandQty ?? quantity ?? 0)
@@ -4385,21 +4644,21 @@ async function explodeMBOM(
     if (partCode && detailUomCode) {
       uomCodeByPartCode[partCode] = detailUomCode;
     }
-    const availableBefore = projectedAvailableMap[partCode] || 0;
-    const actualAvailableBefore = projectedActualAvailableMap[partCode] || 0;
+    const availableBefore = projectedAvailableMap[stockKey] || 0;
+    const actualAvailableBefore = projectedActualAvailableMap[stockKey] || 0;
     const onHandQty = actualAvailableBefore;
-    const allocatedQty = projectedAllocatedMap[partCode] || 0;
+    const allocatedQty = projectedAllocatedMap[stockKey] || 0;
     const netRequirement = evaluateFromSet(options.formulas, "MRP_NET_REQUIREMENT", {
       grossRequirement,
       projectedAvailable: availableBefore,
     });
 
     // Kurangi projected stock komponen agar demand berikutnya tidak pakai stok awal yang sama.
-    projectedAvailableMap[partCode] = Math.max(
+    projectedAvailableMap[stockKey] = Math.max(
       availableBefore - grossRequirement,
       0,
     );
-    projectedActualAvailableMap[partCode] = Math.max(
+    projectedActualAvailableMap[stockKey] = Math.max(
       actualAvailableBefore - grossRequirement,
       0,
     );
@@ -4526,17 +4785,17 @@ async function explodeMBOM(
       _productionScheduleQty: orderType === "Production"
         ? productionExplosionQty
         : 0,
+      _planningStockKey: stockKey,
     };
 
-    if (orderType === "Purchase" && options.initialAvailableMap?.[partCode] === undefined) {
-      options.initialAvailableMap[partCode] = availableBefore;
-      options.initialActualAvailableMap[partCode] = actualAvailableBefore;
-      options.initialAllocatedMap[partCode] = allocatedQty;
+    if (orderType === "Purchase" && options.initialAvailableMap?.[stockKey] === undefined) {
+      options.initialAvailableMap[stockKey] = availableBefore;
+      options.initialActualAvailableMap[stockKey] = actualAvailableBefore;
+      options.initialAllocatedMap[stockKey] = allocatedQty;
     }
 
     requirements.push(requirement);
     requirementIdByMbomDetailId.set(detail.id, requirement.id);
-    grossOutputQtyByMbomDetailId.set(detail.id, Math.max(Number(grossRequirement || 0), 0));
     netOutputQtyByMbomDetailId.set(
       detail.id,
       Math.max(Number(
@@ -4589,12 +4848,6 @@ async function explodeMBOM(
             rootRequirementId: requirement.rootRequirementId,
             parentTreePath: requirement.treePath,
             parentComponentLevel: requirement.mbomLevelComponent,
-            productionSourcePartCodes: collectProductionPathCodes(
-              mbomHeader,
-              validDetails,
-              detail,
-              inheritedProductionSourceCodes,
-            ),
           },
         );
         requirements.push(...subExploded.requirements);
@@ -5082,12 +5335,20 @@ function buildMrpSourceRows(order, requirementRows = []) {
       ? roundPlanningQty(Number(order.qty || 0) - allocated)
       : roundPlanningQty(totalBasis > 0 ? Number(order.qty || 0) * basis / totalBasis : Number(order.qty || 0) / candidates.length);
     allocated = roundPlanningQty(allocated + qty);
+    const forecastNumbers = [
+      row.mpsDetail?.forecastDetail?.forecastNumber,
+      ...((String(row.mpsDetail?.notes || "").match(/forecast\s+(.+?);\s*SO/i)?.[1] || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value && value !== "-")),
+    ].filter(Boolean);
+    const distinctForecastNumbers = [...new Set(forecastNumbers)];
     return {
       plannedOrderNumber: order.orderNumber,
       mrpRunNumber: row.runNumber || order.runNumber || null,
       mpsNumber: row.mpsDetail?.mpsNumber || order.mrpRun?.mpsNumber || null,
       mpsDetailId: row.mpsDetailId || null,
-      forecastNumber: row.mpsDetail?.forecastDetail?.forecastNumber || null,
+      forecastNumber: distinctForecastNumbers.length === 1 ? distinctForecastNumbers[0] : null,
       forecastDetailId: row.mpsDetail?.forecastDetailId || null,
       soNumber: row.mpsDetail?.soNumber || null,
       sourceType: row.sourceType || order.referenceType || "MRP",
@@ -5098,7 +5359,12 @@ function buildMrpSourceRows(order, requirementRows = []) {
       fgPartCode: row.mpsDetail?.partCode || null,
       qty,
       uomCode: order.uomCode || null,
-      metadata: row.consumptionSources || undefined,
+      metadata: (row.consumptionSources || distinctForecastNumbers.length)
+        ? {
+          consumptionSources: row.consumptionSources || [],
+          forecastNumbers: distinctForecastNumbers,
+        }
+        : undefined,
     };
   }).filter((row) => row.qty > 0);
 }
@@ -5123,7 +5389,11 @@ function buildMrpPurchaseRequestDetails(orders, partByCode, runNumber, requireme
     // the same Material Master demand as Coil, Sheet or Pieces, so it must not
     // split the MRP-to-PR consolidation key.
     const key = rawMaterial
-      ? ["MATERIAL", part.material.id || part.material.materialCode, order.uomCode || "KG"].join("|")
+      // One PR header is still shared by Material Master + demand month, but
+      // each released Planned Order remains an independent PR detail. This
+      // preserves the two MRP demand lines and lets Purchasing split supplier,
+      // package/form, and ordered quantity per demand without losing pegging.
+      ? ["MATERIAL", part.material.id || part.material.materialCode, order.orderNumber, order.uomCode || "KG"].join("|")
       : [category, order.partCode, order.uomCode || "UNIT"].join("|");
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push({
@@ -5312,7 +5582,7 @@ exports.updatePlannedOrderProcurement = async (req, res, next) => {
 };
 
 // Output MRP purchase-only. Planned order yang sudah menjadi PR tidak dibuat ulang.
-exports.createPurchaseRequestOutput = async (req, res, next) => {
+const createPurchaseRequestOutputLegacy = async (req, res, next) => {
   try {
     const runNumber = await resolveCurrentRunNumber(req.params.runNumber);
     if (!runNumber) return res.status(404).json({ message: "MRP Run tidak ditemukan" });
@@ -5439,6 +5709,7 @@ exports.createPurchaseRequestOutput = async (req, res, next) => {
               mpsNumber: true,
               partCode: true,
               soNumber: true,
+              notes: true,
               customerCode: true,
               startDate: true,
               forecastDetailId: true,
@@ -5486,7 +5757,11 @@ exports.createPurchaseRequestOutput = async (req, res, next) => {
           || (procurementGroup !== "MATERIAL" ? requestedTargets[procurementGroup.toLowerCase()] : null)
           || (groupedOrders.size === 1 ? req.body?.targetPrNumber : null);
         if (procurementGroup === "MATERIAL") {
-          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`PR-MATERIAL|${material?.id}|${demandBucket}`}))`;
+          // pg_advisory_xact_lock returns PostgreSQL `void`. `$queryRaw`
+          // attempts to deserialize that value and Prisma rejects the
+          // unsupported result type. This statement is side-effect only, so
+          // execute it without materialising a result row.
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`PR-MATERIAL|${material?.id}|${demandBucket}`}))`;
         }
         let target = explicitTarget
           ? await tx.purchaseRequisition.findFirst({
@@ -5546,11 +5821,11 @@ exports.createPurchaseRequestOutput = async (req, res, next) => {
           let nextLine = target.details.reduce((max, row) => Math.max(max, Number(row.lineNumber || 0)), 0) + 1;
           for (const incoming of requestDetails) {
             const identity = incoming.procurementCategory === "MATERIAL"
-              ? `MATERIAL|${incoming.materialCode}|${incoming.uomCode || ""}`
+              ? `MATERIAL|${incoming.materialCode}|${incoming.uomCode || ""}|${incoming.plannedOrderNumber || ""}`
               : `${incoming.procurementCategory}|${incoming.partCode || incoming.description}|${incoming.uomCode || ""}`;
             const existing = target.details.find((row) => {
               const rowIdentity = row.procurementCategory === "MATERIAL"
-                ? `MATERIAL|${row.materialCode}|${row.uomCode || ""}`
+                ? `MATERIAL|${row.materialCode}|${row.uomCode || ""}|${row.plannedOrderNumber || ""}`
                 : `${row.procurementCategory}|${row.partCode || row.description}|${row.uomCode || ""}`;
               return rowIdentity === identity;
             });
@@ -6087,4 +6362,6 @@ exports.bulkRemove = async (req, res, next) => {
     next(e);
   }
 };
+
+exports.__test = { expandMpsDetailsByDeliveryPhases, planningStockKey };
 

@@ -4,11 +4,20 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
-const { assertStockBalanceNotFrozen } = require("./utils/stockOpnameFreezeGuard");
+const {
+  assertStockBalanceNotFrozen,
+  assertWarehouseNotFrozen,
+} = require("./utils/stockOpnameFreezeGuard");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const { assertQuantity } = require("../../utils/uomQuantity");
+const {
+  listMaterialPieceSources,
+  resolveMaterialPieceConversion,
+} = require("../../services/inventory/materialPieceConversionService");
+const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
 
 const MOVEMENT_TYPES = new Set(["IN", "OUT", "TRANSFER", "ADJUSTMENT"]);
+const MATERIAL_PIECE_MODE = "MATERIAL_FROM_PART_PCS";
 
 const number = (value, label) => {
   const parsed = Number(value);
@@ -48,6 +57,7 @@ function identityWhere(input, warehouseCode, rackCode) {
 
 async function findOrCreateBalance(tx, input, warehouseCode, rackCode, qty, direction, formulas) {
   const where = identityWhere(input, warehouseCode, rackCode);
+  await lockStockBalanceIdentity(tx, where);
   const existing = await tx.stockBalance.findFirst({ where, select: { id: true, qtyOnHand: true, qtyReserved: true, qtyQC: true, qtyAvailable: true } });
   if (direction === "OUT" && !existing) {
     const error = new Error("Saldo stok untuk item/lot/lokasi tersebut tidak ditemukan.");
@@ -78,6 +88,7 @@ async function findOrCreateBalance(tx, input, warehouseCode, rackCode, qty, dire
     qtyReserved: 0,
     qtyQC: 0,
   });
+  await assertWarehouseNotFrozen(tx, warehouseCode);
   const balance = await tx.stockBalance.create({
     data: {
       ...where,
@@ -248,7 +259,34 @@ exports.list = async (req, res, next) => {
       prisma.stockMovement.findMany({ where, orderBy: buildSort(req.query) || { movementDate: "desc" }, skip: (page - 1) * limit, take: limit }),
       prisma.stockMovement.count({ where }),
     ]);
-    res.json({ items: items.map(mapDoc), total, page, limit });
+    const mappedItems = items.map(mapDoc);
+    const partCodes = [...new Set(mappedItems.map((item) => item.partCode).filter(Boolean))];
+    const parts = partCodes.length ? await prisma.part.findMany({
+      where: { partCode: { in: partCodes }, isDeleted: false },
+      select: {
+        partCode: true,
+        partNumber: true,
+        process: { select: { processName: true } },
+        mbomDetails: {
+          where: { isDeleted: false, mbomHeader: { isDeleted: false } },
+          select: {
+            mbomHeader: { select: { revision: true } },
+            mbomProcesses: {
+              where: { isDeleted: false },
+              orderBy: { sequence: "asc" },
+              select: { sequence: true, occurrenceCode: true, process: { select: { processName: true } } },
+            },
+          },
+        },
+      },
+    }) : [];
+    const partInfoByCode = new Map(parts.map((part) => {
+      const bomProcesses = part.mbomDetails.flatMap((detail) => (detail.mbomProcesses || []).map((item) => ({ ...item, revision: detail.mbomHeader?.revision || 0 })))
+        .sort((left, right) => Number(right.revision || 0) - Number(left.revision || 0) || Number(left.sequence || 0) - Number(right.sequence || 0));
+      const bomProcess = bomProcesses.find((item) => item.process?.processName || item.occurrenceCode);
+      return [part.partCode, { partNumber: part.partNumber, processName: bomProcess?.occurrenceCode || bomProcess?.process?.processName || part.process?.processName || null }];
+    }));
+    res.json({ items: mappedItems.map((item) => ({ ...item, partNumber: partInfoByCode.get(item.partCode)?.partNumber || item.partNumber || null, mbomProcessName: partInfoByCode.get(item.partCode)?.processName || null })), total, page, limit });
   } catch (error) { next(error); }
 };
 
@@ -260,14 +298,32 @@ exports.get = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.listMaterialPieceSources = async (req, res, next) => {
+  try {
+    const items = await listMaterialPieceSources(prisma, { q: req.query.q });
+    res.json({ items, total: items.length });
+  } catch (error) { next(error); }
+};
+
+function materialPieceAuditNote(input, conversion) {
+  const audit = [
+    `[PCS_TO_KG] ${conversion.sourcePartCode}`,
+    `${conversion.sourceQtyPcs} PCS x ${conversion.grossWeightKgPerPcs} KG/PCS`,
+    `= ${conversion.convertedQtyKg} KG ${conversion.materialCode}`,
+    `BOM ${conversion.mbomNoReg}`,
+  ].join(" | ");
+  return [text(input.notes), audit].filter(Boolean).join("\n");
+}
+
 exports.create = async (req, res, next) => {
   try {
     const input = req.body || {};
+    const usesMaterialPieceConversion = String(input.inputMode || "").toUpperCase() === MATERIAL_PIECE_MODE;
     const movementType = String(input.movementType || "").toUpperCase();
     if (!MOVEMENT_TYPES.has(movementType)) return res.status(400).json({ message: "movementType harus IN, OUT, TRANSFER, atau ADJUSTMENT." });
     const warehouseCode = text(input.warehouseCode);
     if (!warehouseCode) return res.status(400).json({ message: "warehouseCode wajib diisi." });
-    const qty = number(input.qty, "Qty");
+    const requestedQty = number(usesMaterialPieceConversion ? input.sourceQtyPcs : input.qty, usesMaterialPieceConversion ? "Qty sumber PCS" : "Qty");
     if (movementType === "TRANSFER" && !text(input.destinationWarehouseCode)) return res.status(400).json({ message: "destinationWarehouseCode wajib untuk transfer." });
     const formulas = await getFormulaSet(prisma, "inventory");
     const result = await prisma.$transaction(async (tx) => {
@@ -276,7 +332,27 @@ exports.create = async (req, res, next) => {
       if (movementType === "TRANSFER") {
         await assertInventoryLocation(tx, text(input.destinationWarehouseCode), input.destinationRackCode);
       }
-      const payload = { ...(await resolveMovementItem(tx, input)), performedBy: actor };
+      const conversion = usesMaterialPieceConversion
+        ? await resolveMaterialPieceConversion(tx, { ...input, sourceQtyPcs: requestedQty })
+        : null;
+      const normalizedInput = conversion ? {
+        ...input,
+        stockType: "Material",
+        materialId: conversion.materialId,
+        materialCode: conversion.materialCode,
+        materialName: conversion.materialName,
+        materialType: conversion.materialType,
+        spec: conversion.materialSpec,
+        thickness: conversion.materialThickness,
+        width: conversion.materialWidth,
+        CSP: conversion.materialCSP,
+        uomCode: conversion.targetUomCode,
+        transactionType: text(input.transactionType) || "MANUAL_MATERIAL_CONVERSION",
+        referenceType: text(input.referenceType) || "MATERIAL_PCS_CONVERSION",
+        notes: materialPieceAuditNote(input, conversion),
+      } : input;
+      const qty = conversion?.convertedQtyKg ?? requestedQty;
+      const payload = { ...(await resolveMovementItem(tx, normalizedInput)), performedBy: actor };
       // Piece/sheet/coil movements are discrete units. Reject fractional input
       // at the inventory boundary so balances and downstream reservations never
       // acquire values such as 11785.714 pcs.
@@ -289,26 +365,26 @@ exports.create = async (req, res, next) => {
         const inNumber = await generateMovementNumber("IN", tx);
         const out = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: source.before, qtyAfter: source.after }, outNumber, "TRANSFER", "OUT", warehouseCode, input.rackCode, qty, -qty, transferGroupId) });
         const incoming = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: destination.before, qtyAfter: destination.after }, inNumber, "TRANSFER", "IN", input.destinationWarehouseCode, input.destinationRackCode, qty, qty, transferGroupId) });
-        await queueDirtyPartCodes(tx, [payload.partCode], {
+        await queueDirtyPartCodes(tx, [conversion?.sourcePartCode || payload.partCode], {
           reason: "STOCK",
           sourceNumber: transferGroupId,
           notes: "Transfer stock mengubah net availability MRP.",
         });
-        return { items: [out, incoming], transferGroupId };
+        return { items: [out, incoming], transferGroupId, conversion };
       }
       const adjustmentDecrease = movementType === "ADJUSTMENT" && (String(input.adjustmentType || "").toUpperCase() === "DECREASE" || Number(input.deltaQty) < 0);
       const direction = movementType === "OUT" || adjustmentDecrease ? "OUT" : "IN";
       const balance = await findOrCreateBalance(tx, payload, warehouseCode, input.rackCode, qty, direction, formulas);
       const movementNumber = await generateMovementNumber(movementType, tx);
       const movement = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: balance.before, qtyAfter: balance.after, adjustmentType: movementType === "ADJUSTMENT" ? (direction === "OUT" ? "DECREASE" : "INCREASE") : input.adjustmentType }, movementNumber, movementType, direction, warehouseCode, input.rackCode, qty, direction === "OUT" ? -qty : qty) });
-      await queueDirtyPartCodes(tx, [payload.partCode], {
+      await queueDirtyPartCodes(tx, [conversion?.sourcePartCode || payload.partCode], {
         reason: "STOCK",
         sourceNumber: movementNumber,
         notes: "Stock movement mengubah net availability MRP.",
       });
-      return { items: [movement] };
+      return { items: [movement], conversion };
     });
-    res.status(201).json({ items: result.items.map(mapDoc), transferGroupId: result.transferGroupId || null });
+    res.status(201).json({ items: result.items.map(mapDoc), transferGroupId: result.transferGroupId || null, conversion: result.conversion || null });
   } catch (error) { next(error); }
 };
 

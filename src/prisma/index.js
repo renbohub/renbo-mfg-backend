@@ -45,6 +45,27 @@ const prisma = new PrismaClient({
     : ['error'],
 });
 
+async function assertDatabaseSchemaReady() {
+  const missing = await prisma.$queryRaw`
+    SELECT expected.table_name
+    FROM (VALUES
+      ('tbl_users'),
+      ('tbl_paymentterm'),
+      ('tbl_uom'),
+      ('tbl_currency'),
+      ('tbl_process'),
+      ('tbl_rack')
+    ) AS expected(table_name)
+    WHERE to_regclass('public.' || expected.table_name) IS NULL
+  `;
+  if (missing.length) {
+    const names = missing.map((row) => row.table_name).join(', ');
+    throw new Error(
+      `Database schema belum siap. Tabel hilang: ${names}. Jalankan "npm run db:bootstrap" (atau "npx prisma migrate deploy") dari folder backend dengan DATABASE_URL yang benar, lalu restart server.`,
+    );
+  }
+}
+
 // Connection test
 async function connectDatabase() {
   try {
@@ -53,6 +74,7 @@ async function connectDatabase() {
     // PostgreSQL benar-benar menerima koneksi sebelum server dijalankan.
     await prisma.$queryRaw`SELECT 1`;
     console.log('✅ PostgreSQL Connected successfully');
+    await assertDatabaseSchemaReady();
     
     // Run seeder after connection
     const runSeeders = require('./utils/seeder');

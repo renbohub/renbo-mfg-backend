@@ -69,19 +69,20 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const fileName = text(req.body?.fileName); const fileType = text(req.body?.fileType || "xlsx").toLowerCase(); const rows = normalizeRows(req.body?.rows);
+    const fileName = text(req.body?.fileName); const fileType = text(req.body?.fileType || "xlsx").toLowerCase(); const importType = text(req.body?.importType || "FORECAST").toUpperCase(); const rows = normalizeRows(req.body?.rows);
     if (!fileName) return res.status(400).json({ message: "fileName wajib diisi." });
     if (!rows.length) return res.status(400).json({ message: "Minimal satu row diperlukan untuk import staging." });
     const errorCount = rows.filter((row) => row.status === "ERROR").length;
-    const sourceChecksum = text(req.body?.sourceChecksum) || crypto.createHash("sha256").update(JSON.stringify({ fileName, fileType, rows })).digest("hex");
+    if (!["FORECAST", "SALES_HISTORY", "MATERIAL_DEMAND_HISTORY"].includes(importType)) return res.status(400).json({ message: "importType tidak didukung." });
+    const sourceChecksum = text(req.body?.sourceChecksum) || crypto.createHash("sha256").update(JSON.stringify({ fileName, fileType, importType, rows })).digest("hex");
     const existing = await prisma.excelImportBatch.findFirst({
-      where: { sourceChecksum, fileType, status: { in: ["VALIDATED", "VALIDATION_ERROR", "APPROVED", "APPLIED"] } },
+      where: { sourceChecksum, fileType, importType, status: { in: ["VALIDATED", "VALIDATION_ERROR", "APPROVED", "APPLIED"] } },
       include: { rows: { orderBy: [{ sheetName: "asc" }, { rowNumber: "asc" }] } },
     });
     if (existing) return res.json({ ...mapDoc(existing), idempotent: true });
     const item = await prisma.$transaction(async (tx) => {
       const batchNumber = await generateBatchNumber(tx);
-      return tx.excelImportBatch.create({ data: { batchNumber, fileName, fileType, sourceChecksum, sourcePeriod: text(req.body?.sourcePeriod) || null, status: errorCount ? "VALIDATION_ERROR" : "VALIDATED", rowCount: rows.length, errorCount, metadata: req.body?.metadata || null, notes: text(req.body?.notes) || null, createdBy: req.user?.username || req.user?.email || "system", rows: { create: rows.map((row) => ({ sheetName: row.sheetName, rowNumber: row.rowNumber, sourceJson: row.sourceJson, mappedJson: row.mappedJson || null, status: row.status, errorCode: row.errorCode, errorMessage: row.errorMessage })) } }, include: { rows: true } });
+      return tx.excelImportBatch.create({ data: { batchNumber, fileName, fileType, importType, sourceChecksum, sourcePeriod: text(req.body?.sourcePeriod) || null, status: errorCount ? "VALIDATION_ERROR" : "VALIDATED", rowCount: rows.length, errorCount, metadata: req.body?.metadata || null, notes: text(req.body?.notes) || null, createdBy: req.user?.username || req.user?.email || "system", rows: { create: rows.map((row) => ({ sheetName: row.sheetName, rowNumber: row.rowNumber, sourceJson: row.sourceJson, mappedJson: row.mappedJson || null, status: row.status, errorCode: row.errorCode, errorMessage: row.errorMessage })) } }, include: { rows: true } });
     });
     res.status(201).json(mapDoc(item));
   } catch (error) { next(error); }

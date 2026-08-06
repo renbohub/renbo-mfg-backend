@@ -547,9 +547,42 @@ function buildMovementFromPart(sourceMovement, part) {
   };
 }
 
-async function isFinalProductionWorkOrder(tx, workOrder = {}) {
+async function isFinalProductionWorkOrder(tx, workOrder = {}, productionLog = {}) {
   if (!workOrder?.moId || workOrder.sequence === null || workOrder.sequence === undefined) {
     return false;
+  }
+
+  // MPP can publish parallel child routes whose local MBOM sequence is the
+  // same. The allocation dependency graph, carried by the originating DPP,
+  // is the authoritative way to identify the terminal output for FG receipt.
+  let dpsId = productionLog?.dpsId || null;
+  if (!dpsId && (productionLog?.id || productionLog?.logNumber)) {
+    const persistedLog = await tx.productionLog.findFirst({
+      where: productionLog.id ? { id: productionLog.id } : { logNumber: productionLog.logNumber },
+      select: { dpsId: true },
+    });
+    dpsId = persistedLog?.dpsId || null;
+  }
+  if (dpsId) {
+    const schedule = await tx.dailyProductionSchedule.findUnique({
+      where: { id: dpsId },
+      select: { productionPlanAllocationId: true },
+    });
+    if (schedule?.productionPlanAllocationId) {
+      const allocation = await tx.productionPlanAllocation.findUnique({
+        where: { id: schedule.productionPlanAllocationId },
+        select: { id: true, planId: true },
+      });
+      if (allocation?.planId) {
+        const siblings = await tx.productionPlanAllocation.findMany({
+          where: { planId: allocation.planId, isDeleted: false, status: { not: "Cancelled" } },
+          select: { predecessorAllocationIds: true },
+        });
+        return !siblings.some((candidate) =>
+          Array.isArray(candidate.predecessorAllocationIds)
+          && candidate.predecessorAllocationIds.includes(allocation.id));
+      }
+    }
   }
 
   const nextWorkOrder = await tx.workOrder.findFirst({
@@ -570,7 +603,7 @@ async function resolvePassedOutputTarget(tx, inspection = {}, sourceMovement = {
     return null;
   }
 
-  const isFinalOperation = await isFinalProductionWorkOrder(tx, inspection.workOrder);
+  const isFinalOperation = await isFinalProductionWorkOrder(tx, inspection.workOrder, inspection.productionLog);
   if (!isFinalOperation) return null;
 
   return {
@@ -1280,7 +1313,7 @@ async function getMoQcHoldWipSources(tx, inspection) {
 
 async function buildFgReceiptRow(tx, inspection) {
   if (!inspection?.productionLog?.logNumber || !inspection.workOrder) return null;
-  const isFinalOperation = await isFinalProductionWorkOrder(tx, inspection.workOrder);
+  const isFinalOperation = await isFinalProductionWorkOrder(tx, inspection.workOrder, inspection.productionLog);
   if (!isFinalOperation) return null;
 
   const sourceMovement = await getProductionLogQcHoldMovement(tx, inspection.productionLog.logNumber);
@@ -1294,6 +1327,7 @@ async function buildFgReceiptRow(tx, inspection) {
 
   return {
     id: inspection.id,
+    moId: inspection.manufacturingOrder?.id || inspection.workOrder?.moId || null,
     inspectionNumber: inspection.inspectionNumber,
     inspectionDate: inspection.inspectionDate,
     moNumber: inspection.manufacturingOrder?.moNumber || null,
@@ -1316,7 +1350,181 @@ async function buildFgReceiptRow(tx, inspection) {
       rackCode: sourceMovement.rackCode || null,
       lotNumber: sourceMovement.lotNumber || null,
     },
+    receiptState: "READY_TO_RECEIVE",
+    actionable: true,
+    blockers: [],
   };
+}
+
+async function buildNonComponentFgTrackingRows(tx, options = {}) {
+  const query = String(options.q || "").trim();
+  const manufacturingOrders = await tx.manufacturingOrder.findMany({
+    where: {
+      isDeleted: false,
+      status: { not: "Cancelled" },
+      qtyPlanned: { gt: 0 },
+      monthlyProductionPlanNumber: { not: null },
+      ...(options.moId ? { id: options.moId } : {}),
+      part: {
+        isDeleted: false,
+        itemType: "FG",
+        partType: { not: "COMP" },
+      },
+      ...(query
+        ? {
+            OR: [
+              { moNumber: { contains: query, mode: "insensitive" } },
+              { monthlyProductionPlanNumber: { contains: query, mode: "insensitive" } },
+              { part: { partCode: { contains: query, mode: "insensitive" } } },
+              { part: { partName: { contains: query, mode: "insensitive" } } },
+              { workOrders: { some: { woNumber: { contains: query, mode: "insensitive" } } } },
+              { productionLogs: { some: { logNumber: { contains: query, mode: "insensitive" } } } },
+              { qualityInspections: { some: { inspectionNumber: { contains: query, mode: "insensitive" } } } },
+            ],
+          }
+        : {}),
+    },
+    orderBy: [{ plannedEndDate: "asc" }, { moNumber: "asc" }],
+    select: {
+      id: true,
+      moNumber: true,
+      monthlyProductionPlanNumber: true,
+      monthlyProductionPlanLineNumber: true,
+      plannedEndDate: true,
+      qtyPlanned: true,
+      uomCode: true,
+      status: true,
+      part: {
+        select: {
+          partCode: true,
+          partNumber: true,
+          partName: true,
+          itemType: true,
+          partType: true,
+        },
+      },
+      workOrders: {
+        where: { isDeleted: false, status: { not: "Cancelled" } },
+        orderBy: [{ sequence: "desc" }, { woNumber: "desc" }],
+        select: {
+          woNumber: true,
+          sequence: true,
+          status: true,
+          outputPartCode: true,
+          outputPartNumber: true,
+          outputPartName: true,
+          productionLogs: {
+            where: { isDeleted: false },
+            orderBy: [{ logDate: "desc" }, { createdAt: "desc" }],
+            select: { logNumber: true, status: true, qtyGood: true },
+          },
+        },
+      },
+      qualityInspections: {
+        where: { isDeleted: false },
+        orderBy: [{ inspectionDate: "desc" }, { createdAt: "desc" }],
+        select: { inspectionNumber: true, status: true, decision: true, qtyPassed: true },
+      },
+    },
+  });
+
+  const inspectionNumbers = manufacturingOrders.flatMap((mo) => mo.qualityInspections.map((inspection) => inspection.inspectionNumber));
+  const receivedMovements = inspectionNumbers.length
+    ? await tx.stockMovement.findMany({
+        where: {
+          referenceType: "QUALITY_INSPECTION",
+          referenceNumber: { in: inspectionNumbers },
+          transactionType: "PRODUCTION",
+          movementType: "IN",
+          stockType: "Finished Goods",
+          isDeleted: false,
+        },
+        select: { referenceNumber: true, qty: true },
+      })
+    : [];
+  const receivedByInspection = new Map();
+  receivedMovements.forEach((movement) => receivedByInspection.set(
+    movement.referenceNumber,
+    Number(receivedByInspection.get(movement.referenceNumber) || 0) + Number(movement.qty || 0),
+  ));
+
+  return manufacturingOrders.map((mo) => {
+    const receivedQty = mo.qualityInspections.reduce(
+      (sum, inspection) => sum + Number(receivedByInspection.get(inspection.inspectionNumber) || 0),
+      0,
+    );
+    const pendingQty = Math.max(0, Number(mo.qtyPlanned || 0) - receivedQty);
+    if (pendingQty <= 0.000001) return null;
+
+    const finalWorkOrder = mo.workOrders[0] || null;
+    const latestLog = finalWorkOrder?.productionLogs?.[0] || null;
+    const completedAcceptedQcs = mo.qualityInspections.filter((inspection) =>
+      inspection.status === "Completed"
+      && ["ACCEPTED", "CONDITIONAL ACCEPT", "CONDITIONAL_ACCEPT"].includes(String(inspection.decision || "").trim().toUpperCase()));
+    let receiptState = "WAITING_PRODUCTION";
+    let blockerCode = "FG_NONCOMP_PRODUCTION_PENDING";
+    let blockerMessage = "FG non-component tidak memiliki proses langsung; receipt menunggu output WIP terakhir dari proses in-house.";
+    const references = [
+      { type: "MO", label: mo.moNumber, href: `/modules/production/manufacturing-orders/${encodeURIComponent(mo.moNumber)}` },
+      mo.monthlyProductionPlanNumber
+        ? { type: "MPP", label: mo.monthlyProductionPlanNumber, href: `/modules/planning-ppic/monthly-production-plans/${encodeURIComponent(mo.monthlyProductionPlanNumber)}` }
+        : null,
+      { type: "PART", label: mo.part.partCode, href: `/master-data/parts/${encodeURIComponent(mo.part.partCode)}/edit?key=${encodeURIComponent(mo.part.partCode)}` },
+    ].filter(Boolean);
+
+    if (!finalWorkOrder) {
+      receiptState = "WAITING_FINAL_OUTPUT";
+      blockerCode = "FG_NONCOMP_FINAL_OUTPUT_MISSING";
+      blockerMessage = "Belum ada Work Order penghasil WIP terakhir. Periksa BOM/routing child lalu generate Work Order dari MO.";
+    } else {
+      references.push({ type: "WO", label: finalWorkOrder.woNumber, href: `/modules/production/work-orders/${encodeURIComponent(finalWorkOrder.woNumber)}` });
+      if (!latestLog || latestLog.status !== "Approved") {
+        receiptState = "WAITING_PRODUCTION";
+        blockerCode = "FG_NONCOMP_PRODUCTION_LOG_PENDING";
+        blockerMessage = "Output proses in-house terakhir belum memiliki Production Log Approved.";
+        if (latestLog) references.push({ type: "LOG", label: latestLog.logNumber, href: `/modules/production/production-logs/${encodeURIComponent(latestLog.logNumber)}` });
+      } else if (!completedAcceptedQcs.length) {
+        receiptState = "WAITING_QC";
+        blockerCode = "FG_NONCOMP_QC_PENDING";
+        blockerMessage = "Output WIP terakhir sudah diproduksi tetapi belum memiliki QC Completed dan Accepted.";
+        references.push({ type: "LOG", label: latestLog.logNumber, href: `/modules/production/production-logs/${encodeURIComponent(latestLog.logNumber)}` });
+        references.push({ type: "QC", label: "Buat / selesaikan QC", href: `/modules/production/quality-inspections/new?productionLogNumber=${encodeURIComponent(latestLog.logNumber)}` });
+      } else {
+        receiptState = "WAITING_RECEIPT_RECONCILIATION";
+        blockerCode = "FG_NONCOMP_RECEIPT_QTY_GAP";
+        blockerMessage = "QC Accepted sudah ada, tetapi seluruh outstanding belum menjadi baris receipt siap posting. Periksa qty QC dan source WIP release.";
+        const latestQc = completedAcceptedQcs[0];
+        references.push({ type: "QC", label: latestQc.inspectionNumber, href: `/modules/production/quality-inspections/${encodeURIComponent(latestQc.inspectionNumber)}` });
+      }
+    }
+
+    return {
+      id: `MO:${mo.id}`,
+      moId: mo.id,
+      trackingKey: `MO:${mo.moNumber}`,
+      inspectionNumber: null,
+      inspectionDate: null,
+      moNumber: mo.moNumber,
+      monthlyProductionPlanNumber: mo.monthlyProductionPlanNumber,
+      monthlyProductionPlanLineNumber: mo.monthlyProductionPlanLineNumber,
+      dueDate: mo.plannedEndDate,
+      woNumber: finalWorkOrder?.woNumber || null,
+      productionLogNumber: latestLog?.logNumber || null,
+      sourcePart: finalWorkOrder
+        ? { partCode: finalWorkOrder.outputPartCode, partNumber: finalWorkOrder.outputPartNumber, partName: finalWorkOrder.outputPartName, stockType: "WIP" }
+        : null,
+      sourceWips: [],
+      fgPart: mo.part,
+      qtyPassed: completedAcceptedQcs.reduce((sum, inspection) => sum + Number(inspection.qtyPassed || 0), 0),
+      qtyReceived: receivedQty,
+      qtyPending: pendingQty,
+      uomCode: mo.uomCode,
+      sourceLocation: null,
+      receiptState,
+      actionable: false,
+      blockers: [{ severity: "BLOCKING", code: blockerCode, message: blockerMessage, references }],
+    };
+  }).filter(Boolean);
 }
 
 function buildAutoCompletionData(data = {}) {
@@ -1398,6 +1606,30 @@ async function closeMaterialIssuesIfReady(tx, moId) {
 }
 
 async function syncNextWorkOrderPlannedQtyFromSequence(tx, completedWo) {
+  const capacityDailyPlan = completedWo?.id
+    ? await tx.dailyProductionSchedule.findFirst({
+        where: {
+          woId: completedWo.id,
+          productionPlanAllocationId: { not: null },
+          isDeleted: false,
+        },
+        select: { productionPlanAllocationId: true },
+      })
+    : null;
+  if (capacityDailyPlan) {
+    // The capacity allocation graph already defines exact qty per branch and
+    // delivery batch. A legacy raw-sequence propagation would sum parallel
+    // parts together and overwrite every downstream WO with an unrelated qty.
+    return {
+      mode: "CAPACITY_GRAPH",
+      sourceAllocationId: capacityDailyPlan.productionPlanAllocationId,
+      plannedQty: Number(completedWo.qtyGood || 0),
+      updatedCount: 0,
+      workOrderUpdatedCount: 0,
+      vendorProcessUpdatedCount: 0,
+    };
+  }
+
   if (
     !completedWo?.moId
     || completedWo.sequence === null
@@ -1458,6 +1690,21 @@ async function syncNextWorkOrderPlannedQtyFromSequence(tx, completedWo) {
 }
 
 async function syncNextOperationPlannedQtyFromVendorSequence(tx, completedVendorOrder) {
+  const capacityAllocationId = String(completedVendorOrder?.notes || "").match(/\[CAPACITY-VENDOR:([^\]]+)\]/)?.[1] || null;
+  if (capacityAllocationId) {
+    // Capacity Planning already owns exact transfer-batch quantities for every
+    // graph successor. A raw sequence update would overwrite unrelated
+    // branches (and the second delivery phase) with this phase's accepted qty.
+    return {
+      mode: "CAPACITY_GRAPH",
+      sourceAllocationId: capacityAllocationId,
+      plannedQty: Number(completedVendorOrder.qtyAccepted || 0),
+      updatedCount: 0,
+      workOrderUpdatedCount: 0,
+      vendorProcessUpdatedCount: 0,
+    };
+  }
+
   if (
     !completedVendorOrder?.moId
     || completedVendorOrder.sequence === null
@@ -1672,6 +1919,7 @@ async function syncVendorProcessFromCompletedQc(tx, vendorProcessOrderId) {
       qtyReceived: true,
       vendorCode: true,
       vendorRate: true,
+      notes: true,
     },
   });
   if (!order) return null;
@@ -1719,6 +1967,32 @@ async function syncVendorProcessFromCompletedQc(tx, vendorProcessOrderId) {
     },
   });
 
+  // Capacity-driven vendor work is published as one DPP per transfer batch.
+  // Keep that daily source as the execution truth when vendor QC completes or
+  // is rolled back, just like an in-house Production Log updates its DPP.
+  const capacityAllocationId = String(order.notes || "").match(/\[CAPACITY-VENDOR:([^\]]+)\]/)?.[1] || null;
+  let dailyPlan = null;
+  if (capacityAllocationId) {
+    const linkedPlan = await tx.dailyProductionSchedule.findFirst({
+      where: {
+        moId: order.moId,
+        productionPlanAllocationId: capacityAllocationId,
+        isDeleted: false,
+      },
+      select: { id: true, scheduleNumber: true, plannedQty: true },
+    });
+    if (linkedPlan) {
+      const actualQty = Math.min(qtyAccepted, Number(linkedPlan.plannedQty || 0));
+      const status = isCompleted ? "Completed" : Number(order.qtySent || 0) > 0 ? "In Progress" : "Draft";
+      const synced = await tx.dailyProductionSchedule.update({
+        where: { id: linkedPlan.id },
+        data: { actualQty, status },
+        select: { scheduleNumber: true, status: true, actualQty: true, plannedQty: true },
+      });
+      dailyPlan = synced;
+    }
+  }
+
   const nextOperationPlan = await syncNextOperationPlannedQtyFromVendorSequence(tx, updated);
   const syncedMo = await syncManufacturingOrderQtyFromWorkOrders(tx, updated.moId);
   return {
@@ -1727,6 +2001,7 @@ async function syncVendorProcessFromCompletedQc(tx, vendorProcessOrderId) {
     qtyAccepted: updated.qtyAccepted,
     qtyReject: updated.qtyReject,
     qtyRework: updated.qtyRework,
+    dailyPlan,
     nextOperationPlan,
     manufacturingOrder: syncedMo,
   };
@@ -3041,6 +3316,26 @@ exports.pendingFgReceipts = async (req, res, next) => {
       }
     }
 
+    // Non-component FG is an in-house receipt milestone and intentionally has
+    // no routing process of its own. Keep it visible in FG Receipt while its
+    // child/final WIP, Production Log, and QC are still being completed.
+    const readyQtyByMoId = new Map();
+    rows.forEach((row) => {
+      if (!row.moId) return;
+      readyQtyByMoId.set(row.moId, Number(readyQtyByMoId.get(row.moId) || 0) + Number(row.qtyPending || 0));
+    });
+    const trackingRows = await buildNonComponentFgTrackingRows(prisma, { q, moId });
+    trackingRows.forEach((row) => {
+      const waitingQty = Math.max(0, Number(row.qtyPending || 0) - Number(readyQtyByMoId.get(row.moId) || 0));
+      if (waitingQty > 0.000001) rows.push({ ...row, qtyPending: waitingQty });
+    });
+    rows.sort((left, right) => {
+      const leftReady = left.actionable ? 0 : 1;
+      const rightReady = right.actionable ? 0 : 1;
+      if (leftReady !== rightReady) return leftReady - rightReady;
+      return new Date(left.inspectionDate || left.dueDate || 0) - new Date(right.inspectionDate || right.dueDate || 0);
+    });
+
     for (const pendingMoId of pendingMoIds) {
       const syncedMo = await syncManufacturingOrderQtyFromWorkOrders(prisma, pendingMoId);
       if (syncedMo) {
@@ -3289,6 +3584,7 @@ exports.receiveFg = async (req, res, next) => {
       if (!Number.isFinite(receiptQty) || receiptQty <= 0) {
         throw Object.assign(new Error("qty receipt harus lebih dari 0."), { statusCode: 400 });
       }
+      assertQuantity(receiptQty, pendingRow.uomCode, "Qty FG Receipt");
       if (receiptQty - pendingRow.qtyPending > 0.000001) {
         throw Object.assign(
           new Error(`qty receipt melebihi pending FG. Pending: ${pendingRow.qtyPending}.`),

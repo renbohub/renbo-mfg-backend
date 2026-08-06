@@ -44,6 +44,7 @@ const numberingRulesRouter = require("./master-data/numbering-rules");
 const foundationRouter = require("./master-data/foundation");
 const routingRouter = require("./engineering/routing");
 const controlTowerRouter = require("./dashboard/control-tower");
+const executiveDashboardRouter = require("./dashboard/executive");
 const incomingTransactionRouter = require("./incoming/transactions");
 const outgoingTransactionRouter = require("./outgoing/transactions");
 
@@ -55,12 +56,14 @@ const warehousesRouter = require("./inventory/warehouses");
 const racksRouter = require("./inventory/racks");
 const lotsRouter = require("./inventory/lots");
 const stockBalancesRouter = require("./inventory/stock-balances");
+const stockReservationsRouter = require("./inventory/stock-reservations");
 const stockMovementsRouter = require("./inventory/stock-movements");
 const stockOpnameRouter = require("./inventory/stock-opname");
 
 
 const purchaseOrderRouter = require("./purchasing/purchase-orders");
 const purchaseRequisitionsRouter = require("./purchasing/purchase-requisitions");
+const purchaseSuggestionsRouter = require("./purchasing/purchase-suggestions");
 const purchaseInvoicesRouter = require("./purchasing/purchase-invoices");
 const {
   goodsReceiptsRouter,
@@ -179,6 +182,7 @@ function registerRoutes(app) {
   api.use("/master-data/foundation", auth, foundationRouter);
   api.use("/engineering", auth, routingRouter);
   api.use("/dashboard/control-tower", auth, controlTowerRouter);
+  api.use("/dashboard/executive", auth, executiveDashboardRouter);
   api.use("/incoming", auth, incomingTransactionRouter);
   api.use("/outgoing", auth, outgoingTransactionRouter);
 
@@ -196,6 +200,7 @@ function registerRoutes(app) {
   api.use("/inventory/racks", auth, racksRouter);
   api.use("/inventory/lots", auth, lotsRouter);
   api.use("/inventory/stock-balances", auth, stockBalancesRouter);
+  api.use("/inventory/stock-reservations", auth, stockReservationsRouter);
   api.use("/inventory/stock-movements", auth, stockMovementsRouter);
   api.use("/inventory/stock-opname", auth, stockOpnameRouter);
 
@@ -210,6 +215,7 @@ function registerRoutes(app) {
   // Purchasing routes
   api.use("/purchasing/purchase-order", auth, purchaseOrderRouter);
   api.use("/purchasing/purchase-requisitions", auth, purchaseRequisitionsRouter);
+  api.use("/purchasing/purchase-suggestions", auth, purchaseSuggestionsRouter);
   api.use("/purchasing/purchase-invoices", auth, purchaseInvoicesRouter);
 
   // Incoming routes

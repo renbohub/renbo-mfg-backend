@@ -2,9 +2,11 @@ const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { assertQuantity } = require("../../utils/uomQuantity");
+const { predecessorQuantityStatus } = require("../../services/planning/capacityPlanningService");
 const {
   buildAvailability,
 } = require("./services/productionWorkflowService");
+const { materializeChildFgShortage } = require("./services/childFgReceiptService");
 
 const parseDate = (value) => {
   if (!value) return null;
@@ -156,8 +158,35 @@ async function generateScheduleNumber(tx = prisma, date = new Date()) {
  * complete availability here would issue every material in the finished-good
  * BOM (and at the full MO quantity) for every daily process.
  */
-async function buildScheduleMaterialAvailability(tx, schedule, mo) {
-  const targetPartCode = String(schedule?.partCode || "").trim();
+async function buildScheduleMaterialAvailability(tx, schedule, mo, options = {}) {
+  // `DailyProductionSchedule.partCode` used to be filled from the parent MO,
+  // which made every operation look like it produced the finished good.  Use
+  // the execution references as the source of truth so legacy schedules also
+  // issue the direct inputs of their actual operation output.
+  const [workOrderOutput, routeOutput] = await Promise.all([
+    schedule?.woId
+      ? tx.workOrder.findFirst({
+          where: { id: schedule.woId, isDeleted: false },
+          select: { outputPartCode: true },
+        })
+      : null,
+    schedule?.mbomProcessId
+      ? tx.mBOMProcess.findFirst({
+          where: { id: schedule.mbomProcessId, isDeleted: false },
+          select: {
+            mbomDetail: {
+              select: { part: { select: { partCode: true } } },
+            },
+          },
+        })
+      : null,
+  ]);
+  const targetPartCode = String(
+    workOrderOutput?.outputPartCode
+      || routeOutput?.mbomDetail?.part?.partCode
+      || schedule?.partCode
+      || "",
+  ).trim();
   if (!targetPartCode || !mo) return { items: [], mbomHeader: null };
 
   const [parentHeader, candidates] = await Promise.all([
@@ -206,7 +235,7 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo) {
     partId: target.mbomHeader?.partId || mo.partId,
     qtyPlanned,
   };
-  const availability = await buildAvailability(tx, scopedMo, {
+  let availability = await buildAvailability(tx, scopedMo, {
     // Material production is issued in its purchasing/base weight unit (kg),
     // while PURCHASE_PART remains in the discrete BOM UOM (normally pcs).
     // Do not inherit an old MO-wide KG mode because a single production item
@@ -219,6 +248,23 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo) {
     // and FG COMP. Deeper descendants remain owned by their own Daily Plan.
     includeDirectProductionInputs: true,
   });
+
+  // A nested FG has an implicit receipt boundary between its final WIP and
+  // the parent assembly. Materialize only the shortage authorized by the MPP
+  // `[FG-RECEIPT:CHILD]` line, then rebuild availability for the MI sources.
+  if (options.materializeChildFg === true) {
+    const directItems = (availability.items || []).filter((item) => item.parentDetailId === target.id);
+    for (const item of directItems) {
+      if (Number(item.shortage || 0) <= 0) continue;
+      await materializeChildFgShortage(tx, schedule, item, options.performedBy || "system");
+    }
+    availability = await buildAvailability(tx, scopedMo, {
+      requirementUomMode: "BY_ITEM_TYPE",
+      ignoreMaterialIssues: true,
+      ignoreReservations: true,
+      includeDirectProductionInputs: true,
+    });
+  }
 
   // Scope strictly to one level below the scheduled production item. The
   // parentDetailId relation is the source of truth; item type/category is not
@@ -241,31 +287,80 @@ async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
   if (!warehouse) return existing || null;
   const mo = await tx.manufacturingOrder.findUnique({ where: { id: schedule.moId }, select: { id: true, moNumber: true, partId: true, qtyPlanned: true, uomCode: true, materialRequirementUomMode: true, inputSourceType: true, sourceStockBalanceId: true, sourceQtyPlanned: true, sourcePartCode: true, sourcePartNumber: true, sourceWarehouseCode: true, sourceRackCode: true, sourceLotNumber: true } });
   const availability = mo
-    ? await buildScheduleMaterialAvailability(tx, schedule, mo)
+    ? await buildScheduleMaterialAvailability(tx, schedule, mo, {
+        materializeChildFg: true,
+        performedBy,
+      })
     : { items: [] };
-  const issueDetails = (availability.items || []).filter((item) => Number(item.qtyRemaining || item.qtyRequired || 0) > 0).map((item, index) => ({
-    lineNumber: index + 1,
-    partCode: item.partCode,
-    partNumber: item.partNumber,
-    partName: item.partName,
-    spec: item.spec,
-    thickness: item.thickness,
-    width: item.width,
-    CSP: item.CSP,
-    stockBalanceId: item.stockBalanceId,
-    requirementSource: item.requirementSource || "MBOM",
-    rackCode: item.rackCode,
-    qtyRequired: Number(item.qtyRemaining || item.qtyRequired || 0),
-    qtyIssued: Number(item.qtyRemaining || item.qtyRequired || 0),
-    uomCode: item.uomCode,
-    lotNumber: item.lotNumber,
-    notes: [
-      "Prepared from Daily Production Plan consume",
-      item.requirementSource ? `source=${item.requirementSource}` : null,
-      item.parentPartCode ? `parent=${item.parentPartCode}` : null,
-      item.itemType ? `itemType=${item.itemType}` : null,
-    ].filter(Boolean).join("; "),
-  }));
+  if (!(availability.items || []).length) {
+    throw Object.assign(
+      new Error(`BOM input untuk proses ${schedule.partCode || schedule.scheduleNumber} tidak ditemukan. Material Issue kosong tidak boleh diposting.`),
+      { statusCode: 409, code: "DPP_BOM_INPUT_EMPTY" },
+    );
+  }
+  const issueDetails = [];
+  for (const item of (availability.items || []).filter((row) => Number(row.qtyRemaining || row.qtyRequired || 0) > 0)) {
+    let remaining = Number(item.qtyRemaining || item.qtyRequired || 0);
+    const sources = Array.isArray(item.sourceDetails) ? item.sourceDetails : [];
+
+    // One BOM requirement may be covered by several lots/balances. Preserve
+    // each selected balance in the Material Issue so Inventory can consume the
+    // same sources proven available by the DPP check.
+    for (const source of sources) {
+      if (remaining <= 0) break;
+      const sourceQty = Number(source.qtyReserved ?? source.qtyCandidate ?? source.qtyConsumed ?? source.qtyHistorical ?? source.qtyAvailable ?? 0);
+      const qty = Math.min(Math.max(sourceQty, 0), remaining);
+      if (qty <= 0) continue;
+      issueDetails.push({
+        lineNumber: issueDetails.length + 1,
+        partCode: item.partCode,
+        partNumber: item.partNumber,
+        partName: item.partName,
+        spec: item.spec,
+        thickness: item.thickness,
+        width: item.width,
+        CSP: item.CSP,
+        stockBalanceId: source.stockBalanceId || null,
+        requirementSource: item.requirementSource || "MBOM",
+        rackCode: source.rackCode || item.rackCode,
+        qtyRequired: qty,
+        qtyIssued: qty,
+        uomCode: source.uomCode || item.uomCode,
+        lotNumber: source.lotNumber || item.lotNumber,
+        notes: [
+          "Prepared from Daily Production Plan consume",
+          item.requirementSource ? `source=${item.requirementSource}` : null,
+          item.parentPartCode ? `parent=${item.parentPartCode}` : null,
+          item.itemType ? `itemType=${item.itemType}` : null,
+          source.materialCode ? `material=${source.materialCode}` : null,
+        ].filter(Boolean).join("; "),
+      });
+      remaining = Math.max(0, remaining - qty);
+    }
+
+    // Keep an explicit shortage line for audit. Normal DPP execution will be
+    // blocked before issue when no real stock source can cover this remainder.
+    if (remaining > 0) {
+      issueDetails.push({
+        lineNumber: issueDetails.length + 1,
+        partCode: item.partCode,
+        partNumber: item.partNumber,
+        partName: item.partName,
+        spec: item.spec,
+        thickness: item.thickness,
+        width: item.width,
+        CSP: item.CSP,
+        stockBalanceId: null,
+        requirementSource: item.requirementSource || "MBOM",
+        rackCode: item.rackCode,
+        qtyRequired: remaining,
+        qtyIssued: remaining,
+        uomCode: item.uomCode,
+        lotNumber: item.lotNumber,
+        notes: "Prepared from Daily Production Plan consume; stock source unresolved",
+      });
+    }
+  }
   if (existing) {
     // Reconcile an automatically prepared Draft created before material
     // scoping was process-aware. Issued/closed documents are never changed.
@@ -287,8 +382,11 @@ async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
   const prefix = `MI-${day.getUTCFullYear()}${String(day.getUTCMonth() + 1).padStart(2, "0")}${String(day.getUTCDate()).padStart(2, "0")}`;
   const last = await tx.materialIssue.findFirst({ where: { issueNumber: { startsWith: prefix } }, orderBy: { issueNumber: "desc" }, select: { issueNumber: true } });
   const sequence = Number(last?.issueNumber?.split("-").pop() || 0) + 1;
+  const sourceWarehouseCode = availability.warehouseCode
+    || issueDetails.map((detail) => (availability.items || []).flatMap((item) => item.sourceDetails || []).find((source) => source.stockBalanceId === detail.stockBalanceId)?.warehouseCode).find(Boolean)
+    || warehouse.warehouseCode;
   return tx.materialIssue.create({
-    data: { issueNumber: `${prefix}-${String(sequence).padStart(3, "0")}`, issueDate: new Date(), moId: schedule.moId, woId: schedule.woId || null, warehouseCode: warehouse.warehouseCode, issuedBy: performedBy, status: "Draft", notes: `[DPS-CONSUME:${schedule.scheduleNumber}] Material issue dibuat otomatis; lakukan consume di Inventory.`, details: { create: issueDetails } },
+    data: { issueNumber: `${prefix}-${String(sequence).padStart(3, "0")}`, issueDate: new Date(), moId: schedule.moId, woId: schedule.woId || null, warehouseCode: sourceWarehouseCode, issuedBy: performedBy, status: "Draft", notes: `[DPS-CONSUME:${schedule.scheduleNumber}] Material issue dibuat otomatis; lakukan consume di Inventory.`, details: { create: issueDetails } },
     include: { details: { where: { isDeleted: false } } },
   });
 }
@@ -351,8 +449,8 @@ function mapScheduleDoc(schedule) {
     processCode: doc.process?.processCode || null,
     processName: doc.process?.processName || null,
     sourceModule: ppicMarker ? "PPIC" : "Production",
-    monthlyProductionPlanNumber: ppicMarker?.[1] || null,
-    monthlyProductionPlanLineNumber: ppicMarker ? Number(ppicMarker[2]) : null,
+    monthlyProductionPlanNumber: doc.productionPlan?.planNumber || ppicMarker?.[1] || null,
+    monthlyProductionPlanLineNumber: doc.productionPlanAllocation?.lineNumber || (ppicMarker ? Number(ppicMarker[2]) : null),
   };
 }
 
@@ -373,10 +471,10 @@ exports.list = async (req, res, next) => {
     };
 
     if (String(req.query.sourceModule || "").toUpperCase() === "PPIC") {
-      where.notes = { contains: "[PPIC-DPP:" };
+      where.productionPlanId = { not: null };
     }
     if (req.query.planNumber) {
-      where.notes = { contains: `[PPIC-DPP:${String(req.query.planNumber).trim()}:` };
+      where.productionPlan = { planNumber: String(req.query.planNumber).trim(), isDeleted: false };
     }
     if (scheduleDate) {
       const { start, end } = dayRange(scheduleDate);
@@ -399,7 +497,13 @@ exports.list = async (req, res, next) => {
     const skip = (Number(page) - 1) * take;
     const orderBy = buildSort(req.query) || [{ scheduleDate: "asc" }, { shift: "asc" }, { sequence: "asc" }];
     const [items, total] = await Promise.all([
-      prisma.dailyProductionSchedule.findMany({ where, orderBy, skip, take }),
+      prisma.dailyProductionSchedule.findMany({
+        where, orderBy, skip, take,
+        include: {
+          productionPlan: { select: { planNumber: true, status: true } },
+          productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true } },
+        },
+      }),
       prisma.dailyProductionSchedule.count({ where }),
     ]);
     const hydratedItems = await attachScheduleMachines(prisma, items);
@@ -414,9 +518,13 @@ exports.get = async (req, res, next) => {
   try {
     const schedule = await prisma.dailyProductionSchedule.findUnique({
       where: { scheduleNumber: req.params.scheduleNumber },
+      include: {
+        productionPlan: { select: { planNumber: true, status: true } },
+        productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true } },
+      },
     });
     if (!schedule || schedule.isDeleted) return res.status(404).json({ message: "Daily production schedule tidak ditemukan" });
-    if (String(req.query.sourceModule || "").toUpperCase() === "PPIC" && !String(schedule.notes || "").includes("[PPIC-DPP:")) {
+    if (String(req.query.sourceModule || "").toUpperCase() === "PPIC" && !schedule.productionPlanId) {
       return res.status(404).json({ message: "Daily Production Plan PPIC tidak ditemukan" });
     }
     const [manufacturingOrder, workOrder, materialIssues, productionLogs] = await Promise.all([
@@ -602,11 +710,115 @@ exports.update = async (req, res, next) => {
 const setStatus = (status) => async (req, res, next) => {
   try {
     const schedule = await prisma.$transaction(async (tx) => {
+      const current = await tx.dailyProductionSchedule.findUnique({ where: { scheduleNumber: req.params.scheduleNumber } });
+      if (!current || current.isDeleted) throw Object.assign(new Error("Daily Production Plan tidak ditemukan."), { statusCode: 404 });
+      if (["Released", "In Progress", "Completed"].includes(status)) {
+        if (!current.productionPlanId || !current.productionPlanAllocationId || !current.mbomProcessId) {
+          throw Object.assign(new Error("Daily Production Plan harus dipublikasikan dari MPP Capacity Planning dan memiliki allocation/routing trace lengkap."), { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" });
+        }
+        if (String(current.shift || "").toUpperCase() !== "VENDOR" && (!current.moId || !current.woId)) {
+          throw Object.assign(new Error("Daily Production Plan in-house wajib memiliki MO dan WO reference."), { statusCode: 409, code: "DAILY_PLAN_EXECUTION_REFERENCE_INCOMPLETE" });
+        }
+      }
+      const allowedFrom = {
+        Released: ["Draft"],
+        "In Progress": ["Released"],
+        Completed: ["In Progress"],
+        Cancelled: ["Draft", "Released", "In Progress"],
+      };
+      if (!(allowedFrom[status] || []).includes(current.status)) {
+        throw Object.assign(new Error(`Daily Production Plan tidak dapat berubah dari ${current.status} menjadi ${status}.`), { statusCode: 409, code: "DAILY_PLAN_STATUS_TRANSITION_INVALID" });
+      }
+      if (status === "In Progress" && String(current.shift || "").toUpperCase() !== "VENDOR") {
+        const [workOrder, openMaterialIssue, postedMaterialIssue, allocation] = await Promise.all([
+          tx.workOrder.findFirst({ where: { id: current.woId, isDeleted: false }, select: { status: true, woNumber: true } }),
+          tx.materialIssue.count({ where: { woId: current.woId, isDeleted: false, status: { in: ["Draft", "Pending", "Released"] } } }),
+          tx.materialIssue.findFirst({
+            where: {
+              moId: current.moId,
+              woId: current.woId,
+              isDeleted: false,
+              notes: { contains: `[DPS-CONSUME:${current.scheduleNumber}]` },
+              status: { in: ["Issued", "Partially Returned", "Closed"] },
+              details: { some: { isDeleted: false, qtyIssued: { gt: 0 } } },
+            },
+            select: { id: true, issueNumber: true },
+          }),
+          tx.productionPlanAllocation.findUnique({
+            where: { id: current.productionPlanAllocationId },
+            select: { predecessorAllocationIds: true, planId: true, lineNumber: true, uomCode: true },
+          }),
+        ]);
+        if (!workOrder || !["Material Issued", "In Production"].includes(workOrder.status)) {
+          throw Object.assign(new Error(`WO ${workOrder?.woNumber || current.woNumber || "-"} belum Material Issued.`), { statusCode: 409, code: "MATERIAL_NOT_ISSUED" });
+        }
+        if (openMaterialIssue > 0) {
+          throw Object.assign(new Error("Material Issue untuk Daily Production Plan ini belum diposting Inventory."), { statusCode: 409, code: "MATERIAL_ISSUE_OPEN" });
+        }
+        if (!postedMaterialIssue) {
+          throw Object.assign(new Error("Material Issue Daily Production Plan tidak mempunyai detail stock yang sudah diposting."), { statusCode: 409, code: "MATERIAL_ISSUE_EMPTY" });
+        }
+        const predecessorIds = Array.isArray(allocation?.predecessorAllocationIds) ? allocation.predecessorAllocationIds : [];
+        const predecessorAllocations = predecessorIds.length
+          ? await tx.productionPlanAllocation.findMany({
+              where: { id: { in: predecessorIds }, isDeleted: false },
+              select: { id: true, lineNumber: true, uomCode: true },
+            })
+          : [];
+        const lineNumbers = [...new Set([
+          Number(allocation?.lineNumber || 0),
+          ...predecessorAllocations.map((row) => Number(row.lineNumber || 0)),
+        ].filter(Boolean))];
+        const planDetails = allocation?.planId && lineNumbers.length
+          ? await tx.monthlyProductionPlanDetail.findMany({
+              where: { planId: allocation.planId, lineNumber: { in: lineNumbers }, isDeleted: false },
+              select: { lineNumber: true, qtyPlanned: true },
+            })
+          : [];
+        const targetByLine = new Map(planDetails.map((row) => [Number(row.lineNumber), Number(row.qtyPlanned || 0)]));
+        const predecessorById = new Map(predecessorAllocations.map((row) => [row.id, row]));
+        for (const predecessorId of predecessorIds) {
+          const predecessorOutput = await tx.dailyProductionSchedule.aggregate({
+            where: {
+              productionPlanAllocationId: predecessorId,
+              isDeleted: false,
+              status: "Completed",
+            },
+            _sum: { actualQty: true },
+          });
+          const predecessorAllocation = predecessorById.get(predecessorId);
+          const quantityStatus = predecessorQuantityStatus(
+            predecessorOutput._sum.actualQty,
+            targetByLine.get(Number(predecessorAllocation?.lineNumber || 0)),
+            current.plannedQty,
+            targetByLine.get(Number(allocation?.lineNumber || 0)),
+            predecessorAllocation?.uomCode,
+            current.uomCode,
+          );
+          if (quantityStatus.short) {
+            const message = quantityStatus.mode === "COVERAGE"
+              ? `Coverage output predecessor baru ${(quantityStatus.predecessorCoverage * 100).toFixed(2)}%, belum cukup untuk Daily Plan ${(quantityStatus.successorCoverage * 100).toFixed(2)}%.`
+              : `Output predecessor baru ${Number(predecessorOutput._sum.actualQty || 0)}, belum cukup untuk menjalankan ${current.plannedQty}.`;
+            throw Object.assign(new Error(message), { statusCode: 409, code: "PREDECESSOR_OUTPUT_NOT_READY" });
+          }
+        }
+      }
+      let completedActualQty = null;
+      if (status === "Completed") {
+        const approved = await tx.productionLog.aggregate({
+          where: { dpsId: current.id, isDeleted: false, status: "Approved" },
+          _sum: { qtyProduced: true },
+        });
+        completedActualQty = Number(approved._sum.qtyProduced || 0);
+        if (completedActualQty <= 0) {
+          throw Object.assign(new Error("Daily Production Plan hanya dapat diselesaikan setelah memiliki Production Log Approved."), { statusCode: 409, code: "APPROVED_PRODUCTION_LOG_REQUIRED" });
+        }
+      }
       const updated = await tx.dailyProductionSchedule.update({
         where: { scheduleNumber: req.params.scheduleNumber },
         data: {
           status,
-          ...(status === "Completed" ? { actualQty: Number(req.body?.actualQty || 0) } : {}),
+          ...(status === "Completed" ? { actualQty: completedActualQty } : {}),
         },
       });
 
@@ -625,6 +837,7 @@ const setStatus = (status) => async (req, res, next) => {
     });
     res.json(mapScheduleDoc(schedule));
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code || null });
     next(error);
   }
 };
@@ -643,6 +856,12 @@ exports.consume = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const schedule = await tx.dailyProductionSchedule.findUnique({ where: { scheduleNumber: req.params.scheduleNumber } });
       if (!schedule || schedule.isDeleted) throw Object.assign(new Error("Daily production schedule tidak ditemukan"), { statusCode: 404 });
+      if (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId) {
+        throw Object.assign(new Error("Daily Production Plan harus berasal dari MPP Capacity Planning sebelum material dikonsumsi."), { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" });
+      }
+      if (String(schedule.shift || "").toUpperCase() !== "VENDOR" && (!schedule.moId || !schedule.woId)) {
+        throw Object.assign(new Error("Daily Production Plan in-house wajib memiliki MO dan WO reference."), { statusCode: 409, code: "DAILY_PLAN_EXECUTION_REFERENCE_INCOMPLETE" });
+      }
       if (!["Draft", "Released"].includes(schedule.status)) throw Object.assign(new Error(`Daily plan ${schedule.scheduleNumber} tidak dapat dikonsumsi dari status ${schedule.status}.`), { statusCode: 409 });
       const updated = schedule.status === "Draft" ? await tx.dailyProductionSchedule.update({ where: { scheduleNumber: schedule.scheduleNumber }, data: { status: "Released" } }) : schedule;
       if (updated.woId) await tx.workOrder.updateMany({ where: { id: updated.woId, isDeleted: false, status: { in: ["Draft", "Planned"] } }, data: { status: "Released" } });
@@ -650,7 +869,7 @@ exports.consume = async (req, res, next) => {
       return { schedule: mapScheduleDoc(await attachScheduleMachines(tx, updated)), materialIssue };
     });
     res.json(result);
-  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
+  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code || null }); next(error); }
 };
 
 exports.dispatchFromWorkOrders = async (req, res, next) => {
@@ -882,4 +1101,12 @@ exports.remove = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+// Kept out of the HTTP surface. Maintenance scripts use the same material
+// scoping and document builder as normal DPP execution so a repair cannot
+// drift from the production transaction logic.
+exports.__maintenance = {
+  buildScheduleMaterialAvailability,
+  ensureMaterialIssueDraft,
 };

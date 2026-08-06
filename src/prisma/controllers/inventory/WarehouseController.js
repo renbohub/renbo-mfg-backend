@@ -18,11 +18,86 @@ const parseBoolean = (value) => {
 
 const normalizeWarehousePayload = (payload = {}) => {
   const normalized = convertNumericFields(payload, ["capacity"]);
-  if (normalized.isActive !== undefined) {
-    normalized.isActive = parseBoolean(normalized.isActive);
-  }
+  ["isActive", "availableForMrp", "availableForProduction", "availableForDelivery"].forEach((field) => {
+    if (normalized[field] !== undefined) normalized[field] = parseBoolean(normalized[field]);
+  });
+  if (normalized.warehouseCode !== undefined) normalized.warehouseCode = String(normalized.warehouseCode || "").trim().toUpperCase();
+  if (normalized.warehouseName !== undefined) normalized.warehouseName = String(normalized.warehouseName || "").trim();
+  if (normalized.location !== undefined) normalized.location = String(normalized.location || "").trim() || null;
+  if (normalized.type !== undefined) normalized.type = String(normalized.type || "Main").trim();
+  if (normalized.stockStatus !== undefined) normalized.stockStatus = String(normalized.stockStatus || "AVAILABLE").trim().toUpperCase();
   return normalized;
 };
+
+const ACTIVE_STO_STATUSES = ["DRAFT", "COUNTING", "WAITING_APPROVAL", "APPROVED"];
+
+function validateWarehouse(data, current = null) {
+  const code = data.warehouseCode ?? current?.warehouseCode;
+  const name = data.warehouseName ?? current?.warehouseName;
+  if (!code) {
+    const error = new Error("warehouseCode wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!name) {
+    const error = new Error("warehouseName wajib diisi.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (data.capacity != null && Number(data.capacity) < 0) {
+    const error = new Error("capacity tidak boleh negatif.");
+    error.statusCode = 400;
+    throw error;
+  }
+}
+
+async function enrichWarehouseRows(items) {
+  const codes = items.map((item) => item.warehouseCode);
+  if (!codes.length) return [];
+  const [stockGroups, rackGroups, stoGroups] = await Promise.all([
+    prisma.stockBalance.groupBy({
+      by: ["warehouseCode"],
+      where: { warehouseCode: { in: codes }, isDeleted: false },
+      _count: { _all: true },
+      _sum: {
+        qtyOnHand: true,
+        qtyAvailable: true,
+        qtyReserved: true,
+        qtyQC: true,
+      },
+    }),
+    prisma.rack.groupBy({
+      by: ["warehouseCode"],
+      where: { warehouseCode: { in: codes }, isDeleted: false, isActive: true },
+      _count: { _all: true },
+    }),
+    prisma.stockOpnameHeader.groupBy({
+      by: ["warehouseCode"],
+      where: {
+        warehouseCode: { in: codes },
+        isDeleted: false,
+        status: { in: ACTIVE_STO_STATUSES },
+      },
+      _count: { _all: true },
+    }),
+  ]);
+  const stockByWarehouse = new Map(stockGroups.map((group) => [group.warehouseCode, group]));
+  const racksByWarehouse = new Map(rackGroups.map((group) => [group.warehouseCode, group._count._all]));
+  const stoByWarehouse = new Map(stoGroups.map((group) => [group.warehouseCode, group._count._all]));
+  return items.map((item) => {
+    const stock = stockByWarehouse.get(item.warehouseCode);
+    return mapDoc({
+      ...item,
+      rackCount: racksByWarehouse.get(item.warehouseCode) || 0,
+      stockItemCount: stock?._count?._all || 0,
+      qtyOnHand: stock?._sum?.qtyOnHand || 0,
+      qtyAvailable: stock?._sum?.qtyAvailable || 0,
+      qtyReserved: stock?._sum?.qtyReserved || 0,
+      qtyQC: stock?._sum?.qtyQC || 0,
+      activeStoCount: stoByWarehouse.get(item.warehouseCode) || 0,
+    });
+  });
+}
 
 // ============================================
 // GENERATE WAREHOUSE CODE
@@ -97,7 +172,7 @@ exports.list = async (req, res, next) => {
     ]);
 
     res.json({
-      items: items.map(mapDoc),
+      items: await enrichWarehouseRows(items),
       total,
       page: pageNumber,
       limit: limitNumber,
@@ -114,15 +189,68 @@ exports.get = async (req, res, next) => {
   try {
     const { code } = req.params;
 
-    const warehouse = await prisma.warehouse.findUnique({
-      where: { warehouseCode: code },
+    const warehouse = await prisma.warehouse.findFirst({
+      where: { warehouseCode: code, isDeleted: false },
+      include: {
+        racks: {
+          where: { isDeleted: false },
+          orderBy: [{ zone: "asc" }, { rackCode: "asc" }],
+        },
+        stockOpnameHeaders: {
+          where: { isDeleted: false, status: { in: ACTIVE_STO_STATUSES } },
+          orderBy: { stoDate: "desc" },
+          select: {
+            stoNo: true,
+            stoType: true,
+            stoDate: true,
+            status: true,
+            inventoryFrozen: true,
+          },
+        },
+        stockMovements: {
+          where: { isDeleted: false },
+          orderBy: { movementDate: "desc" },
+          take: 20,
+          select: {
+            movementNumber: true,
+            movementDate: true,
+            movementType: true,
+            direction: true,
+            transactionType: true,
+            partCode: true,
+            materialCode: true,
+            rackCode: true,
+            lotNumber: true,
+            qty: true,
+            uomCode: true,
+            referenceNumber: true,
+          },
+        },
+      },
     });
 
     if (!warehouse) {
       return res.status(404).json({ message: "Warehouse tidak ditemukan" });
     }
 
-    res.json(mapDoc(warehouse));
+    const [enriched] = await enrichWarehouseRows([warehouse]);
+    const stockByType = await prisma.stockBalance.groupBy({
+      by: ["stockType"],
+      where: { warehouseCode: code, isDeleted: false },
+      _count: { _all: true },
+      _sum: { qtyOnHand: true, qtyAvailable: true, qtyReserved: true, qtyQC: true },
+    });
+    res.json(mapDoc({
+      ...enriched,
+      inventoryByType: stockByType.map((group) => ({
+        stockType: group.stockType || "Unclassified",
+        stockLines: group._count._all,
+        qtyOnHand: group._sum.qtyOnHand || 0,
+        qtyAvailable: group._sum.qtyAvailable || 0,
+        qtyReserved: group._sum.qtyReserved || 0,
+        qtyQC: group._sum.qtyQC || 0,
+      })),
+    }));
   } catch (e) {
     next(e);
   }
@@ -134,6 +262,7 @@ exports.get = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const data = normalizeWarehousePayload(req.body);
+    validateWarehouse(data);
 
     const warehouse = await prisma.warehouse.create({
       data,
@@ -152,6 +281,10 @@ exports.update = async (req, res, next) => {
   try {
     const { code } = req.params;
     const data = normalizeWarehousePayload(req.body);
+    const current = await prisma.warehouse.findFirst({ where: { warehouseCode: code, isDeleted: false } });
+    if (!current) return res.status(404).json({ message: "Warehouse tidak ditemukan" });
+    delete data.warehouseCode;
+    validateWarehouse(data, current);
 
     const warehouse = await prisma.warehouse.update({
       where: { warehouseCode: code },
@@ -170,7 +303,12 @@ exports.update = async (req, res, next) => {
 exports.remove = async (req, res, next) => {
   try {
     const { code } = req.params;
-
+    const [stockLines, activeSto] = await Promise.all([
+      prisma.stockBalance.count({ where: { warehouseCode: code, isDeleted: false, qtyOnHand: { not: 0 } } }),
+      prisma.stockOpnameHeader.count({ where: { warehouseCode: code, isDeleted: false, status: { in: ACTIVE_STO_STATUSES } } }),
+    ]);
+    if (activeSto > 0) return res.status(409).json({ message: "Warehouse tidak dapat dihapus karena masih memiliki Stock Opname aktif." });
+    if (stockLines > 0) return res.status(409).json({ message: "Warehouse tidak dapat dihapus karena masih memiliki saldo stok." });
     await prisma.warehouse.update({
       where: { warehouseCode: code },
       data: { isDeleted: true },
@@ -193,10 +331,15 @@ exports.bulkCreate = async (req, res, next) => {
       return res.status(400).json({ message: "Warehouses harus berupa array" });
     }
 
+    const normalizedWarehouses = warehouses.map((warehouse) => {
+      const data = normalizeWarehousePayload(warehouse);
+      validateWarehouse(data);
+      return data;
+    });
     const createdWarehouses = await prisma.$transaction(
-      warehouses.map((warehouse) =>
+      normalizedWarehouses.map((warehouse) =>
         prisma.warehouse.create({
-          data: normalizeWarehousePayload(warehouse),
+          data: warehouse,
         })
       )
     );
@@ -221,6 +364,17 @@ exports.bulkRemove = async (req, res, next) => {
       return res.status(400).json({ message: "IDs harus berupa array" });
     }
 
+    const targets = await prisma.warehouse.findMany({
+      where: { id: { in: ids }, isDeleted: false },
+      select: { id: true, warehouseCode: true },
+    });
+    const codes = targets.map((item) => item.warehouseCode);
+    const [stockLines, activeSto] = await Promise.all([
+      prisma.stockBalance.count({ where: { warehouseCode: { in: codes }, isDeleted: false, qtyOnHand: { not: 0 } } }),
+      prisma.stockOpnameHeader.count({ where: { warehouseCode: { in: codes }, isDeleted: false, status: { in: ACTIVE_STO_STATUSES } } }),
+    ]);
+    if (activeSto > 0) return res.status(409).json({ message: "Bulk remove ditolak karena terdapat Stock Opname aktif." });
+    if (stockLines > 0) return res.status(409).json({ message: "Bulk remove ditolak karena terdapat saldo stok." });
     await prisma.warehouse.updateMany({
       where: { id: { in: ids } },
       data: { isDeleted: true },

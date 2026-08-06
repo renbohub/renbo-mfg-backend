@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { prisma } = require("../../index");
 const { buildSoLineReferenceNumber } = require("../../services/production/sales-order/soReservationService");
 const { syncOperationalSalesOrderStatus } = require("../../services/production/sales-order/soStatusService");
+const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const scheduleNumber = () => `DS-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
 async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy) {
@@ -19,6 +20,7 @@ async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy
     const take = Math.min(remaining, open, available);
     if (take <= 0) continue;
     const balance = reservation.stockBalance;
+    await assertStockBalanceNotFrozen(tx, balance.id);
     const qtyBefore = Number(balance.qtyOnHand || 0);
     const qtyAfter = qtyBefore - take;
     const reservedAfter = Math.max(0, Number(balance.qtyReserved || 0) - take);

@@ -7,6 +7,9 @@ const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameF
 const {
   buildExcludeSpecialRackCondition,
 } = require("../inventory/utils/stockReservationHelpers");
+const {
+  getRoutingOperations,
+} = require("./services/productionWorkflowService");
 
 const FINAL_STOCK_TYPE = "Finished Goods";
 const WIP_STOCK_TYPE = "WIP";
@@ -1066,6 +1069,39 @@ async function reduceReceivedQcHoldStock(tx, movement, now = new Date()) {
 }
 
 async function assertVendorProcessSequenceReady(tx, order) {
+  const capacityAllocationId = String(order?.notes || "").match(/\[CAPACITY-VENDOR:([^\]]+)\]/)?.[1] || null;
+  if (capacityAllocationId) {
+    const allocation = await tx.productionPlanAllocation.findFirst({
+      where: { id: capacityAllocationId, isDeleted: false },
+      select: { predecessorAllocationIds: true },
+    });
+    const predecessorIds = Array.isArray(allocation?.predecessorAllocationIds)
+      ? allocation.predecessorAllocationIds.filter(Boolean)
+      : [];
+    if (!predecessorIds.length) return;
+    const completedPredecessors = await tx.dailyProductionSchedule.findMany({
+      where: {
+        moId: order.moId,
+        productionPlanAllocationId: { in: predecessorIds },
+        isDeleted: false,
+        status: "Completed",
+      },
+      select: { productionPlanAllocationId: true },
+    });
+    const completedIds = new Set(completedPredecessors.map((row) => row.productionPlanAllocationId));
+    const missingIds = predecessorIds.filter((id) => !completedIds.has(id));
+    if (!missingIds.length) return;
+    const blockers = await tx.dailyProductionSchedule.findMany({
+      where: { moId: order.moId, productionPlanAllocationId: { in: missingIds }, isDeleted: false },
+      select: { scheduleNumber: true, status: true },
+      orderBy: [{ scheduleDate: "asc" }, { scheduleNumber: "asc" }],
+    });
+    const label = blockers.length
+      ? blockers.map((row) => `${row.scheduleNumber} (${row.status})`).join(", ")
+      : `${missingIds.length} predecessor DPP belum terbit`;
+    throw Object.assign(new Error(`Vendor Process belum bisa dikirim. Predecessor DPP belum selesai: ${label}.`), { statusCode: 409 });
+  }
+
   if (!order?.moId || order.sequence === null || order.sequence === undefined) {
     return;
   }
@@ -1312,14 +1348,43 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
       statusCode: 400,
     });
   }
+  const capacityVendorAllocations = mo.monthlyProductionPlanNumber && mo.monthlyProductionPlanLineNumber != null
+    ? await tx.productionPlanAllocation.findMany({
+      where: {
+        isDeleted: false,
+        status: { in: ["Draft", "Published"] },
+        routingMode: "VENDOR",
+        plan: { planNumber: mo.monthlyProductionPlanNumber, isDeleted: false },
+        OR: [
+          { lineNumber: mo.monthlyProductionPlanLineNumber },
+          {
+            dailyProductionSchedules: {
+              some: { moId: mo.id, shift: "VENDOR", isDeleted: false },
+            },
+          },
+        ],
+      },
+      include: {
+        vendor: { select: { id: true, vendorCode: true, vendorName: true } },
+        mbomProcess: {
+          include: {
+            process: { select: { id: true, processCode: true, processName: true } },
+          },
+        },
+      },
+      orderBy: [{ vendorSendDate: "asc" }, { scheduleDate: "asc" }, { createdAt: "asc" }],
+    })
+    : [];
+  const capacityVendorProcessIds = new Set(capacityVendorAllocations.map((row) => row.mbomProcessId));
   const requestedStartSequence = toNumber(
     options.startSequence ?? mo?.sourceStartSequence,
     0,
   ) || inferStartSequenceFromSourcePartCode(operations, mo?.sourcePartCode);
+  const bomVendorOperations = operations.filter((operation) => !capacityVendorProcessIds.has(operation.process.id));
   const scopedOperations = requestedStartSequence > 0
-    ? operations.filter(operation => toNumber(operation.sequence) >= requestedStartSequence)
-    : operations;
-  if (scopedOperations.length === 0) {
+    ? bomVendorOperations.filter(operation => toNumber(operation.sequence) >= requestedStartSequence)
+    : bomVendorOperations;
+  if (scopedOperations.length === 0 && capacityVendorAllocations.length === 0) {
     if (requireVendorOperations) {
       throw Object.assign(new Error("Tidak ada MBOM Detail category Vendor untuk MO ini."), {
         statusCode: 400,
@@ -1393,6 +1458,123 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
       },
     });
     created.push(order);
+  }
+
+  if (capacityVendorAllocations.length > 0) {
+    const { operations: inHouseOperations } = await getRoutingOperations(tx, mo);
+    const capacityOperationByProcessId = new Map(inHouseOperations.map((operation) => [operation.process?.id, operation]));
+    // A capacity recommendation may keep an existing Vendor-category routing
+    // as vendor work, not only redirect an in-house route. Adapt those vendor
+    // operations to the same component identity used by capacity VPOs.
+    for (const vendorOperation of operations) {
+      capacityOperationByProcessId.set(vendorOperation.process?.id, {
+        mbomDetailId: vendorOperation.detail?.id || null,
+        componentPartId: vendorOperation.inputPart?.id || null,
+        componentPartCode: vendorOperation.inputPart?.partCode || null,
+        componentPartNumber: vendorOperation.inputPart?.partNumber || null,
+        componentPartName: vendorOperation.inputPart?.partName || null,
+        uomCode: vendorOperation.detail?.uomCode || mo.uomCode || null,
+        sequence: vendorOperation.sequence || 0,
+      });
+    }
+    for (const allocation of capacityVendorAllocations) {
+      const operation = capacityOperationByProcessId.get(allocation.mbomProcessId);
+      if (!operation) continue;
+      const marker = `[CAPACITY-VENDOR:${allocation.id}]`;
+      const duplicate = await tx.vendorProcessOrder.findFirst({
+        where: { moId: mo.id, isDeleted: false, notes: { contains: marker } },
+      });
+      if (duplicate) {
+        existing.push(duplicate);
+        continue;
+      }
+      const qtyPlanned = roundQuantity(toNumber(allocation.plannedQty));
+      const dueDate = allocation.vendorReturnDate || allocation.scheduleDate || mo.plannedEndDate || null;
+      const orderNumber = await generateVendorProcessOrderNumber(tx);
+      const predecessorAllocationIds = Array.isArray(allocation.predecessorAllocationIds)
+        ? allocation.predecessorAllocationIds.filter(Boolean)
+        : [];
+      const predecessorDailyPlan = predecessorAllocationIds.length
+        ? await tx.dailyProductionSchedule.findFirst({
+            where: {
+              moId: mo.id,
+              productionPlanAllocationId: { in: predecessorAllocationIds },
+              isDeleted: false,
+              woId: { not: null },
+            },
+            select: { woId: true },
+            orderBy: [{ scheduleDate: "desc" }, { createdAt: "desc" }],
+          })
+        : null;
+      const predecessorWorkOrder = predecessorDailyPlan?.woId
+        ? await tx.workOrder.findFirst({
+            where: { id: predecessorDailyPlan.woId, isDeleted: false },
+            select: {
+              outputPartId: true,
+              outputPartCode: true,
+              outputPartNumber: true,
+              outputPartName: true,
+            },
+          })
+        : null;
+      const inputPart = {
+        id: predecessorWorkOrder?.outputPartId || operation.componentPartId || null,
+        code: predecessorWorkOrder?.outputPartCode || operation.componentPartCode || null,
+        number: predecessorWorkOrder?.outputPartNumber || operation.componentPartNumber || null,
+        name: predecessorWorkOrder?.outputPartName || operation.componentPartName || null,
+      };
+      const costSnapshot = await resolveVendorPriceSnapshot(tx, {
+        vendorCode: allocation.vendor?.vendorCode || null,
+        inputPartId: inputPart.id,
+        inputPartCode: inputPart.code,
+        outputPartId: operation.componentPartId || null,
+        outputPartCode: operation.componentPartCode || null,
+        processCode: allocation.mbomProcess?.process?.processCode || null,
+        processName: allocation.mbomProcess?.process?.processName || null,
+        qtyPlanned,
+      });
+      const phase = {
+        allocationId: allocation.id,
+        sendDate: allocation.vendorSendDate || allocation.scheduleDate,
+        returnDate: allocation.vendorReturnDate || allocation.scheduleDate,
+        qtySend: allocation.plannedQty,
+        expectedReturnQty: allocation.expectedReturnQty ?? allocation.plannedQty,
+      };
+      created.push(await tx.vendorProcessOrder.create({
+        data: {
+          orderNumber,
+          orderDate: new Date(),
+          moId: mo.id,
+          moNumber: mo.moNumber,
+          mbomHeaderId: mbomHeader.id,
+          mbomNoReg: mbomHeader.noReg,
+          mbomDetailId: operation.mbomDetailId || null,
+          mbomProcessId: allocation.mbomProcessId,
+          processId: allocation.mbomProcess?.processId || operation.processId || null,
+          processCode: allocation.mbomProcess?.process?.processCode || null,
+          processName: allocation.mbomProcess?.process?.processName || null,
+          sequence: operation.sequence || 0,
+          vendorCode: allocation.vendor?.vendorCode || null,
+          vendorName: allocation.vendor?.vendorName || null,
+          inputPartId: inputPart.id,
+          inputPartCode: inputPart.code,
+          inputPartNumber: inputPart.number,
+          inputPartName: inputPart.name,
+          outputPartId: operation.componentPartId || null,
+          outputPartCode: operation.componentPartCode || null,
+          outputPartNumber: operation.componentPartNumber || null,
+          outputPartName: operation.componentPartName || null,
+          stockType: WIP_STOCK_TYPE,
+          qtyPlanned,
+          uomCode: operation.uomCode || mo.uomCode || null,
+          ...costSnapshot,
+          dueDate,
+          status: allocation.vendor?.vendorCode ? "Ready to Send" : "Planned",
+          createdBy,
+          notes: `${marker} Internal BOM process dialihkan ke vendor dari Capacity Planning; phase ${JSON.stringify(phase)}`,
+        },
+      }));
+    }
   }
 
   return { created, existing, mbomNoReg: mbomHeader.noReg };
@@ -1687,7 +1869,7 @@ exports.send = async (req, res, next) => {
           notes: `Send WO output ${sourceWorkOrder.woNumber} to vendor ${order.vendorCode || ""} for ${order.orderNumber}`.trim(),
         }));
       } else if (sourceType === SOURCE_PREVIOUS_WIP) {
-        const balances = await findPreviousWipBalances(tx, order);
+        const balances = await findPreviousWipBalances(tx, order, req.body || {});
         sourceMovements = await consumeSourceBalancesForVendorSend(
           tx,
           order,
@@ -1805,6 +1987,19 @@ exports.send = async (req, res, next) => {
           status,
         },
       });
+
+      const capacityAllocationId = String(order.notes || "").match(/\[CAPACITY-VENDOR:([^\]]+)\]/)?.[1] || null;
+      if (capacityAllocationId) {
+        await tx.dailyProductionSchedule.updateMany({
+          where: {
+            moId: order.moId,
+            productionPlanAllocationId: capacityAllocationId,
+            isDeleted: false,
+            status: { in: ["Draft", "Released", "In Progress"] },
+          },
+          data: { status: "In Progress" },
+        });
+      }
 
       return { updated, movementNumber, movementNumbers };
     });

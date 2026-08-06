@@ -16,6 +16,18 @@ const {
   queueDirtyItem,
 } = require("../../utils/mrpDirtyQueue");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
+const { planningMonthKey } = require("../../utils/planningMonth");
+const { MONTHLY_SOURCE_PREFIX, syncMonthlyMps } = require("./monthlyPlanningService");
+
+function preferCanonicalMonthlyMps(rows = []) {
+  const canonicalMonths = new Set(rows
+    .filter((row) => String(row.sourceKey || "").startsWith(MONTHLY_SOURCE_PREFIX))
+    .map((row) => planningMonthKey(row.periodStart)));
+  return rows.filter((row) => (
+    String(row.sourceKey || "").startsWith(MONTHLY_SOURCE_PREFIX)
+    || !canonicalMonths.has(planningMonthKey(row.periodStart))
+  ));
+}
 
 function createRequirementIdentity(parentRequirementId = null, rootRequirementId = null) {
   const id = randomUUID();
@@ -102,11 +114,12 @@ function resolveKgPerPcs(part) {
 
 function normalizePurchasingSupplyQty(row) {
   const qty = Number(row?.qty || 0);
-  if (qty <= 0) return 0;
-  if (!isKgUom(row?.uomCode)) return qty;
-
-  const kgPerPcs = resolveKgPerPcs(row?.part);
-  return kgPerPcs ? qty / kgPerPcs : qty;
+  // PR quantities are already stored in the MRP demand UOM. PO quantities can
+  // be SHEET/COIL/PCS, but callers normalize them through conversion fields
+  // before reaching this function. Dividing KG by the part gross weight here
+  // converts the same supply twice and causes almost the full demand to be
+  // planned again on every monthly rerun.
+  return qty > 0 ? qty : 0;
 }
 
 function normalizeReleaseQtyToPlannedOrderBase(qty, uomCode, plannedOrder) {
@@ -527,6 +540,9 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
         qty: true,
         qtyReceived: true,
         uomCode: true,
+        convertedPurchaseQty: true,
+        conversionFactor: true,
+        conversionUomCode: true,
       },
     }),
   ]);
@@ -641,10 +657,19 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   }
 
   for (const row of purchaseOrderDetails) {
+    const conversionFactor = Number(row.conversionFactor || 0);
+    const orderedDemandQty = Number(row.convertedPurchaseQty || 0);
+    const usesPurchaseConversion = orderedDemandQty > 0
+      && conversionFactor > 0
+      && normalizeUomCode(row.conversionUomCode);
+    const remainingQty = usesPurchaseConversion
+      ? orderedDemandQty - (Number(row.qtyReceived || 0) * conversionFactor)
+      : Number(row.qty || 0) - Number(row.qtyReceived || 0);
     const openQty = Math.max(
       normalizePurchasingSupplyQty({
         ...row,
-        qty: Number(row.qty || 0) - Number(row.qtyReceived || 0),
+        qty: remainingQty,
+        uomCode: usesPurchaseConversion ? row.conversionUomCode : row.uomCode,
         part: supplyPartByCode.get(normalizePartCode(row.partCode)),
       }),
       0,
@@ -2221,16 +2246,20 @@ async function invokeExistingMrpRun(mpsNumber, runDate = new Date(), runBy = "sy
 
 async function runFullNightlyMrp(tx = prisma, options = {}) {
   const { runBy = "system", runDate = new Date() } = options;
-  const soOnlyTargets = await buildOpenSoOnlyTargets(tx);
+  const monthlySync = await syncMonthlyMps(tx, { runBy });
+  const coveredSoNumbers = new Set(monthlySync.coveredSoNumbers);
+  const allSoOnlyTargets = await buildOpenSoOnlyTargets(tx);
+  const soOnlyTargets = new Map([...allSoOnlyTargets.entries()]
+    .filter(([soNumber]) => !coveredSoNumbers.has(soNumber)));
 
-  const mpsList = await tx.mPS.findMany({
+  const mpsList = preferCanonicalMonthlyMps(await tx.mPS.findMany({
     where: {
       isDeleted: false,
       status: { in: ["Confirmed", "Released"] },
     },
-    select: { mpsNumber: true },
+    select: { mpsNumber: true, sourceKey: true, periodStart: true },
     orderBy: { periodStart: "asc" },
-  });
+  }));
 
   const results = [];
   for (const [soNumber, partCodeSet] of soOnlyTargets.entries()) {
@@ -2288,6 +2317,11 @@ async function runFullNightlyMrp(tx = prisma, options = {}) {
         partCodes: [...partCodes],
       })),
       mpsNumbers: mpsList.map((m) => m.mpsNumber),
+      monthlySync: {
+        months: monthlySync.months,
+        mpsNumbers: monthlySync.changedMpsNumbers,
+        coveredSoNumbers: monthlySync.coveredSoNumbers,
+      },
       successCount,
       failedCount,
       cleanup,
@@ -2336,16 +2370,26 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
     data: { status: "Processing" },
   });
 
+  const monthlySync = await syncMonthlyMps(tx, { runBy });
   const dirtyItemIds = dirtyItems.map((item) => item.itemId);
   const impactedTree = await buildBomImpactTree(tx, dirtyItemIds);
   const impactedItemIds = impactedTree.map((node) => node.itemId);
   const snapshot = await buildSupplyDemandSnapshot(tx, impactedTree, new Date());
-  const mpsNumbers = await findImpactedMpsNumbers(tx, impactedItemIds);
+  const impactedMpsNumbers = await findImpactedMpsNumbers(tx, impactedItemIds);
+  const candidateMpsNumbers = uniq(impactedMpsNumbers);
+  const candidateMpsRows = candidateMpsNumbers.length
+    ? await tx.mPS.findMany({
+      where: { mpsNumber: { in: candidateMpsNumbers }, isDeleted: false },
+      select: { mpsNumber: true, sourceKey: true, periodStart: true },
+    })
+    : [];
+  const mpsNumbers = preferCanonicalMonthlyMps(candidateMpsRows).map((row) => row.mpsNumber);
   const partMap = await loadPartMap(tx, dirtyItemIds);
   const soOnlyPartCodesByNumber = new Map();
 
   for (const dirtyItem of dirtyItems) {
     if (String(dirtyItem.reason || "").toLowerCase() !== "sales-order-demand" || !dirtyItem.sourceNumber) continue;
+    if (monthlySync.coveredSoNumbers.includes(dirtyItem.sourceNumber)) continue;
     const partCode = normalizePartCode(partMap.get(dirtyItem.itemId)?.partCode);
     if (!partCode) continue;
     if (!soOnlyPartCodesByNumber.has(dirtyItem.sourceNumber)) {
@@ -2402,6 +2446,11 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
       impactedItemIds,
       snapshot,
       mpsNumbers,
+      monthlySync: {
+        months: monthlySync.months,
+        mpsNumbers: monthlySync.changedMpsNumbers,
+        coveredSoNumbers: monthlySync.coveredSoNumbers,
+      },
       soOnlyRuns: [...soOnlyPartCodesByNumber.entries()].map(([soNumber, partCodes]) => ({
         soNumber,
         partCodes: [...partCodes],
@@ -2415,8 +2464,11 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
   await tx.mRPDirtyItem.updateMany({
     where: { id: { in: dirtyItems.map((item) => item.id) } },
     data: {
-      status: "Done",
-      processedAt: new Date(),
+      status: failedCount > 0 ? "Failed" : "Done",
+      processedAt: failedCount > 0 ? null : new Date(),
+      notes: failedCount > 0
+        ? `Net-change MRP gagal: ${results.filter((result) => result && result.ok === false).map((result) => result.error || result.mpsNumber || result.soNumber).join("; ")}`
+        : undefined,
     },
   });
 

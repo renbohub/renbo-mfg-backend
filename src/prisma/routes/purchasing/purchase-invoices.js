@@ -13,6 +13,7 @@ const invoiceApproval = approvalGate({
   model: "purchaseInvoice",
   lookupField: "invoiceNumber",
   numberField: "invoiceNumber",
+  requireExistingRequest: true,
 });
 
 router.get("/", authorize("purchaseOrder", "read"), controller.list);

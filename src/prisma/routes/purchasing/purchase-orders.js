@@ -5,8 +5,8 @@ const { logger } = require("../../middleware/logger");
 const { uploadQuotationFiles } = require("../../middleware/uploads");
 const { approvalGate } = require("../../services/approvalRuleService");
 
-const purchaseOrderApproval = approvalGate({ moduleCode: "purchasing", pageCode: "purchase-order", actionCode: "approve", documentType: "PurchaseOrder", param: "poNumber", model: "purchaseOrder", lookupField: "poNumber", numberField: "poNumber" });
-const purchaseOrderRejection = approvalGate({ moduleCode: "purchasing", pageCode: "purchase-order", actionCode: "approve", documentType: "PurchaseOrder", param: "poNumber", model: "purchaseOrder", lookupField: "poNumber", numberField: "poNumber", decision: "Rejected" });
+const purchaseOrderApproval = approvalGate({ moduleCode: "purchasing", pageCode: "purchase-order", actionCode: "approve", documentType: "PurchaseOrder", param: "poNumber", model: "purchaseOrder", lookupField: "poNumber", numberField: "poNumber", requireExistingRequest: true });
+const purchaseOrderRejection = approvalGate({ moduleCode: "purchasing", pageCode: "purchase-order", actionCode: "approve", documentType: "PurchaseOrder", param: "poNumber", model: "purchaseOrder", lookupField: "poNumber", numberField: "poNumber", decision: "Rejected", requireExistingRequest: true });
 
 // Helper routes di atas /:id/:poNumber agar tidak tertangkap sebagai ID
 router.get("/generate-number", authorize("purchaseOrder", "create"), ctrl.generateNumber);

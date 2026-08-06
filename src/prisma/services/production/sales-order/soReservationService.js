@@ -779,6 +779,20 @@ const syncReservationsForConfirmedSO = async (tx, soHeader, details = []) => {
   });
   existingReservations = await reconcileActiveReservationsWithStock(tx, existingReservations);
 
+  // A deliberate manual unreserve is an explicit exception for this SO line.
+  // Keep it from being recreated by a later SO status synchronization.
+  const manualUnreserveRows = await tx.stockReservation.findMany({
+    where: {
+      referenceType: "SO",
+      ...buildSoReservationReferenceWhere(soHeader.soNumber),
+      isDeleted: false,
+      status: "Cancelled",
+      notes: { startsWith: "[MANUAL-UNRESERVE]" },
+    },
+    select: { referenceNumber: true },
+  });
+  const manualUnreservedReferences = new Set(manualUnreserveRows.map((row) => row.referenceNumber));
+
   const existingMap = new Map();
   for (const reservation of existingReservations) {
     if (!existingMap.has(reservation.referenceNumber)) {
@@ -827,6 +841,7 @@ const syncReservationsForConfirmedSO = async (tx, soHeader, details = []) => {
 
   // Create / adjust reservation sesuai qty detail terbaru
   for (const [referenceNumber, detail] of targetMap.entries()) {
+    if (manualUnreservedReferences.has(referenceNumber)) continue;
     const qtyTarget = Number(detail.qty || 0);
     const existingList = existingMap.get(referenceNumber) || [];
 

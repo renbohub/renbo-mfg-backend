@@ -3,7 +3,7 @@ const ctrl = require("../../controllers/production/ProductionLogController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 const { approvalGate } = require("../../services/approvalRuleService");
-const productionLogApproval = approvalGate({ moduleCode: "production", pageCode: "production-logs", actionCode: "approve", documentType: "ProductionLog", param: "logNumber", model: "productionLog", lookupField: "logNumber", numberField: "logNumber", amountField: "qtyProduced" });
+const productionLogApproval = approvalGate({ moduleCode: "production", pageCode: "production-logs", actionCode: "approve", documentType: "ProductionLog", param: "logNumber", model: "productionLog", lookupField: "logNumber", numberField: "logNumber", amountField: "qtyProduced", requireExistingRequest: true });
 
 // Helper routes HARUS di atas /:logNumber
 router.get("/generate-number", authorize("productionLogs", "create"), ctrl.generateNumber);

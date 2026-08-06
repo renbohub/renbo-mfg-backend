@@ -1,7 +1,6 @@
 const DEFAULT_FORMULAS = Object.freeze({
-  // Safety buffer is based on next-month forecast, net of currently available
-  // FG stock.  A custom Master Formula can still override this rule.
-  MPS_BUFFER_QTY: "max(round(bufferBaseQty * bufferPercent / 100, 6) - stockAvailableQty, 0)",
+  // MPS is gross demand; available FG stock is netted once by MRP.
+  MPS_BUFFER_QTY: "round(bufferBaseQty * bufferPercent / 100, 6)",
   MPS_EFFECTIVE_DEMAND: "forecastQty + bufferQty",
   MPS_TARGET_QTY: "max(effectiveDemandQty * productionPercent / 100, actualSalesOrderQty)",
   MRP_NET_REQUIREMENT: "max(grossRequirement - projectedAvailable, 0)",

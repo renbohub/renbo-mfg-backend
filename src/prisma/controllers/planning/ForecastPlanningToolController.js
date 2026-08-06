@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const MPSController = require("./MPSController");
 const MRPController = require("./MRPController");
 const MonthlyProductionPlanController = require("./MonthlyProductionPlanController");
+const PurchaseSuggestionController = require("../purchasing/PurchaseSuggestionController");
 
 const text = (value) => String(value ?? "").trim() || null;
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
@@ -39,7 +40,36 @@ async function loadSnapshot(forecastNumber = null) {
     include: { details: { where: { isDeleted: false, part: { is: { isDeleted: false, itemType: "FG" } } }, orderBy: { lineNumber: "asc" }, include: { part: { select: { id: true, partCode: true, partName: true, itemType: true } } } } },
   });
   const forecastNumbers = forecasts.map((row) => row.forecastNumber);
-  const mps = forecastNumbers.length ? await prisma.mPS.findMany({ where: { forecastNumber: { in: forecastNumbers }, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { id: true, partCode: true, forecastQty: true, bufferQty: true, effectiveDemandQty: true, qtyPlanned: true, actualSalesOrderQty: true, status: true } } }, orderBy: { periodStart: "asc" } }) : [];
+  const rawMps = forecastNumbers.length ? await prisma.mPS.findMany({
+    where: {
+      isDeleted: false,
+      OR: [
+        { forecastNumber: { in: forecastNumbers } },
+        { details: { some: { isDeleted: false, forecastDetail: { forecastNumber: { in: forecastNumbers } } } } },
+        { details: { some: { isDeleted: false, demandSources: { some: { sourceType: "FORECAST", sourceNumber: { in: forecastNumbers } } } } } },
+      ],
+    },
+    include: {
+      details: {
+        where: { isDeleted: false },
+        select: {
+          id: true, partCode: true, forecastQty: true, bufferQty: true,
+          effectiveDemandQty: true, qtyPlanned: true, actualSalesOrderQty: true, status: true,
+          forecastDetail: { select: { forecastNumber: true } },
+          demandSources: { where: { sourceType: "FORECAST" }, select: { sourceNumber: true } },
+        },
+      },
+    },
+    orderBy: { periodStart: "asc" },
+  }) : [];
+  const mps = rawMps.map((row) => ({
+    ...row,
+    sourceForecastNumbers: [...new Set([
+      row.forecastNumber,
+      ...row.details.map((detail) => detail.forecastDetail?.forecastNumber),
+      ...row.details.flatMap((detail) => detail.demandSources.map((source) => source.sourceNumber)),
+    ].filter(Boolean))],
+  }));
   const mpsNumbers = mps.map((row) => row.mpsNumber);
   const mrpRuns = mpsNumbers.length ? await prisma.mRPRun.findMany({ where: { mpsNumber: { in: mpsNumbers }, isDeleted: false }, select: { runNumber: true, mpsNumber: true, planNumber: true, planRevision: true, status: true, totalRequirements: true, totalPlannedOrders: true, runDate: true, isCurrentPlan: true }, orderBy: { createdAt: "desc" } }) : [];
   const runNumbers = mrpRuns.map((row) => row.runNumber);
@@ -54,7 +84,7 @@ async function loadSnapshot(forecastNumber = null) {
   const purchaseRequests = plannedOrderNumbers.length ? await prisma.purchaseRequisition.findMany({ where: { isDeleted: false, details: { some: { isDeleted: false, plannedOrderNumber: { in: plannedOrderNumbers } } } }, select: { prNumber: true, status: true, sourceType: true, poType: true, requiredDate: true, convertedToPO: true, details: { where: { isDeleted: false, plannedOrderNumber: { in: plannedOrderNumbers } }, select: { plannedOrderNumber: true, partCode: true, materialCode: true, qty: true, uomCode: true, proposedSupplierCode: true, confirmedSupplierCode: true } } } }) : [];
 
   const byForecast = forecasts.map((forecast) => {
-    const forecastMps = mps.filter((row) => row.forecastNumber === forecast.forecastNumber);
+    const forecastMps = mps.filter((row) => row.forecastNumber === forecast.forecastNumber || row.sourceForecastNumbers.includes(forecast.forecastNumber));
     const numbers = new Set(forecastMps.map((row) => row.mpsNumber));
     const forecastMrp = mrpRuns.filter((row) => numbers.has(row.mpsNumber));
     const forecastRuns = new Set(forecastMrp.map((row) => row.runNumber));
@@ -85,7 +115,7 @@ async function loadSnapshot(forecastNumber = null) {
 }
 
 exports.status = async (req, res, next) => {
-  try { res.json(await loadSnapshot(text(req.query.forecastNumber))); } catch (error) { next(error); }
+  try { res.json(await loadSnapshot(text(req.params?.forecastNumber || req.query.forecastNumber))); } catch (error) { next(error); }
 };
 
 exports.sync = async (req, res, next) => {
@@ -115,7 +145,7 @@ exports.sync = async (req, res, next) => {
       if (!item.productionPlans.some((plan) => plan.sourceType === `MPS:${mps.mpsNumber}`)) {
         try { const result = await invoke(MonthlyProductionPlanController.createFromMps, { body: { mpsNumber: mps.mpsNumber, productionPercent: req.body?.productionPercent ?? 100 }, user: req.user }); actions.push({ action: "CREATE_PRODUCTION_PLAN", mpsNumber: mps.mpsNumber, result: result.body }); } catch (error) { actions.push({ action: "CREATE_PRODUCTION_PLAN", mpsNumber: mps.mpsNumber, status: "BLOCKED", message: error.message }); }
       }
-      try { const result = await invoke(MRPController.createPurchaseRequestOutput, { params: { runNumber: run.runNumber }, body: {}, user: req.user }); actions.push({ action: "CREATE_PR", mpsNumber: mps.mpsNumber, result: result.body }); } catch (error) { actions.push({ action: "CREATE_PR", mpsNumber: mps.mpsNumber, status: "BLOCKED", message: error.message }); }
+      try { const result = await invoke(PurchaseSuggestionController.generate, { params: { runNumber: run.runNumber }, body: {}, user: req.user }); actions.push({ action: "CREATE_PURCHASE_SUGGESTION", mpsNumber: mps.mpsNumber, result: result.body }); } catch (error) { actions.push({ action: "CREATE_PURCHASE_SUGGESTION", mpsNumber: mps.mpsNumber, status: "BLOCKED", message: error.message }); }
     }
     const finalState = await loadSnapshot(forecastNumber);
     actions.push({ action: "CREATE_PRODUCTION_LOG_AFTER_MO_WO", status: "MANUAL", message: "Production log tidak dibuat otomatis; MO, WO, shift, operator, qty good/reject dan approval harus diisi di Production module." });

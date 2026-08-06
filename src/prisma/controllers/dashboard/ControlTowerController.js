@@ -5,6 +5,10 @@ const allocationStatus = (required, allocated) => {
   const variance = Number(allocated || 0) - Number(required || 0);
   return Math.abs(variance) <= 0.000001 ? "EXACT" : variance < 0 ? "UNDER" : "OVER";
 };
+const calendarDayStamp = (value) => {
+  const date = new Date(value);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+};
 
 async function purchaseControlBySo(soNumbers = []) {
   if (!soNumbers.length) return new Map();
@@ -74,7 +78,18 @@ function summarizeSalesOrder(so, now = new Date()) {
   const outstandingQty = Math.max(orderedQty - deliveredQty, 0);
   const overdue = so.deliveryDate && new Date(so.deliveryDate) < now && outstandingQty > 0;
   const scheduleRisk = so.deliverySchedules.some((item) => ["Cancelled", "Failed"].includes(item.status));
-  const risk = overdue ? "CRITICAL" : scheduleRisk ? "RISK" : outstandingQty > 0 ? "WARNING" : "HEALTHY";
+  const lateSchedules = so.deliverySchedules.filter((item) => {
+    const actualDate = item.actualDate || item.deliveredAt;
+    return item.status === "Delivered"
+      && item.plannedDate
+      && actualDate
+      && new Date(actualDate) > new Date(item.plannedDate);
+  });
+  const maxLateDays = lateSchedules.reduce((max, item) => {
+    const actualDate = item.actualDate || item.deliveredAt;
+    return Math.max(max, Math.round((calendarDayStamp(actualDate) - calendarDayStamp(item.plannedDate)) / 86400000));
+  }, 0);
+  const risk = overdue ? "CRITICAL" : scheduleRisk || lateSchedules.length ? "RISK" : outstandingQty > 0 ? "WARNING" : "HEALTHY";
   return {
     soNumber: so.soNumber,
     customer: so.customer,
@@ -89,7 +104,11 @@ function summarizeSalesOrder(so, now = new Date()) {
     parts: [...new Set(so.details.map((detail) => detail.partCode).filter(Boolean))],
     deliverySchedules: so.deliverySchedules,
     demandStatus: "CONFIRMED",
-    deliveryStatus: outstandingQty === 0 ? "COMPLETED" : "OPEN",
+    deliveryStatus: outstandingQty === 0
+      ? lateSchedules.length ? "COMPLETED_LATE" : "COMPLETED"
+      : "OPEN",
+    lateDeliveryCount: lateSchedules.length,
+    maxLateDays,
     risk,
   };
 }
@@ -99,9 +118,10 @@ exports.list = async (req, res, next) => {
     const page = Math.max(Number(req.query.page || 1), 1);
     const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 500);
     const q = String(req.query.q || req.query.search || "").trim();
+    const activeOnly = [true, "true", "1"].includes(req.query.activeOnly);
     const where = {
       isDeleted: false,
-      status: { notIn: ["Cancelled", "Completed"] },
+      status: { notIn: activeOnly ? ["Cancelled", "Completed"] : ["Cancelled"] },
       ...(q ? { OR: [
         { soNumber: { contains: q, mode: "insensitive" } },
         { customerCode: { contains: q, mode: "insensitive" } },
@@ -138,7 +158,7 @@ exports.list = async (req, res, next) => {
         purchaseSuppliers: purchase?.suppliers || [],
       };
     });
-    res.json({ items, total: count, page, limit, summary: { total: count, critical: items.filter((item) => item.risk === "CRITICAL").length, risk: items.filter((item) => item.risk === "RISK").length, warning: items.filter((item) => item.risk === "WARNING").length } });
+    res.json({ items, total: count, page, limit, summary: { total: count, critical: items.filter((item) => item.risk === "CRITICAL").length, risk: items.filter((item) => item.risk === "RISK").length, warning: items.filter((item) => item.risk === "WARNING").length, completedLate: items.filter((item) => item.deliveryStatus === "COMPLETED_LATE").length } });
   } catch (error) { next(error); }
 };
 

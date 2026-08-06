@@ -52,9 +52,25 @@ async function assertStockBalanceNotFrozen(tx, stockBalanceId, options = {}) {
   await assertStockBalancesNotFrozen(tx, [stockBalanceId], options);
 }
 
+async function assertWarehouseNotFrozen(tx, warehouseCode, options = {}) {
+  if (!warehouseCode) return;
+  const lock = await tx.stockOpnameHeader.findFirst({
+    where: {
+      warehouseCode,
+      isDeleted: false,
+      inventoryFrozen: true,
+      status: { in: ACTIVE_FROZEN_STO_STATUSES },
+      ...(options.allowStoNo ? { stoNo: { not: options.allowStoNo } } : {}),
+    },
+    select: { stoNo: true, status: true },
+  });
+  if (lock) throwFrozenStockError({ header: lock });
+}
+
 module.exports = {
   ACTIVE_FROZEN_STO_STATUSES,
   assertStockBalanceNotFrozen,
   assertStockBalancesNotFrozen,
+  assertWarehouseNotFrozen,
   findFrozenStockOpnameLock,
 };

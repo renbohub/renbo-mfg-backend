@@ -1,7 +1,9 @@
 const { prisma } = require("../../index");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
+const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
+const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 
-const include = { details: { where: { isDeleted: false, part: { is: { isDeleted: false, itemType: "FG" } } }, orderBy: { lineNumber: "asc" }, include: { part: true } } };
+const include = { details: { where: { isDeleted: false, part: { is: { isDeleted: false, itemType: "FG" } } }, orderBy: { lineNumber: "asc" }, include: { part: true, deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } } };
 const text = (value) => String(value ?? "").trim() || null;
 const date = (value) => {
   if (!value) return null;
@@ -29,7 +31,10 @@ function detailData(row, index, forecastNumber, part) {
   };
 }
 
-async function normalizeForecastDetails(rows, tx) {
+async function normalizeForecastDetails(rows, tx, customerCode) {
+  const selectedCustomerCode = text(customerCode);
+  if (!selectedCustomerCode) throw Object.assign(new Error("Customer Forecast wajib dipilih sebelum memilih Part FG."), { statusCode: 400 });
+  const normalizedCustomerCode = selectedCustomerCode.toUpperCase();
   const partIds = [...new Set(rows.map((row) => text(row.partId)).filter(Boolean))];
   const partCodes = [...new Set(rows.map((row) => text(row.partCode)).filter(Boolean))];
   const parts = (partIds.length || partCodes.length) ? await tx.part.findMany({
@@ -41,7 +46,7 @@ async function normalizeForecastDetails(rows, tx) {
         ...(partCodes.length ? [{ partCode: { in: partCodes } }] : []),
       ],
     },
-    select: { id: true, partCode: true, itemType: true },
+    select: { id: true, partCode: true, itemType: true, customerCode: true, customerCodes: true },
   }) : [];
   const byId = new Map(parts.map((part) => [part.id, part]));
   const byCode = new Map(parts.map((part) => [part.partCode, part]));
@@ -49,6 +54,10 @@ async function normalizeForecastDetails(rows, tx) {
     const part = byId.get(text(row.partId)) || byCode.get(text(row.partCode));
     if (!part) {
       throw Object.assign(new Error(`Baris forecast ${index + 1} wajib memilih Part dengan item type FG. Child/WIP/RAW tidak boleh masuk Forecast.`), { statusCode: 400 });
+    }
+    const linkedCustomers = [part.customerCode, ...(part.customerCodes || [])].map((value) => String(value || "").trim().toUpperCase()).filter(Boolean);
+    if (!linkedCustomers.includes(normalizedCustomerCode)) {
+      throw Object.assign(new Error(`Baris forecast ${index + 1}: Part ${part.partCode} tidak terikat ke customer ${selectedCustomerCode}.`), { statusCode: 400 });
     }
     if (!text(row.forecastMonth || row.M1Forecast) || number(row.forecastQty ?? row.M1Qty) <= 0) {
       throw Object.assign(new Error(`Baris forecast ${index + 1} wajib memiliki bulan dan qty lebih dari 0.`), { statusCode: 400 });
@@ -70,6 +79,20 @@ function toMonthlyRows(rows = []) {
   });
 }
 
+function deriveForecastPeriod(rows = []) {
+  const months = toMonthlyRows(rows)
+    .map((row) => date(row.forecastMonth))
+    .filter(Boolean)
+    .sort((a, b) => a - b);
+  if (!months.length) throw Object.assign(new Error("Periode Forecast tidak dapat dihitung karena bulan forecast belum diisi."), { statusCode: 400 });
+  const first = months[0];
+  const last = months[months.length - 1];
+  return {
+    periodStart: new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), 1)),
+    periodEnd: new Date(Date.UTC(last.getUTCFullYear(), last.getUTCMonth() + 1, 0)),
+  };
+}
+
 function serialize(doc) {
   if (!doc) return doc;
   return { ...doc, details: toMonthlyRows(doc.details) };
@@ -81,7 +104,7 @@ function headerData(body, user) {
   const periodStart = date(body.periodStart); const periodEnd = date(body.periodEnd);
   if (!periodStart || !periodEnd) throw Object.assign(new Error("Periode Forecast wajib diisi dengan tanggal yang valid."), { statusCode: 400 });
   if (periodStart > periodEnd) throw Object.assign(new Error("Periode mulai tidak boleh melewati periode selesai."), { statusCode: 400 });
-  return { forecastName: text(body.forecastName), periodStart, periodEnd, customerCode: text(body.customerCode), demandBucket, sourceBatchNumber: text(body.sourceBatchNumber), status: text(body.status) || "Draft", notes: text(body.notes), createdBy: user?.username || user?.email || null };
+  return { forecastName: text(body.forecastName), periodStart, periodEnd, customerCode: text(body.customerCode), demandBucket, sourceBatchNumber: text(body.sourceBatchNumber), status: "Draft", notes: text(body.notes), createdBy: user?.username || user?.email || null };
 }
 
 const monthKey = (value) => { const d = date(value); return d && !Number.isNaN(d.getTime()) ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01` : null; };
@@ -162,25 +185,53 @@ exports.demandSummary = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.monthlyConsumption = async (req, res, next) => {
+  try {
+    const detailRows = await buildDemandSummary({ startDate: text(req.query.startDate), endDate: text(req.query.endDate) });
+    const months = new Map();
+    for (const row of detailRows) {
+      const item = months.get(row.month) || { month: row.month, forecastQty: 0, actualSalesOrderQty: 0, effectiveDemandQty: 0, forecastNumbers: new Set(), customerCodes: new Set(), partCodes: new Set() };
+      item.forecastQty += number(row.forecastQty);
+      item.actualSalesOrderQty += number(row.actualSalesOrderQty);
+      item.effectiveDemandQty += Math.max(number(row.forecastQty), number(row.actualSalesOrderQty));
+      row.forecastNumbers.forEach((value) => item.forecastNumbers.add(value));
+      if (row.customerCode) item.customerCodes.add(row.customerCode);
+      if (row.partCode) item.partCodes.add(row.partCode);
+      months.set(row.month, item);
+    }
+    const monthKeys = [...months.keys()];
+    const mpsRows = monthKeys.length ? await prisma.mPS.findMany({
+      where: { sourceKey: { in: monthKeys.map((month) => `MONTH:${month.slice(0, 7)}`) }, isDeleted: false },
+      include: { deliveryPlans: { where: { isDeleted: false, targetType: "CUSTOMER", lockedBySource: true }, orderBy: { plannedDate: "asc" } } },
+    }) : [];
+    const mpsByMonth = new Map(mpsRows.map((row) => [monthKey(row.periodStart), row]));
+    const items = [...months.values()].sort((a, b) => a.month.localeCompare(b.month)).map((row) => {
+      const mps = mpsByMonth.get(row.month);
+      return { ...row, forecastNumbers: [...row.forecastNumbers], customerCodes: [...row.customerCodes], partCodes: [...row.partCodes], forecastCount: row.forecastNumbers.size, customerCount: row.customerCodes.size, partCount: row.partCodes.size, mpsNumber: mps?.mpsNumber || null, mpsStatus: mps?.status || "Belum dihitung", replanRequired: Boolean(mps?.replanRequired), replanReason: mps?.replanReason || null, earliestDeliveryDate: mps?.deliveryPlans?.[0]?.plannedDate || null, deliveryPhaseCount: mps?.deliveryPlans?.length || 0 };
+    });
+    res.json({ items, total: items.length });
+  } catch (error) { next(error); }
+};
+
 exports.generateNumber = async (_req, res, next) => { try { res.json({ forecastNumber: await nextNumber() }); } catch (error) { next(error); } };
 
 exports.create = async (req, res, next) => {
   try {
-    if (!req.body.periodStart || !req.body.periodEnd) return res.status(400).json({ message: "Periode Forecast wajib diisi" });
     const rows = Array.isArray(req.body.details) ? req.body.details : [];
     if (!rows.length) return res.status(400).json({ message: "Minimal satu baris forecast wajib diisi" });
     if (rows.some((row) => !row.partCode || !row.forecastMonth)) return res.status(400).json({ message: "Part dan bulan forecast wajib diisi pada setiap baris" });
     const doc = await prisma.$transaction(async (tx) => {
       const forecastNumber = text(req.body.forecastNumber) || await nextNumber(tx);
-      const details = await normalizeForecastDetails(rows, tx);
+      const details = await normalizeForecastDetails(rows, tx, req.body.customerCode);
       details.forEach((row) => { row.forecastNumber = forecastNumber; });
-      const created = await tx.forecast.create({ data: { forecastNumber, versionGroup: text(req.body.versionGroup) || forecastNumber, version: 1, isCurrentVersion: true, ...headerData(req.body, req.user), details: { create: details.map(({ forecastNumber: _parent, ...row }) => row) } }, include });
+      const created = await tx.forecast.create({ data: { forecastNumber, versionGroup: text(req.body.versionGroup) || forecastNumber, version: 1, isCurrentVersion: true, ...headerData({ ...req.body, ...deriveForecastPeriod(details) }, req.user), details: { create: details.map(({ forecastNumber: _parent, ...row }) => row) } }, include });
+      await replaceDeliveryTargets(tx, { sourceType: "FORECAST", sourceNumber: forecastNumber, customerCode: text(req.body.customerCode), lines: created.details, inputRows: rows, user: req.user?.username || req.user?.email });
       await queueDirtyPartCodes(tx, details.map((row) => row.partCode), {
         reason: "FORECAST",
         sourceNumber: forecastNumber,
         notes: "Forecast dibuat/diubah; net-change MRP dijadwalkan.",
       });
-      return created;
+      return tx.forecast.findUnique({ where: { forecastNumber }, include });
     });
     res.status(201).json(serialize(doc));
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
@@ -188,19 +239,25 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const existing = await prisma.forecast.findFirst({ where: { forecastNumber: req.params.forecastNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } });
+    const existing = await prisma.forecast.findFirst({ where: { forecastNumber: req.params.forecastNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true, M1Forecast: true, M1Qty: true, M2Forecast: true, M2Qty: true, M3Forecast: true, M3Qty: true, deliveryTargets: { where: { isDeleted: false } } } } } });
     if (!existing) return res.status(404).json({ message: "Forecast tidak ditemukan" });
     if (existing.status !== "Draft") return res.status(409).json({ message: `Forecast ${existing.forecastNumber} sudah ${existing.status} dan tidak dapat diedit. Gunakan workflow revisi.` });
     const doc = await prisma.$transaction(async (tx) => {
       const rows = Array.isArray(req.body.details) ? req.body.details : null;
+      let periodDetails = existing.details;
       if (rows) {
         if (!rows.length || rows.some((row) => !row.partCode || !row.forecastMonth)) throw Object.assign(new Error("Part dan bulan forecast wajib diisi pada setiap baris"), { statusCode: 400 });
         await tx.forecastDetail.deleteMany({ where: { forecastNumber: existing.forecastNumber } });
-        const details = await normalizeForecastDetails(rows, tx);
+        const details = await normalizeForecastDetails(rows, tx, req.body.customerCode || existing.customerCode);
         details.forEach((row) => { row.forecastNumber = existing.forecastNumber; });
         await tx.forecastDetail.createMany({ data: details });
+        const createdLines = await tx.forecastDetail.findMany({ where: { forecastNumber: existing.forecastNumber, isDeleted: false }, orderBy: { lineNumber: "asc" } });
+        periodDetails = createdLines;
+        await replaceDeliveryTargets(tx, { sourceType: "FORECAST", sourceNumber: existing.forecastNumber, customerCode: text(req.body.customerCode || existing.customerCode), lines: createdLines, inputRows: rows, user: req.user?.username || req.user?.email, trackChange: true, previousTargets: existing.details.flatMap((row) => row.deliveryTargets || []), impactSourceNumbers: [existing.forecastNumber, existing.revisionOfForecastNumber] });
+      } else {
+        await normalizeForecastDetails(existing.details, tx, req.body.customerCode || existing.customerCode);
       }
-      const data = headerData({ ...existing, ...req.body }, req.user); delete data.createdBy;
+      const data = headerData({ ...existing, ...req.body, ...deriveForecastPeriod(periodDetails) }, req.user); delete data.createdBy;
       const updated = await tx.forecast.update({ where: { forecastNumber: existing.forecastNumber }, data, include });
       await queueDirtyPartCodes(tx, [
         ...existing.details.map((row) => row.partCode),
@@ -225,7 +282,7 @@ exports.revise = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const existing = await tx.forecast.findFirst({
         where: { forecastNumber: req.params.forecastNumber, isDeleted: false },
-        include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } } },
+        include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } } },
       });
       if (!existing) throw Object.assign(new Error("Forecast tidak ditemukan"), { statusCode: 404 });
       if (!["Draft", "Confirmed", "Partial Product", "Consumed"].includes(existing.status)) {
@@ -252,7 +309,7 @@ exports.revise = async (req, res, next) => {
       const created = await tx.forecast.create({
         data: {
           forecastNumber,
-          ...headerData({ ...existing, status: "Draft", notes }, req.user),
+          ...headerData({ ...existing, ...deriveForecastPeriod(details), status: "Draft", notes }, req.user),
           versionGroup: existing.versionGroup || existing.forecastNumber,
           version: number(existing.version) + 1,
           isCurrentVersion: true,
@@ -265,6 +322,7 @@ exports.revise = async (req, res, next) => {
         },
         include,
       });
+      await replaceDeliveryTargets(tx, { sourceType: "FORECAST", sourceNumber: forecastNumber, customerCode: existing.customerCode, lines: created.details, inputRows: existing.details.map((row) => ({ forecastMonth: row.M1Forecast, forecastQty: row.M1Qty, deliveryTargets: row.deliveryTargets })), user: req.user?.username || req.user?.email });
       await tx.forecast.update({
         where: { forecastNumber: existing.forecastNumber },
         data: {
@@ -273,12 +331,20 @@ exports.revise = async (req, res, next) => {
           notes: [existing.notes, `Digantikan oleh ${forecastNumber}: ${reason}`].filter(Boolean).join("; "),
         },
       });
+      await markDownstreamDemandChange(tx, {
+        sourceType: "FORECAST",
+        sourceNumbers: [existing.forecastNumber],
+        reason: `Forecast ${existing.forecastNumber} direvisi menjadi ${forecastNumber}; MPS, MRP, dan Purchase Suggestion wajib dihitung ulang.`,
+        user: req.user?.username || req.user?.email,
+        changeType: "FORECAST_REVISION",
+      });
       await queueDirtyPartCodes(tx, details.map((row) => row.partCode), {
         reason: "FORECAST",
         sourceNumber: forecastNumber,
         notes: `Revisi ${existing.forecastNumber} dibuat; net-change MRP dijadwalkan.`,
       });
-      return { ...serialize(created), previousForecastNumber: existing.forecastNumber };
+      const revised = await tx.forecast.findUnique({ where: { forecastNumber }, include });
+      return { ...serialize(revised), previousForecastNumber: existing.forecastNumber };
     });
     res.status(201).json(result);
   } catch (error) {
@@ -302,17 +368,57 @@ exports.submit = async (req, res, next) => {
     if (!forecast.periodStart || !forecast.periodEnd || forecast.periodStart > forecast.periodEnd) return res.status(400).json({ message: "Periode Forecast belum valid." });
     const monthlyDetails = toMonthlyRows(forecast.details);
     if (!monthlyDetails.length || monthlyDetails.some((row) => !row.partCode || Number(row.forecastQty || 0) <= 0 || !row.forecastMonth)) return res.status(400).json({ message: "Forecast harus memiliki minimal satu part FG dengan bulan dan qty lebih dari 0." });
+    await assertCompleteDeliveryTargets(prisma, "FORECAST", forecastNumber, forecast.details);
+    const totalForecastQty = monthlyDetails.reduce((sum, row) => sum + number(row.forecastQty), 0);
+    const result = await prisma.$transaction(async (tx) => {
+      const approvalRequest = await submitDocumentForApproval({
+        moduleCode: "sales",
+        pageCode: "forecasts",
+        actionCode: "approve",
+        documentType: "Forecast",
+        documentId: forecast.id,
+        documentNumber: forecast.forecastNumber,
+        amount: totalForecastQty,
+        context: { ...forecast, totalForecastQty },
+        requestedByUserId: req.user?.id,
+        requestedBy: req.user?.username || req.user?.email,
+        tx,
+      });
+      const updated = await tx.forecast.update({
+        where: { forecastNumber },
+        data: {
+          status: "Submitted",
+          approvedBy: null,
+          approvedDate: null,
+          notes: [forecast.notes, `Submitted for approval by ${req.user?.username || req.user?.email || "system"}`].filter(Boolean).join("; ") || null,
+        },
+        include,
+      });
+      return { updated, approvalRequest };
+    });
+    res.json({ ...serialize(result.updated), approvalRequest: result.approvalRequest });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+
+exports.approve = async (req, res, next) => {
+  try {
+    const forecastNumber = text(req.params.forecastNumber);
+    const forecast = await prisma.forecast.findFirst({ where: { forecastNumber, isDeleted: false } });
+    if (!forecast) return res.status(404).json({ message: "Forecast tidak ditemukan" });
+    if (forecast.status !== "Submitted") return res.status(409).json({ message: `Forecast hanya dapat di-approve dari Submitted. Status saat ini ${forecast.status}.` });
     const updated = await prisma.forecast.update({
       where: { forecastNumber },
       data: {
         status: "Confirmed",
         approvedBy: req.user?.username || req.user?.email || "system",
         approvedDate: new Date(),
-        notes: [forecast.notes, `Submitted by ${req.user?.username || req.user?.email || "system"}`].filter(Boolean).join("; ") || null,
       },
       include,
     });
-    res.json(serialize(updated));
+    res.json({ ...serialize(updated), approvalRequest: req.approval?.request || null });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     next(error);

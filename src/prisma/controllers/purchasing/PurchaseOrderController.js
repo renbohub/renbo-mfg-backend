@@ -17,8 +17,7 @@ const {
 } = require("../../utils/uomCodeNormalizer");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const {
-  resolveApprovalRule,
-  createApprovalRequest,
+  submitDocumentForApproval,
 } = require("../../services/approvalRuleService");
 
 async function queuePoDirtyParts(tx, poNumber, notes) {
@@ -1543,36 +1542,33 @@ exports.submitChecking = async (req, res, next) => {
     }
 
     const actionBy = req.user?.username || req.user?.email || "System";
-    const po = await prisma.purchaseOrder.update({
-      where: { poNumber: existing.poNumber },
-      data: { status: PO_STATUS.SUBMITTED },
-      include: PO_INCLUDE,
-    });
-    const approvalRule = await resolveApprovalRule({
-      moduleCode: "purchasing",
-      pageCode: "purchase-order",
-      actionCode: "approve",
-      documentType: "PurchaseOrder",
-      amount: po.totalAmount,
-      currencyCode: po.currencyCode,
-      context: po,
-    });
-    const approvalRequest = approvalRule
-      ? await createApprovalRequest({
-          rule: approvalRule,
+    const result = await prisma.$transaction(async (tx) => {
+      const current = await tx.purchaseOrder.findUnique({
+        where: { poNumber: existing.poNumber },
+        include: PO_INCLUDE,
+      });
+      const approvalRequest = await submitDocumentForApproval({
           moduleCode: "purchasing",
           pageCode: "purchase-order",
           actionCode: "approve",
           documentType: "PurchaseOrder",
-          documentId: po.id,
-          documentNumber: po.poNumber,
-          amount: po.totalAmount,
-          currencyCode: po.currencyCode,
-          context: po,
+          documentId: current.id,
+          documentNumber: current.poNumber,
+          amount: current.totalAmount,
+          currencyCode: current.currencyCode,
+          context: current,
           requestedByUserId: req.user?.id,
           requestedBy: actionBy,
-        })
-      : null;
+          tx,
+      });
+      const po = await tx.purchaseOrder.update({
+        where: { poNumber: existing.poNumber },
+        data: { status: PO_STATUS.SUBMITTED },
+        include: PO_INCLUDE,
+      });
+      return { po, approvalRequest };
+    });
+    const { po, approvalRequest } = result;
 
     try {
       await notificationHelper.notifyPurchaseOrder(
@@ -1591,6 +1587,7 @@ exports.submitChecking = async (req, res, next) => {
 
     res.json({ ...(await mapPOResponse(po)), approvalRequest });
   } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     next(e);
   }
 };
@@ -1925,19 +1922,13 @@ exports.manualComplete = async (req, res, next) => {
       return res.status(400).json({ message: `PO dengan status ${existing.status} tidak dapat di-complete manual.` });
     }
 
-    const warehouseCode = normalizeText(req.body?.warehouseCode);
-    const rackCode = normalizeText(req.body?.rackCode) || null;
-    if (!warehouseCode) {
-      return res.status(400).json({ message: "Warehouse tujuan wajib dipilih" });
-    }
-
     const performedBy = req.user?.username || req.user?.email || "System";
     const po = await prisma.$transaction(async (tx) => {
-      const poForReceipt = await tx.purchaseOrder.findUnique({ where: { poNumber: existing.poNumber }, include: PO_INCLUDE });
-      await receiveRemainingPoToStock(tx, poForReceipt, warehouseCode, rackCode, performedBy);
+      // Manual complete closes the commercial remainder only. Physical receipt
+      // must always use GR -> IQC -> putaway and may never bypass QC.
       return tx.purchaseOrder.update({
         where: { poNumber: existing.poNumber },
-        data: { status: "Completed", approvedBy: existing.approvedBy || performedBy, approvedDate: existing.approvedDate || new Date() },
+        data: { status: "Completed", approvedBy: existing.approvedBy || performedBy, approvedDate: existing.approvedDate || new Date(), notes: [req.body?.reason || req.body?.notes, "Closed manually without receiving outstanding quantity"].filter(Boolean).join(" | ") },
         include: PO_INCLUDE,
       });
     });

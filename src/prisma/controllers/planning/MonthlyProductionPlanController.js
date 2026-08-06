@@ -1,5 +1,7 @@
 const { prisma } = require("../../index");
 const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
+const { recommendMonthlyCapacity } = require("../../services/planning/capacityRecommendationService");
+const { findPreset } = require("../../services/planning/capacitySimulationPresetService");
 const dailyProductionScheduleController = require("../production/DailyProductionScheduleController");
 const {
   buildMaterialReadinessSnapshot,
@@ -15,6 +17,36 @@ const { isDiscreteUom, normalizeQuantity, splitQuantity } = require("../../utils
 const include = { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } } };
 
 const text = (value) => String(value ?? "").trim() || null;
+const dateOnly = (value) => {
+  const input = String(value || "").slice(0, 10);
+  const parsed = new Date(`${input}T00:00:00.000Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+const jakartaTodayDate = () => {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return dateOnly(`${values.year}-${values.month}-${values.day}`);
+};
+function assertCapacityDateEditable(value) {
+  const allocationDate = value instanceof Date ? dateOnly(value) : dateOnly(value);
+  if (allocationDate && allocationDate < jakartaTodayDate()) {
+    throw Object.assign(new Error(`Capacity ${allocationDate.toISOString().slice(0, 10)} sudah menjadi histori Production dan tidak dapat diubah.`), { statusCode: 409, code: "CAPACITY_HISTORY_LOCKED" });
+  }
+  return allocationDate;
+}
+const executionShift = (value) => {
+  const normalized = String(value || "").trim().toUpperCase();
+  return ({ "1": "1A", "2": "2A", "3": "3A" })[normalized] || normalized;
+};
+const calendarDaysBetween = (start, end) => Math.max(Math.ceil((end - start) / 86400000), 0);
+const freezeFenceDate = (days) => { const value = new Date(); value.setUTCHours(0, 0, 0, 0); value.setUTCDate(value.getUTCDate() + Math.max(Math.trunc(number(days)), 0)); return value; };
+function requireFreezeOverride(plan, allocationDate, planningMode, body) {
+  assertCapacityDateEditable(allocationDate);
+  if (planningMode !== "PRODUCTION" || !allocationDate || allocationDate > freezeFenceDate(plan.freezeFenceDays)) return null;
+  const reason = text(body?.freezeOverrideReason || body?.overrideReason);
+  if (!reason || reason.length < 10) throw Object.assign(new Error(`Tanggal berada dalam freeze fence ${number(plan.freezeFenceDays)} hari. Isi alasan override minimal 10 karakter.`), { statusCode: 409, code: "CAPACITY_FREEZE_FENCE" });
+  return reason;
+}
 const isGeneratedProcess = (row) => String(row?.notes || "").includes("[MRP-PRODUCTION]");
 const isChildFgReceipt = (row) => isGeneratedProcess(row)
   && String(row?.part?.itemType || "").trim().toUpperCase() === "FG";
@@ -36,6 +68,17 @@ async function nextDailyPlanNumber(tx, value) {
   });
   const sequence = number(last?.scheduleNumber?.split("-").pop()) + 1;
   return `${prefix}${String(sequence).padStart(3, "0")}`;
+}
+
+async function nextWorkOrderNumber(tx, value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  const prefix = `WO-${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}-`;
+  const last = await tx.workOrder.findFirst({
+    where: { woNumber: { startsWith: prefix } },
+    orderBy: { woNumber: "desc" },
+    select: { woNumber: true },
+  });
+  return `${prefix}${String(number(last?.woNumber?.split("-").pop()) + 1).padStart(3, "0")}`;
 }
 
 function dailyPlanMarker(planNumber, allocation, moNumber) {
@@ -63,6 +106,11 @@ function serialize(plan) {
 }
 
 function detailFromMps(row, lineNumber) {
+  const uomCode = row.part?.productionUomCode
+    || row.part?.baseUomCode
+    || row.part?.stockUomCode
+    || row.mbom?.uomCode
+    || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : null);
   return {
     lineNumber,
     plannedOrderNumber: null,
@@ -76,8 +124,8 @@ function detailFromMps(row, lineNumber) {
     bufferQty: number(row.bufferQty),
     productionPercent: number(row.productionPercent || 100),
     effectiveDemandQty: number(row.effectiveDemandQty),
-    qtyPlanned: number(row.qtyPlanned),
-    uomCode: row.part?.productionUomCode || row.part?.baseUomCode || row.mbom?.uomCode || null,
+    qtyPlanned: normalizeQuantity(row.qtyPlanned, uomCode),
+    uomCode,
     requiredDate: row.endDate,
     priority: number(row.priority) || 1,
     status: "Planned",
@@ -92,14 +140,21 @@ function sourcePartCode(row) {
 // Production Plan is an execution proposal: PPIC may reduce/increase the
 // forecast portion here without changing the approved MPS.  Actual SO remains
 // a hard floor, and child/SFG quantities follow their parent FG proportionally.
-function derivePlanDetails(mpsDetails, productionPercent) {
+function derivePlanDetails(mpsDetails, productionPercent, netProductionByMpsDetail = new Map()) {
   const ratio = productionPercent / 100;
   const isProcess = (row) => isGeneratedProcess(row);
   const receipts = mpsDetails.filter((row) => !isProcess(row));
   const receiptById = new Map(receipts.map((row) => [row.id, row]));
   const receiptByLegacyKey = new Map(receipts.map((row) => [`${row.customerCode || ""}|${row.partCode}|${row.forecastPeriodOffset || ""}`, row]));
   const receiptByMonth = new Map(receipts.map((row) => [`${row.customerCode || ""}|${row.partCode}|${monthKey(row.startDate)}`, row]));
-  const adjustedReceiptQty = new Map(receipts.map((row) => [row.id, Math.max(number(row.effectiveDemandQty) * ratio, number(row.actualSalesOrderQty))]));
+  const adjustedReceiptQty = new Map(receipts.map((row) => {
+    const mrpNetQty = netProductionByMpsDetail.get(row.id);
+    const baseQty = mrpNetQty == null
+      ? Math.max(number(row.effectiveDemandQty), number(row.actualSalesOrderQty))
+      : number(mrpNetQty);
+    const uomCode = row.part?.productionUomCode || row.part?.baseUomCode || row.part?.stockUomCode || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : null);
+    return [row.id, normalizeQuantity(baseQty * ratio, uomCode)];
+  }));
   return mpsDetails.map((row) => {
     if (!isProcess(row)) {
       return {
@@ -110,13 +165,21 @@ function derivePlanDetails(mpsDetails, productionPercent) {
     }
     const sourceId = String(row.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
     const source = receiptById.get(sourceId) || receiptByLegacyKey.get(`${row.customerCode || ""}|${sourcePartCode(row) || ""}|${row.forecastPeriodOffset || ""}`) || receiptByMonth.get(`${row.customerCode || ""}|${sourcePartCode(row) || ""}|${monthKey(row.startDate)}`);
-    if (!source) return { ...row, qtyPlanned: number(row.qtyPlanned) * ratio };
+    if (!source) {
+      const rowUom = row.part?.productionUomCode || row.part?.baseUomCode || row.part?.stockUomCode || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : row.uomCode);
+      return { ...row, uomCode: row.uomCode || rowUom, qtyPlanned: normalizeQuantity(number(row.qtyPlanned) * ratio, rowUom) };
+    }
     const sourceOriginalQty = Math.max(number(source.qtyPlanned), 0);
     const childFactor = sourceOriginalQty > 0 ? number(row.qtyPlanned) / sourceOriginalQty : 1;
     return {
       ...row,
+      uomCode: row.uomCode || row.part?.productionUomCode || row.part?.baseUomCode || row.part?.stockUomCode || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : null),
       forecastQty: number(row.forecastQty) || number(source.forecastQty), actualSalesOrderQty: number(row.actualSalesOrderQty) || number(source.actualSalesOrderQty), bufferBaseQty: number(row.bufferBaseQty) || number(source.bufferBaseQty), bufferPercent: number(row.bufferPercent) || number(source.bufferPercent), bufferQty: number(row.bufferQty) || number(source.bufferQty), effectiveDemandQty: number(row.effectiveDemandQty) || number(source.effectiveDemandQty), productionPercent,
-      qtyPlanned: Math.max(adjustedReceiptQty.get(source.id) * childFactor, number(source.actualSalesOrderQty) * childFactor),
+      // Generated MPS process rows already contain the MRP-netted production
+      // quantity. Only apply PPIC's explicit production percentage here.
+      qtyPlanned: normalizeQuantity(netProductionByMpsDetail.has(source.id)
+        ? number(row.qtyPlanned) * ratio
+        : Math.max(adjustedReceiptQty.get(source.id) * childFactor, number(source.actualSalesOrderQty) * childFactor), row.part?.productionUomCode || row.part?.baseUomCode || row.part?.stockUomCode || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : row.uomCode)),
     };
   });
 }
@@ -126,7 +189,28 @@ async function withMpsSnapshot(plan) {
   if (!mpsNumber) return plan;
   const mps = await prisma.mPS.findFirst({
     where: { mpsNumber, isDeleted: false },
-    select: { details: { where: { isDeleted: false }, select: { id: true, lineNumber: true, forecastQty: true, actualSalesOrderQty: true, bufferBaseQty: true, bufferPercent: true, bufferQty: true, productionPercent: true, effectiveDemandQty: true, qtyPlanned: true } } },
+    select: {
+      details: {
+        where: { isDeleted: false },
+        select: {
+          id: true,
+          lineNumber: true,
+          partCode: true,
+          customerCode: true,
+          startDate: true,
+          notes: true,
+          forecastQty: true,
+          actualSalesOrderQty: true,
+          bufferBaseQty: true,
+          bufferPercent: true,
+          bufferQty: true,
+          productionPercent: true,
+          effectiveDemandQty: true,
+          qtyPlanned: true,
+          part: { select: { partName: true, partNumber: true } },
+        },
+      },
+    },
   });
   if (!mps) return plan;
   const byId = new Map(mps.details.map((row) => [row.id, row]));
@@ -137,7 +221,13 @@ async function withMpsSnapshot(plan) {
       const sourceLine = String(detail.notes || "").match(/\[MPS-LINE:(\d+)\]/)?.[1];
       const source = byId.get(detail.mpsDetailId) || byLineNumber.get(sourceLine);
       if (!source) return detail;
+      const parentSourceId = String(source.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      const parentSource = byId.get(parentSourceId) || source;
       const synced = { ...detail, ...Object.fromEntries(["forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferPercent", "bufferQty", "effectiveDemandQty"].map((field) => [field, source[field]])), mpsDetailId: source.id };
+      synced.planningCustomerCode = parentSource.customerCode || null;
+      synced.planningMonth = parentSource.startDate || plan.planMonth;
+      synced.parentFgPartCode = parentSource.partCode || source.partCode || detail.partCode;
+      synced.parentFgPartName = parentSource.part?.partName || parentSource.part?.partNumber || null;
       if (plan.status === "Draft" && !isGeneratedProcess(detail)) {
         synced.qtyPlanned = Math.max(
           number(source.effectiveDemandQty) * number(detail.productionPercent || 100) / 100,
@@ -536,10 +626,26 @@ exports.createFromMps = async (req, res, next) => {
     });
     if (!mps) return res.status(404).json({ message: "MPS tidak ditemukan." });
     if (mps.status !== "Confirmed") return res.status(409).json({ message: "MPS harus Confirmed sebelum dibuat menjadi Production Plan." });
-    const validDetails = derivePlanDetails(mps.details, productionPercent);
-    if (!validDetails.length) return res.status(400).json({ message: "MPS belum mempunyai FG receipt atau child/SFG process." });
     const completedMrp = await prisma.mRPRun.findFirst({ where: { mpsNumber, isDeleted: false, isCurrentPlan: true, status: "Completed" }, orderBy: { createdAt: "desc" }, select: { runNumber: true } });
     if (!completedMrp) return res.status(409).json({ message: "Jalankan MRP sampai Completed sebelum membuat Production Plan agar material sudah diperiksa." });
+    const rootRequirements = await prisma.mRPRequirement.findMany({
+      where: {
+        runNumber: completedMrp.runNumber,
+        isDeleted: false,
+        orderType: "Production",
+        requirementType: "Independent",
+        levelMBOM: 0,
+        mpsDetailId: { not: null },
+      },
+      select: { mpsDetailId: true, plannedOrderQty: true, adjustedOrderQty: true, netRequirement: true },
+    });
+    const netProductionByMpsDetail = new Map();
+    for (const row of rootRequirements) {
+      const qty = number(row.adjustedOrderQty || row.plannedOrderQty || row.netRequirement);
+      netProductionByMpsDetail.set(row.mpsDetailId, number(netProductionByMpsDetail.get(row.mpsDetailId)) + qty);
+    }
+    const validDetails = derivePlanDetails(mps.details, productionPercent, netProductionByMpsDetail);
+    if (!validDetails.length) return res.status(400).json({ message: "MPS belum mempunyai FG receipt atau child/SFG process." });
 
     const grouped = new Map();
     for (const row of validDetails) {
@@ -566,21 +672,42 @@ exports.createFromMps = async (req, res, next) => {
             }
             const stale = existing.details.filter((detail) => !matchedIds.has(detail.id));
             if (stale.length) await tx.monthlyProductionPlanDetail.updateMany({ where: { id: { in: stale.map((detail) => detail.id) } }, data: { isDeleted: true, status: "Cancelled", notes: "Synchronized: MPS line no longer active" } });
+            const positiveQtyCount = await tx.monthlyProductionPlanDetail.count({
+              where: { planId: existing.id, isDeleted: false, qtyPlanned: { gt: 0.000001 } },
+            });
+            if (positiveQtyCount === 0) {
+              await tx.monthlyProductionPlan.update({
+                where: { id: existing.id },
+                data: {
+                  status: "Closed",
+                  closedBy: req.user?.username || req.user?.email || "system",
+                  closedAt: new Date(),
+                  notes: `Production plan dari ${mps.mpsNumber}; kebutuhan produksi 0 karena demand sudah tercakup stock pada ${completedMrp.runNumber}.`,
+                },
+              });
+            }
           }
           const synchronized = await tx.monthlyProductionPlan.findFirst({ where: { id: existing.id }, include });
           plans.push({ ...serialize(synchronized), existing: true, synchronized: existing.status === "Draft" });
           continue;
         }
         const planNumber = await nextPlanNumber(tx, planMonth);
+        const noProductionRequired = details.every((row) => number(row.qtyPlanned) <= 0.000001);
         const created = await tx.monthlyProductionPlan.create({
           data: {
             planNumber,
             planMonth,
             periodStart: monthStart(planMonth),
             periodEnd: monthEnd(planMonth),
-            status: "Draft",
+            status: noProductionRequired ? "Closed" : "Draft",
             sourceType,
-            notes: `Production plan dari ${mps.mpsNumber}; material check ${completedMrp.runNumber}; adjustment ${productionPercent}% (minimum SO aktual)`,
+            notes: noProductionRequired
+              ? `Production plan dari ${mps.mpsNumber}; kebutuhan produksi 0 karena demand sudah tercakup stock pada ${completedMrp.runNumber}.`
+              : `Production plan dari ${mps.mpsNumber}; material check ${completedMrp.runNumber}; adjustment ${productionPercent}% (minimum SO aktual)`,
+            ...(noProductionRequired ? {
+              closedBy: req.user?.username || req.user?.email || "system",
+              closedAt: new Date(),
+            } : {}),
             createdBy: req.user?.username || req.user?.email || null,
             details: {
               create: details.map((row, index) => detailFromMps(row, index + 1)),
@@ -592,7 +719,151 @@ exports.createFromMps = async (req, res, next) => {
       }
       return plans;
     });
-    res.status(201).json({ items: result, total: result.length, sourceMpsNumber: mps.mpsNumber, mrpRunNumber: completedMrp.runNumber, productionPercent });
+    const actor = req.user?.username || req.user?.email || "system";
+    const items = [];
+    for (const item of result) {
+      let capacityRecommendation = null;
+      // First creation and Draft re-sync both receive a fresh recommendation.
+      // The service only replaces its own AUTO_RECOMMENDATION rows; PPIC's
+      // manual allocations remain authoritative.
+      if ((!item.existing || item.synchronized) && item.status === "Draft") {
+        try {
+          capacityRecommendation = await recommendMonthlyCapacity(prisma, item.planNumber, { actor });
+        } catch (recommendationError) {
+          capacityRecommendation = { ready: false, error: recommendationError.message };
+        }
+      }
+      items.push({ ...item, capacityRecommendation });
+    }
+    res.status(201).json({ items, total: items.length, sourceMpsNumber: mps.mpsNumber, mrpRunNumber: completedMrp.runNumber, productionPercent });
+  } catch (error) { next(error); }
+};
+
+exports.recommendCapacity = async (req, res, next) => {
+  try {
+    const planningMode = String(req.body?.planningMode || "PRODUCTION").toUpperCase() === "SIMULATION" ? "SIMULATION" : "PRODUCTION";
+    const scenarioKey = planningMode === "SIMULATION" ? String(req.body?.scenarioKey || "").trim().toLowerCase() : null;
+    const presetId = String(req.body?.presetId || scenarioKey || "").trim().toLowerCase() || null;
+    if (planningMode === "SIMULATION" && !scenarioKey) return res.status(400).json({ message: "Pilih preset simulasi bulanan terlebih dahulu." });
+    if (presetId && !(await findPreset(prisma, presetId))) return res.status(404).json({ message: "Preset capacity tidak ditemukan." });
+    const planningGranularity = String(req.body?.planningGranularity || "DAY").toUpperCase() === "WEEK" ? "WEEK" : "DAY";
+    const rollingLookbackWeeks = Math.min(Math.max(Math.trunc(number(req.body?.rollingLookbackWeeks)), 0), 12);
+    const freezeFenceDays = Math.min(Math.max(Math.trunc(number(req.body?.freezeFenceDays)), 0), 31);
+    await prisma.monthlyProductionPlan.update({ where: { planNumber: req.params.planNumber }, data: { planningGranularity, rollingLookbackWeeks, freezeFenceDays } });
+    const recommendation = await recommendMonthlyCapacity(prisma, req.params.planNumber, {
+      actor: req.user?.username || req.user?.email || "system",
+      planningMode,
+      scenarioKey,
+      presetId,
+    });
+    if (planningMode === "PRODUCTION") {
+      await prisma.monthlyProductionPlan.update({ where: { planNumber: req.params.planNumber }, data: { replanRequired: !recommendation.ready, replanReason: recommendation.ready ? null : "Capacity recommendation masih memiliki blocker.", ...(recommendation.ready ? { lastReplannedAt: new Date() } : {}) } });
+      if (recommendation.ready) await prisma.planningChangeImpact.updateMany({ where: { status: "PENDING_REPLAN", affectedPlanNumbers: { array_contains: [req.params.planNumber] } }, data: { status: "RESOLVED", resolutionNotes: `Production Capacity dihitung ulang melalui ${req.params.planNumber}.`, resolvedBy: req.user?.username || req.user?.email || "system", resolvedAt: new Date() } });
+    }
+    res.json(recommendation);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+
+exports.adoptCapacitySimulation = async (req, res, next) => {
+  try {
+    const scenarioKey = String(req.body?.scenarioKey || "").trim().toLowerCase();
+    if (!/^preset-[a-z0-9-]{8,}$/i.test(scenarioKey)) return res.status(400).json({ message: "Pilih preset simulasi bulanan yang akan dijadikan Production Capacity." });
+    const preset = await findPreset(prisma, scenarioKey);
+    if (!preset) return res.status(404).json({ message: "Preset simulasi tidak ditemukan atau sudah tidak tersedia." });
+    const plan = await prisma.monthlyProductionPlan.findFirst({
+      where: { planNumber: req.params.planNumber, isDeleted: false },
+      select: { id: true, planNumber: true, status: true, periodStart: true, periodEnd: true },
+    });
+    if (!plan) return res.status(404).json({ message: "Production Plan tidak ditemukan." });
+    if (!["Draft", "Confirmed", "Released", "In Progress"].includes(plan.status)) {
+      return res.status(409).json({ message: `Production Capacity tidak dapat direvisi saat MPP berstatus ${plan.status}.` });
+    }
+    const today = jakartaTodayDate();
+    const simulationRows = await prisma.productionPlanAllocation.findMany({
+      where: { planId: plan.id, planningMode: "SIMULATION", scenarioKey, status: "Draft", isDeleted: false },
+      orderBy: [{ scheduleDate: "asc" }, { plannedStartTime: "asc" }, { createdAt: "asc" }],
+    });
+    const simulation = simulationRows.filter((row) => dateOnly(row.scheduleDate) >= today);
+    if (!simulation.length) return res.status(409).json({ message: "Preset tidak mempunyai allocation hari ini atau mendatang. Hari yang sudah lewat dikunci sebagai histori Production.", code: "CAPACITY_HISTORY_LOCKED" });
+    const production = await prisma.productionPlanAllocation.findMany({
+      where: { planId: plan.id, planningMode: "PRODUCTION", status: { in: ["Draft", "Published"] }, isDeleted: false },
+      select: { id: true, lineNumber: true, mbomProcessId: true, scheduleDate: true, shift: true, plannedQty: true, deliveryPhaseId: true, transferBatchNumber: true },
+    });
+    const replaceableProduction = production.filter((row) => dateOnly(row.scheduleDate) >= today);
+    const preservedProduction = production.filter((row) => dateOnly(row.scheduleDate) < today);
+    const productionIds = replaceableProduction.map((row) => row.id);
+    const linkedSchedules = await prisma.dailyProductionSchedule.findMany({
+      where: { productionPlanId: plan.id, isDeleted: false, status: { not: "Cancelled" } },
+      select: { id: true, scheduleNumber: true, scheduleDate: true, status: true },
+    });
+    const replaceableSchedules = linkedSchedules.filter((row) => dateOnly(row.scheduleDate) >= today);
+    const lockedSchedules = replaceableSchedules.filter((row) => row.status !== "Draft");
+    if (lockedSchedules.length) {
+      return res.status(409).json({
+        message: "Simulation tidak dapat mengganti Production Capacity karena DPP sudah dijalankan. Batalkan melalui workflow revisi DPP terlebih dahulu.",
+        code: "DPP_REVISION_LOCKED",
+        schedules: lockedSchedules,
+      });
+    }
+    const actor = req.user?.username || req.user?.email || "system";
+    const planningGranularity = String(req.body?.planningGranularity || "DAY").toUpperCase() === "WEEK" ? "WEEK" : "DAY";
+    const rollingLookbackWeeks = Math.min(Math.max(Math.trunc(number(req.body?.rollingLookbackWeeks)), 0), 12);
+    const freezeFenceDays = Math.min(Math.max(Math.trunc(number(req.body?.freezeFenceDays)), 0), 31);
+    const result = await prisma.$transaction(async (tx) => {
+      if (replaceableSchedules.length) await tx.dailyProductionSchedule.updateMany({ where: { id: { in: replaceableSchedules.map((row) => row.id) } }, data: { status: "Cancelled", isDeleted: true } });
+      if (productionIds.length) await tx.productionPlanAllocation.updateMany({ where: { id: { in: productionIds } }, data: { status: "Cancelled", isDeleted: true } });
+      const idMap = new Map();
+      const simulationById = new Map(simulationRows.map((row) => [row.id, row]));
+      const fingerprint = (row) => [row.lineNumber, row.mbomProcessId, dateOnly(row.scheduleDate)?.toISOString().slice(0, 10), row.shift, row.deliveryPhaseId || "", row.transferBatchNumber || "", number(row.plannedQty)].join("|");
+      const preservedProductionByFingerprint = new Map(preservedProduction.map((row) => [fingerprint(row), row.id]));
+      for (const source of simulation) {
+        const created = await tx.productionPlanAllocation.create({
+          data: {
+            planId: source.planId, lineNumber: source.lineNumber, mbomProcessId: source.mbomProcessId,
+            scheduleDate: source.scheduleDate, shift: source.shift, plannedStartTime: source.plannedStartTime,
+            plannedEndTime: source.plannedEndTime, machineId: source.machineId, routingMode: source.routingMode,
+            vendorId: source.vendorId, vendorSendDate: source.vendorSendDate, vendorReturnDate: source.vendorReturnDate,
+            vendorLeadTimeDays: source.vendorLeadTimeDays, expectedReturnQty: source.expectedReturnQty,
+            plannedQty: source.plannedQty, uomCode: source.uomCode, status: "Draft", notes: source.notes,
+            allocationSource: source.allocationSource, planningMode: "PRODUCTION", scenarioKey: null,
+            recommendationReason: source.recommendationReason, capacityMode: source.capacityMode,
+            deliveryPhaseId: source.deliveryPhaseId, deliveryPhaseNumber: source.deliveryPhaseNumber,
+            transferBatchNumber: source.transferBatchNumber, predecessorAllocationIds: null, createdBy: actor,
+          },
+        });
+        idMap.set(source.id, created.id);
+      }
+      for (const source of simulation) {
+        const mapped = Array.isArray(source.predecessorAllocationIds) ? source.predecessorAllocationIds.map((id) => {
+          if (idMap.has(id)) return idMap.get(id);
+          const historicalSource = simulationById.get(id);
+          return historicalSource && dateOnly(historicalSource.scheduleDate) < today
+            ? preservedProductionByFingerprint.get(fingerprint(historicalSource))
+            : null;
+        }).filter(Boolean) : [];
+        if (mapped.length) await tx.productionPlanAllocation.update({ where: { id: idMap.get(source.id) }, data: { predecessorAllocationIds: mapped } });
+      }
+      const simulationMachineIds = [...new Set(simulation.filter((row) => row.routingMode === "INHOUSE" && row.machineId).map((row) => row.machineId))];
+      const calendarStart = new Date(Math.max(plan.periodStart.getTime(), today.getTime()));
+      for (let scheduleDate = calendarStart; scheduleDate <= plan.periodEnd; scheduleDate = new Date(scheduleDate.getTime() + 86400000)) {
+        const date = scheduleDate.toISOString().slice(0, 10); const configured = preset.dailyOverrides?.[date] || null; const weekDay = scheduleDate.getUTCDay(); const weekendHoliday = !configured && ((weekDay === 6 && !preset.includeSaturday) || (weekDay === 0 && !preset.includeSunday));
+        const dayStatus = configured?.dayStatus || (weekendHoliday ? "HOLIDAY" : "WORKING"); const shiftsPerDay = Math.max(1, Math.min(Number(configured?.shiftCount || preset.shiftCount || 1), 3)); const overtimeStart = configured?.overtimeStart || preset.overtimeStart || null; const overtimeEnd = configured?.overtimeEnd || preset.overtimeEnd || null;
+        for (const machineId of simulationMachineIds) {
+          await tx.capacityDayOverride.upsert({
+            where: { planId_machineId_scheduleDate: { planId: plan.id, machineId, scheduleDate } },
+            update: { dayStatus, shiftsPerDay, overtimeStart, overtimeEnd, reason: `[SIMULATION-PRESET:${preset.id}] ${preset.name}`, changedBy: actor, changedAt: new Date(), isDeleted: false },
+            create: { planId: plan.id, machineId, scheduleDate, dayStatus, shiftsPerDay, overtimeStart, overtimeEnd, reason: `[SIMULATION-PRESET:${preset.id}] ${preset.name}`, changedBy: actor },
+          });
+        }
+      }
+      await tx.monthlyProductionPlan.update({ where: { id: plan.id }, data: { planningGranularity, rollingLookbackWeeks, freezeFenceDays, replanRequired: false, replanReason: null, lastReplannedAt: new Date() } });
+      await tx.planningChangeImpact.updateMany({ where: { status: "PENDING_REPLAN", affectedPlanNumbers: { array_contains: [plan.planNumber] } }, data: { status: "RESOLVED", resolutionNotes: `Simulation ${scenarioKey} diadopsi menjadi Production Capacity ${plan.planNumber}.`, resolvedBy: actor, resolvedAt: new Date() } });
+      return { adoptedCount: idMap.size, appliedCalendarDays: plan.periodEnd < calendarStart ? 0 : Math.floor((plan.periodEnd - calendarStart) / 86400000) + 1, appliedMachineCount: simulationMachineIds.length, cancelledDppCount: replaceableSchedules.length, replacedProductionCount: productionIds.length, lockedPastAllocationCount: preservedProduction.length, lockedPastDppCount: linkedSchedules.length - replaceableSchedules.length };
+    });
+    res.json({ planNumber: plan.planNumber, scenarioKey, planningMode: "PRODUCTION", ...result, message: "Preset berhasil ditetapkan sebagai Production Capacity. Hari yang sudah lewat tetap dikunci sebagai histori." });
   } catch (error) { next(error); }
 };
 
@@ -602,6 +873,7 @@ exports.confirm = async (req, res, next) => {
     if (!plan) return res.status(404).json({ message: "Monthly Production Plan tidak ditemukan." });
     if (plan.status !== "Draft") return res.status(409).json({ message: `Production Plan tidak dapat dikonfirmasi dari status ${plan.status}.` });
     if (!plan.details.length) return res.status(400).json({ message: "Production Plan tanpa detail tidak dapat dikonfirmasi." });
+    if (plan.replanRequired) return res.status(409).json({ message: plan.replanReason || "Production Plan harus direplan setelah perubahan target delivery.", code: "DELIVERY_REPLAN_REQUIRED" });
     const updated = await prisma.monthlyProductionPlan.update({ where: { planNumber: plan.planNumber }, data: { status: "Confirmed", confirmedBy: req.user?.username || req.user?.email || null, confirmedAt: new Date() }, include });
     res.json(serialize(updated));
   } catch (error) { next(error); }
@@ -612,6 +884,7 @@ exports.release = async (req, res, next) => {
     const plan = await prisma.monthlyProductionPlan.findFirst({ where: { planNumber: req.params.planNumber, isDeleted: false }, include });
     if (!plan) return res.status(404).json({ message: "Monthly Production Plan tidak ditemukan." });
     if (plan.status !== "Confirmed") return res.status(409).json({ message: `Production Plan harus Confirmed sebelum release, status saat ini ${plan.status}.` });
+    if (plan.replanRequired) return res.status(409).json({ message: plan.replanReason || "Production Plan harus direplan setelah perubahan target delivery.", code: "DELIVERY_REPLAN_REQUIRED" });
     const capacity = await buildCapacitySnapshot(prisma, {
       ...(req.body || {}),
       planNumber: plan.planNumber,
@@ -653,17 +926,48 @@ exports.convertToDailyPlans = async (req, res, next) => {
         code: "MONTHLY_PLAN_NOT_RELEASED",
       });
     }
+    if (plan.replanRequired) return res.status(409).json({ message: plan.replanReason || "Jalankan ulang Production Capacity sebelum revisi DPP.", code: "DELIVERY_REPLAN_REQUIRED" });
+
+    // UOM is a foreign key in WO/DPP. Capacity allocations can originate from
+    // legacy snapshots that use different letter casing (for example `PCS`
+    // while the canonical master key is `pcs`). Publish the real master key.
+    const masterUoms = await prisma.uom.findMany({
+      where: { isDeleted: false },
+      select: { uomCode: true },
+    });
+    const canonicalUomByLower = new Map(masterUoms.map((row) => [String(row.uomCode).trim().toLowerCase(), row.uomCode]));
+    const canonicalUomCode = (...candidates) => {
+      for (const candidate of candidates) {
+        const value = String(candidate || "").trim();
+        if (!value) continue;
+        const canonical = canonicalUomByLower.get(value.toLowerCase());
+        if (canonical) return canonical;
+      }
+      return null;
+    };
 
     {
     const draftAllocations = await prisma.productionPlanAllocation.findMany({
-      where: { planId: plan.id, isDeleted: false, status: "Draft" },
+      where: { planId: plan.id, isDeleted: false, status: "Draft", planningMode: "PRODUCTION" },
       include: {
         mbomProcess: {
           select: {
             id: true,
+            noReg: true,
+            mbomDetailId: true,
             processId: true,
             sequence: true,
+            cycleTime: true,
+            machineId: true,
+            diesId: true,
             process: { select: { processCode: true, processName: true } },
+            machine: { select: { costingRate: true, costingRateType: true, currencyCode: true } },
+            mbomDetail: {
+              select: {
+                partId: true,
+                part: { select: { partCode: true, partNumber: true, partName: true } },
+              },
+            },
           },
         },
       },
@@ -680,7 +984,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
       where: {
         monthlyProductionPlanNumber: plan.planNumber,
         isDeleted: false,
-        status: { not: "Cancelled" },
+        status: { notIn: ["Cancelled", "Completed"] },
       },
       include: {
         part: { select: { partCode: true } },
@@ -698,31 +1002,150 @@ exports.convertToDailyPlans = async (req, res, next) => {
       });
     }
 
+    const allocationBomNumbers = [...new Set(
+      draftAllocations.map((allocation) => allocation.mbomProcess?.noReg).filter(Boolean),
+    )];
+    const allocationBomHeaders = allocationBomNumbers.length
+      ? await prisma.mBOMHeader.findMany({
+        where: { noReg: { in: allocationBomNumbers }, isDeleted: false },
+        select: { noReg: true, partId: true },
+      })
+      : [];
+    const bomOwnerPartIdByNumber = new Map(
+      allocationBomHeaders.map((header) => [header.noReg, header.partId]),
+    );
+    const sourceMpsNumber = String(plan.sourceType || "").startsWith("MPS:")
+      ? String(plan.sourceType).slice(4)
+      : null;
+    const sourceMpsDetails = sourceMpsNumber ? await prisma.mPSDetail.findMany({
+      where: { mpsNumber: sourceMpsNumber, isDeleted: false },
+      select: { id: true, notes: true },
+    }) : [];
+    const sourceMpsById = new Map(sourceMpsDetails.map((row) => [row.id, row]));
+    const planDetailByMpsId = new Map(plan.details.filter((row) => row.mpsDetailId).map((row) => [row.mpsDetailId, row]));
+    const parentLineByLine = new Map();
+    for (const detail of plan.details) {
+      // MRP reruns can replace generated MPS detail ids. The MPP snapshot
+      // keeps the immutable source marker, so prefer it over the current MPS row.
+      const sourceId = String(detail.notes || sourceMpsById.get(detail.mpsDetailId)?.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1];
+      const parentDetail = sourceId ? planDetailByMpsId.get(sourceId) : null;
+      if (parentDetail) parentLineByLine.set(number(detail.lineNumber), number(parentDetail.lineNumber));
+    }
+    const mosByPartId = new Map();
+    for (const mo of manufacturingOrders) {
+      if (!mo.partId) continue;
+      if (!mosByPartId.has(mo.partId)) mosByPartId.set(mo.partId, []);
+      mosByPartId.get(mo.partId).push(mo);
+    }
+
     const mosByLine = new Map();
     for (const mo of manufacturingOrders) {
       const lineNumber = number(mo.monthlyProductionPlanLineNumber);
       if (!mosByLine.has(lineNumber)) mosByLine.set(lineNumber, []);
       mosByLine.get(lineNumber).push(mo);
     }
-    const parentMOs = mosByLine.get(1) || [];
-    const mosForLine = (lineNumber) => {
-      const direct = mosByLine.get(number(lineNumber)) || [];
-      return direct.length ? direct : parentMOs;
+    const receiptLineNumbers = new Set(plan.details.filter((row) => !isGeneratedProcess(row)).map((row) => number(row.lineNumber)));
+    const parentMOs = manufacturingOrders.filter((mo) => receiptLineNumbers.has(number(mo.monthlyProductionPlanLineNumber)));
+    const mosForAllocation = (allocation) => {
+      const ownerPartId = bomOwnerPartIdByNumber.get(allocation.mbomProcess?.noReg);
+      const owned = ownerPartId ? (mosByPartId.get(ownerPartId) || []) : [];
+      if (owned.length) return owned;
+      const direct = mosByLine.get(number(allocation.lineNumber)) || [];
+      if (direct.length) return direct;
+      const parentLine = parentLineByLine.get(number(allocation.lineNumber));
+      const parentOwned = parentLine ? (mosByLine.get(parentLine) || []) : [];
+      if (parentOwned.length) return parentOwned;
+      // A single-FG plan has an unambiguous fallback. Multi-FG plans must
+      // never guess by processId because common processes (PRG/SPOT/WELD)
+      // occur under several forecast parents.
+      return parentMOs.length === 1 ? parentMOs : [];
     };
+
+    const allocationById = new Map(draftAllocations.map((allocation) => [allocation.id, allocation]));
+    const allocationDepthMemo = new Map();
+    const allocationDepth = (allocation, visiting = new Set()) => {
+      if (!allocation) return 0;
+      if (allocationDepthMemo.has(allocation.id)) return allocationDepthMemo.get(allocation.id);
+      if (visiting.has(allocation.id)) return 0;
+      const nextVisiting = new Set(visiting).add(allocation.id);
+      const predecessors = Array.isArray(allocation.predecessorAllocationIds)
+        ? allocation.predecessorAllocationIds.map((id) => allocationById.get(id)).filter(Boolean)
+        : [];
+      const depth = predecessors.length
+        ? Math.max(...predecessors.map((row) => allocationDepth(row, nextVisiting))) + 1
+        : 0;
+      allocationDepthMemo.set(allocation.id, depth);
+      return depth;
+    };
+    const routeDepthById = new Map();
+    const routePlannedQtyById = new Map();
+    for (const allocation of draftAllocations) {
+      const routeId = allocation.mbomProcess?.id;
+      if (!routeId) continue;
+      routeDepthById.set(routeId, Math.max(number(routeDepthById.get(routeId)), allocationDepth(allocation)));
+      routePlannedQtyById.set(routeId, number(routePlannedQtyById.get(routeId)) + number(allocation.plannedQty));
+    }
+
+    // Create the exact child-routing WO needed by each capacity allocation.
+    // The same process can occur more than once in a nested BOM, therefore
+    // mbomProcessId (not processId) is the execution identity.
+    const generatedWorkOrders = await prisma.$transaction(async (tx) => {
+      const created = [];
+      const generatedKeys = new Set();
+      for (const allocation of draftAllocations) {
+        if (String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR") continue;
+        const route = allocation.mbomProcess;
+        const mo = mosForAllocation(allocation)[0] || null;
+        if (!route?.id || !route.processId || !mo) continue;
+        const key = `${mo.id}|${route.id}`;
+        if (generatedKeys.has(key) || (mo.workOrders || []).some((wo) => wo.mbomProcessId === route.id)) continue;
+        generatedKeys.add(key);
+        const workOrder = await tx.workOrder.create({
+          data: {
+            woNumber: await nextWorkOrderNumber(tx, allocation.scheduleDate),
+            woDate: new Date(),
+            moId: mo.id,
+            mbomDetailId: route.mbomDetailId || null,
+            mbomProcessId: route.id,
+            outputPartId: route.mbomDetail?.partId || mo.partId || null,
+            outputPartCode: route.mbomDetail?.part?.partCode || mo.part?.partCode || null,
+            outputPartNumber: route.mbomDetail?.part?.partNumber || null,
+            outputPartName: route.mbomDetail?.part?.partName || null,
+            processId: route.processId,
+            sequence: (number(routeDepthById.get(route.id)) + 1) * 10,
+            cycleTime: number(route.cycleTime),
+            diesId: route.diesId || null,
+            machineId: allocation.machineId || route.machineId || null,
+            machineCostingRate: route.machine?.costingRate ?? null,
+            machineRateType: route.machine?.costingRateType || null,
+            machineCurrency: route.machine?.currencyCode || null,
+            plannedDate: allocation.scheduleDate,
+            plannedQty: normalizeQuantity(routePlannedQtyById.get(route.id), canonicalUomCode(allocation.uomCode, mo.uomCode)),
+            uomCode: canonicalUomCode(allocation.uomCode, mo.uomCode),
+            status: "Planned",
+            notes: `[MPP-CHILD-ROUTING:${plan.planNumber}:${allocation.lineNumber}:${route.id}] Generated from Capacity Planning`,
+          },
+        });
+        mo.workOrders.push(workOrder);
+        created.push(workOrder);
+      }
+      return created;
+    });
+
     const moIds = manufacturingOrders.map((mo) => mo.id);
-    const processIds = [...new Set(draftAllocations.map((row) => row.mbomProcess?.processId).filter(Boolean))];
+    const mbomProcessIds = [...new Set(draftAllocations.map((row) => row.mbomProcess?.id).filter(Boolean))];
     const committed = await prisma.dailyProductionSchedule.groupBy({
-      by: ["moId", "processId"],
+      by: ["moId", "mbomProcessId"],
       where: {
         moId: { in: moIds },
-        processId: { in: processIds },
+        mbomProcessId: { in: mbomProcessIds },
         isDeleted: false,
         status: { in: ["Draft", "Released", "In Progress", "Completed"] },
       },
       _sum: { plannedQty: true },
     });
     const committedByMoProcess = new Map(committed.map((row) => [
-      `${row.moId}|${row.processId}`,
+      `${row.moId}|${row.mbomProcessId}`,
       number(row._sum.plannedQty),
     ]));
     const remainingByMoProcess = new Map();
@@ -731,7 +1154,8 @@ exports.convertToDailyPlans = async (req, res, next) => {
 
     for (const allocation of draftAllocations) {
       const processId = allocation.mbomProcess?.processId;
-      const candidateMos = mosForLine(allocation.lineNumber);
+      const mbomProcessId = allocation.mbomProcess?.id;
+      const candidateMos = mosForAllocation(allocation);
       if (!processId) {
         publishBlockers.push({ allocationId: allocation.id, reason: "ROUTING_PROCESS_REFERENCE_MISSING" });
         continue;
@@ -743,18 +1167,20 @@ exports.convertToDailyPlans = async (req, res, next) => {
       let qtyToAssign = number(allocation.plannedQty);
       for (const mo of candidateMos) {
         if (qtyToAssign <= 0.000001) break;
-        const remainingKey = `${mo.id}|${processId}`;
+        const remainingKey = `${mo.id}|${mbomProcessId}`;
+        const workOrder = (mo.workOrders || []).find((wo) => wo.mbomProcessId === mbomProcessId)
+          || (mo.workOrders || []).find((wo) => !wo.mbomProcessId && wo.processId === processId) || null;
         if (!remainingByMoProcess.has(remainingKey)) {
+          const executionTargetQty = workOrder ? number(workOrder.plannedQty) : number(mo.qtyPlanned);
           remainingByMoProcess.set(
             remainingKey,
-            Math.max(number(mo.qtyPlanned) - number(committedByMoProcess.get(remainingKey)), 0),
+            Math.max(executionTargetQty - number(committedByMoProcess.get(remainingKey)), 0),
           );
         }
         const available = number(remainingByMoProcess.get(remainingKey));
         if (available <= 0) continue;
-        const assignedQty = normalizeQuantity(Math.min(qtyToAssign, available), allocation.uomCode || mo.uomCode);
-        const workOrder = (mo.workOrders || []).find((wo) => wo.processId === processId);
-        if (!workOrder) {
+        const assignedQty = normalizeQuantity(Math.min(qtyToAssign, available), canonicalUomCode(allocation.uomCode, mo.uomCode));
+        if (!workOrder && String(allocation.routingMode || "INHOUSE").toUpperCase() !== "VENDOR") {
           publishBlockers.push({
             allocationId: allocation.id,
             moNumber: mo.moNumber,
@@ -764,7 +1190,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
           qtyToAssign = 0;
           break;
         }
-        desired.push({ allocation, mo, workOrder, processId, assignedQty });
+        desired.push({ allocation, mo, workOrder, processId, mbomProcessId, assignedQty });
         remainingByMoProcess.set(remainingKey, available - assignedQty);
         qtyToAssign -= assignedQty;
       }
@@ -794,20 +1220,34 @@ exports.convertToDailyPlans = async (req, res, next) => {
           data: {
             scheduleNumber: await nextDailyPlanNumber(tx, scheduleDate),
             scheduleDate,
-            shift: item.allocation.shift,
+            shift: executionShift(item.allocation.shift),
             moId: item.mo.id,
             moNumber: item.mo.moNumber,
-            woId: item.workOrder.id,
-            woNumber: item.workOrder.woNumber,
-            partId: item.mo.partId,
-            partCode: item.mo.part?.partCode || null,
+            woId: item.workOrder?.id || null,
+            woNumber: item.workOrder?.woNumber || null,
+            // A Daily Production Plan represents one routing operation, not
+            // the parent MO receipt. Its item identity must therefore be the
+            // operation output (WO for in-house, route detail for vendor).
+            // Using the parent FG here creates empty Material Issues and leaves
+            // every intermediate WIP lot unconsumed.
+            partId: item.workOrder?.outputPartId
+              || item.allocation.mbomProcess?.mbomDetail?.partId
+              || item.mo.partId,
+            partCode: item.workOrder?.outputPartCode
+              || item.allocation.mbomProcess?.mbomDetail?.part?.partCode
+              || item.mo.part?.partCode
+              || null,
             processId: item.processId,
+            productionPlanId: plan.id,
+            productionPlanAllocationId: item.allocation.id,
+            mbomProcessId: item.mbomProcessId,
             machineId: item.allocation.routingMode === "INHOUSE" ? item.allocation.machineId : null,
+            vendorId: item.allocation.routingMode === "VENDOR" ? item.allocation.vendorId : null,
             plannedQty: item.assignedQty,
-            uomCode: item.allocation.uomCode || item.mo.uomCode || null,
+            uomCode: canonicalUomCode(item.allocation.uomCode, item.mo.uomCode),
             sequence: number(item.allocation.mbomProcess?.sequence),
             status: "Draft",
-            notes: `${marker} mode ${item.allocation.routingMode}${item.allocation.vendorId ? `; vendor ${item.allocation.vendorId}` : ""}${item.allocation.notes ? `; ${item.allocation.notes}` : ""}`,
+            notes: `${marker} mode ${item.allocation.routingMode}${item.allocation.vendorId ? `; vendor ${item.allocation.vendorId}` : ""}${item.allocation.vendorSendDate ? `; send ${String(item.allocation.vendorSendDate).slice(0, 10)}` : ""}${item.allocation.vendorReturnDate ? `; return ${String(item.allocation.vendorReturnDate).slice(0, 10)}` : ""}${item.allocation.expectedReturnQty != null ? `; expected return ${item.allocation.expectedReturnQty}` : ""}${item.allocation.notes ? `; ${item.allocation.notes}` : ""}`,
             createdBy: req.user?.username || req.user?.email || null,
           },
         }));
@@ -828,6 +1268,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
       total: published.length,
       summary: {
         createdCount: published.length,
+        generatedWorkOrderCount: generatedWorkOrders.length,
         publishedAllocationCount: draftAllocations.length,
         updatedCount: 0,
       },
@@ -1010,7 +1451,8 @@ exports.convertToDailyPlans = async (req, res, next) => {
         }
         const availableForMo = number(remainingByMoProcess.get(remainingKey));
         if (availableForMo <= 0 || qtyToAssign <= 0) continue;
-        const assignedQty = isDiscreteUom(allocation.uomCode)
+        const allocationUomCode = canonicalUomCode(allocation.uomCode, mo.uomCode);
+        const assignedQty = isDiscreteUom(allocationUomCode)
           ? Math.min(Math.round(qtyToAssign), Math.round(availableForMo))
           : Math.min(qtyToAssign, availableForMo);
         const workOrder = (mo.workOrders || []).find((row) => row.processId === route.processId) || null;
@@ -1042,7 +1484,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
         const scheduleDate = new Date(`${allocation.scheduleDate}T00:00:00.000Z`);
         const data = {
           scheduleDate,
-          shift: allocation.shift,
+          shift: executionShift(allocation.shift),
           moId: allocation.mo.id,
           moNumber: allocation.mo.moNumber,
           woId: allocation.workOrder?.id || null,
@@ -1051,11 +1493,11 @@ exports.convertToDailyPlans = async (req, res, next) => {
           partCode: allocation.partCode || allocation.mo.part?.partCode || null,
           processId: allocation.processId,
           machineId: allocation.routingMode === "INHOUSE" ? allocation.machineId : null,
-          plannedQty: normalizeQuantity(allocation.qty, allocation.uomCode || allocation.mo.uomCode),
-          uomCode: allocation.uomCode || allocation.mo.uomCode || null,
+          plannedQty: normalizeQuantity(allocation.qty, canonicalUomCode(allocation.uomCode, allocation.mo.uomCode)),
+          uomCode: canonicalUomCode(allocation.uomCode, allocation.mo.uomCode),
           sequence: number(allocation.sequence),
           status: "Draft",
-          notes: `${marker} Capacity ${number(allocation.minutes)} min; mode ${allocation.routingMode}${allocation.vendorId ? `; vendor ${allocation.vendorId}` : ""}${allocation.diesId ? `; dies ${allocation.diesId}` : ""}.`,
+          notes: `${marker} Capacity ${number(allocation.minutes)} min; mode ${allocation.routingMode}${allocation.vendorId ? `; vendor ${allocation.vendorId}` : ""}${allocation.vendorSendDate ? `; send ${String(allocation.vendorSendDate).slice(0, 10)}` : ""}${allocation.vendorReturnDate ? `; return ${String(allocation.vendorReturnDate).slice(0, 10)}` : ""}${allocation.expectedReturnQty != null ? `; expected return ${allocation.expectedReturnQty}` : ""}${allocation.diesId ? `; dies ${allocation.diesId}` : ""}.`,
           createdBy: req.user?.username || req.user?.email || null,
         };
         if (existing) {
@@ -1125,23 +1567,39 @@ exports.createManualDailyPlan = async (req, res, next) => {
       return res.status(409).json({ message: `MPP berstatus ${plan.status} tidak dapat menerima alokasi produksi baru.` });
     }
     const lineNumber = Number(req.body?.lineNumber);
+    const planningMode = String(req.body?.planningMode || "PRODUCTION").toUpperCase() === "SIMULATION" ? "SIMULATION" : "PRODUCTION";
+    const scenarioKey = planningMode === "SIMULATION" ? String(req.body?.scenarioKey || "").trim().toLowerCase() : null;
     const mbomProcessId = text(req.body?.mbomProcessId);
-    const scheduleDateText = String(req.body?.scheduleDate || "").slice(0, 10);
-    const scheduleDate = new Date(`${scheduleDateText}T00:00:00.000Z`);
     const routingMode = String(req.body?.routingMode || "INHOUSE").toUpperCase();
+    const scheduleDate = dateOnly(routingMode === "VENDOR"
+      ? (req.body?.vendorSendDate || req.body?.scheduleDate)
+      : req.body?.scheduleDate);
     const shift = routingMode === "VENDOR" ? "VENDOR" : String(req.body?.shift || "1");
     const plannedQty = number(req.body?.plannedQty);
     const machineId = text(req.body?.machineId);
     const vendorId = text(req.body?.vendorId);
+    const vendorReturnDate = routingMode === "VENDOR" ? dateOnly(req.body?.vendorReturnDate) : null;
+    const expectedReturnQtyInput = req.body?.expectedReturnQty == null
+      ? plannedQty
+      : number(req.body.expectedReturnQty);
     const notes = text(req.body?.notes);
-    if (!Number.isInteger(lineNumber) || lineNumber < 1 || !mbomProcessId || Number.isNaN(scheduleDate.getTime()) || plannedQty <= 0) {
+    if (!Number.isInteger(lineNumber) || lineNumber < 1 || !mbomProcessId || !scheduleDate || plannedQty <= 0) {
       return res.status(400).json({ message: "Line, routing process, tanggal, dan qty alokasi wajib diisi." });
     }
+    if (planningMode === "SIMULATION" && !/^preset-[a-z0-9-]{8,}$/i.test(scenarioKey || "")) return res.status(400).json({ message: "Simulation allocation harus memakai preset bulanan yang tersimpan." });
+    if (planningMode === "SIMULATION" && !(await findPreset(prisma, scenarioKey))) return res.status(404).json({ message: "Preset simulasi tidak ditemukan." });
     if (scheduleDate < plan.periodStart || scheduleDate > plan.periodEnd) {
       return res.status(400).json({ message: "Tanggal alokasi harus berada dalam periode MPP." });
     }
+    const freezeOverrideReason = requireFreezeOverride(plan, scheduleDate, planningMode, req.body);
     if (!["INHOUSE", "VENDOR"].includes(routingMode) || (routingMode === "INHOUSE" && (!machineId || !["1", "2", "3"].includes(shift))) || (routingMode === "VENDOR" && !vendorId)) {
       return res.status(400).json({ message: "Pilih shift dan mesin untuk in-house, atau vendor untuk proses vendor." });
+    }
+    if (routingMode === "VENDOR" && (!vendorReturnDate || vendorReturnDate < scheduleDate)) {
+      return res.status(400).json({ message: "Tanggal kembali vendor wajib diisi dan tidak boleh sebelum tanggal kirim." });
+    }
+    if (routingMode === "VENDOR" && expectedReturnQtyInput <= 0) {
+      return res.status(400).json({ message: "Qty ekspektasi kembali vendor harus lebih dari nol." });
     }
     const line = plan.details.find((row) => Number(row.lineNumber) === lineNumber && !row.isDeleted);
     if (!line) return res.status(404).json({ message: "Line Production Plan tidak ditemukan." });
@@ -1156,14 +1614,20 @@ exports.createManualDailyPlan = async (req, res, next) => {
       return res.status(409).json({ message: "Routing process tidak sesuai dengan line Production Plan." });
     }
     if (!route.processId) return res.status(409).json({ message: "Routing belum mempunyai reference process." });
+    let selectedVendor = null;
     if (routingMode === "INHOUSE") {
-      const allowedMachines = [route.machineId, ...(Array.isArray(route.alternativeMachineIds) ? route.alternativeMachineIds : [])].filter(Boolean);
-      if (!allowedMachines.includes(machineId)) return res.status(409).json({ message: "Mesin bukan mesin utama/alternatif pada routing MBOM." });
-      if (!await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: "Active" } })) {
+      const selectedMachine = await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: "Active" }, select: { id: true, machineSpecificationCode: true } });
+      const requiredSpecification = route.machineSpecificationCode || (route.machineId ? (await prisma.machine.findUnique({ where: { id: route.machineId }, select: { machineSpecificationCode: true } }))?.machineSpecificationCode : null);
+      if (!selectedMachine) {
         return res.status(409).json({ message: "Mesin tidak aktif atau tidak ditemukan." });
       }
-    } else if (!await prisma.vendor.findFirst({ where: { id: vendorId, isDeleted: false, status: "Active" } })) {
-      return res.status(409).json({ message: "Vendor tidak aktif atau tidak ditemukan." });
+      if (!requiredSpecification || selectedMachine.machineSpecificationCode !== requiredSpecification) return res.status(409).json({ message: "Mesin tidak memenuhi Machine Specification routing BOM." });
+    } else {
+      selectedVendor = await prisma.vendor.findFirst({
+        where: { id: vendorId, isDeleted: false, status: "Active" },
+        select: { id: true, vendorCode: true, vendorName: true, leadTimeDays: true },
+      });
+      if (!selectedVendor) return res.status(409).json({ message: "Vendor tidak aktif atau tidak ditemukan." });
     }
 
     const allocated = await prisma.productionPlanAllocation.aggregate({
@@ -1173,10 +1637,18 @@ exports.createManualDailyPlan = async (req, res, next) => {
         mbomProcessId,
         isDeleted: false,
         status: { in: ["Draft", "Published"] },
+        planningMode,
+        ...(planningMode === "SIMULATION" ? { scenarioKey } : {}),
       },
       _sum: { plannedQty: true },
     });
     const normalizedQty = normalizeQuantity(plannedQty, line.uomCode);
+    const expectedReturnQty = routingMode === "VENDOR"
+      ? normalizeQuantity(expectedReturnQtyInput, line.uomCode)
+      : null;
+    if (routingMode === "VENDOR" && expectedReturnQty > normalizedQty + 0.000001) {
+      return res.status(409).json({ message: "Qty ekspektasi kembali tidak boleh melebihi qty yang dikirim ke vendor." });
+    }
     const remainingQty = Math.max(number(line.qtyPlanned) - number(allocated._sum.plannedQty), 0);
     if (normalizedQty > remainingQty + 0.000001) {
       return res.status(409).json({ message: `Qty alokasi melebihi sisa MPP untuk proses ini. Sisa tersedia ${remainingQty} ${line.uomCode || ""}.` });
@@ -1192,20 +1664,40 @@ exports.createManualDailyPlan = async (req, res, next) => {
         machineId: routingMode === "INHOUSE" ? machineId : null,
         routingMode,
         vendorId: routingMode === "VENDOR" ? vendorId : null,
+        vendorSendDate: routingMode === "VENDOR" ? scheduleDate : null,
+        vendorReturnDate,
+        vendorLeadTimeDays: routingMode === "VENDOR"
+          ? Math.max(number(selectedVendor?.leadTimeDays), 0)
+          : null,
+        expectedReturnQty,
         plannedQty: normalizedQty,
         uomCode: line.uomCode || null,
         status: "Draft",
-        notes,
+        planningMode,
+        scenarioKey,
+        notes: [notes, freezeOverrideReason ? `[FREEZE-OVERRIDE] ${freezeOverrideReason}` : null].filter(Boolean).join("; ") || null,
         createdBy: req.user?.username || req.user?.email || null,
       },
     });
     res.status(201).json({
       planNumber: plan.planNumber,
+      planningMode,
+      scenarioKey,
       allocation,
       summary: {
         createdCount: 1,
         plannedQty: normalizedQty,
         remainingQty: normalizeQuantity(remainingQty - normalizedQty, line.uomCode),
+        ...(routingMode === "VENDOR" ? {
+          vendorSchedule: {
+            vendorCode: selectedVendor.vendorCode,
+            sendDate: scheduleDate,
+            returnDate: vendorReturnDate,
+            plannedLeadTimeDays: calendarDaysBetween(scheduleDate, vendorReturnDate),
+            masterLeadTimeDays: number(selectedVendor.leadTimeDays),
+            expectedReturnQty,
+          },
+        } : {}),
       },
     });
   } catch (error) {
@@ -1214,11 +1706,73 @@ exports.createManualDailyPlan = async (req, res, next) => {
   }
 };
 
+exports.updateManualAllocation = async (req, res, next) => {
+  try {
+    const allocation = await prisma.productionPlanAllocation.findFirst({
+      where: { id: req.params.allocationId, isDeleted: false },
+      include: {
+        plan: { include: { details: { where: { isDeleted: false, status: { not: "Cancelled" } } } } },
+        mbomProcess: { include: { machine: { select: { machineSpecificationCode: true } } } },
+      },
+    });
+    if (!allocation || allocation.plan.planNumber !== req.params.planNumber) return res.status(404).json({ message: "Draft allocation tidak ditemukan." });
+    if (allocation.status !== "Draft") return res.status(409).json({ message: "Hanya allocation Draft yang dapat diedit." });
+    const routingMode = String(req.body?.routingMode || allocation.routingMode || "INHOUSE").toUpperCase();
+    const scheduleDate = dateOnly(routingMode === "VENDOR" ? (req.body?.vendorSendDate || req.body?.scheduleDate) : req.body?.scheduleDate);
+    const vendorReturnDate = routingMode === "VENDOR" ? dateOnly(req.body?.vendorReturnDate) : null;
+    const plannedQty = normalizeQuantity(req.body?.plannedQty, allocation.uomCode);
+    const expectedReturnQty = routingMode === "VENDOR" ? normalizeQuantity(req.body?.expectedReturnQty ?? plannedQty, allocation.uomCode) : null;
+    const shift = routingMode === "VENDOR" ? "VENDOR" : String(req.body?.shift || allocation.shift || "1");
+    const machineId = text(req.body?.machineId);
+    const vendorId = text(req.body?.vendorId);
+    if (!scheduleDate || plannedQty <= 0) return res.status(400).json({ message: "Tanggal dan qty allocation wajib diisi." });
+    const freezeOverrideReason = requireFreezeOverride(allocation.plan, scheduleDate, allocation.planningMode, req.body);
+    if (scheduleDate < allocation.plan.periodStart || scheduleDate > allocation.plan.periodEnd) return res.status(400).json({ message: "Tanggal allocation harus berada dalam periode MPP." });
+    if (routingMode === "INHOUSE" && (!machineId || !["1", "2", "3"].includes(shift))) return res.status(400).json({ message: "Mesin dan shift wajib dipilih." });
+    if (routingMode === "VENDOR" && (!vendorId || !vendorReturnDate || vendorReturnDate < scheduleDate)) return res.status(400).json({ message: "Vendor, tanggal kirim, dan tanggal kembali wajib valid." });
+    if (routingMode === "VENDOR" && (expectedReturnQty <= 0 || expectedReturnQty > plannedQty + 0.000001)) return res.status(400).json({ message: "Qty kembali vendor harus lebih dari nol dan tidak melebihi qty kirim." });
+    let selectedVendor = null;
+    if (routingMode === "INHOUSE") {
+      const machine = await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: "Active" }, select: { id: true, machineSpecificationCode: true } });
+      const requiredSpecification = allocation.mbomProcess.machineSpecificationCode || allocation.mbomProcess.machine?.machineSpecificationCode;
+      if (!machine || !requiredSpecification || machine.machineSpecificationCode !== requiredSpecification) return res.status(409).json({ message: "Mesin tidak aktif atau tidak memenuhi Machine Specification routing." });
+    } else {
+      selectedVendor = await prisma.vendor.findFirst({ where: { id: vendorId, isDeleted: false, status: "Active" }, select: { id: true, leadTimeDays: true } });
+      if (!selectedVendor) return res.status(409).json({ message: "Vendor tidak aktif atau tidak ditemukan." });
+    }
+    const line = allocation.plan.details.find((row) => Number(row.lineNumber) === Number(allocation.lineNumber));
+    if (!line) return res.status(409).json({ message: "Line MPP allocation sudah tidak tersedia." });
+    const other = await prisma.productionPlanAllocation.aggregate({
+      where: {
+        id: { not: allocation.id }, planId: allocation.planId, lineNumber: allocation.lineNumber,
+        mbomProcessId: allocation.mbomProcessId, planningMode: allocation.planningMode,
+        ...(allocation.planningMode === "SIMULATION" ? { scenarioKey: allocation.scenarioKey } : {}),
+        isDeleted: false, status: { in: ["Draft", "Published"] },
+      },
+      _sum: { plannedQty: true },
+    });
+    const remainingQty = Math.max(number(line.qtyPlanned) - number(other._sum.plannedQty), 0);
+    if (plannedQty > remainingQty + 0.000001) return res.status(409).json({ message: `Qty edit melebihi sisa MPP ${remainingQty} ${allocation.uomCode || ""}.` });
+    const updated = await prisma.productionPlanAllocation.update({
+      where: { id: allocation.id },
+      data: {
+        scheduleDate, shift, plannedQty, routingMode,
+        machineId: routingMode === "INHOUSE" ? machineId : null,
+        vendorId: routingMode === "VENDOR" ? vendorId : null,
+        vendorSendDate: routingMode === "VENDOR" ? scheduleDate : null,
+        vendorReturnDate, vendorLeadTimeDays: routingMode === "VENDOR" ? Math.max(number(selectedVendor?.leadTimeDays), 0) : null,
+        expectedReturnQty, notes: [text(req.body?.notes), freezeOverrideReason ? `[FREEZE-OVERRIDE] ${freezeOverrideReason}` : null].filter(Boolean).join("; ") || null,
+      },
+    });
+    res.json({ planNumber: allocation.plan.planNumber, allocation: updated, message: "Allocation berhasil diperbarui." });
+  } catch (error) { next(error); }
+};
+
 exports.removeManualAllocation = async (req, res, next) => {
   try {
     const plan = await prisma.monthlyProductionPlan.findFirst({
       where: { planNumber: req.params.planNumber, isDeleted: false },
-      select: { id: true, planNumber: true },
+      select: { id: true, planNumber: true, freezeFenceDays: true },
     });
     if (!plan) return res.status(404).json({ message: "Production Plan tidak ditemukan." });
     const allocation = await prisma.productionPlanAllocation.findFirst({
@@ -1228,6 +1782,7 @@ exports.removeManualAllocation = async (req, res, next) => {
     if (allocation.status !== "Draft") {
       return res.status(409).json({ message: "Allocation yang sudah dipublikasikan tidak dapat dihapus dari Capacity Check." });
     }
+    requireFreezeOverride(plan, allocation.scheduleDate, allocation.planningMode, req.body);
     const updated = await prisma.productionPlanAllocation.update({
       where: { id: allocation.id },
       data: { status: "Cancelled", isDeleted: true },
@@ -1265,16 +1820,18 @@ exports.assignCapacityMachine = async (req, res, next) => {
     const scheduleDate = new Date(`${String(req.body?.scheduleDate || '').slice(0, 10)}T00:00:00.000Z`);
     const reason = String(req.body?.reason || '').trim();
     if (!Number.isInteger(lineNumber) || lineNumber < 1 || !mbomProcessId || Number.isNaN(scheduleDate.getTime())) return res.status(400).json({ message: "Line, routing process, dan tanggal assignment wajib dipilih." });
+    assertCapacityDateEditable(scheduleDate);
     if (!["INHOUSE", "VENDOR"].includes(routingMode) || (routingMode === "INHOUSE" && !machineId) || (routingMode === "VENDOR" && !vendorId)) return res.status(400).json({ message: "Pilih mesin untuk INHOUSE atau vendor untuk VENDOR." });
     if (reason.length < 10) return res.status(400).json({ message: "Alasan perpindahan mesin minimal 10 karakter." });
     const line = plan.details.find((item) => Number(item.lineNumber) === lineNumber && !item.isDeleted);
     if (!line) return res.status(404).json({ message: "Detail Production Plan tidak ditemukan." });
     const route = await prisma.mBOMProcess.findFirst({ where: { id: mbomProcessId, isDeleted: false }, include: { mbomDetail: { select: { partId: true, part: { select: { partCode: true } } } } } });
     if (!route || (line.partId && route.mbomDetail?.partId !== line.partId) || (!line.partId && route.mbomDetail?.part?.partCode !== line.partCode)) return res.status(409).json({ message: "Routing process tidak sesuai dengan part pada Production Plan." });
-    const alternatives = [route.machineId, ...(Array.isArray(route.alternativeMachineIds) ? route.alternativeMachineIds : [])].filter(Boolean);
-    if (routingMode === "INHOUSE" && !alternatives.includes(machineId)) return res.status(409).json({ message: "Mesin bukan mesin utama/alternatif routing BOM." });
-    const machine = machineId ? await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: 'Active' }, select: { id: true, machineCode: true, machineName: true } }) : null;
+    const legacyMachine = route.machineId ? await prisma.machine.findUnique({ where: { id: route.machineId }, select: { machineSpecificationCode: true } }) : null;
+    const requiredSpecification = route.machineSpecificationCode || legacyMachine?.machineSpecificationCode || null;
+    const machine = machineId ? await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: 'Active' }, select: { id: true, machineCode: true, machineName: true, machineSpecificationCode: true } }) : null;
     if (routingMode === "INHOUSE" && !machine) return res.status(409).json({ message: "Mesin tidak aktif atau tidak ditemukan." });
+    if (routingMode === "INHOUSE" && (!requiredSpecification || machine.machineSpecificationCode !== requiredSpecification)) return res.status(409).json({ message: "Mesin tidak memenuhi Machine Specification routing BOM." });
     if (diesId && !await prisma.dies.findFirst({ where: { id: diesId, isDeleted: false, status: "Active" } })) return res.status(409).json({ message: "Dies/QD tidak aktif atau tidak ditemukan." });
     if (routingMode === "VENDOR" && !await prisma.vendor.findFirst({ where: { id: vendorId, isDeleted: false, status: "Active" } })) return res.status(409).json({ message: "Vendor tidak aktif atau tidak ditemukan." });
     const override = await prisma.capacityMachineOverride.upsert({
@@ -1297,6 +1854,7 @@ exports.setCapacityDay = async (req, res, next) => {
     const shiftsPerDay = req.body?.shiftsPerDay == null ? null : Number(req.body.shiftsPerDay);
     const reason = String(req.body?.reason || "").trim();
     if (Number.isNaN(scheduleDate.getTime()) || scheduleDate < plan.periodStart || scheduleDate > plan.periodEnd) return res.status(400).json({ message: "Tanggal harus berada dalam periode Production Plan." });
+    assertCapacityDateEditable(scheduleDate);
     if (!['WORKING', 'HOLIDAY', 'OVERLOAD'].includes(dayStatus) || (shiftsPerDay != null && (![1, 2, 3].includes(shiftsPerDay)))) return res.status(400).json({ message: "Status atau jumlah shift harian tidak valid." });
     const time = (value) => value && /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value)) ? String(value) : null;
     const overtimeStart = time(req.body?.overtimeStart);
@@ -1344,6 +1902,7 @@ exports.setGlobalCapacityDay = async (req, res, next) => {
     const shiftsPerDay = req.body?.shiftsPerDay == null ? null : Number(req.body.shiftsPerDay);
     const reason = String(req.body?.reason || '').trim();
     if (Number.isNaN(scheduleDate.getTime()) || !machineId) return res.status(400).json({ message: 'Mesin dan tanggal wajib dipilih.' });
+    assertCapacityDateEditable(scheduleDate);
     if (!['WORKING', 'HOLIDAY', 'OVERLOAD'].includes(dayStatus) || (shiftsPerDay != null && ![1, 2, 3].includes(shiftsPerDay))) return res.status(400).json({ message: 'Status atau jumlah shift harian tidak valid.' });
     const time = (value) => value && /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value)) ? String(value) : null;
     const overtimeStart = time(req.body?.overtimeStart);
