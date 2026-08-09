@@ -2,12 +2,13 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_PLAN_STATUSES = ["Draft", "Confirmed", "Released", "In Progress"];
 const ACTIVE_SCHEDULE_STATUSES = ["Draft", "Released", "In Progress", "Completed"];
 const { getFormulaSet, evaluateFromSet } = require("../masterFormulaService");
-const { findPreset, presetCapacityQuery, shiftDurationMinutes } = require("./capacitySimulationPresetService");
+const { findPreset, findActivePreset, presetCapacityQuery, shiftDurationMinutes } = require("./capacitySimulationPresetService");
 const {
   canonicalizeRoutingOperations,
   compareRoutingOperations,
 } = require("../../utils/routingSequence");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
+const { intervalsOverlap, isDiesCapacityBlockingEnabled, isDiesTonnageCompatible, isPressResource, maintenanceInterval, plannedInterval } = require("./diesCapacityService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 2) => Number(number(value).toFixed(digits));
@@ -43,6 +44,198 @@ function predecessorQuantityStatus(predecessorOutput, predecessorPlanQty, succes
   return { mode: "RAW_QTY", predecessorCoverage: null, successorCoverage: null, short: output + 0.000001 < required };
 }
 
+function logicalPredecessorGroupKey(allocation = {}) {
+  const planNumber = allocation.plan?.planNumber || allocation.planNumber || "NO_PLAN";
+  const lineNumber = allocation.lineNumber ?? "NO_LINE";
+  const routeId = allocation.mbomProcessId || allocation.mbomProcess?.id || allocation.mbomProcess?.processId || "NO_ROUTE";
+  const phase = allocation.deliveryPhaseId
+    ? `ID:${allocation.deliveryPhaseId}`
+    : allocation.deliveryPhaseNumber != null
+      ? `NUMBER:${allocation.deliveryPhaseNumber}`
+      : "NO_PHASE";
+  return `${planNumber}|${lineNumber}|${routeId}|${phase}`;
+}
+
+/**
+ * A successor can legitimately depend on several finite-capacity chunks from
+ * the same routing operation. Quantity readiness belongs to that logical
+ * route/MPP-line/delivery-phase, not to each physical chunk. Only chunks that
+ * finish no later than the successor start can contribute available WIP.
+ */
+function predecessorOutputQuantity(predecessor = {}) {
+  return String(predecessor.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
+    ? number(predecessor.expectedReturnQty ?? predecessor.plannedQty)
+    : number(predecessor.plannedQty);
+}
+
+function ensurePredecessorWipEntry(wipState, predecessor, outputQty = predecessorOutputQuantity(predecessor)) {
+  if (!(wipState instanceof Map) || predecessor?.id == null) return null;
+  const allocationId = String(predecessor.id);
+  let entry = wipState.get(allocationId);
+  if (!entry) {
+    entry = {
+      allocationId: predecessor.id,
+      originalOutputQty: number(outputQty),
+      remainingOutputQty: number(outputQty),
+      reservations: [],
+    };
+    wipState.set(allocationId, entry);
+  }
+  return entry;
+}
+
+function groupPredecessorAllocations(predecessors = [], successorStart, wipState = null) {
+  const start = successorStart instanceof Date ? successorStart : new Date(successorStart);
+  const startTime = start.getTime();
+  const groups = new Map();
+  const seenAllocationIds = new Set();
+
+  for (const predecessor of predecessors) {
+    const allocationId = predecessor?.id == null ? null : String(predecessor.id);
+    if (allocationId && seenAllocationIds.has(allocationId)) continue;
+    if (allocationId) seenAllocationIds.add(allocationId);
+    const vendorMode = String(predecessor.routingMode || "INHOUSE").toUpperCase() === "VENDOR";
+    const finishAt = vendorMode
+      ? allocationMoment(predecessor.vendorReturnDate || predecessor.scheduleDate, predecessor.plannedEndTime, true)
+      : allocationMoment(predecessor.scheduleDate, predecessor.plannedEndTime, true);
+    const originalOutputQty = predecessorOutputQuantity(predecessor);
+    const wipEntry = ensurePredecessorWipEntry(wipState, predecessor, originalOutputQty);
+    const outputQty = wipEntry ? Math.max(number(wipEntry.remainingOutputQty), 0) : originalOutputQty;
+    const reservedOutputQty = Math.max(originalOutputQty - outputQty, 0);
+    const finishedBeforeSuccessor = Number.isFinite(startTime) && finishAt.getTime() <= startTime;
+    const key = logicalPredecessorGroupKey(predecessor);
+    const current = groups.get(key) || {
+      key,
+      planNumber: predecessor.plan?.planNumber || predecessor.planNumber || null,
+      lineNumber: predecessor.lineNumber ?? null,
+      routeId: predecessor.mbomProcessId || predecessor.mbomProcess?.id || null,
+      deliveryPhaseId: predecessor.deliveryPhaseId || null,
+      deliveryPhaseNumber: predecessor.deliveryPhaseNumber ?? null,
+      processCode: predecessor.mbomProcess?.process?.processCode || null,
+      uomCode: predecessor.uomCode || null,
+      availableOutputQty: 0,
+      lateOutputQty: 0,
+      linkedOutputQty: 0,
+      grossLinkedOutputQty: 0,
+      reservedOutputQty: 0,
+      finishedBatchCount: 0,
+      lateBatchCount: 0,
+      batches: [],
+    };
+
+    current.linkedOutputQty += outputQty;
+    current.grossLinkedOutputQty += originalOutputQty;
+    current.reservedOutputQty += reservedOutputQty;
+    if (finishedBeforeSuccessor) {
+      current.availableOutputQty += outputQty;
+      current.finishedBatchCount += 1;
+    } else {
+      current.lateOutputQty += outputQty;
+      current.lateBatchCount += 1;
+    }
+    current.batches.push({
+      allocationId: predecessor.id,
+      transferBatchNumber: predecessor.transferBatchNumber ?? null,
+      outputQty: round(outputQty, 3),
+      originalOutputQty: round(originalOutputQty, 3),
+      reservedOutputQty: round(reservedOutputQty, 3),
+      uomCode: predecessor.uomCode || null,
+      finishAt,
+      finishedBeforeSuccessor,
+      priorReservations: (wipEntry?.reservations || []).map((reservation) => ({ ...reservation })),
+    });
+    groups.set(key, current);
+  }
+
+  return [...groups.values()].map((group) => ({
+    ...group,
+    availableOutputQty: round(group.availableOutputQty, 3),
+    lateOutputQty: round(group.lateOutputQty, 3),
+    linkedOutputQty: round(group.linkedOutputQty, 3),
+    grossLinkedOutputQty: round(group.grossLinkedOutputQty, 3),
+    reservedOutputQty: round(group.reservedOutputQty, 3),
+    batches: group.batches.sort((left, right) => left.finishAt - right.finishAt
+      || String(left.allocationId).localeCompare(String(right.allocationId))),
+  })).sort((left, right) => left.key.localeCompare(right.key));
+}
+
+/**
+ * Reserve physical predecessor output for one successor. The caller processes
+ * successors chronologically, so an earlier successor always owns its WIP
+ * first. Every reservation is stored against the physical allocation id; this
+ * prevents the same split batch from being counted again through another set
+ * of dependency links.
+ */
+function reservePredecessorGroupOutput(group, requiredOutputQty, successor = {}, wipState) {
+  const requiredQty = Math.max(number(requiredOutputQty), 0);
+  let outstandingQty = requiredQty;
+  const batchReservations = [];
+
+  for (const batch of group?.batches || []) {
+    if (outstandingQty <= COVERAGE_EPSILON) break;
+    const entry = wipState instanceof Map ? wipState.get(String(batch.allocationId)) : null;
+    const remainingQty = entry ? Math.max(number(entry.remainingOutputQty), 0) : Math.max(number(batch.outputQty), 0);
+    const reservedQty = Math.min(remainingQty, outstandingQty);
+    if (reservedQty <= COVERAGE_EPSILON) continue;
+    const reservation = {
+      predecessorAllocationId: batch.allocationId,
+      successorAllocationId: successor.id || successor.allocationId || null,
+      successorStartAt: successor.startAt instanceof Date ? successor.startAt.toISOString() : successor.startAt || null,
+      reservedQty: round(reservedQty, 3),
+      finishedBeforeSuccessor: Boolean(batch.finishedBeforeSuccessor),
+    };
+    if (entry) {
+      entry.remainingOutputQty = Math.max(number(entry.remainingOutputQty) - reservedQty, 0);
+      entry.reservations.push(reservation);
+    }
+    batchReservations.push({ ...reservation, finishAt: batch.finishAt });
+    outstandingQty -= reservedQty;
+  }
+
+  const readyReservedQty = batchReservations
+    .filter((reservation) => reservation.finishedBeforeSuccessor)
+    .reduce((sum, reservation) => sum + number(reservation.reservedQty), 0);
+  const lateReservedQty = batchReservations
+    .filter((reservation) => !reservation.finishedBeforeSuccessor)
+    .reduce((sum, reservation) => sum + number(reservation.reservedQty), 0);
+  return {
+    requiredQty: round(requiredQty, 3),
+    reservedQty: round(requiredQty - Math.max(outstandingQty, 0), 3),
+    readyReservedQty: round(readyReservedQty, 3),
+    lateReservedQty: round(lateReservedQty, 3),
+    unreservedQty: round(Math.max(outstandingQty, 0), 3),
+    batchReservations,
+  };
+}
+
+function predecessorGroupReadiness(group, predecessorPlanQty, successorQty, successorPlanQty, successorUomCode) {
+  const quantityStatus = predecessorQuantityStatus(
+    group?.availableOutputQty,
+    predecessorPlanQty,
+    successorQty,
+    successorPlanQty,
+    group?.uomCode,
+    successorUomCode,
+  );
+  const linkedQuantityStatus = predecessorQuantityStatus(
+    group?.linkedOutputQty,
+    predecessorPlanQty,
+    successorQty,
+    successorPlanQty,
+    group?.uomCode,
+    successorUomCode,
+  );
+  return {
+    status: !quantityStatus.short
+      ? "READY"
+      : number(group?.lateBatchCount) > 0 && !linkedQuantityStatus.short
+        ? "TIMING_BLOCKED"
+        : "QTY_BLOCKED",
+    quantityStatus,
+    linkedQuantityStatus,
+  };
+}
+
 function parseDateOnly(value, fallback = new Date()) {
   const source = value || fallback;
   const parsed = source instanceof Date ? new Date(source) : new Date(`${String(source).slice(0, 10)}T00:00:00.000Z`);
@@ -64,6 +257,17 @@ function allocationMoment(date, time, endOfDay = false) {
     ? String(time).slice(0, 5)
     : endOfDay ? "23:59" : "00:00";
   return new Date(`${day}T${clock}:00.000Z`);
+}
+
+function allocationStartMoment(allocation = {}) {
+  return String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
+    ? allocationMoment(allocation.vendorSendDate || allocation.scheduleDate, allocation.plannedStartTime, false)
+    : allocationMoment(allocation.scheduleDate, allocation.plannedStartTime, false);
+}
+
+function compareAllocationConsumptionOrder(left, right) {
+  return allocationStartMoment(left) - allocationStartMoment(right)
+    || String(left?.id || "").localeCompare(String(right?.id || ""));
 }
 
 function resolveRange(query = {}) {
@@ -133,14 +337,14 @@ function resolveDailyCapacity({
   const day = parseDateOnly(key).getUTCDay();
   const weekendClosed = !hasOverride && ((day === 6 && !includeSaturday) || (day === 0 && !includeSunday));
   const shiftsPerDay = hasOverride
-    ? Math.min(Math.max(number(override.shiftsPerDay) || defaultShiftsPerDay, 1), 3)
+    ? Math.min(Math.max(override.shiftsPerDay == null ? defaultShiftsPerDay : number(override.shiftsPerDay), 0), 3)
     : defaultShiftsPerDay;
   // A saved machine-date rule replaces the scenario overtime. An empty
   // overtime range therefore explicitly means zero overtime for that date.
   const dailyOvertimeMinutes = hasOverride
     ? overtimeMinutes(override.overtimeStart, override.overtimeEnd)
     : defaultOvertimeHours * 60;
-  const isClosed = dayStatus === "HOLIDAY" || weekendClosed;
+  const isClosed = dayStatus === "HOLIDAY" || shiftsPerDay <= 0 || weekendClosed;
   const effectiveShiftHours = hasOverride && number(override.shiftHours) > 0 ? number(override.shiftHours) : shiftHours;
   const availableMinutes = isClosed
     ? 0
@@ -163,7 +367,7 @@ function resolveDailyCapacity({
 }
 
 function pushIssue(target, issue, seen) {
-  const key = [issue.code, issue.planNumber, issue.lineNumber, issue.partCode, issue.processCode, issue.routeId, issue.machineCode, issue.allocationId, issue.relatedAllocationId].join("|");
+  const key = [issue.code, issue.planNumber, issue.lineNumber, issue.partCode, issue.processCode, issue.routeId, issue.machineCode, issue.diesCode, issue.allocationId, issue.relatedAllocationId, issue.relatedScheduleId].join("|");
   if (seen.has(key)) return;
   seen.add(key);
   target.push({
@@ -178,12 +382,14 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const planningMode = String(query.planningMode || "PRODUCTION").toUpperCase() === "SIMULATION" ? "SIMULATION" : "PRODUCTION";
   const scenarioKey = planningMode === "SIMULATION" ? String(query.presetId || query.scenarioKey || "").trim() || null : null;
   const presetId = String(query.presetId || scenarioKey || "").trim() || null;
-  const selectedPreset = presetId ? await findPreset(prisma, presetId) : null;
+  const selectedPreset = presetId
+    ? await findPreset(prisma, presetId)
+    : planningMode === "PRODUCTION" ? await findActivePreset(prisma) : null;
   const effectiveQuery = selectedPreset ? { ...query, ...presetCapacityQuery(selectedPreset) } : query;
   const formulas = await getFormulaSet(prisma, "capacity");
   const range = resolveRange(effectiveQuery);
   const shiftHours = Math.min(Math.max(number(effectiveQuery.shiftHours) || 8, 1), 24);
-  const shiftsPerDay = Math.min(Math.max(number(effectiveQuery.shiftsPerDay) || 1, 1), 3);
+  const shiftsPerDay = Math.min(Math.max(number(effectiveQuery.shiftsPerDay) || 2, 1), 3);
   const efficiencyPercent = Math.min(Math.max(number(effectiveQuery.efficiencyPercent) || 85, 1), 100);
   const overtimeHours = Math.min(Math.max(number(effectiveQuery.overtimeHours), 0), 12);
   const includeSaturday = bool(effectiveQuery.includeSaturday, false);
@@ -240,7 +446,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           : {}),
       },
       orderBy: [{ scheduleDate: "asc" }, { shift: "asc" }, { sequence: "asc" }],
-      select: { id: true, scheduleNumber: true, scheduleDate: true, shift: true, moId: true, moNumber: true, woId: true, woNumber: true, partCode: true, processId: true, machineId: true, plannedQty: true, actualQty: true, uomCode: true, sequence: true, status: true },
+      select: { id: true, scheduleNumber: true, scheduleDate: true, shift: true, plannedStartTime: true, plannedEndTime: true, moId: true, moNumber: true, woId: true, woNumber: true, partCode: true, processId: true, machineId: true, diesId: true, plannedQty: true, actualQty: true, uomCode: true, sequence: true, status: true, productionPlan: { select: { planNumber: true } } },
     }),
     prisma.downtimeLog.findMany({
       where: { downtimeDate: { gte: range.start, lt: range.endExclusive }, isDeleted: false, status: { not: "Cancelled" }, machineCode: { not: null } },
@@ -263,7 +469,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           ...(planNumber ? { planNumber } : {}),
         },
       },
-      include: { plan: { select: { planNumber: true, status: true, sourceType: true, periodStart: true, periodEnd: true } } },
+      include: { plan: { select: { planNumber: true, status: true, sourceType: true, periodStart: true, periodEnd: true, recommendationSummary: true } } },
       orderBy: [{ requiredDate: "asc" }, { priority: "asc" }, { lineNumber: "asc" }],
     }),
     prisma.capacityMachineOverride.findMany({
@@ -286,19 +492,35 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const globalDayOverrideByMachineDate = new Map(calendarOverrides.map((item) => [`${item.machineId}|${dateKey(item.scheduleDate)}`, { ...item, scope: "GLOBAL" }]));
   const dayOverrideByMachineDate = new Map(dayOverrides.map((item) => [`${item.machineId}|${dateKey(item.scheduleDate)}`, { ...item, scope: "PLAN" }]));
   const presetDayOverrideByDate = new Map(Object.entries(selectedPreset?.dailyOverrides || {}).map(([date, rule]) => {
-    const activeShifts = (rule.shifts || []).slice(0, rule.shiftCount || 0);
+    const presetShiftCount = Math.min(Math.max(rule.shiftCount == null ? 2 : number(rule.shiftCount), 0), 3);
+    const activeShifts = (rule.shifts || []).slice(0, presetShiftCount);
     const shiftHoursOverride = activeShifts.length ? activeShifts.reduce((sum, shift) => sum + shiftDurationMinutes(shift), 0) / activeShifts.length / 60 : shiftHours;
-    return [date, { ...rule, shiftsPerDay: Math.max(rule.shiftCount || 1, 1), shiftHours: shiftHoursOverride, scope: "CAPACITY_PRESET" }];
+    return [date, { ...rule, shiftsPerDay: presetShiftCount, shiftHours: shiftHoursOverride, scope: "CAPACITY_PRESET" }];
   }));
   const [availableDies, availableVendors] = await Promise.all([
-    prisma.dies.findMany({ where: { isDeleted: false, status: "Active" }, select: { id: true, diesCode: true, diesName: true, diesType: true }, orderBy: { diesCode: "asc" } }),
+    prisma.dies.findMany({
+      where: { isDeleted: false, status: "Active" },
+      select: {
+        id: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true,
+        shotCounter: true, maxShotLifetime: true, nextMaintenanceDate: true,
+        diesParts: { where: { isActive: true }, select: { partId: true, isPrimary: true, effectiveDate: true, expiryDate: true, expectedOutput: true } },
+        maintenances: { where: { isDeleted: false }, select: { maintenanceNumber: true, maintenanceDate: true, startDate: true, endDate: true } },
+      },
+      orderBy: { diesCode: "asc" },
+    }),
     prisma.vendor.findMany({ where: { isDeleted: false, status: "Active" }, select: { id: true, vendorCode: true, vendorName: true, leadTimeDays: true }, orderBy: { vendorCode: "asc" } }),
   ]);
+  // Keep the heatmap/readiness calendar identical to the allocator: an
+  // explicit plan decision wins, then the selected simulation/current-use
+  // preset, and the global machine calendar is the final fallback.
+  const dayOverrideForDate = (key, machineId) => dayOverrideByMachineDate.get(`${machineId}|${key}`)
+    || dayOverrideByMachineDate.get(`null|${key}`)
+    || presetDayOverrideByDate.get(key)
+    || globalDayOverrideByMachineDate.get(`${machineId}|${key}`)
+    || null;
   const capacityRuleForDate = (key, machineId) => resolveDailyCapacity({
     key,
-    override: planningMode === "SIMULATION"
-      ? presetDayOverrideByDate.get(key) || null
-      : dayOverrideByMachineDate.get(`${machineId}|${key}`) || presetDayOverrideByDate.get(key) || globalDayOverrideByMachineDate.get(`${machineId}|${key}`) || null,
+    override: dayOverrideForDate(key, machineId),
     shiftHours,
     defaultShiftsPerDay: shiftsPerDay,
     defaultOvertimeHours: overtimeHours,
@@ -315,6 +537,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const machineById = new Map(machines.map((machine) => [machine.id, machine]));
   const machineByCode = new Map(machines.map((machine) => [machine.machineCode, machine]));
   const vendorById = new Map(availableVendors.map((vendor) => [vendor.id, vendor]));
+  const diesById = new Map(availableDies.map((dies) => [dies.id, dies]));
   const processById = new Map(processes.map((process) => [process.id, process]));
   const processByCode = new Map(processes.map((process) => [process.processCode, process]));
   const routesByPartId = new Map();
@@ -336,9 +559,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     cells: Object.fromEntries(range.dates.map((key) => {
       const capacityRule = capacityRuleForDate(key, machine.id);
       const cell = machineCell(machine, key, capacityRule.availableMinutes);
-      cell.dayOverride = planningMode === "SIMULATION"
-        ? presetDayOverrideByDate.get(key) || null
-        : dayOverrideByMachineDate.get(`${machine.id}|${key}`) || presetDayOverrideByDate.get(key) || globalDayOverrideByMachineDate.get(`${machine.id}|${key}`) || null;
+      cell.dayOverride = dayOverrideForDate(key, machine.id);
       cell.capacityRule = capacityRule;
       return [key, cell];
     })),
@@ -446,6 +667,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         plannedStartTime: true,
         plannedEndTime: true,
         machineId: true,
+        diesId: true,
         routingMode: true,
         vendorId: true,
         vendorSendDate: true,
@@ -460,6 +682,9 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         planningMode: true,
         scenarioKey: true,
         recommendationReason: true,
+        // Expose persisted scoring evidence so every recommended slot remains auditable in the UI.
+        recommendationScore: true,
+        recommendationScoreBreakdown: true,
         capacityMode: true,
         deliveryPhaseId: true,
         deliveryPhaseNumber: true,
@@ -472,6 +697,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
             processId: true,
             sequence: true,
             cycleTime: true,
+            diesId: true,
             machineSpecificationCode: true,
             process: { select: { processCode: true, processName: true } },
           },
@@ -493,7 +719,11 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const scheduledQtyByPlanProcess = new Map();
 
   const allocationById = new Map(productionPlanAllocations.map((row) => [row.id, row]));
-  for (const allocation of productionPlanAllocations.filter((row) => row.status === "Draft")) {
+  const predecessorWipState = new Map();
+  const draftAllocationsInConsumptionOrder = productionPlanAllocations
+    .filter((row) => row.status === "Draft")
+    .sort(compareAllocationConsumptionOrder);
+  for (const allocation of draftAllocationsInConsumptionOrder) {
     const detail = planDetails.find((row) => row.plan.planNumber === allocation.plan.planNumber
       && number(row.lineNumber) === number(allocation.lineNumber));
     const route = allocation.mbomProcess;
@@ -540,56 +770,228 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     }
 
     const predecessorIds = Array.isArray(allocation.predecessorAllocationIds) ? allocation.predecessorAllocationIds : [];
+    const successorStart = allocationStartMoment(allocation);
+    const linkedPredecessors = [];
     for (const predecessorId of predecessorIds) {
       const predecessor = allocationById.get(predecessorId);
       if (!predecessor || predecessor.plan.planNumber !== allocation.plan.planNumber) {
         pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_MISSING", message: `Predecessor allocation ${predecessorId} tidak ditemukan pada MPP yang sama.`, resolution: "Jalankan ulang recommendation atau perbaiki dependency allocation." }, issueKeys);
         continue;
       }
-      const predecessorFinish = String(predecessor.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
-        ? allocationMoment(predecessor.vendorReturnDate || predecessor.scheduleDate, predecessor.plannedEndTime, true)
-        : allocationMoment(predecessor.scheduleDate, predecessor.plannedEndTime, true);
-      const successorStart = String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
-        ? allocationMoment(allocation.vendorSendDate || allocation.scheduleDate, allocation.plannedStartTime, false)
-        : allocationMoment(allocation.scheduleDate, allocation.plannedStartTime, false);
-      if (predecessorFinish > successorStart) {
-        pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_FINISH_AFTER_SUCCESSOR", message: `Proses sebelumnya selesai ${predecessorFinish.toISOString()} setelah proses berikutnya mulai ${successorStart.toISOString()}.`, resolution: "Majukan predecessor atau mundurkan successor; untuk hari yang sama isi jam mulai/selesai." }, issueKeys);
-      }
-      const predecessorOutput = String(predecessor.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
-        ? number(predecessor.expectedReturnQty ?? predecessor.plannedQty)
-        : number(predecessor.plannedQty);
-      const predecessorDetail = planDetails.find((row) => row.plan.planNumber === predecessor.plan.planNumber
-        && number(row.lineNumber) === number(predecessor.lineNumber));
-      const quantityStatus = predecessorQuantityStatus(
-        predecessorOutput,
+      linkedPredecessors.push(predecessor);
+    }
+
+    // One logical predecessor can be split into several finite-capacity
+    // allocations. Validate the cumulative ready WIP once per route/line/phase
+    // rather than incorrectly requiring every split to cover the successor.
+    for (const predecessorGroup of groupPredecessorAllocations(linkedPredecessors, successorStart, predecessorWipState)) {
+      const predecessor = allocationById.get(predecessorGroup.batches[0]?.allocationId);
+      if (!predecessor) continue;
+      const predecessorProcessCode = predecessorGroup.processCode || "Proses sebelumnya";
+      const successorProcessCode = processCode || "Proses berikutnya";
+      const predecessorDetail = planDetails.find((row) => row.plan.planNumber === predecessorGroup.planNumber
+        && number(row.lineNumber) === number(predecessorGroup.lineNumber));
+      const relatedAllocationIds = predecessorGroup.batches.map((batch) => batch.allocationId);
+      const lateBatches = predecessorGroup.batches.filter((batch) => !batch.finishedBeforeSuccessor);
+
+      const groupReadiness = predecessorGroupReadiness(
+        predecessorGroup,
         predecessorDetail?.qtyPlanned,
         allocation.plannedQty,
         detail?.qtyPlanned,
-        predecessor.uomCode,
         allocation.uomCode,
       );
-      if (quantityStatus.short) {
+      const { quantityStatus } = groupReadiness;
+      const requiredPredecessorOutput = quantityStatus.mode === "COVERAGE"
+        ? quantityStatus.successorCoverage * number(predecessorDetail?.qtyPlanned)
+        : number(allocation.plannedQty);
+      const additionalPredecessorQty = Math.max(requiredPredecessorOutput - predecessorGroup.availableOutputQty, 0);
+      const maximumSuccessorQty = quantityStatus.mode === "COVERAGE"
+        ? quantityStatus.predecessorCoverage * number(detail?.qtyPlanned)
+        : predecessorGroup.availableOutputQty;
+      const reservation = reservePredecessorGroupOutput(
+        predecessorGroup,
+        requiredPredecessorOutput,
+        { id: allocation.id, startAt: successorStart },
+        predecessorWipState,
+      );
+
+      // A future linked chunk is harmless when already-finished chunks cover
+      // the successor. When the future output is specifically what closes the
+      // gap, report one timing blocker (not a duplicate quantity blocker).
+      if (groupReadiness.status === "TIMING_BLOCKED") {
+        const requiredLateReservations = reservation.batchReservations.filter((item) => !item.finishedBeforeSuccessor);
+        const requiredLateIds = new Set(requiredLateReservations.map((item) => String(item.predecessorAllocationId)));
+        const requiredLateBatches = lateBatches.filter((batch) => requiredLateIds.has(String(batch.allocationId)));
+        const unblockAt = requiredLateBatches.at(-1)?.finishAt || lateBatches.at(-1).finishAt;
+        const requiredLateQty = reservation.lateReservedQty;
+        pushIssue(issues, {
+          ...common,
+          relatedAllocationId: requiredLateBatches[0]?.allocationId || lateBatches[0].allocationId,
+          relatedAllocationIds,
+          severity: "blocking",
+          category: "SEQUENCE",
+          code: "PLAN_PREDECESSOR_FINISH_AFTER_SUCCESSOR",
+          message: `${predecessorProcessCode} memiliki WIP siap ${capacityQtyText(predecessorGroup.availableOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""}; masih perlu ${capacityQtyText(additionalPredecessorQty, predecessorGroup.uomCode)} dari ${requiredLateBatches.length} split batch yang baru selesai setelah ${successorProcessCode} mulai.`,
+          resolution: `Majukan batch predecessor yang dibutuhkan sebelum ${successorStart.toISOString()}, atau mundurkan successor setelah ${unblockAt.toISOString()}.`,
+          blockerDetail: {
+            cause: "Jumlah total predecessor mencukupi, tetapi sebagian output yang dibutuhkan belum selesai saat successor mulai.",
+            impact: `${successorProcessCode} hanya dapat memakai WIP dari batch yang telah selesai sebelum waktu mulai.`,
+            predecessorGroupKey: predecessorGroup.key,
+            shortageQtyAtStart: round(additionalPredecessorQty, 3),
+            linkedBatchCount: predecessorGroup.batches.length,
+            readyBatchCount: predecessorGroup.finishedBatchCount,
+            lateBatchCount: predecessorGroup.lateBatchCount,
+            requiredLateBatchCount: requiredLateBatches.length,
+            requiredLateOutputQty: round(requiredLateQty, 3),
+            reservation,
+            readyOutputQty: predecessorGroup.availableOutputQty,
+            lateOutputQty: predecessorGroup.lateOutputQty,
+            requiredPredecessorOutput: round(requiredPredecessorOutput, 3),
+            uomCode: predecessorGroup.uomCode,
+            batches: predecessorGroup.batches.map((batch) => ({ ...batch, finishAt: batch.finishAt.toISOString(), requiredToUnblock: requiredLateIds.has(String(batch.allocationId)) })),
+            successor: { allocationId: allocation.id, processCode: successorProcessCode, startAt: successorStart.toISOString(), unblockAt: unblockAt.toISOString() },
+          },
+        }, issueKeys);
+        continue;
+      }
+
+      if (groupReadiness.status === "QTY_BLOCKED") {
+        const batchSummary = `${predecessorGroup.finishedBatchCount}/${predecessorGroup.batches.length} split batch selesai sebelum successor mulai`;
+        const priorSuccessorIds = [...new Set(predecessorGroup.batches.flatMap((batch) => batch.priorReservations || [])
+          .map((item) => item.successorAllocationId).filter(Boolean))].sort((left, right) => String(left).localeCompare(String(right)));
+        const reservationSummary = predecessorGroup.reservedOutputQty > COVERAGE_EPSILON
+          ? ` ${capacityQtyText(predecessorGroup.reservedOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""} sudah dialokasikan ke ${priorSuccessorIds.length} successor yang mulai lebih dahulu.`
+          : "";
+        const lateSummary = predecessorGroup.lateBatchCount
+          ? ` ${capacityQtyText(predecessorGroup.lateOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""} dari ${predecessorGroup.lateBatchCount} batch terlambat belum dihitung sebagai WIP siap.`
+          : "";
         const message = quantityStatus.mode === "COVERAGE"
-          ? `Coverage predecessor ${round(quantityStatus.predecessorCoverage * 100, 2)}% belum cukup untuk successor ${round(quantityStatus.successorCoverage * 100, 2)}%.`
-          : `Output predecessor ${capacityQtyText(predecessorOutput, predecessor.uomCode)} belum cukup untuk successor ${capacityQtyText(allocation.plannedQty, allocation.uomCode)}.`;
-        pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_QTY_SHORT", message, resolution: "Tambah coverage batch predecessor sebelum menjalankan successor." }, issueKeys);
+          ? `${predecessorProcessCode} baru mencakup ${round(quantityStatus.predecessorCoverage * 100, 2)}% (${capacityQtyText(predecessorGroup.availableOutputQty, predecessorGroup.uomCode)} dari target ${capacityQtyText(predecessorDetail?.qtyPlanned, predecessorGroup.uomCode)}; ${batchSummary}), sementara ${successorProcessCode} sudah dijadwalkan ${round(quantityStatus.successorCoverage * 100, 2)}% (${capacityQtyText(allocation.plannedQty, allocation.uomCode)} dari target ${capacityQtyText(detail?.qtyPlanned, allocation.uomCode)}).${reservationSummary}${lateSummary}`
+          : `Output kumulatif predecessor yang siap baru ${capacityQtyText(predecessorGroup.availableOutputQty, predecessorGroup.uomCode)} dari ${batchSummary}, belum cukup untuk successor ${capacityQtyText(allocation.plannedQty, allocation.uomCode)}.${reservationSummary}${lateSummary}`;
+        const resolution = `Tambah atau majukan predecessor minimal ${capacityQtyText(additionalPredecessorQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""} hingga WIP siap ${capacityQtyText(requiredPredecessorOutput, predecessorGroup.uomCode)}, atau turunkan successor maksimal menjadi ${capacityQtyText(maximumSuccessorQty, allocation.uomCode)} ${allocation.uomCode || ""}.`;
+        const latestReadyBatch = [...predecessorGroup.batches].reverse().find((batch) => batch.finishedBeforeSuccessor);
+        pushIssue(issues, {
+          ...common,
+          relatedAllocationId: predecessorGroup.batches[0].allocationId,
+          relatedAllocationIds,
+          severity: "blocking",
+          category: "SEQUENCE",
+          code: "PLAN_PREDECESSOR_QTY_SHORT",
+          message,
+          resolution,
+          blockerDetail: {
+            cause: predecessorGroup.reservedOutputQty > COVERAGE_EPSILON
+              ? `WIP predecessor tidak boleh dipakai ulang: ${capacityQtyText(predecessorGroup.reservedOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""} sudah direservasi oleh successor lebih awal (${priorSuccessorIds.join(", ") || "allocation sebelumnya"}).`
+              : `Coverage successor melebihi WIP kumulatif dari split batch predecessor yang selesai tepat waktu (${batchSummary}).`,
+            impact: `${successorProcessCode} tidak boleh mulai penuh karena WIP tersedia belum mencukupi. Jika dipaksakan, schedule terlihat on-time tetapi material antar-proses tidak tersedia.`,
+            predecessorGroupKey: predecessorGroup.key,
+            shortageQty: round(additionalPredecessorQty, 3),
+            shortageUomCode: predecessorGroup.uomCode || null,
+            coverageGapPercent: quantityStatus.mode === "COVERAGE" ? round((quantityStatus.successorCoverage - quantityStatus.predecessorCoverage) * 100, 2) : null,
+            requiredPredecessorOutput: round(requiredPredecessorOutput, 3),
+            maximumSuccessorQty: round(maximumSuccessorQty, 3),
+            grossLinkedOutputQty: predecessorGroup.grossLinkedOutputQty,
+            previouslyReservedOutputQty: predecessorGroup.reservedOutputQty,
+            previousSuccessorAllocationIds: priorSuccessorIds,
+            reservation,
+            linkedBatchCount: predecessorGroup.batches.length,
+            readyBatchCount: predecessorGroup.finishedBatchCount,
+            lateBatchCount: predecessorGroup.lateBatchCount,
+            lateOutputQty: predecessorGroup.lateOutputQty,
+            batches: predecessorGroup.batches.map((batch) => ({ ...batch, finishAt: batch.finishAt.toISOString() })),
+            predecessor: {
+              allocationId: predecessorGroup.batches[0].allocationId,
+              allocationIds: relatedAllocationIds,
+              processCode: predecessorProcessCode,
+              partCode: predecessorDetail?.partCode || null,
+              outputQty: round(predecessorGroup.availableOutputQty, 3),
+              linkedOutputQty: round(predecessorGroup.linkedOutputQty, 3),
+              grossLinkedOutputQty: round(predecessorGroup.grossLinkedOutputQty, 3),
+              previouslyReservedOutputQty: round(predecessorGroup.reservedOutputQty, 3),
+              targetQty: round(predecessorDetail?.qtyPlanned, 3),
+              coveragePercent: quantityStatus.predecessorCoverage == null ? null : round(quantityStatus.predecessorCoverage * 100, 2),
+              uomCode: predecessorGroup.uomCode || null,
+              finishAt: latestReadyBatch?.finishAt?.toISOString() || null,
+            },
+            successor: { allocationId: allocation.id, processCode: successorProcessCode, partCode: detail?.partCode || null, plannedQty: round(allocation.plannedQty, 3), targetQty: round(detail?.qtyPlanned, 3), coveragePercent: quantityStatus.successorCoverage == null ? null : round(quantityStatus.successorCoverage * 100, 2), uomCode: allocation.uomCode || null, startAt: successorStart.toISOString() },
+          },
+        }, issueKeys);
       }
     }
   }
 
-  const timedInhouse = productionPlanAllocations.filter((row) => row.status === "Draft"
-    && String(row.routingMode || "INHOUSE").toUpperCase() === "INHOUSE"
-    && row.machineId && row.plannedStartTime && row.plannedEndTime);
+  const timedInhouse = [
+    ...productionPlanAllocations.filter((row) => row.status === "Draft"
+      && String(row.routingMode || "INHOUSE").toUpperCase() === "INHOUSE")
+      .map((row) => ({
+        ...row,
+        source: "ALLOCATION",
+        planNumber: row.plan.planNumber,
+        diesId: row.diesId || row.mbomProcess?.diesId || null,
+        route: row.mbomProcess,
+      })),
+    ...schedules.filter((row) => row.machineId).map((row) => ({
+      ...row,
+      source: "SCHEDULE",
+      planNumber: row.productionPlan?.planNumber || null,
+      allocationId: null,
+      route: { process: processById.get(row.processId) || null },
+    })),
+  ];
+  for (const row of timedInhouse) {
+    const machine = machineById.get(row.machineId);
+    const requiresDies = isDiesCapacityBlockingEnabled() && isPressResource(machine, row.route);
+    const dies = diesById.get(row.diesId);
+    const common = {
+      severity: "blocking",
+      category: "DIES",
+      planNumber: row.planNumber,
+      lineNumber: row.lineNumber || null,
+      routeId: row.mbomProcessId || null,
+      allocationId: row.source === "ALLOCATION" ? row.id : null,
+      relatedScheduleId: row.source === "SCHEDULE" ? row.id : null,
+      machineCode: machine?.machineCode || null,
+    };
+    if (requiresDies && !row.diesId) {
+      pushIssue(issues, { ...common, code: "PLAN_DIES_REQUIRED", message: `${machine?.machineCode || "Mesin Press"} wajib dijadwalkan bersama Dies.`, resolution: "Tetapkan Dies pada routing MBOM atau draft allocation." }, issueKeys);
+      continue;
+    }
+    if (!row.diesId) continue;
+    if (!dies) {
+      pushIssue(issues, { ...common, code: "PLAN_DIES_INACTIVE", message: "Dies allocation tidak aktif atau tidak ditemukan.", resolution: "Pilih Dies aktif atau selesaikan maintenance Dies." }, issueKeys);
+      continue;
+    }
+    common.diesCode = dies.diesCode;
+    if (!isDiesTonnageCompatible(dies, machine)) {
+      pushIssue(issues, { ...common, code: "PLAN_DIES_MACHINE_TONNAGE_MISMATCH", message: `${machine?.machineCode || "Mesin"} ${number(machine?.tonnage)}T tidak mencukupi Dies ${dies.diesCode} ${number(dies.tonnage)}T.`, resolution: "Pilih mesin Press dengan tonase yang mencukupi." }, issueKeys);
+    }
+    const interval = plannedInterval(row.scheduleDate, row.plannedStartTime, row.plannedEndTime);
+    if (requiresDies && !interval) {
+      pushIssue(issues, { ...common, code: "PLAN_DIES_TIME_REQUIRED", message: `Jam mulai dan selesai wajib diisi untuk mengunci kapasitas Dies ${dies.diesCode}.`, resolution: "Isi planned start dan planned end allocation." }, issueKeys);
+      continue;
+    }
+    const maintenance = interval && dies.maintenances.find((item) => intervalsOverlap(interval, maintenanceInterval(item)));
+    if (maintenance) {
+      pushIssue(issues, { ...common, code: "PLAN_DIES_MAINTENANCE_OVERLAP", message: `Dies ${dies.diesCode} overlap maintenance ${maintenance.maintenanceNumber}.`, resolution: "Pindahkan jadwal atau selesaikan maintenance Dies." }, issueKeys);
+    }
+  }
   for (let leftIndex = 0; leftIndex < timedInhouse.length; leftIndex += 1) {
     for (let rightIndex = leftIndex + 1; rightIndex < timedInhouse.length; rightIndex += 1) {
       const left = timedInhouse[leftIndex];
       const right = timedInhouse[rightIndex];
-      if (left.machineId !== right.machineId || left.shift !== right.shift || dateKey(left.scheduleDate) !== dateKey(right.scheduleDate)) continue;
-      const overlaps = allocationMoment(left.scheduleDate, left.plannedStartTime) < allocationMoment(right.scheduleDate, right.plannedEndTime)
-        && allocationMoment(right.scheduleDate, right.plannedStartTime) < allocationMoment(left.scheduleDate, left.plannedEndTime);
+      const leftInterval = plannedInterval(left.scheduleDate, left.plannedStartTime, left.plannedEndTime);
+      const rightInterval = plannedInterval(right.scheduleDate, right.plannedStartTime, right.plannedEndTime);
+      const overlaps = intervalsOverlap(leftInterval, rightInterval);
       if (!overlaps) continue;
-      const machine = machineById.get(left.machineId);
-      pushIssue(issues, { severity: "blocking", category: "MACHINE", code: "PLAN_MACHINE_TIME_OVERLAP", planNumber: left.plan.planNumber, lineNumber: left.lineNumber, routeId: left.mbomProcessId, allocationId: left.id, relatedAllocationId: right.id, machineCode: machine?.machineCode || null, message: `${machine?.machineCode || "Mesin"} memiliki jadwal overlap pada ${dateKey(left.scheduleDate)} shift ${left.shift}.`, resolution: "Ubah jam, shift, lane, atau mesin salah satu allocation." }, issueKeys);
+      if (left.machineId === right.machineId) {
+        const machine = machineById.get(left.machineId);
+        pushIssue(issues, { severity: "blocking", category: "MACHINE", code: "PLAN_MACHINE_TIME_OVERLAP", planNumber: left.planNumber, lineNumber: left.lineNumber, routeId: left.mbomProcessId, allocationId: left.source === "ALLOCATION" ? left.id : null, relatedAllocationId: right.source === "ALLOCATION" ? right.id : null, relatedScheduleId: right.source === "SCHEDULE" ? right.id : null, machineCode: machine?.machineCode || null, message: `${machine?.machineCode || "Mesin"} memiliki jadwal overlap pada ${dateKey(left.scheduleDate)}.`, resolution: "Ubah jam, shift, lane, atau mesin salah satu allocation." }, issueKeys);
+      }
+      if (left.diesId && left.diesId === right.diesId) {
+        const dies = diesById.get(left.diesId);
+        pushIssue(issues, { severity: "blocking", category: "DIES", code: "PLAN_DIES_TIME_OVERLAP", planNumber: left.planNumber, lineNumber: left.lineNumber, routeId: left.mbomProcessId, allocationId: left.source === "ALLOCATION" ? left.id : null, relatedAllocationId: right.source === "ALLOCATION" ? right.id : null, relatedScheduleId: right.source === "SCHEDULE" ? right.id : null, diesCode: dies?.diesCode || null, machineCode: machineById.get(left.machineId)?.machineCode || null, message: `Dies ${dies?.diesCode || left.diesId} dipakai bersamaan pada lebih dari satu jadwal.`, resolution: "Geser jam/tanggal salah satu proses atau gunakan Dies alternatif yang kompatibel." }, issueKeys);
+      }
     }
   }
 
@@ -673,6 +1075,22 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     if (routingMode !== "VENDOR") {
       if (!route.machineId) pushIssue(issues, { severity: "warning", code: "ROUTING_MACHINE_MISSING", routeId: route.id, partCode, message: `${partCode || route.noReg} · ${route.process?.processCode || "Process"} belum mempunyai mesin pada routing.` }, issueKeys);
       if (resolveCycleMinutes(route.cycleTime, route.machine, workingAvailableMinutes) <= 0) pushIssue(issues, { severity: "warning", code: "ROUTING_CYCLE_MISSING", routeId: route.id, partCode, machineCode: route.machine?.machineCode || null, message: `${partCode || route.noReg} · ${route.process?.processCode || "Process"} belum mempunyai cycle time.` }, issueKeys);
+      const routeRequiresDies = isDiesCapacityBlockingEnabled() && isPressResource(route.machine || eligibleMachinesForRoute(route)[0], route);
+      const compatibleDies = availableDies.filter((dies) => route.diesId === dies.id
+        || dies.diesParts.some((mapping) => mapping.partId === route.mbomDetail?.partId));
+      if (routeRequiresDies && !compatibleDies.length) {
+        pushIssue(issues, {
+          severity: "blocking",
+          category: "DIES",
+          code: "ROUTING_DIES_MISSING",
+          routeId: route.id,
+          partCode,
+          processCode: route.process?.processCode || null,
+          machineCode: route.machine?.machineCode || null,
+          message: `${partCode || route.noReg} belum memiliki Dies aktif yang terhubung ke routing/part.`,
+          resolution: "Tetapkan Dies pada routing MBOM atau aktifkan mapping Dies-Part.",
+        }, issueKeys);
+      }
     } else if (!route.vendorId) {
       pushIssue(issues, {
         severity: "info",
@@ -716,7 +1134,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const woIds = [...new Set(schedules.map((row) => row.woId).filter(Boolean))];
   const workOrders = woIds.length ? await prisma.workOrder.findMany({
     where: { id: { in: woIds } },
-    select: { id: true, cycleTime: true, outputPartCode: true, processId: true, machineId: true, process: { select: { processCode: true, processName: true } } },
+    select: { id: true, cycleTime: true, outputPartCode: true, processId: true, machineId: true, diesId: true, process: { select: { processCode: true, processName: true } } },
   }) : [];
   const workOrderById = new Map(workOrders.map((row) => [row.id, row]));
 
@@ -747,13 +1165,14 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       cycleTimeMinutes: cycleMinutes,
       efficiencyPercent: 100,
     });
-    cell.items.push({ source: "FIRM", reference: schedule.scheduleNumber, planNumber: planMo?.monthlyProductionPlanNumber || null, lineNumber: planMo?.monthlyProductionPlanLineNumber || null, processId: scheduledProcessId, moNumber: schedule.moNumber, woNumber: schedule.woNumber, partCode: schedule.partCode, processCode: wo?.process?.processCode || processById.get(schedule.processId)?.processCode || null, shift: schedule.shift, qty: number(schedule.plannedQty), uomCode: schedule.uomCode, minutes: round(loadMinutes), status: schedule.status });
+    cell.items.push({ source: "FIRM", reference: schedule.scheduleNumber, planNumber: planMo?.monthlyProductionPlanNumber || null, lineNumber: planMo?.monthlyProductionPlanLineNumber || null, processId: scheduledProcessId, moNumber: schedule.moNumber, woNumber: schedule.woNumber, partCode: schedule.partCode, processCode: wo?.process?.processCode || processById.get(schedule.processId)?.processCode || null, shift: schedule.shift, diesId: schedule.diesId || wo?.diesId || null, qty: number(schedule.plannedQty), uomCode: schedule.uomCode, minutes: round(loadMinutes), status: schedule.status });
   }
 
-  // Draft MPP allocations are the PPIC planning source before MO/WO exists.
-  // Published rows are represented by their Daily Production Schedule and must
-  // not be counted twice.
-  for (const allocation of productionPlanAllocations.filter((item) => item.status === "Draft")) {
+  // Draft in-house allocations are the PPIC planning source before MO/WO exists.
+  // Published in-house rows are represented by their Daily Production Schedule
+  // and must not be counted twice. Vendor allocations remain visible after
+  // publish because their send-return interval has no machine heatmap row.
+  for (const allocation of productionPlanAllocations) {
     const allocationDetail = planDetails.find((detail) =>
       detail.plan.planNumber === allocation.plan.planNumber
       && number(detail.lineNumber) === number(allocation.lineNumber));
@@ -804,7 +1223,9 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         }, issueKeys);
       }
       vendorAssignments.push({
-        source: allocation.allocationSource === "AUTO_RECOMMENDATION" ? "RECOMMENDED" : "MANUAL",
+        source: allocation.status === "Published"
+          ? "PUBLISHED"
+          : allocation.allocationSource === "AUTO_RECOMMENDATION" ? "RECOMMENDED" : "MANUAL",
         allocationId: allocation.id,
         planningMode: allocation.planningMode,
         scenarioKey: allocation.scenarioKey,
@@ -836,6 +1257,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       });
       continue;
     }
+    if (allocation.status !== "Draft") continue;
     const machine = machineById.get(allocation.machineId);
     const cell = rowByMachineId.get(allocation.machineId)?.cells[dateKey(allocation.scheduleDate)];
     const cycleMinutes = resolveCycleMinutes(allocation.mbomProcess?.cycleTime, machine, workingAvailableMinutes);
@@ -885,6 +1307,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       mbomProcessId: allocation.mbomProcessId,
       routingMode: "INHOUSE",
       machineId: allocation.machineId,
+      diesId: allocation.diesId || allocation.mbomProcess?.diesId || null,
       scheduleDate: dateKey(allocation.scheduleDate),
       shift: allocation.shift,
       plannedStartTime: allocation.plannedStartTime,
@@ -893,6 +1316,8 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       deliveryPhaseNumber: allocation.deliveryPhaseNumber,
       transferBatchNumber: allocation.transferBatchNumber,
       recommendationReason: allocation.recommendationReason,
+      recommendationScore: allocation.recommendationScore,
+      recommendationScoreBreakdown: allocation.recommendationScoreBreakdown,
       qty: number(allocation.plannedQty),
       uomCode: allocation.uomCode,
       minutes: round(loadMinutes),
@@ -1057,7 +1482,8 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           cell.proposedMinutes += allocatedMinutes;
           const allocatedDate = dateKey(cursor);
           if (!firstAllocatedDate || allocatedDate < firstAllocatedDate) firstAllocatedDate = allocatedDate;
-          cell.items.push({ source: "PROPOSED", reference: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode, processCode: route.process?.processCode || null, routingNumber: route.routingNumber, sequence: number(route.sourceSequence || route.sequence), routingSequence: number(route.sourceSequence || route.sequence), mbomProcessId: route.id, diesId: machineOverride?.diesId || route.diesId || null, routingMode: "INHOUSE", machineSpecificationCode: routeSpecificationCode(route), allowedMachineIds: eligibleMachines.map((candidate) => candidate.id), machineOverride: machineOverride ? { machineId: machine.id, reason: machineOverride.reason } : null, qty: capacityQty(allocatedQty, detail.uomCode), uomCode: detail.uomCode, minutes: round(allocatedMinutes), status: detail.plan.status });
+          const routeDies = machineOverride?.diesId || route.diesId || availableDies.find((dies) => dies.diesParts.some((mapping) => mapping.partId === route.mbomDetail?.partId))?.id || null;
+          cell.items.push({ source: "PROPOSED", reference: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode, processCode: route.process?.processCode || null, routingNumber: route.routingNumber, sequence: number(route.sourceSequence || route.sequence), routingSequence: number(route.sourceSequence || route.sequence), mbomProcessId: route.id, diesId: routeDies, routingMode: "INHOUSE", machineSpecificationCode: routeSpecificationCode(route), allowedMachineIds: eligibleMachines.map((candidate) => candidate.id), machineOverride: machineOverride ? { machineId: machine.id, reason: machineOverride.reason } : null, qty: capacityQty(allocatedQty, detail.uomCode), uomCode: detail.uomCode, minutes: round(allocatedMinutes), status: detail.plan.status });
           remainingMinutes -= allocatedMinutes;
         }
         cursor = addDays(cursor, -1);
@@ -1100,6 +1526,9 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         routingMode,
         machineSpecificationCode: routeSpecificationCode(route),
         allowedMachineIds,
+        requiresDies: isDiesCapacityBlockingEnabled() && isPressResource(machineById.get(route.machineId) || machineById.get(allowedMachineIds[0]), route),
+        diesId: routeOverride?.diesId || route.diesId || null,
+        allowedDiesIds: availableDies.filter((dies) => route.diesId === dies.id || dies.diesParts.some((mapping) => mapping.partId === route.mbomDetail?.partId)).map((dies) => dies.id),
         cycleMinutesByMachine: Object.fromEntries(allowedMachineIds.map((machineId) => [
           machineId,
           round(resolveCycleMinutes(route.cycleTime, machineById.get(machineId), workingAvailableMinutes), 6),
@@ -1128,12 +1557,33 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   }
 
   const deliveryCoverage = [];
+  const recommendationPhaseById = new Map();
+  const fgCompletionDaysByPlan = new Map();
+  for (const detail of planDetails) {
+    const summary = detail.plan?.recommendationSummary;
+    for (const result of Array.isArray(summary?.phaseResults) ? summary.phaseResults : []) {
+      if (result.phaseId) recommendationPhaseById.set(result.phaseId, result);
+    }
+    fgCompletionDaysByPlan.set(
+      detail.plan.planNumber,
+      Math.max(Math.trunc(number(summary?.capacityFlowRule?.active?.delivery?.fgCompletionDaysBefore)), 0),
+    );
+  }
   for (const detail of planDetails.filter((row) => row.mpsDetailId && !String(row.notes || "").includes("[MRP-PRODUCTION]"))) {
     const mpsNumber = String(detail.plan.sourceType || "").startsWith("MPS:") ? String(detail.plan.sourceType).slice(4) : null;
     if (!mpsNumber) continue;
     const configured = deliveryPhases.filter((phase) => phase.mpsNumber === mpsNumber && phase.mpsDetailId === detail.mpsDetailId);
     const configuredQty = configured.reduce((sum, phase) => sum + number(phase.qtyPlanned), 0);
-    const shortageQty = Math.max(number(detail.qtyPlanned) - configuredQty, 0);
+    // Delivery phases cover gross customer demand only. Buffer stock remains a
+    // valid internal production target and must not be reported as an
+    // incomplete customer delivery phase.
+    const customerDemandQty = Math.max(
+      number(detail.actualSalesOrderQty),
+      number(detail.forecastQty),
+      number(detail.effectiveDemandQty) - number(detail.bufferQty),
+      0,
+    );
+    const shortageQty = Math.max(customerDemandQty - configuredQty, 0);
     if (shortageQty <= 0.000001) continue;
     const code = configured.length ? "DELIVERY_PHASE_QTY_SHORT" : "DELIVERY_PHASE_REQUIRED";
     pushIssue(issues, {
@@ -1148,7 +1598,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       phaseId: null, phaseNumber: null, mpsNumber, mpsDetailId: detail.mpsDetailId,
       planNumber: detail.plan.planNumber, lineNumber: detail.lineNumber, partCode: detail.partCode,
       targetType: "CUSTOMER", targetCode: null, plannedDate: detail.requiredDate ? dateKey(detail.requiredDate) : null,
-      phaseQty: 0, cumulativeRequiredQty: number(detail.qtyPlanned), plannedQtyByDueDate: configuredQty,
+      phaseQty: 0, cumulativeRequiredQty: customerDemandQty, plannedQtyByDueDate: configuredQty,
       shortageQty: capacityQty(shortageQty, detail.uomCode), uomCode: detail.uomCode, status: configured.length ? "INCOMPLETE" : "MISSING",
     });
   }
@@ -1209,19 +1659,27 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       && candidate.mpsDetailId === phase.mpsDetailId
       && parseDateOnly(candidate.plannedDate) <= parseDateOnly(phase.plannedDate)).map((candidate) => candidate.id));
     const autoPhaseAllocations = productionPlanAllocations.filter((allocation) =>
-      allocation.status === "Draft"
+      ["Draft", "Published"].includes(allocation.status)
       && allocation.allocationSource === "AUTO_RECOMMENDATION"
       && coveredAutoPhaseIds.has(allocation.deliveryPhaseId));
     const autoPredecessorIds = new Set(autoPhaseAllocations.flatMap((allocation) =>
       Array.isArray(allocation.predecessorAllocationIds) ? allocation.predecessorAllocationIds : []));
-    const autoTerminalQtyByDueDate = autoPhaseAllocations.reduce((sum, allocation) => {
-      // A terminal output is not referenced as a predecessor by another
-      // allocation in the same delivery phase graph.
-      if (autoPredecessorIds.has(allocation.id)) return sum;
+    const terminalAllocationByBatch = new Map();
+    for (const allocation of autoPhaseAllocations.filter((row) => !autoPredecessorIds.has(row.id))) {
+      // A BOM can have several terminal-looking child branches. Delivery is
+      // represented by the terminal operation that finishes last in each
+      // transfer batch, not by summing every child branch output.
+      const batchKey = `${allocation.deliveryPhaseId}|${allocation.transferBatchNumber || allocation.id}`;
       const completionDate = String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
         ? (allocation.vendorReturnDate || allocation.scheduleDate)
         : allocation.scheduleDate;
-      if (parseDateOnly(completionDate) > parseDateOnly(phase.plannedDate)) return sum;
+      const completionKey = allocationMoment(completionDate, allocation.plannedEndTime, true).getTime();
+      const current = terminalAllocationByBatch.get(batchKey);
+      if (!current || completionKey > current.completionKey) terminalAllocationByBatch.set(batchKey, { allocation, completionDate, completionKey });
+    }
+    const autoTerminalQtyByDueDate = [...terminalAllocationByBatch.values()].reduce((sum, item) => {
+      if (parseDateOnly(item.completionDate) > parseDateOnly(phase.plannedDate)) return sum;
+      const allocation = item.allocation;
       return sum + (String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
         ? number(allocation.expectedReturnQty ?? allocation.plannedQty)
         : number(allocation.plannedQty));
@@ -1244,7 +1702,9 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       }, 0)
       : 0;
     const initialStockQty = number(initialStockQtyByDetailId.get(directDetail.id));
-    const plannedQtyByDueDate = initialStockQty + firmQtyByDueDate + legacyDraftQtyByDueDate + autoTerminalQtyByDueDate;
+    // Published recommendation rows and DPP firm schedules can describe the
+    // same production output. Use the larger coverage, never their sum.
+    const plannedQtyByDueDate = initialStockQty + Math.max(firmQtyByDueDate, autoTerminalQtyByDueDate) + legacyDraftQtyByDueDate;
     const shortageQty = Math.max(cumulativeRequiredQty - plannedQtyByDueDate, 0);
     deliveryCoverage.push({
       phaseId: phase.id,
@@ -1257,6 +1717,8 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       targetType: phase.targetType,
       targetCode: phase.targetCode,
       plannedDate: dateKey(phase.plannedDate),
+      targetFgDate: recommendationPhaseById.get(phase.id)?.targetFgDate
+        || dateKey(addDays(phase.plannedDate, -number(fgCompletionDaysByPlan.get(directDetail.plan.planNumber)))),
       phaseQty: number(phase.qtyPlanned),
       cumulativeRequiredQty: capacityQty(cumulativeRequiredQty, phase.uomCode || detail.uomCode),
       initialStockQty: capacityQty(initialStockQty, phase.uomCode || detail.uomCode),
@@ -1289,7 +1751,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const processLoads = new Map();
   if (manualAllocation) {
     for (let index = vendorAssignments.length - 1; index >= 0; index -= 1) {
-      if (!["MANUAL", "RECOMMENDED"].includes(vendorAssignments[index].source)) vendorAssignments.splice(index, 1);
+      if (!["MANUAL", "RECOMMENDED", "PUBLISHED"].includes(vendorAssignments[index].source)) vendorAssignments.splice(index, 1);
     }
     for (const row of machineRows) {
       for (const key of range.dates) {
@@ -1355,7 +1817,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const blockingIssues = issues.filter((issue) => issue.severity === "blocking");
   const overridableIssues = issues.filter((issue) => issue.severity === "overridable");
   return {
-    parameters: { startDate: dateKey(range.start), endDate: dateKey(range.end), shiftHours, shiftsPerDay, efficiencyPercent, overtimeHours, includeSaturday, includeSunday, scenarioName, planningMode, scenarioKey, presetId: selectedPreset?.id || null, planningGranularity, rollingLookbackWeeks, freezeFenceDays, freezeFenceDate: dateKey(freezeFenceDate), availableMinutesPerMachineDay: workingAvailableMinutes, planNumber, manualAllocation },
+    parameters: { startDate: dateKey(range.start), endDate: dateKey(range.end), shiftHours, shiftsPerDay, efficiencyPercent, overtimeHours, includeSaturday, includeSunday, scenarioName, planningMode, scenarioKey, presetId: selectedPreset?.id || null, presetMode: selectedPreset ? (presetId ? "SIMULATION_SELECTED" : "CURRENT_USE") : "DEFAULT_TWO_SHIFT", planningGranularity, rollingLookbackWeeks, freezeFenceDays, freezeFenceDate: dateKey(freezeFenceDate), availableMinutesPerMachineDay: workingAvailableMinutes, planNumber, manualAllocation },
     scenario: {
       scenarioName,
       shiftHours,
@@ -1431,4 +1893,14 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   };
 }
 
-module.exports = { buildCapacitySnapshot, resolveRange, resolveDailyCapacity, predecessorQuantityStatus };
+module.exports = {
+  buildCapacitySnapshot,
+  resolveRange,
+  resolveDailyCapacity,
+  predecessorQuantityStatus,
+  logicalPredecessorGroupKey,
+  groupPredecessorAllocations,
+  reservePredecessorGroupOutput,
+  predecessorGroupReadiness,
+  compareAllocationConsumptionOrder,
+};

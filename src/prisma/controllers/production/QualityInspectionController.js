@@ -18,6 +18,10 @@ const {
 } = require("../../services/production/sales-order/soStatusService");
 const { generateDailyNumber } = require("./services/productionIntegrationHelpers");
 const { assertQuantity } = require("../../utils/uomQuantity");
+const {
+  ensureDefaultNumberingRule,
+  generateConfiguredNumber,
+} = require("../../services/numberingService");
 
 // Generate nomor Inspeksi QC otomatis: QC-YYYYMMDD-001
 async function generateQcNumber() {
@@ -3516,7 +3520,6 @@ exports.receiveFg = async (req, res, next) => {
       qty,
       warehouseCode,
       rackCode,
-      lotNumber,
       notes,
     } = req.body || {};
 
@@ -3641,12 +3644,29 @@ exports.receiveFg = async (req, res, next) => {
       });
 
       const fgMovementSource = buildMovementFromPart(sourceMovement, inspection.manufacturingOrder.part);
+      await ensureDefaultNumberingRule("LOT_PRODUCTION", tx);
+      const priorFgReceipt = await tx.stockMovement.findFirst({
+        where: {
+          referenceType: "QUALITY_INSPECTION",
+          referenceNumber: inspection.inspectionNumber,
+          transactionType: "PRODUCTION",
+          movementType: "IN",
+          stockType: "Finished Goods",
+          isDeleted: false,
+          lotNumber: { not: null },
+        },
+        orderBy: { movementDate: "asc" },
+        select: { lotNumber: true },
+      });
+      const productionLotNumber = priorFgReceipt?.lotNumber || await generateConfiguredNumber("LOT_PRODUCTION", {
+        db: tx,
+        context: { code: fgMovementSource.partCode || "" },
+        fallback: () => `FGLOT-${now.toISOString().slice(0, 10).replace(/-/g, "")}-${inspection.inspectionNumber}`,
+      });
       const fgTarget = {
         warehouseCode: targetWarehouseCode,
         rackCode: typeof rackCode === "string" && rackCode.trim() ? rackCode.trim() : null,
-        lotNumber: typeof lotNumber === "string" && lotNumber.trim()
-          ? lotNumber.trim()
-          : sourceMovement.lotNumber || null,
+        lotNumber: productionLotNumber,
       };
       const targetBalance = await upsertDispositionTargetBalance(
         tx,

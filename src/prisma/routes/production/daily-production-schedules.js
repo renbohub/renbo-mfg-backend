@@ -4,6 +4,8 @@ const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
 router.get("/generate-number", authorize("dailyProductionSchedules", "create"), ctrl.generateNumber);
+router.get("/filter-options", authorize("dailyProductionSchedules", "read"), ctrl.filterOptions);
+router.get("/gantt", authorize("dailyProductionSchedules", "read"), ctrl.gantt);
 router.post("/dispatch-from-work-orders", authorize("dailyProductionSchedules", "dispatch"), logger("dailyProductionSchedules", "dispatch"), ctrl.dispatchFromWorkOrders);
 router.post("/:scheduleNumber/consume", authorize("dailyProductionSchedules", "release"), logger("dailyProductionSchedules", "consume"), ctrl.consume);
 router.post("/:scheduleNumber/release", authorize("dailyProductionSchedules", "release"), logger("dailyProductionSchedules", "release"), ctrl.release);

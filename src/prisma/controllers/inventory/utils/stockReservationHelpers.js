@@ -11,7 +11,9 @@ const {
 const SPECIAL_RACK_PREFIXES = ["RACK-SCRAP", "RACK-REJECT", "RACK-REWORK"];
 
 const isSpecialRackCode = (rackCode) => {
-  const normalizedRackCode = normalizeText(rackCode).toUpperCase();
+  // Stock yang belum putaway dapat memiliki rackCode null. Nilai tersebut
+  // bukan special rack dan tidak boleh membuat proses issue gagal.
+  const normalizedRackCode = String(normalizeText(rackCode) || "").toUpperCase();
   return SPECIAL_RACK_PREFIXES.some((prefix) =>
     normalizedRackCode.startsWith(prefix),
   );

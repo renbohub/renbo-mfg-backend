@@ -15,6 +15,7 @@ router.patch("/bulk-remove", authorize("purchaseOrder", "delete"), logger("purch
 
 // Standard CRUD (logger untuk semua CUD operations)
 router.get("/", authorize("purchaseOrder", "read"), ctrl.list);
+router.get("/:poNumber/pdf", authorize("purchaseOrder", "read"), ctrl.exportPdf);
 router.get("/:poNumber/revisions", authorize("purchaseOrder", "read"), ctrl.revisionHistory);
 router.post("/:poNumber/revisions/:commentId/replies", authorize("purchaseOrder", "read"), logger("purchaseOrder", "reply-revision", {
   paramKey: 'poNumber',

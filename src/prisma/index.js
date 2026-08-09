@@ -1,11 +1,11 @@
-const path = require('path');
-require('dotenv').config({
-  path: path.resolve(__dirname, '../../.env'),
+const path = require("path");
+require("dotenv").config({
+  path: path.resolve(__dirname, "../../.env"),
   override: true,
 });
-const { PrismaClient } = require('@prisma/client');
-const { PrismaPg } = require('@prisma/adapter-pg');
-const { Pool } = require('pg');
+const { PrismaClient } = require("@prisma/client");
+const { PrismaPg } = require("@prisma/adapter-pg");
+const { Pool } = require("pg");
 
 const resolveDatabaseConfig = () => {
   const connectionString = process.env.DATABASE_URL;
@@ -13,7 +13,7 @@ const resolveDatabaseConfig = () => {
 
   try {
     const parsed = new URL(connectionString);
-    const schema = parsed.searchParams.get('schema');
+    const schema = parsed.searchParams.get("schema");
     if (!schema) return { poolConfig: { connectionString }, schema: undefined };
 
     return {
@@ -29,7 +29,7 @@ const resolveDatabaseConfig = () => {
 };
 
 const { poolConfig, schema } = resolveDatabaseConfig();
-console.log('📦 Prisma schema:', schema || 'default');
+console.log("📦 Prisma schema:", schema || "default");
 
 // Create PostgreSQL pool
 const pool = new Pool(poolConfig);
@@ -40,9 +40,10 @@ const adapter = new PrismaPg(pool, schema ? { schema } : undefined);
 // Create Prisma Client with adapter
 const prisma = new PrismaClient({
   adapter,
-  log: process.env.NODE_ENV === 'development' 
-    ? ['query', 'info', 'warn', 'error']
-    : ['error'],
+  log:
+    process.env.NODE_ENV === "development"
+      ? ["query", "info", "warn", "error"]
+      : ["error"],
 });
 
 async function assertDatabaseSchemaReady() {
@@ -59,7 +60,7 @@ async function assertDatabaseSchemaReady() {
     WHERE to_regclass('public.' || expected.table_name) IS NULL
   `;
   if (missing.length) {
-    const names = missing.map((row) => row.table_name).join(', ');
+    const names = missing.map((row) => row.table_name).join(", ");
     throw new Error(
       `Database schema belum siap. Tabel hilang: ${names}. Jalankan "npm run db:bootstrap" (atau "npx prisma migrate deploy") dari folder backend dengan DATABASE_URL yang benar, lalu restart server.`,
     );
@@ -73,16 +74,21 @@ async function connectDatabase() {
     // PrismaPg membuka koneksi secara lazy. Query ringan ini memastikan
     // PostgreSQL benar-benar menerima koneksi sebelum server dijalankan.
     await prisma.$queryRaw`SELECT 1`;
-    console.log('✅ PostgreSQL Connected successfully');
+    console.log("✅ PostgreSQL Connected successfully");
     await assertDatabaseSchemaReady();
-    
+
     // Run seeder after connection
-    const runSeeders = require('./utils/seeder');
+    const runSeeders = require("./utils/seeder");
     await runSeeders();
   } catch (error) {
-    console.error('❌ PostgreSQL Connection Failed:', error.message);
-    console.error('   Make sure PostgreSQL is running and DATABASE_URL is correct');
-    console.error('   DATABASE_URL:', process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')); // hide password
+    console.error("❌ PostgreSQL Connection Failed:", error.message);
+    console.error(
+      "   Make sure PostgreSQL is running and DATABASE_URL is correct",
+    );
+    console.error(
+      "   DATABASE_URL:",
+      process.env.DATABASE_URL?.replace(/:[^:@]+@/, ":***@"),
+    ); // hide password
     process.exit(1);
   }
 }
@@ -90,15 +96,15 @@ async function connectDatabase() {
 // Graceful shutdown
 async function disconnectDatabase() {
   await prisma.$disconnect();
-  console.log('PostgreSQL Disconnected');
+  console.log("PostgreSQL Disconnected");
 }
 
-process.on('beforeExit', disconnectDatabase);
-process.on('SIGINT', async () => {
+process.on("beforeExit", disconnectDatabase);
+process.on("SIGINT", async () => {
   await disconnectDatabase();
   process.exit(0);
 });
-process.on('SIGTERM', async () => {
+process.on("SIGTERM", async () => {
   await disconnectDatabase();
   process.exit(0);
 });

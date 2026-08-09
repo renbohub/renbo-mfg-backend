@@ -14,6 +14,7 @@ const frontendPrForm = read("../frontend/public/js/purchasing-pr-form.js");
 const frontendPrView = read("../frontend/views/purchasing/pr-form.ejs");
 const frontendModuleRoutes = read("../frontend/src/routes/modules.js");
 const frontendSupplyForm = read("../frontend/public/js/supply-chain-form.js");
+const frontendSupplyView = read("../frontend/views/operations/supply-chain-form.ejs");
 const frontendInventoryForm = read("../frontend/public/js/inventory-form.js");
 const frontendInventoryView = read("../frontend/views/inventory/form.ejs");
 const incoming = read("src/prisma/controllers/incoming/IncomingTransactionController.js");
@@ -49,6 +50,12 @@ const contracts = [
   ["PR category filter does not hide Purchase Orders", frontendModuleRoutes.includes('const purchaseCategory = isPurchaseRequisition') && frontendModuleRoutes.includes(": null;")],
   ["Sent PO can open a preselected Goods Receipt", frontendDetail.includes("data-create-goods-receipt") && frontendSupplyForm.includes('new URLSearchParams(location.search).get("poNumber")') && frontendSupplyForm.includes("await loadSource()")],
   ["Goods Receipt accepts only receiving PO statuses", incoming.includes('["Sent", "Confirmed", "Partial Receipt"].includes(po.status)') && incoming.includes("Warehouse penerimaan tidak aktif")],
+  ["Goods Receipt accepts under and over receipt variance", !incoming.includes("Receipt quantity exceeds the outstanding PO") && incoming.includes("overReceivedQty") && frontendSupplyForm.includes("Boleh kurang / lebih")],
+  ["Small shortage can close PO while large shortage stays partial", incoming.includes("AUTO_CLOSE_SHORTAGE_PERCENT") && incoming.includes('poStatus = poCompleted ? "Completed" : "Partial Receipt"') && frontendSupplyForm.includes('shortagePercent <= AUTO_CLOSE_SHORTAGE_PERCENT ? "Close PO" : "Partial Receipt"')],
+  ["Goods Receipt can manually consume an eligible PO", frontendSupplyView.includes("Pilih PO secara manual") && frontendSupplyView.includes("Pilih PO untuk dikonsumsi") && frontendSupplyForm.includes('$("sourceNumber").addEventListener("change"')],
+  ["Goods Receipt generates internal lot and keeps supplier lot manual", incoming.includes('ensureDefaultNumberingRule("LOT_INCOMING", tx)') && incoming.includes('generateConfiguredNumber("LOT_INCOMING"') && incoming.includes("supplierLotNumber") && frontendSupplyForm.includes("data-supplier-lot") && frontendSupplyForm.includes("supplierLotNumber: row.supplierLot") && !frontendSupplyForm.includes("lotNumber: row.lot")],
+  ["Incoming IQC uses a simplified operator input workspace", frontendDetail.includes("renderIncomingInspectionCollections") && frontendDetail.includes("data-iqc-accept-all") && frontendDetail.includes("Qty Diterima Baik") && frontendDetail.includes("Qty Reject") && frontendDetail.includes("updateIncomingInspectionSummary")],
+  ["Incoming IQC only sends reject disposition when reject exists", frontendDetail.includes('rejectedDisposition: qtyRejected > 0') && frontendDetail.includes('dispositionReference: qtyRejected > 0') && frontendDetail.includes("Referensi retur wajib diisi")],
   ["Manual Complete uses warehouse and rack dropdowns", frontendDetail.includes("collectManualCompleteLocation") && frontendDetail.includes("data-manual-warehouse") && frontendDetail.includes("data-manual-rack") && !frontendDetail.includes('window.prompt("Warehouse tujuan untuk sisa penerimaan:')],
   ["Stock Movement uses master-backed dropdowns", frontendInventoryView.includes('<select id="warehouseCode" required>') && frontendInventoryView.includes('<select id="itemCode" required>') && frontendInventoryView.includes('<select id="lotNumber">') && frontendInventoryForm.includes("/master-data/api/parts?start=0&length=500") && frontendInventoryForm.includes("/master-data/api/uom?start=0&length=500")],
   ["Rack master belongs to Warehouse", schema.includes('warehouseCode String? @map("warehouse_code")') && rackController.includes("where.warehouseCode") && frontendMasterRegistry.includes('label: "Rack Warehouse"')],

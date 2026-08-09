@@ -12,7 +12,13 @@ const DEFAULT_RULES = [
   ["MACHINE", "Kode Mesin", "MCH", "{PREFIX}-{SEQ}", 4, "NONE"], ["DIES", "Kode Dies", "DIE", "{PREFIX}-{SEQ}", 4, "NONE"], ["WAREHOUSE", "Kode Gudang", "WH", "{PREFIX}-{SEQ}", 3, "NONE"], ["RACK", "Kode Rak", "RCK", "{PREFIX}-{SEQ}", 4, "NONE"],
   ["SUB_PROCESS", "Kode Sub Proses", "SPR", "{PREFIX}-{SEQ}", 4, "NONE"], ["MATERIAL_ISSUE", "Material Issue", "MI", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["PRODUCTION_LOG", "Production Log", "PL", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
   ["QUALITY_INSPECTION", "Quality Inspection", "QC", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["VENDOR_PROCESS_ORDER", "Vendor Process Order", "VPO", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["WIP", "WIP Entry", "WIP", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
-  ["DOWNTIME", "Downtime Log", "DT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["DAILY_PRODUCTION_SCHEDULE", "Daily Production Schedule", "DPS", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["PLANNED_ORDER", "Planned Order", "PO", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"]
+  ["DOWNTIME", "Downtime Log", "DT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["DAILY_PRODUCTION_SCHEDULE", "Daily Production Schedule", "DPS", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"], ["PLANNED_ORDER", "Planned Order", "PO", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT", "Lot Umum", "LOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT_INCOMING", "Lot Internal Incoming", "INLOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT_PRODUCTION", "Lot Finished Goods Production", "FGLOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT_WIP", "Lot Work In Process", "WIPLOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT_VENDOR_PROCESS", "Lot Vendor Process", "VPLOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"],
+  ["LOT_ADJUSTMENT", "Lot Inventory Adjustment", "ADJLOT", "{PREFIX}-{YYYY}{MM}{DD}-{SEQ}", 4, "DAILY"]
 ];
 
 function pad(value, size = 2) { return String(value).padStart(size, "0"); }
@@ -60,9 +66,18 @@ async function getRule(ruleKey, db = prisma) {
 }
 async function ensureDefaultNumberingRules(db = prisma) {
   if (!db.numberingRule) return;
-  await Promise.all(DEFAULT_RULES.map(([ruleKey, ruleName, prefix, pattern, sequenceLength, resetPolicy]) => db.numberingRule.upsert({
-    where: { ruleKey }, update: {}, create: { ruleKey, ruleName, prefix, pattern, sequenceLength, resetPolicy, notes: "Rule default sistem. Pola dapat diubah dari master data." }
-  })));
+  await Promise.all(DEFAULT_RULES.map(([ruleKey]) => ensureDefaultNumberingRule(ruleKey, db)));
+}
+async function ensureDefaultNumberingRule(ruleKey, db = prisma) {
+  if (!db.numberingRule) return null;
+  const definition = DEFAULT_RULES.find(([key]) => key === String(ruleKey || "").trim().toUpperCase());
+  if (!definition) return null;
+  const [key, ruleName, prefix, pattern, sequenceLength, resetPolicy] = definition;
+  return db.numberingRule.upsert({
+    where: { ruleKey: key },
+    update: {},
+    create: { ruleKey: key, ruleName, prefix, pattern, sequenceLength, resetPolicy, notes: "Rule default sistem. Pola dapat diubah dari master data." },
+  });
 }
 async function previewConfiguredNumber(ruleKey, options = {}) {
   const rule = await getRule(ruleKey, options.db || prisma); return rule ? formatNumber(rule, rule.nextNumber, options.context, options.date || new Date()) : null;
@@ -78,4 +93,4 @@ async function generateConfiguredNumber(ruleKey, options = {}) {
   return formatNumber(updated, updated.nextNumber - updated.incrementBy, options.context, date);
 }
 
-module.exports = { TOKENS, RESET_POLICIES, SIBLING_ALPHA_MODES, DEFAULT_RULES, normalizeRuleInput, formatNumber, getRule, ensureDefaultNumberingRules, previewConfiguredNumber, generateConfiguredNumber };
+module.exports = { TOKENS, RESET_POLICIES, SIBLING_ALPHA_MODES, DEFAULT_RULES, normalizeRuleInput, formatNumber, getRule, ensureDefaultNumberingRule, ensureDefaultNumberingRules, previewConfiguredNumber, generateConfiguredNumber };

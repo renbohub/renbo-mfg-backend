@@ -55,6 +55,13 @@ async function main() {
       returned: payload.items.length,
     });
   }
+  if (!Array.isArray(inventory.traceability?.items) || !inventory.traceability?.summary) {
+    throw new Error("inventory FG COMP traceability contract tidak lengkap");
+  }
+  console.log("PASS inventory FG COMP traceability", {
+    total: inventory.traceability.total,
+    ready: inventory.traceability.summary.fgCompWithReadyFg,
+  });
 
   const today = new Date();
   const startDate = new Date(today.getFullYear(), today.getMonth(), 1);

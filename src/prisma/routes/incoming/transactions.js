@@ -2,6 +2,8 @@ const router = require("express").Router();
 const ctrl = require("../../controllers/incoming/IncomingTransactionController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
+router.get("/dashboard", authorize("purchaseOrder", "read"), ctrl.dashboard);
+router.get("/goods-receipts/allocation-plan/:poNumber", authorize("purchaseOrder", "read"), ctrl.getAllocationPlan);
 router.post("/goods-receipts", authorize("purchaseOrder", "create"), logger("goods-receipt", "create"), ctrl.receivePurchaseOrder);
 router.post("/incoming-inspections", authorize("purchaseOrder", "create"), logger("incoming-inspection", "create"), ctrl.createInspection);
 router.post("/incoming-inspections/:inspectionNumber/complete", authorize("purchaseOrder", "update"), logger("incoming-inspection", "complete"), ctrl.completeInspection);

@@ -3,6 +3,7 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { assertQuantity } = require("../../utils/uomQuantity");
 const { predecessorQuantityStatus } = require("../../services/planning/capacityPlanningService");
+const { resolveDiesAssignment } = require("../../services/planning/diesCapacityService");
 const {
   buildAvailability,
 } = require("./services/productionWorkflowService");
@@ -333,32 +334,29 @@ async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
           item.parentPartCode ? `parent=${item.parentPartCode}` : null,
           item.itemType ? `itemType=${item.itemType}` : null,
           source.materialCode ? `material=${source.materialCode}` : null,
+          availability.mbomHeader?.noReg ? `mbom=${availability.mbomHeader.noReg}` : null,
+          item.detailId ? `mbomDetail=${item.detailId}` : null,
+          `dppQty=${Number(schedule.plannedQty || 0)}`,
+          schedule.uomCode ? `dppUom=${schedule.uomCode}` : null,
+          `qtyPer=${Number(item.qtyPer || 0)}`,
+          `scrap=${Number(item.scrapFactor || 0)}`,
+          item.kgPerQty != null ? `kgPerQty=${Number(item.kgPerQty || 0)}` : null,
+          `totalRequired=${Number(item.qtyRequired || 0)}`,
         ].filter(Boolean).join("; "),
       });
       remaining = Math.max(0, remaining - qty);
     }
 
-    // Keep an explicit shortage line for audit. Normal DPP execution will be
-    // blocked before issue when no real stock source can cover this remainder.
     if (remaining > 0) {
-      issueDetails.push({
-        lineNumber: issueDetails.length + 1,
-        partCode: item.partCode,
-        partNumber: item.partNumber,
-        partName: item.partName,
-        spec: item.spec,
-        thickness: item.thickness,
-        width: item.width,
-        CSP: item.CSP,
-        stockBalanceId: null,
-        requirementSource: item.requirementSource || "MBOM",
-        rackCode: item.rackCode,
-        qtyRequired: remaining,
-        qtyIssued: remaining,
-        uomCode: item.uomCode,
-        lotNumber: item.lotNumber,
-        notes: "Prepared from Daily Production Plan consume; stock source unresolved",
-      });
+      const availableQty = Number(item.qtyRemaining || item.qtyRequired || 0) - remaining;
+      throw Object.assign(
+        new Error(
+          `Stock ${item.partCode || item.partNumber || "material"} belum cukup ` +
+          `(tersedia ${availableQty}, dibutuhkan ${Number(item.qtyRemaining || item.qtyRequired || 0)}). ` +
+          "Daily Production Schedule tetap Draft sampai seluruh stock siap.",
+        ),
+        { statusCode: 409, code: "DPP_STOCK_NOT_READY" },
+      );
     }
   }
   if (existing) {
@@ -396,6 +394,12 @@ async function resolveWorkOrder(woNumber) {
   return prisma.workOrder.findUnique({
     where: { woNumber },
     include: {
+      mbomProcess: {
+        include: {
+          process: { select: { processCode: true, processName: true } },
+          mbomDetail: { select: { partId: true } },
+        },
+      },
       manufacturingOrder: {
         include: { part: { select: { id: true, partCode: true } } },
       },
@@ -407,16 +411,25 @@ const machineSelect = {
   id: true,
   machineCode: true,
   machineName: true,
+  machineType: true,
+  machineFamily: true,
+  machineTechnology: true,
+  machineSpecificationCode: true,
+  machineSpecificationName: true,
+  tonnage: true,
   capacity: true,
   capacityUnit: true,
   cycleTime: true,
+  lineCode: true,
+  location: true,
 };
 
 async function attachScheduleMachines(client, schedules = []) {
   const items = Array.isArray(schedules) ? schedules : [schedules];
   const machineIds = [...new Set(items.map((row) => row?.machineId).filter(Boolean))];
   const processIds = [...new Set(items.map((row) => row?.processId).filter(Boolean))];
-  const [machines, processes] = await Promise.all([
+  const diesIds = [...new Set(items.map((row) => row?.diesId).filter(Boolean))];
+  const [machines, processes, dies] = await Promise.all([
     machineIds.length
       ? client.machine.findMany({ where: { id: { in: machineIds } }, select: machineSelect })
       : [],
@@ -426,13 +439,18 @@ async function attachScheduleMachines(client, schedules = []) {
           select: { id: true, processCode: true, processName: true },
         })
       : [],
+    diesIds.length
+      ? client.dies.findMany({ where: { id: { in: diesIds }, isDeleted: false }, select: { id: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true, status: true } })
+      : [],
   ]);
   const machineById = new Map(machines.map((row) => [row.id, row]));
   const processById = new Map(processes.map((row) => [row.id, row]));
+  const diesById = new Map(dies.map((row) => [row.id, row]));
   const hydrated = items.map((row) => row ? {
     ...row,
     machine: machineById.get(row.machineId) || null,
     process: processById.get(row.processId) || null,
+    dies: diesById.get(row.diesId) || null,
   } : row);
   return Array.isArray(schedules) ? hydrated : hydrated[0];
 }
@@ -444,8 +462,12 @@ function mapScheduleDoc(schedule) {
     ...doc,
     machineCode: doc.machine?.machineCode || null,
     machineName: doc.machine?.machineName || null,
+    diesCode: doc.dies?.diesCode || null,
+    diesName: doc.dies?.diesName || null,
     machineCapacity: doc.machine?.capacity ?? null,
     machineCapacityUnit: doc.machine?.capacityUnit || null,
+    lineCode: doc.machine?.lineCode || null,
+    machineLocation: doc.machine?.location || null,
     processCode: doc.process?.processCode || null,
     processName: doc.process?.processName || null,
     sourceModule: ppicMarker ? "PPIC" : "Production",
@@ -453,6 +475,83 @@ function mapScheduleDoc(schedule) {
     monthlyProductionPlanLineNumber: doc.productionPlanAllocation?.lineNumber || (ppicMarker ? Number(ppicMarker[2]) : null),
   };
 }
+
+exports.filterOptions = async (_req, res, next) => {
+  try {
+    const usedMachineIds = await prisma.dailyProductionSchedule.findMany({
+      where: { isDeleted: false, shift: { not: "VENDOR" }, machineId: { not: null } },
+      distinct: ["machineId"],
+      select: { machineId: true },
+    });
+    const machineFields = { id: true, machineCode: true, machineName: true, lineCode: true, location: true, status: true };
+    const [machines, allMachines] = await Promise.all([
+      prisma.machine.findMany({
+        where: { id: { in: usedMachineIds.map((row) => row.machineId).filter(Boolean) }, isDeleted: false },
+        select: machineFields,
+        orderBy: [{ lineCode: "asc" }, { machineCode: "asc" }],
+      }),
+      prisma.machine.findMany({
+        where: { isDeleted: false, status: "Active" },
+        select: machineFields,
+        orderBy: [{ lineCode: "asc" }, { machineCode: "asc" }],
+      }),
+    ]);
+    res.json({ machines, allMachines });
+  } catch (error) { next(error); }
+};
+
+exports.gantt = async (req, res, next) => {
+  try {
+    const anchor = parseDate(req.query.weekStart) || new Date();
+    const { start: anchorStart } = dayRange(anchor);
+    const weekStart = new Date(anchorStart);
+    const day = weekStart.getDay();
+    weekStart.setDate(weekStart.getDate() - (day === 0 ? 6 : day - 1));
+    const weekEnd = addDays(weekStart, 7);
+    const where = {
+      isDeleted: false,
+      shift: { not: "VENDOR" },
+      scheduleDate: { gte: weekStart, lt: weekEnd },
+    };
+    if (req.query.shift) where.shift = String(req.query.shift);
+    if (req.query.status) where.status = String(req.query.status);
+    if (req.query.machineCode || req.query.lineCode) {
+      const machines = await prisma.machine.findMany({
+        where: {
+          isDeleted: false,
+          ...(req.query.machineCode ? { machineCode: String(req.query.machineCode) } : {}),
+          ...(req.query.lineCode ? { lineCode: String(req.query.lineCode) } : {}),
+        },
+        select: { id: true },
+      });
+      where.machineId = { in: machines.map((machine) => machine.id) };
+    }
+    if (req.query.q) {
+      const q = String(req.query.q).trim();
+      where.OR = [
+        { scheduleNumber: { contains: q, mode: "insensitive" } },
+        { moNumber: { contains: q, mode: "insensitive" } },
+        { woNumber: { contains: q, mode: "insensitive" } },
+        { partCode: { contains: q, mode: "insensitive" } },
+      ];
+    }
+    const items = await prisma.dailyProductionSchedule.findMany({
+      where,
+      orderBy: [{ machineId: "asc" }, { scheduleDate: "asc" }, { shift: "asc" }, { sequence: "asc" }],
+      include: {
+        productionPlan: { select: { planNumber: true, status: true } },
+        productionPlanAllocation: { select: { id: true, lineNumber: true, mbomProcessId: true } },
+      },
+    });
+    const hydratedItems = await attachScheduleMachines(prisma, items);
+    res.json({
+      items: hydratedItems.map(mapScheduleDoc),
+      total: items.length,
+      weekStart: weekStart.toISOString(),
+      weekEnd: addDays(weekStart, 6).toISOString(),
+    });
+  } catch (error) { next(error); }
+};
 
 exports.generateNumber = async (req, res, next) => {
   try {
@@ -465,10 +564,15 @@ exports.generateNumber = async (req, res, next) => {
 
 exports.list = async (req, res, next) => {
   try {
-    const { q, scheduleDate, shift, status, machineId, isDeleted, page = 1, limit = 100 } = req.query;
-    const where = {
-      isDeleted: isDeleted === undefined ? false : isDeleted === "true",
-    };
+    const { q, scheduleDate, shift, status, machineId, machineCode, lineCode, dateScope, isDeleted, page = 1, limit = 100 } = req.query;
+      const where = {
+        isDeleted: isDeleted === undefined ? false : isDeleted === "true",
+      };
+      // Vendor operations have their own outbound/inbound queues. Keep legacy
+      // VENDOR schedules readable by key, but never mix them into Daily Plan.
+      if (String(req.query.includeVendor || "").toLowerCase() !== "true") {
+        where.shift = { not: "VENDOR" };
+      }
 
     if (String(req.query.sourceModule || "").toUpperCase() === "PPIC") {
       where.productionPlanId = { not: null };
@@ -480,9 +584,25 @@ exports.list = async (req, res, next) => {
       const { start, end } = dayRange(scheduleDate);
       where.scheduleDate = { gte: start, lte: end };
     }
-    if (shift) where.shift = shift;
+    if (!scheduleDate && dateScope === "overdue") {
+      const { start } = dayRange(new Date());
+      where.scheduleDate = { lt: start };
+      if (!status) where.status = { in: ["Draft", "Released", "In Progress"] };
+    }
+      if (shift && String(shift).toUpperCase() !== "VENDOR") where.shift = shift;
     if (status) where.status = Array.isArray(status) ? { in: status } : status;
     if (machineId) where.machineId = machineId;
+    if (!machineId && (machineCode || lineCode)) {
+      const machines = await prisma.machine.findMany({
+        where: {
+          isDeleted: false,
+          ...(machineCode ? { machineCode: String(machineCode) } : {}),
+          ...(lineCode ? { lineCode: String(lineCode) } : {}),
+        },
+        select: { id: true },
+      });
+      where.machineId = { in: machines.map((machine) => machine.id) };
+    }
     if (q) {
       where.OR = [
         { scheduleNumber: { contains: q, mode: "insensitive" } },
@@ -651,12 +771,26 @@ exports.create = async (req, res, next) => {
     assertQuantity(body.plannedQty || wo?.plannedQty || 0, uomCode, "Planned Qty");
     if (body.actualQty != null && Number(body.actualQty) > 0) assertQuantity(body.actualQty, uomCode, "Actual Qty");
     const scheduleNumber = body.scheduleNumber || (await generateScheduleNumber(prisma, scheduleDate));
+    const machineId = body.machineId || wo?.machineId || null;
+    const machine = machineId ? await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false, status: "Active" } }) : null;
+    const diesAssignment = machine && wo?.mbomProcess
+      ? await resolveDiesAssignment(prisma, {
+        route: wo.mbomProcess,
+        machine,
+        diesId: body.diesId || wo.diesId,
+        scheduleDate,
+        plannedStartTime: body.plannedStartTime,
+        plannedEndTime: body.plannedEndTime,
+      })
+      : { dies: null };
 
     const schedule = await prisma.dailyProductionSchedule.create({
       data: {
         scheduleNumber,
         scheduleDate,
         shift: body.shift,
+        plannedStartTime: body.plannedStartTime || null,
+        plannedEndTime: body.plannedEndTime || null,
         moId: body.moId || mo?.id || null,
         moNumber: body.moNumber || mo?.moNumber || null,
         woId: body.woId || wo?.id || null,
@@ -664,7 +798,8 @@ exports.create = async (req, res, next) => {
         partId: body.partId || mo?.partId || null,
         partCode: body.partCode || mo?.part?.partCode || null,
         processId: body.processId || wo?.processId || null,
-        machineId: body.machineId || wo?.machineId || null,
+        machineId,
+        diesId: diesAssignment.dies?.id || body.diesId || wo?.diesId || null,
         plannedQty: Number(body.plannedQty || wo?.plannedQty || 0),
         actualQty: Number(body.actualQty || 0),
         uomCode,
@@ -684,20 +819,72 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const body = req.body || {};
-    const existing = await prisma.dailyProductionSchedule.findUnique({ where: { scheduleNumber: req.params.scheduleNumber }, select: { uomCode: true } });
+    const existing = await prisma.dailyProductionSchedule.findUnique({
+      where: { scheduleNumber: req.params.scheduleNumber },
+      include: { productionPlanAllocation: { select: { plannedQty: true } } },
+    });
+    if (!existing || existing.isDeleted) return res.status(404).json({ message: "Daily Production Plan tidak ditemukan." });
+    if (!["Draft", "Released", "In Progress"].includes(existing.status)) {
+      return res.status(409).json({ message: `Daily Production Plan status ${existing.status} tidak dapat direvisi.` });
+    }
     const uomCode = body.uomCode || existing?.uomCode || null;
-    if (body.plannedQty !== undefined) assertQuantity(body.plannedQty, uomCode, "Planned Qty");
-    if (body.actualQty !== undefined && Number(body.actualQty) > 0) assertQuantity(body.actualQty, uomCode, "Actual Qty");
+    let plannedQty = null;
+    if (body.plannedQty !== undefined) {
+      assertQuantity(body.plannedQty, uomCode, "Planned Qty");
+      plannedQty = Number(body.plannedQty);
+      if (plannedQty <= 0) return res.status(400).json({ message: "Planned Qty wajib lebih dari nol." });
+      const logged = await prisma.productionLog.aggregate({
+        where: { dpsId: existing.id, isDeleted: false },
+        _sum: { qtyProduced: true },
+      });
+      const executedQty = Math.max(Number(existing.actualQty || 0), Number(logged._sum.qtyProduced || 0));
+      if (plannedQty + 0.000001 < executedQty) {
+        return res.status(409).json({ message: `Planned Qty tidak boleh lebih kecil dari hasil produksi yang sudah tercatat (${executedQty} ${uomCode || ""}).` });
+      }
+      const allocationQty = Number(existing.productionPlanAllocation?.plannedQty || 0);
+      if (allocationQty > 0 && plannedQty > allocationQty + 0.000001) {
+        return res.status(409).json({ message: `Planned Qty tidak boleh melebihi allocation PPIC (${allocationQty} ${uomCode || ""}). Revisi allocation dari Capacity Planning jika target perlu ditambah.` });
+      }
+    }
+    const scheduleDate = body.scheduleDate !== undefined ? parseDate(body.scheduleDate) : null;
+    if (body.scheduleDate !== undefined && !scheduleDate) return res.status(400).json({ message: "Tanggal DPP tidak valid." });
+    if (body.machineId) {
+      const machine = await prisma.machine.findFirst({ where: { id: body.machineId, isDeleted: false, status: "Active" }, select: { id: true } });
+      if (!machine) return res.status(400).json({ message: "Mesin revisi tidak aktif atau tidak ditemukan." });
+    }
+    const effectiveMachineId = body.machineId !== undefined ? body.machineId : existing.machineId;
+    const effectiveDate = body.scheduleDate !== undefined ? scheduleDate : existing.scheduleDate;
+    const effectiveStart = body.plannedStartTime !== undefined ? body.plannedStartTime : existing.plannedStartTime;
+    const effectiveEnd = body.plannedEndTime !== undefined ? body.plannedEndTime : existing.plannedEndTime;
+    let diesId = body.diesId !== undefined ? body.diesId || null : existing.diesId;
+    if (effectiveMachineId && existing.mbomProcessId) {
+      const [machine, route] = await Promise.all([
+        prisma.machine.findFirst({ where: { id: effectiveMachineId, isDeleted: false, status: "Active" } }),
+        prisma.mBOMProcess.findFirst({ where: { id: existing.mbomProcessId, isDeleted: false }, include: { process: { select: { processCode: true, processName: true } }, mbomDetail: { select: { partId: true } } } }),
+      ]);
+      if (machine && route) diesId = (await resolveDiesAssignment(prisma, {
+        route,
+        machine,
+        diesId,
+        scheduleDate: effectiveDate,
+        plannedStartTime: effectiveStart,
+        plannedEndTime: effectiveEnd,
+        excludeAllocationId: existing.productionPlanAllocationId,
+        excludeScheduleId: existing.id,
+      })).dies?.id || null;
+    }
     const schedule = await prisma.dailyProductionSchedule.update({
       where: { scheduleNumber: req.params.scheduleNumber },
       data: {
-        ...(body.scheduleDate ? { scheduleDate: parseDate(body.scheduleDate) } : {}),
+        ...(body.scheduleDate !== undefined ? { scheduleDate } : {}),
         ...(body.shift !== undefined ? { shift: body.shift } : {}),
+        ...(body.plannedStartTime !== undefined ? { plannedStartTime: body.plannedStartTime || null } : {}),
+        ...(body.plannedEndTime !== undefined ? { plannedEndTime: body.plannedEndTime || null } : {}),
         ...(body.machineId !== undefined ? { machineId: body.machineId || null } : {}),
+        diesId,
         ...(body.operatorName !== undefined ? { operatorName: body.operatorName || null } : {}),
         ...(body.sequence !== undefined ? { sequence: Number(body.sequence || 0) } : {}),
-        ...(body.plannedQty !== undefined ? { plannedQty: Number(body.plannedQty || 0) } : {}),
-        ...(body.actualQty !== undefined ? { actualQty: Number(body.actualQty || 0) } : {}),
+        ...(plannedQty !== null ? { plannedQty } : {}),
         ...(body.notes !== undefined ? { notes: body.notes || null } : {}),
       },
     });
@@ -718,6 +905,22 @@ const setStatus = (status) => async (req, res, next) => {
         }
         if (String(current.shift || "").toUpperCase() !== "VENDOR" && (!current.moId || !current.woId)) {
           throw Object.assign(new Error("Daily Production Plan in-house wajib memiliki MO dan WO reference."), { statusCode: 409, code: "DAILY_PLAN_EXECUTION_REFERENCE_INCOMPLETE" });
+        }
+        if (String(current.shift || "").toUpperCase() !== "VENDOR") {
+          const [machine, route] = await Promise.all([
+            current.machineId ? tx.machine.findFirst({ where: { id: current.machineId, isDeleted: false, status: "Active" } }) : null,
+            current.mbomProcessId ? tx.mBOMProcess.findFirst({ where: { id: current.mbomProcessId, isDeleted: false }, include: { process: { select: { processCode: true, processName: true } }, mbomDetail: { select: { partId: true } } } }) : null,
+          ]);
+          if (machine && route) await resolveDiesAssignment(tx, {
+            route,
+            machine,
+            diesId: current.diesId,
+            scheduleDate: current.scheduleDate,
+            plannedStartTime: current.plannedStartTime,
+            plannedEndTime: current.plannedEndTime,
+            excludeAllocationId: current.productionPlanAllocationId,
+            excludeScheduleId: current.id,
+          });
         }
       }
       const allowedFrom = {
@@ -863,8 +1066,24 @@ exports.consume = async (req, res, next) => {
         throw Object.assign(new Error("Daily Production Plan in-house wajib memiliki MO dan WO reference."), { statusCode: 409, code: "DAILY_PLAN_EXECUTION_REFERENCE_INCOMPLETE" });
       }
       if (!["Draft", "Released"].includes(schedule.status)) throw Object.assign(new Error(`Daily plan ${schedule.scheduleNumber} tidak dapat dikonsumsi dari status ${schedule.status}.`), { statusCode: 409 });
+      if (String(schedule.shift || "").toUpperCase() !== "VENDOR") {
+        const [machine, route] = await Promise.all([
+          schedule.machineId ? tx.machine.findFirst({ where: { id: schedule.machineId, isDeleted: false, status: "Active" } }) : null,
+          schedule.mbomProcessId ? tx.mBOMProcess.findFirst({ where: { id: schedule.mbomProcessId, isDeleted: false }, include: { process: { select: { processCode: true, processName: true } }, mbomDetail: { select: { partId: true } } } }) : null,
+        ]);
+        if (machine && route) await resolveDiesAssignment(tx, {
+          route,
+          machine,
+          diesId: schedule.diesId,
+          scheduleDate: schedule.scheduleDate,
+          plannedStartTime: schedule.plannedStartTime,
+          plannedEndTime: schedule.plannedEndTime,
+          excludeAllocationId: schedule.productionPlanAllocationId,
+          excludeScheduleId: schedule.id,
+        });
+      }
       const updated = schedule.status === "Draft" ? await tx.dailyProductionSchedule.update({ where: { scheduleNumber: schedule.scheduleNumber }, data: { status: "Released" } }) : schedule;
-      if (updated.woId) await tx.workOrder.updateMany({ where: { id: updated.woId, isDeleted: false, status: { in: ["Draft", "Planned"] } }, data: { status: "Released" } });
+      if (updated.woId) await tx.workOrder.updateMany({ where: { id: updated.woId, isDeleted: false, status: { in: ["Draft", "Planned"] } }, data: { status: "Released", machineId: updated.machineId || undefined, diesId: updated.diesId || undefined, shift: updated.shift || undefined } });
       const materialIssue = await ensureMaterialIssueDraft(tx, updated, req.user?.username || req.user?.email || "system");
       return { schedule: mapScheduleDoc(await attachScheduleMachines(tx, updated)), materialIssue };
     });
@@ -1055,6 +1274,7 @@ exports.dispatchFromWorkOrders = async (req, res, next) => {
               partCode: wo.manufacturingOrder?.part?.partCode || null,
               processId: wo.processId || null,
               machineId: wo.machineId || null,
+              diesId: wo.diesId || null,
               plannedQty: plannedQtyForRow,
               uomCode: wo.uomCode || wo.manufacturingOrder?.uomCode || null,
               operatorName: wo.operatorName || null,

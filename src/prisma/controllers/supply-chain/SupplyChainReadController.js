@@ -81,7 +81,7 @@ const receiptListInclude = {
 };
 const receiptDetailInclude = {
   po: { include: { supplier: true, vendor: true } }, warehouse: true,
-  details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { poDetail: true, rack: true } },
+  details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { poDetail: { include: { prDetail: { include: { sources: { where: { isDeleted: false } }, sourcingAllocations: { where: { isDeleted: false } } } } } }, rack: true, allocations: { where: { isDeleted: false }, orderBy: [{ requiredDate: "asc" }, { createdAt: "asc" }] } } },
   incomingInspections: { where: { isDeleted: false }, orderBy: { inspectionDate: "desc" } },
 };
 const receiptWhere = (req) => {
@@ -102,7 +102,7 @@ const inspectionListInclude = {
 };
 const inspectionDetailInclude = {
   gr: { include: { po: true, warehouse: true } },
-  details: { orderBy: { lineNumber: "asc" }, include: { grDetail: { include: { poDetail: true, rack: true } } } },
+  details: { orderBy: { lineNumber: "asc" }, include: { grDetail: { include: { poDetail: { include: { prDetail: { include: { sources: { where: { isDeleted: false } }, sourcingAllocations: { where: { isDeleted: false } } } } } }, rack: true, allocations: { where: { isDeleted: false }, orderBy: [{ requiredDate: "asc" }, { createdAt: "asc" }] } } } } },
 };
 const inspectionWhere = (req) => {
   const where = statusFilter(req, { isDeleted: false });
@@ -124,7 +124,7 @@ const supplierDeliveryWhere = (req) => {
 };
 const supplierDeliveryMap = (row) => ({ ...row, deliveryNumber: row.poNumber, partnerName: row.supplierName || row.vendorName || "-", plannedQty: totalQty(row.details, "qty"), receivedQty: totalQty(row.details, "qtyReceived") });
 exports.listSupplierDeliveries = (req, res, next) => sendList(req, res, next, { delegate: prisma.purchaseOrder, where: supplierDeliveryWhere, include: { details: { where: { isDeleted: false }, select: { qty: true, qtyReceived: true } }, goodsReceipts: { where: { isDeleted: false }, select: { grNumber: true, grDate: true, status: true } } }, orderBy: { deliveryDate: "desc" }, map: supplierDeliveryMap });
-exports.getSupplierDelivery = (req, res, next) => sendDetail(req, res, next, { delegate: prisma.purchaseOrder, key: "poNumber", param: "poNumber", label: "Supplier Delivery", notDeleted: true, include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } }, goodsReceipts: { where: { isDeleted: false }, orderBy: { grDate: "desc" } }, supplier: true, vendor: true }, map: supplierDeliveryMap });
+exports.getSupplierDelivery = (req, res, next) => sendDetail(req, res, next, { delegate: prisma.purchaseOrder, key: "poNumber", param: "poNumber", label: "Supplier Delivery", notDeleted: true, include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { prDetail: { include: { sources: { where: { isDeleted: false } }, sourcingAllocations: { where: { isDeleted: false } } } } } }, goodsReceipts: { where: { isDeleted: false }, orderBy: { grDate: "desc" } }, supplier: true, vendor: true }, map: supplierDeliveryMap });
 
 const putawayWhere = (req) => {
   const where = { isDeleted: false, direction: "IN", transactionType: { in: ["PURCHASE_RECEIVE", "QUALITY_RELEASE"] } };

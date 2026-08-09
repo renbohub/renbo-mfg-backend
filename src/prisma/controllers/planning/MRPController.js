@@ -22,6 +22,9 @@ const {
 } = require("./services/planningRealtimeService");
 const { isSubAssemblyDetail } = require("../../utils/assemblyPolicy");
 const { durationToWorkingDays } = require("../../utils/duration");
+const { effectiveDemandQty: resolvePolicyDemandQty } = require("../../services/planning/demandConsumptionService");
+const { netTimePhasedDemand } = require("../../services/planning/timePhasedNettingService");
+const { procurementSchedule } = require("../../services/planning/procurementSchedulingService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const hybridMrpService = require("../../services/planning/hybridMrpService");
 const { generateForRun: generatePurchaseSuggestionForRun } = require("../purchasing/PurchaseSuggestionController");
@@ -1948,6 +1951,57 @@ function applyNextMonthPurchaseBuffer(requirements = [], options = {}) {
   return purchaseRequirements;
 }
 
+function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = [], options = {}) {
+  const rowsBySupply = new Map();
+  for (const row of requirements) {
+    const supplyKey = row._planningStockKey || normalizePartCode(row.partCode);
+    if (!rowsBySupply.has(supplyKey)) rowsBySupply.set(supplyKey, []);
+    rowsBySupply.get(supplyKey).push(row);
+  }
+  for (const [supplyKey, rows] of rowsBySupply.entries()) {
+    const events = supplyEvents.filter((event) => event.supplyKey === supplyKey);
+    const netted = netTimePhasedDemand({
+      openingQty: Number(options.initialStockAvailableMap?.[supplyKey] || 0),
+      supplyEvents: events,
+      demandEvents: rows.map((row) => ({ id: row.id, qty: Number(row.grossRequirement || 0), requiredDate: row.requiredDate })),
+    });
+    const resultById = new Map(netted.map((row) => [row.id, row]));
+    for (const row of rows) {
+      const result = resultById.get(row.id);
+      if (!result) continue;
+      const eligibleSupply = result.eligibleSupply || [];
+      row.firmSupplyQty = roundPlanningQty(eligibleSupply.filter((event) => event.confidence === "FIRM").reduce((sum, event) => sum + Number(event.qty || 0), 0));
+      row.plannedSupplyQty = roundPlanningQty(eligibleSupply.filter((event) => event.confidence !== "FIRM").reduce((sum, event) => sum + Number(event.qty || 0), 0));
+      row.netRequirement = roundPlanningQty(result.netRequirement);
+      row.firmNetRequirement = roundPlanningQty(result.firmNetRequirement);
+      row.atRiskSupplyQty = roundPlanningQty(result.atRiskSupplyQty);
+      row.projectedAvailableQty = roundPlanningQty(result.projectedAvailableAfter);
+      row.firmProjectedAvailableQty = roundPlanningQty(result.firmProjectedAvailableAfter);
+      row.supplyTimeline = eligibleSupply.map((event) => ({
+        sourceType: event.sourceType,
+        sourceNumber: event.sourceNumber,
+        status: event.status || null,
+        confidence: event.confidence,
+        availableDate: event.availableDate,
+        qty: roundPlanningQty(event.qty),
+      }));
+      row.plannedOrderQty = row.netRequirement;
+      row.adjustedOrderQty = row.netRequirement;
+      const leadTime = Number(options.partnerMap?.[row.partCode]?.leadTimeDays || row.leadTime || 0);
+      const schedule = procurementSchedule({
+        materialRequiredDate: row.requiredDate,
+        supplierLeadTimeDays: leadTime,
+        ...(options.procurementPolicy || {}),
+        asOf: options.asOf || new Date(),
+      });
+      row.latestPrDate = schedule.latestPrDate;
+      row.procurementWindow = schedule.procurementWindow;
+      row.scheduleSource = row.scheduleSource || "MRP_BACKWARD_SCHEDULE";
+    }
+  }
+  return requirements;
+}
+
 function stripRequirementInternals(requirements = []) {
   const persistedIds = new Set(requirements.map((row) => row.id));
   return requirements.map((row) => {
@@ -2062,11 +2116,11 @@ function resolvePlanningPolicy(part) {
 }
 
 function resolveIndependentDemandQty(forecastQty, soQty, part) {
-  const normalizedForecastQty = Number(forecastQty || 0);
-  const normalizedSoQty = Number(soQty || 0);
-  // PPIC plan tetap berbasis Forecast (+ buffer). SO aktual adalah floor,
-  // sehingga plan tidak boleh turun di bawah order customer yang sudah masuk.
-  return Math.max(normalizedForecastQty, normalizedSoQty);
+  return resolvePolicyDemandQty({
+    forecastQty,
+    salesOrderQty: soQty,
+    part,
+  });
 }
 
 function upsertSupplyQty(map, partCode, qty) {
@@ -2803,6 +2857,119 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   return mergeQtyMaps(plannedOrderMap, moMap, productionExecutionMap, mppMap, prMap, poMap);
 }
 
+async function buildPurchasingSupplyTimeline(tx, requirements = [], cutoffDate, options = {}) {
+  const partCodes = [...new Set(requirements.map((row) => normalizePartCode(row.partCode)).filter(Boolean))];
+  if (!partCodes.length) return [];
+  const cutoff = parseDate(cutoffDate) || new Date(Math.max(...requirements.map((row) => new Date(row.requiredDate).getTime())));
+  const parts = await tx.part.findMany({
+    where: { partCode: { in: partCodes }, isDeleted: false },
+    select: {
+      partCode: true, itemType: true, rawType: true, materialId: true,
+      material: { select: { materialCode: true } },
+      partBases: { select: { baseOn: true, grossWeight: true } },
+    },
+  });
+  const partByCode = new Map(parts.map((part) => [normalizePartCode(part.partCode), part]));
+  const materialIds = [...new Set(parts.map((part) => part.materialId).filter(Boolean))];
+  const materialCodes = [...new Set(parts.map((part) => part.material?.materialCode).filter(Boolean))];
+  const requirementByPart = new Map(requirements.map((row) => [normalizePartCode(row.partCode), row]));
+  const requirementByMaterial = new Map(requirements.map((row) => {
+    const part = partByCode.get(normalizePartCode(row.partCode));
+    return [part?.materialId || part?.material?.materialCode, row];
+  }).filter(([identity]) => identity));
+  const identityWhere = {
+    OR: [
+      { partCode: { in: partCodes } },
+      ...(materialIds.length ? [{ materialId: { in: materialIds } }] : []),
+      ...(materialCodes.length ? [{ materialCode: { in: materialCodes } }] : []),
+    ],
+  };
+  const [plannedOrders, prRows, poRows] = await Promise.all([
+    tx.plannedOrder.findMany({
+      where: {
+        isDeleted: false, orderType: "Purchase", status: "Planned",
+        partCode: { in: partCodes }, requiredDate: { lte: cutoff },
+        ...(options.excludeRunNumber ? { runNumber: { not: options.excludeRunNumber } } : {}),
+      },
+      select: { orderNumber: true, partCode: true, qty: true, qtyReleased: true, uomCode: true, requiredDate: true },
+    }),
+    tx.purchaseRequisitionDetail.findMany({
+      where: { isDeleted: false, ...identityWhere, pr: { isDeleted: false, status: { not: "Rejected" }, requiredDate: { lte: cutoff } } },
+      select: {
+        id: true, prNumber: true, partCode: true, materialId: true, materialCode: true,
+        qty: true, orderedQty: true, uomCode: true, convertedPurchaseQty: true,
+        conversionFactor: true, conversionUomCode: true, plannedOrderNumber: true,
+        pr: { select: { requiredDate: true, status: true } },
+      },
+    }),
+    tx.purchaseOrderDetail.findMany({
+      where: {
+        isDeleted: false,
+        po: { isDeleted: false, status: { in: ["Approved", "Sent", "Confirmed", "Partial Receipt"] } },
+        AND: [
+          identityWhere,
+          { OR: [
+            { deliveryDate: { lte: cutoff } },
+            { deliveryDate: null, po: { deliveryDate: { lte: cutoff } } },
+          ] },
+        ],
+      },
+      select: {
+        id: true, poNumber: true, partCode: true, materialId: true, materialCode: true,
+        qty: true, qtyReceived: true, uomCode: true, convertedPurchaseQty: true,
+        conversionFactor: true, conversionUomCode: true, deliveryDate: true,
+        po: { select: { deliveryDate: true, status: true } },
+      },
+    }),
+  ]);
+
+  const resolveRequirement = (row) => requirementByPart.get(normalizePartCode(row.partCode))
+    || requirementByMaterial.get(row.materialId || row.materialCode);
+  const normalizeQty = (row, qty) => {
+    const requirement = resolveRequirement(row);
+    const part = partByCode.get(normalizePartCode(requirement?.partCode || row.partCode));
+    const kgPerQty = resolveKgPerPcs(part).factor;
+    return Math.max(normalizePurchasingSupplyQty({ ...row, qty, part }, {
+      targetUomCode: requirement?.uomCode || options.uomCodeByPartCode?.[requirement?.partCode],
+      kgPerQty,
+    }), 0);
+  };
+  const events = [];
+  const shiftedDate = (value, delayDays = 0) => {
+    const result = new Date(value);
+    result.setUTCDate(result.getUTCDate() + Math.max(Number(delayDays || 0), 0));
+    return result;
+  };
+  for (const row of plannedOrders) {
+    const requirement = resolveRequirement(row);
+    if (!requirement) continue;
+    const qty = normalizeQty(row, Number(row.qty || 0) - Number(row.qtyReleased || 0));
+    if (qty > 0) events.push({ supplyKey: requirement._planningStockKey || normalizePartCode(requirement.partCode), partCode: requirement.partCode, qty, availableDate: row.requiredDate, confidence: "PLANNED", sourceType: "PLANNED_ORDER", sourceNumber: row.orderNumber });
+  }
+  for (const row of prRows) {
+    const requirement = resolveRequirement(row);
+    if (!requirement) continue;
+    const qty = normalizeQty(row, Number(row.qty || 0) - Number(row.orderedQty || 0));
+    if (qty > 0) events.push({ supplyKey: requirement._planningStockKey || normalizePartCode(requirement.partCode), partCode: requirement.partCode, qty, availableDate: row.pr.requiredDate, confidence: "PLANNED", sourceType: "PR", sourceNumber: row.prNumber, status: row.pr.status });
+  }
+  for (const row of poRows) {
+    const requirement = resolveRequirement(row);
+    if (!requirement) continue;
+    const usesConversion = Number(row.convertedPurchaseQty || 0) > 0 && Number(row.conversionFactor || 0) > 0;
+    const remaining = usesConversion
+      ? Number(row.convertedPurchaseQty || 0) - Number(row.qtyReceived || 0) * Number(row.conversionFactor || 0)
+      : Number(row.qty || 0) - Number(row.qtyReceived || 0);
+    const qty = normalizeQty({ ...row, uomCode: usesConversion ? row.conversionUomCode : row.uomCode }, remaining);
+    if (qty > 0) events.push({
+      supplyKey: requirement._planningStockKey || normalizePartCode(requirement.partCode), partCode: requirement.partCode,
+      qty, availableDate: shiftedDate(row.deliveryDate || row.po.deliveryDate, options.poDelayDays),
+      confidence: ["Confirmed", "Partial Receipt"].includes(row.po.status) ? "FIRM" : "PROBABLE",
+      sourceType: "PO", sourceNumber: row.poNumber, status: row.po.status,
+    });
+  }
+  return events.sort((left, right) => new Date(left.availableDate) - new Date(right.availableDate));
+}
+
 async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate, options = {}) {
   const normalizedPartCodes = [...new Set((partCodes || []).map(normalizePartCode).filter(Boolean))];
   if (normalizedPartCodes.length === 0) return {};
@@ -3272,9 +3439,37 @@ exports.get = async (req, res, next) => {
       orderBy: { createdAt: "desc" },
       select: { suggestionNumber: true, status: true, updatedAt: true },
     });
+    const scenarioRuns = mrpRun.mpsNumber ? await prisma.mRPRun.findMany({
+      where: { mpsNumber: mrpRun.mpsNumber, isDeleted: false, status: "Completed" },
+      orderBy: [{ runDate: "desc" }],
+      take: 12,
+      select: {
+        runNumber: true, runDate: true, scenarioKey: true, scenarioName: true, scenarioStatus: true, scenarioAssumptions: true, isCurrentPlan: true,
+        requirements: {
+          where: { isDeleted: false, orderType: "Purchase" },
+          select: { grossRequirement: true, netRequirement: true, firmNetRequirement: true, atRiskSupplyQty: true, procurementWindow: true },
+        },
+      },
+    }) : [];
+    const scenarioComparison = scenarioRuns.map((run) => ({
+      runNumber: run.runNumber,
+      runDate: run.runDate,
+      scenarioKey: run.scenarioKey,
+      scenarioName: run.scenarioName || (run.scenarioStatus === "SIMULATION" ? run.scenarioKey : "Baseline"),
+      scenarioStatus: run.scenarioStatus,
+      scenarioAssumptions: run.scenarioAssumptions,
+      isCurrentPlan: run.isCurrentPlan,
+      itemCount: run.requirements.length,
+      grossRequirement: roundPlanningQty(run.requirements.reduce((sum, row) => sum + Number(row.grossRequirement || 0), 0)),
+      netRequirement: roundPlanningQty(run.requirements.reduce((sum, row) => sum + Number(row.netRequirement || 0), 0)),
+      firmNetRequirement: roundPlanningQty(run.requirements.reduce((sum, row) => sum + Number(row.firmNetRequirement || 0), 0)),
+      atRiskSupplyQty: roundPlanningQty(run.requirements.reduce((sum, row) => sum + Number(row.atRiskSupplyQty || 0), 0)),
+      expediteCount: run.requirements.filter((row) => row.procurementWindow === "EXPEDITE" && Number(row.netRequirement || 0) > 0).length,
+    }));
     res.json(mapDoc({
       ...mrpRun,
       purchaseSuggestion,
+      scenarioComparison,
       requirementTrace,
       productionScheduleTrace,
       requirements: groupedRequirements,
@@ -3405,7 +3600,18 @@ exports.getAudit = async (req, res, next) => {
 // ============================================
 exports.runMRP = async (req, res, next) => {
   try {
-    const { runNumber: requestedRunNumber, mpsNumber, planHorizon, cutoffDate, soDemandPartCodes } = req.body;
+    const {
+      runNumber: requestedRunNumber, mpsNumber, planHorizon, cutoffDate, soDemandPartCodes,
+      scenarioKey, scenarioName, scenarioAssumptions, planningSnapshotAt,
+    } = req.body;
+    const scenarioStatus = String(req.body?.scenarioStatus || (scenarioKey ? "SIMULATION" : "BASELINE")).toUpperCase();
+    if (!new Set(["BASELINE", "SIMULATION", "APPROVED"]).has(scenarioStatus)) {
+      return res.status(400).json({ message: "scenarioStatus harus BASELINE, SIMULATION, atau APPROVED." });
+    }
+    const isSimulation = scenarioStatus === "SIMULATION";
+    const scenarioDemandMultiplier = isSimulation
+      ? Math.min(Math.max(Number(scenarioAssumptions?.demandMultiplier || 1), 0), 5)
+      : 1;
     const startTime = Date.now();
 
     // API clients may omit the run number; generate the same daily sequence as
@@ -3491,15 +3697,21 @@ exports.runMRP = async (req, res, next) => {
         mpsNumber,
         planScope: "MPS",
       });
-      await retirePreviousPlanRevisions(tx, planIdentity.planNumber, runNumber);
+      if (!isSimulation) await retirePreviousPlanRevisions(tx, planIdentity.planNumber, runNumber);
 
       // Create MRP Run header
       const mrpRun = await tx.mRPRun.create({
         data: {
           runNumber,
           ...planIdentity,
+          isCurrentPlan: !isSimulation,
           planHorizon: resolvedPlanHorizon,
           cutoffDate: resolvedCutoffDate,
+          planningSnapshotAt: parseDate(planningSnapshotAt) || new Date(),
+          scenarioKey: String(scenarioKey || "").trim() || null,
+          scenarioName: String(scenarioName || "").trim() || null,
+          scenarioStatus,
+          scenarioAssumptions: scenarioAssumptions && typeof scenarioAssumptions === "object" ? scenarioAssumptions : null,
           status: "Running",
           runBy: req.user?.username || "system",
           mps: {
@@ -3565,12 +3777,14 @@ exports.runMRP = async (req, res, next) => {
           );
         }
 
-        await supersedePreviousMrpArtifacts(
-          tx,
-          mpsNumber,
-          runNumber,
-          req.user?.username || "system",
-        );
+        if (!isSimulation) {
+          await supersedePreviousMrpArtifacts(
+            tx,
+            mpsNumber,
+            runNumber,
+            req.user?.username || "system",
+          );
+        }
 
         const requirements = [];
         const plannedOrders = [];
@@ -3582,6 +3796,7 @@ exports.runMRP = async (req, res, next) => {
         const purchaseInitialAvailableMap = {};
         const purchaseInitialActualAvailableMap = {};
         const purchaseInitialAllocatedMap = {};
+        const purchaseInitialStockAvailableMap = {};
         const mbomHeaderByPartCode = {};
         const uomCodeByPartCode = {};
         const soSourcesByRequirement = new Map();
@@ -3737,7 +3952,7 @@ exports.runMRP = async (req, res, next) => {
 
           // MPS menyimpan Forecast dan Buffer terpisah. MRP memakai demand
           // forecast+buffer sebagai baseline, tetapi tidak boleh lebih kecil dari SO aktual.
-          const forecastQty = Number(mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0);
+          const forecastQty = Number(mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0) * scenarioDemandMultiplier;
           const soQtyInBucket = Number(soConsumption.consumedQty || 0);
           soConsumedByMpsDetail.set(
             mpsDetail.id,
@@ -3748,7 +3963,7 @@ exports.runMRP = async (req, res, next) => {
           // pre-stock target from effective demand and production policy to
           // keep recalculation idempotent.
           const forecastDemandWithBuffer = evaluateFromSet(formulas, "MPS_TARGET_QTY", {
-            effectiveDemandQty: Number(mpsDetail.effectiveDemandQty ?? forecastQty),
+            effectiveDemandQty: Number(mpsDetail.effectiveDemandQty ?? mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0) * scenarioDemandMultiplier,
             productionPercent: Number(mpsDetail.productionPercent ?? 100),
             actualSalesOrderQty: soQtyInBucket,
           });
@@ -4093,6 +4308,7 @@ exports.runMRP = async (req, res, next) => {
                 initialAvailableMap: purchaseInitialAvailableMap,
                 initialActualAvailableMap: purchaseInitialActualAvailableMap,
                 initialAllocatedMap: purchaseInitialAllocatedMap,
+                initialStockAvailableMap: purchaseInitialStockAvailableMap,
                 formulas,
                 parentBufferPercent: partBufferStock,
                 forecastDemandQty: 0,
@@ -4113,31 +4329,48 @@ exports.runMRP = async (req, res, next) => {
         // Satu explosion menghasilkan dua output yang tegas:
         // - Production (FG/child process) disinkronkan ke MPS.
         // - Purchase saja yang menjadi requirement dan planned order MRP.
-        await syncProductionRequirementsToMps(
-          tx,
-          { ...mps, details: sourceMpsDetails },
-          requirements,
-          mbomHeaderByPartCode,
-          runNumber,
-        );
+        if (!isSimulation) {
+          await syncProductionRequirementsToMps(
+            tx,
+            { ...mps, details: sourceMpsDetails },
+            requirements,
+            mbomHeaderByPartCode,
+            runNumber,
+          );
+        }
         const purchaseRequirements = applyNextMonthPurchaseBuffer(requirements, {
           mpsDetails: sourceMpsDetails,
-          initialAvailableMap: purchaseInitialAvailableMap,
-          initialActualAvailableMap: purchaseInitialActualAvailableMap,
-          initialAllocatedMap: purchaseInitialAllocatedMap,
+                initialAvailableMap: purchaseInitialAvailableMap,
+                initialActualAvailableMap: purchaseInitialActualAvailableMap,
+                initialAllocatedMap: purchaseInitialAllocatedMap,
+                initialStockAvailableMap: purchaseInitialStockAvailableMap,
           formulas,
         });
         const partnerMap = await buildPlannedOrderPartnerMap(
           tx,
           purchaseRequirements.map((requirement) => requirement.partCode),
         );
+        const purchasingSupplyTimeline = await buildPurchasingSupplyTimeline(
+          tx,
+          purchaseRequirements,
+          resolvedCutoffDate || mps.periodEnd,
+          {
+            excludeRunNumber: runNumber,
+            uomCodeByPartCode,
+            poDelayDays: isSimulation ? Number(scenarioAssumptions?.poDelayDays || 0) : 0,
+          },
+        );
+        applyTimePhasedPurchaseNetting(purchaseRequirements, purchasingSupplyTimeline, {
+          initialStockAvailableMap: purchaseInitialStockAvailableMap,
+          partnerMap,
+          asOf: parseDate(planningSnapshotAt) || new Date(),
+          procurementPolicy: scenarioAssumptions?.procurementPolicy || {},
+        });
         for (const requirement of purchaseRequirements) {
           const supplierLeadTime = Number(partnerMap[requirement.partCode]?.leadTimeDays || 0);
           if (supplierLeadTime <= 0) continue;
           requirement.leadTime = supplierLeadTime;
-          const supplierOrderDate = new Date(requirement.requiredDate);
-          supplierOrderDate.setDate(supplierOrderDate.getDate() - supplierLeadTime);
-          requirement.orderDate = supplierOrderDate;
+          requirement.orderDate = requirement.latestPrDate || requirement.orderDate;
         }
         // Persist the complete Production -> Purchase requirement tree.  The
         // generated MPS rows remain the executable production schedule, while
@@ -4221,8 +4454,7 @@ exports.runMRP = async (req, res, next) => {
         for (const mrpReq of purchaseRequirements) {
           if (mrpReq.plannedOrderQty > 0) {
             // Calculate order date (required date - lead time)
-            const orderDate = new Date(mrpReq.requiredDate);
-            orderDate.setDate(orderDate.getDate() - mrpReq.leadTime);
+            const orderDate = new Date(mrpReq.latestPrDate || mrpReq.orderDate || mrpReq.requiredDate);
 
             const orderType = "Purchase";
             const isProduction = orderType === "Production";
@@ -4280,7 +4512,7 @@ exports.runMRP = async (req, res, next) => {
               vendorCode: isProduction ? null : partnerMap[mrpReq.partCode]?.vendorCode || null,
               referenceType: "MRP",
               referenceNumber: planIdentity.planNumber || runNumber,
-              status: "Planned",
+              status: isSimulation ? "Simulation" : "Planned",
               notes: plannedOrderNotes,
             };
 
@@ -4346,13 +4578,15 @@ exports.runMRP = async (req, res, next) => {
           });
         }
 
-        await supersedeSoOnlyPlansCoveredByMps(
-          tx,
-          [...affectedSoNumbers],
-          runNumber,
-          planIdentity.planNumber,
-          req.user?.username || "system",
-        );
+        if (!isSimulation) {
+          await supersedeSoOnlyPlansCoveredByMps(
+            tx,
+            [...affectedSoNumbers],
+            runNumber,
+            planIdentity.planNumber,
+            req.user?.username || "system",
+          );
+        }
 
         // Update MRP Run status
         const executionTime = Math.round((Date.now() - startTime) / 1000);
@@ -4374,11 +4608,13 @@ exports.runMRP = async (req, res, next) => {
         emitPlanningPlannedOrderBulkUpdate(createdPlannedOrders, "create", req.user?.username || "system");
         emitPlanningMrpRunUpdate(completedRun, "complete", req.user?.username || "system");
 
-        for (const soNumber of affectedSoNumbers) {
-          await syncOperationalSalesOrderStatus(tx, soNumber);
+        if (!isSimulation) {
+          for (const soNumber of affectedSoNumbers) {
+            await syncOperationalSalesOrderStatus(tx, soNumber);
+          }
         }
 
-        const purchaseSuggestion = plannedOrders.some((order) => order.orderType === "Purchase" && Number(order.qty || 0) > 0)
+        const purchaseSuggestion = !isSimulation && plannedOrders.some((order) => order.orderType === "Purchase" && Number(order.qty || 0) > 0)
           ? await generatePurchaseSuggestionForRun(tx, runNumber, req.user?.username || req.user?.email || "system")
           : null;
 
@@ -4600,6 +4836,9 @@ async function explodeMBOM(
         : isProductionPart
           ? Number(stockForPart.onHand[partCode] || 0)
           : Number(stockForPart.available[partCode] || 0);
+      if (options.initialStockAvailableMap && options.initialStockAvailableMap[stockKey] === undefined) {
+        options.initialStockAvailableMap[stockKey] = stockQty;
+      }
       projectedAvailableMap[stockKey] = stockQty + Number(supplyMap[partCode] || 0);
       projectedActualAvailableMap[stockKey] = rawMaterialPlanning
         ? rowsForPart.reduce((sum, row) => sum + Number(row.qtyOnHand || 0), 0)

@@ -31,6 +31,10 @@ const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormula
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { assertQuantity } = require("../../utils/uomQuantity");
 const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
+const {
+  createProductionShortfallCarryover,
+  rollbackProductionShortfallCarryover,
+} = require("../../services/planning/productionShortfallCarryoverService");
 
 const QUANTITY_TOLERANCE = 0.000001;
 
@@ -1341,6 +1345,15 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
     input.operatorName = input.operatorName || schedule.operatorName || null;
     input.qtyPlanned = Math.max(toNumber(schedule.plannedQty) - toNumber(schedule.actualQty), 0);
     input.logDate = input.logDate || schedule.scheduleDate || null;
+    await tx.workOrder.updateMany({
+      where: { id: schedule.woId, isDeleted: false, status: { notIn: ["Completed", "Cancelled"] } },
+      data: {
+        machineId: schedule.machineId || undefined,
+        diesId: schedule.diesId || undefined,
+        shift: schedule.shift || undefined,
+        operatorName: schedule.operatorName || input.operatorName || undefined,
+      },
+    });
   }
 
   const normalized = await resolveProductionRefs(tx, input, {
@@ -1553,6 +1566,7 @@ async function restoreSubAssemblyReservation(tx, log, movement, qty) {
 }
 
 async function rollbackProductionLogAutomation(tx, log) {
+  await rollbackProductionShortfallCarryover(tx, log.id);
   const movements = await tx.stockMovement.findMany({
     where: {
       referenceType: "PRODUCTION_LOG",
@@ -2330,6 +2344,11 @@ exports.get = async (req, res, next) => {
     const doc = await prisma.productionLog.findFirst({
       where: { logNumber: req.params.logNumber, isDeleted: false },
       include: {
+        carryover: true,
+        coilPhases: {
+          where: { isDeleted: false },
+          orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+        },
         dailyProductionSchedule: {
           select: {
             scheduleNumber: true,
@@ -2423,6 +2442,39 @@ exports.get = async (req, res, next) => {
   }
 };
 
+function normalizeProductionCoilPhases(entries, logNumber) {
+  if (!Array.isArray(entries)) throw Object.assign(new Error("coilPhases harus berupa array."), { statusCode: 400 });
+  const defaultProductionLot = `${logNumber}-PROD`;
+  return entries.map((entry, index) => {
+    const inputLotNumber = String(entry?.inputLotNumber || "").trim();
+    const qtyInput = Math.max(toNumber(entry?.qtyInput), 0);
+    const qtyGood = Math.max(toNumber(entry?.qtyGood), 0);
+    const qtyReject = Math.max(toNumber(entry?.qtyReject), 0);
+    if (!inputLotNumber) throw Object.assign(new Error(`Lot coil/material wajib diisi pada phase ${index + 1}.`), { statusCode: 400 });
+    if (qtyGood + qtyReject <= 0) throw Object.assign(new Error(`Qty OK atau reject wajib diisi pada phase ${index + 1}.`), { statusCode: 400 });
+    if (qtyInput > 0 && qtyGood + qtyReject > qtyInput + 0.000001) {
+      throw Object.assign(new Error(`Total output phase ${index + 1} tidak boleh melebihi qty input.`), { statusCode: 400 });
+    }
+    const startedAt = entry?.startedAt ? new Date(entry.startedAt) : null;
+    const endedAt = entry?.endedAt ? new Date(entry.endedAt) : null;
+    if ((startedAt && Number.isNaN(startedAt.getTime())) || (endedAt && Number.isNaN(endedAt.getTime())) || (startedAt && endedAt && endedAt < startedAt)) {
+      throw Object.assign(new Error(`Waktu phase ${index + 1} tidak valid.`), { statusCode: 400 });
+    }
+    return {
+      phaseNumber: index + 1,
+      coilNumber: String(entry?.coilNumber || "").trim() || null,
+      inputLotNumber,
+      qtyInput,
+      qtyGood,
+      qtyReject,
+      productionLotNumber: String(entry?.productionLotNumber || defaultProductionLot).trim() || defaultProductionLot,
+      startedAt,
+      endedAt,
+      notes: String(entry?.notes || "").trim() || null,
+    };
+  });
+}
+
 exports.create = async (req, res, next) => {
   try {
     const {
@@ -2430,12 +2482,19 @@ exports.create = async (req, res, next) => {
       endTime,
       logDate,
       downtimes = [],
+      coilPhases = [],
       status: _status,
       logNumber: _logNumber,
       ...data
     } = req.body;
 
     const logNumber = await generateLogNumber();
+    const normalizedCoilPhases = normalizeProductionCoilPhases(coilPhases, logNumber);
+    if (normalizedCoilPhases.length) {
+      data.qtyGood = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyGood, 0);
+      data.qtyReject = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyReject, 0);
+      data.qtyProduced = data.qtyGood + data.qtyReject;
+    }
 
     const doc = await prisma.$transaction(async (tx) => {
       const normalized = await normalizeProductionLogInput(tx, data, {
@@ -2513,6 +2572,12 @@ exports.create = async (req, res, next) => {
         },
       });
 
+      if (normalizedCoilPhases.length) {
+        await tx.productionLogCoilPhase.createMany({
+          data: normalizedCoilPhases.map((row) => ({ ...row, productionLogId: productionLog.id })),
+        });
+      }
+
       if (Array.isArray(downtimes) && downtimes.length > 0) {
         for (const entry of downtimes) {
           const downtimeNumber = await generateDowntimeNumber(tx);
@@ -2528,6 +2593,10 @@ exports.create = async (req, res, next) => {
       const doc = await tx.productionLog.findUnique({
         where: { id: productionLog.id },
         include: {
+          coilPhases: {
+            where: { isDeleted: false },
+            orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+          },
           dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
             select: {
@@ -2616,6 +2685,7 @@ exports.update = async (req, res, next) => {
       endTime,
       logDate,
       downtimes,
+      coilPhases,
       status: _status,
       logNumber: _logNumber,
       ...data
@@ -2624,10 +2694,11 @@ exports.update = async (req, res, next) => {
       req.body,
       "downtimes",
     );
+    const coilPhasePayloadSupplied = Object.prototype.hasOwnProperty.call(req.body, "coilPhases");
 
     const existing = await prisma.productionLog.findFirst({
       where: { logNumber: req.params.logNumber, isDeleted: false },
-      select: { id: true, status: true },
+      select: { id: true, logNumber: true, status: true },
     });
     if (!existing)
       return res
@@ -2642,6 +2713,14 @@ exports.update = async (req, res, next) => {
     }
 
     const doc = await prisma.$transaction(async (tx) => {
+      const normalizedCoilPhases = coilPhasePayloadSupplied
+        ? normalizeProductionCoilPhases(Array.isArray(coilPhases) ? coilPhases : [], existing.logNumber)
+        : null;
+      if (normalizedCoilPhases?.length) {
+        data.qtyGood = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyGood, 0);
+        data.qtyReject = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyReject, 0);
+        data.qtyProduced = data.qtyGood + data.qtyReject;
+      }
       const updateData = await normalizeProductionLogInput(tx, data);
       if (logDate !== undefined)
         updateData.logDate = logDate ? new Date(logDate) : null;
@@ -2674,6 +2753,15 @@ exports.update = async (req, res, next) => {
         data: updateData,
       });
 
+      if (coilPhasePayloadSupplied) {
+        await tx.productionLogCoilPhase.deleteMany({ where: { productionLogId: existing.id } });
+        if (normalizedCoilPhases.length) {
+          await tx.productionLogCoilPhase.createMany({
+            data: normalizedCoilPhases.map((row) => ({ ...row, productionLogId: existing.id })),
+          });
+        }
+      }
+
       if (downtimePayloadSupplied) {
         await tx.downtimeLog.updateMany({
           where: { productionLogId: existing.id, isDeleted: false },
@@ -2693,6 +2781,10 @@ exports.update = async (req, res, next) => {
       return tx.productionLog.findUnique({
         where: { id: existing.id },
         include: {
+          coilPhases: {
+            where: { isDeleted: false },
+            orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+          },
           dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
             select: {
@@ -3163,6 +3255,12 @@ exports.approve = async (req, res, next) => {
         },
       });
 
+      const carryover = await createProductionShortfallCarryover(tx, {
+        log: updated,
+        schedule: relatedSchedule,
+        actor: req.user?.username || req.user?.email || "system",
+      });
+
       let automation = null;
       const subAssemblyMovementNumbers = await consumeReservedSubAssembliesForProductionLog(
         tx,
@@ -3249,7 +3347,7 @@ exports.approve = async (req, res, next) => {
         });
       }
 
-      return { updated, automation, outputMovement, subAssemblyMovementNumbers, syncedMo };
+      return { updated, carryover, automation, outputMovement, subAssemblyMovementNumbers, syncedMo };
     });
 
     if (doc.syncedMo) {
@@ -3257,6 +3355,7 @@ exports.approve = async (req, res, next) => {
     }
     res.json({
       ...mapDoc(doc.updated),
+      carryover: doc.carryover ? mapDoc(doc.carryover) : null,
       automation: doc.automation,
       stockMovementNumber: doc.outputMovement?.movementNumber || null,
       consumedWipMovementNumbers: doc.outputMovement?.consumedWipMovementNumbers || [],

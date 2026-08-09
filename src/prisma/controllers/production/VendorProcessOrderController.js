@@ -1342,6 +1342,9 @@ async function receiveVendorOutputToQc(tx, order, body, performedBy) {
 
 async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
   const { requireVendorOperations = false, createdBy = null } = options;
+  const capacityAllocationIds = Array.isArray(options.capacityAllocationIds)
+    ? options.capacityAllocationIds.filter(Boolean)
+    : [];
   const { mbomHeader, operations } = await getVendorRoutingOperations(tx, mo);
   if (!mbomHeader) {
     throw Object.assign(new Error(`MBOM aktif tidak ditemukan untuk MO ${mo.moNumber}.`), {
@@ -1355,14 +1358,18 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
         status: { in: ["Draft", "Published"] },
         routingMode: "VENDOR",
         plan: { planNumber: mo.monthlyProductionPlanNumber, isDeleted: false },
-        OR: [
-          { lineNumber: mo.monthlyProductionPlanLineNumber },
-          {
-            dailyProductionSchedules: {
-              some: { moId: mo.id, shift: "VENDOR", isDeleted: false },
-            },
-          },
-        ],
+        ...(capacityAllocationIds.length
+          ? { id: { in: capacityAllocationIds } }
+          : {
+              OR: [
+                { lineNumber: mo.monthlyProductionPlanLineNumber },
+                {
+                  dailyProductionSchedules: {
+                    some: { moId: mo.id, shift: "VENDOR", isDeleted: false },
+                  },
+                },
+              ],
+            }),
       },
       include: {
         vendor: { select: { id: true, vendorCode: true, vendorName: true } },

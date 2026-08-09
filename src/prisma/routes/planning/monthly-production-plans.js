@@ -11,6 +11,8 @@ router.post("/:planNumber/release", authorize("monthlyProductionPlan", "release"
 router.post("/:planNumber/daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "convert-to-daily-plans"), ctrl.convertToDailyPlans);
 router.post("/:planNumber/manual-daily-plans", authorize("monthlyProductionPlan", "release"), logger("monthlyProductionPlan", "manual-daily-plan"), ctrl.createManualDailyPlan);
 router.post("/:planNumber/manual-allocations", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "manual-allocation"), ctrl.createManualDailyPlan);
+router.get("/:planNumber/capacity-flow-rule", authorize("monthlyProductionPlan", "read"), ctrl.getCapacityFlowRule);
+router.put("/:planNumber/capacity-flow-rule", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-flow-rule"), ctrl.saveCapacityFlowRule);
 router.post("/:planNumber/capacity-recommendation", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-recommendation"), ctrl.recommendCapacity);
 router.post("/:planNumber/capacity-adopt-simulation", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "capacity-adopt-simulation"), ctrl.adoptCapacitySimulation);
 router.patch("/:planNumber/manual-allocations/:allocationId", authorize("monthlyProductionPlan", "update"), logger("monthlyProductionPlan", "edit-manual-allocation"), ctrl.updateManualAllocation);

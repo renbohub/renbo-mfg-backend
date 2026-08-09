@@ -1,6 +1,6 @@
 const { prisma } = require("../../index");
 const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
-const { normalizePreset, loadPresetStore, savePresetStore } = require("../../services/planning/capacitySimulationPresetService");
+const { normalizePreset, loadPresetStore, savePresetStore, activePresetId } = require("../../services/planning/capacitySimulationPresetService");
 
 const SCENARIO_KEYS = {
   "simulation-1": "CAPACITY_SCENARIO_SIMULATION_1",
@@ -114,10 +114,12 @@ exports.saveScenario = async (req, res, next) => {
 exports.getPresets = async (req, res, next) => {
   try {
     const month = String(req.query.month || "").trim();
-    const presets = (await loadPresetStore(prisma))
+    const [storedPresets, currentPresetId] = await Promise.all([loadPresetStore(prisma), activePresetId(prisma)]);
+    const presets = storedPresets
       .filter((preset) => !month || preset.month === month)
+      .map((preset) => ({ ...preset, isCurrentUse: preset.id === currentPresetId }))
       .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
-    res.json({ presets, total: presets.length });
+    res.json({ presets, total: presets.length, currentPresetId });
   } catch (error) { next(error); }
 };
 
@@ -146,6 +148,15 @@ exports.updatePreset = async (req, res, next) => {
       return res.status(409).json({ message: `Nama preset ${preset.name} sudah dipakai pada ${preset.month}.` });
     }
     presets[index] = preset; await savePresetStore(prisma, presets, actor);
-    res.json({ preset, message: `${preset.name} diperbarui.` });
+    const isCurrentUse = (await activePresetId(prisma)) === preset.id;
+    if (isCurrentUse) {
+      const periodStart = new Date(`${preset.month}-01T00:00:00.000Z`);
+      const periodEnd = new Date(Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + 1, 1));
+      await prisma.monthlyProductionPlan.updateMany({
+        where: { isDeleted: false, status: { in: ["Draft", "Confirmed", "Released", "In Progress"] }, periodStart: { lt: periodEnd }, periodEnd: { gte: periodStart } },
+        data: { replanRequired: true, replanReason: `Current Use Capacity ${preset.name} berubah; jalankan ulang auto recommendation sebelum sinkronisasi DPP.` },
+      });
+    }
+    res.json({ preset: { ...preset, isCurrentUse }, message: isCurrentUse ? `${preset.name} diperbarui sebagai Current Use. MPP bulan terkait ditandai untuk auto recommendation ulang.` : `${preset.name} diperbarui.` });
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };

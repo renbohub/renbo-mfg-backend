@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
+const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
 
 const include = { details: { where: { isDeleted: false, part: { is: { isDeleted: false, itemType: "FG" } } }, orderBy: { lineNumber: "asc" }, include: { part: true, deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } } };
 const text = (value) => String(value ?? "").trim() || null;
@@ -109,6 +110,42 @@ function headerData(body, user) {
 
 const monthKey = (value) => { const d = date(value); return d && !Number.isNaN(d.getTime()) ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-01` : null; };
 
+function monthlyConsumptionBucket(month) {
+  return {
+    month,
+    forecastQty: 0,
+    actualSalesOrderQty: 0,
+    effectiveDemandQty: 0,
+    productionTargetQty: 0,
+    customerDeliveryQty: 0,
+    materialPurchaseQty: 0,
+    materialPurchaseOrderCount: 0,
+    forecastNumbers: new Set(),
+    customerCodes: new Set(),
+    partCodes: new Set(),
+    productionPartCodes: new Set(),
+    materialPartCodes: new Set(),
+    mpsNumbers: new Set(),
+    purchaseSourceMpsNumbers: new Set(),
+    mrpRunNumbers: new Set(),
+    customerDeliveryDates: [],
+    materialPurchaseDates: [],
+  };
+}
+
+function consumptionMonthRange(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})(?:-\d{2})?$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  if (monthIndex < 0 || monthIndex > 11) return null;
+  return {
+    key: `${match[1]}-${match[2]}-01`,
+    start: new Date(Date.UTC(year, monthIndex, 1)),
+    end: new Date(Date.UTC(year, monthIndex + 1, 1)),
+  };
+}
+
 async function buildConsumptionProgress(forecast) {
   const demand = toMonthlyRows(forecast.details || []);
   const mps = await prisma.mPS.findMany({ where: { forecastNumber: forecast.forecastNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true, customerCode: true, startDate: true, qtyPlanned: true, notes: true } } } });
@@ -189,27 +226,313 @@ exports.monthlyConsumption = async (req, res, next) => {
   try {
     const detailRows = await buildDemandSummary({ startDate: text(req.query.startDate), endDate: text(req.query.endDate) });
     const months = new Map();
+    const ensureMonth = (month) => {
+      if (!months.has(month)) months.set(month, monthlyConsumptionBucket(month));
+      return months.get(month);
+    };
     for (const row of detailRows) {
-      const item = months.get(row.month) || { month: row.month, forecastQty: 0, actualSalesOrderQty: 0, effectiveDemandQty: 0, forecastNumbers: new Set(), customerCodes: new Set(), partCodes: new Set() };
+      const item = ensureMonth(row.month);
       item.forecastQty += number(row.forecastQty);
       item.actualSalesOrderQty += number(row.actualSalesOrderQty);
       item.effectiveDemandQty += Math.max(number(row.forecastQty), number(row.actualSalesOrderQty));
       row.forecastNumbers.forEach((value) => item.forecastNumbers.add(value));
       if (row.customerCode) item.customerCodes.add(row.customerCode);
       if (row.partCode) item.partCodes.add(row.partCode);
-      months.set(row.month, item);
     }
     const monthKeys = [...months.keys()];
     const mpsRows = monthKeys.length ? await prisma.mPS.findMany({
       where: { sourceKey: { in: monthKeys.map((month) => `MONTH:${month.slice(0, 7)}`) }, isDeleted: false },
-      include: { deliveryPlans: { where: { isDeleted: false, targetType: "CUSTOMER", lockedBySource: true }, orderBy: { plannedDate: "asc" } } },
+      include: {
+        details: { where: { isDeleted: false }, select: { partCode: true, qtyPlanned: true, notes: true } },
+        deliveryPlans: { where: { isDeleted: false, targetType: "CUSTOMER", lockedBySource: true }, orderBy: { plannedDate: "asc" } },
+      },
     }) : [];
     const mpsByMonth = new Map(mpsRows.map((row) => [monthKey(row.periodStart), row]));
+    const consumptionMpsNumbers = mpsRows.map((row) => row.mpsNumber);
+    const mrpRuns = consumptionMpsNumbers.length ? await prisma.mRPRun.findMany({
+      where: { mpsNumber: { in: consumptionMpsNumbers }, isDeleted: false, isCurrentPlan: true },
+      select: { runNumber: true, mpsNumber: true, status: true, runDate: true },
+      orderBy: { runDate: "desc" },
+    }) : [];
+    const latestMrpByMps = new Map();
+    for (const run of mrpRuns) if (!latestMrpByMps.has(run.mpsNumber)) latestMrpByMps.set(run.mpsNumber, run);
+    const runByNumber = new Map(mrpRuns.map((run) => [run.runNumber, run]));
+    const plannedPurchases = mrpRuns.length ? await prisma.plannedOrder.findMany({
+      where: { runNumber: { in: mrpRuns.map((run) => run.runNumber) }, orderType: "Purchase", status: { not: "Cancelled" }, isDeleted: false },
+      select: { runNumber: true, partCode: true, qty: true, orderDate: true, requiredDate: true },
+      orderBy: [{ orderDate: "asc" }, { partCode: "asc" }],
+    }) : [];
+
+    for (const mps of mpsRows) {
+      const productionMonth = monthKey(mps.periodStart);
+      if (productionMonth) {
+        const item = ensureMonth(productionMonth);
+        item.mpsNumbers.add(mps.mpsNumber);
+        for (const detail of mps.details) {
+          if (isGeneratedProcess(detail)) continue;
+          item.productionTargetQty += number(detail.qtyPlanned);
+          if (detail.partCode) item.productionPartCodes.add(detail.partCode);
+        }
+      }
+      for (const target of mps.deliveryPlans) {
+        const deliveryMonth = monthKey(target.plannedDate);
+        if (!deliveryMonth) continue;
+        const item = ensureMonth(deliveryMonth);
+        item.customerDeliveryQty += number(target.qtyPlanned);
+        item.customerDeliveryDates.push(target.plannedDate);
+        item.mpsNumbers.add(mps.mpsNumber);
+      }
+    }
+
+    for (const order of plannedPurchases) {
+      // Purchase belongs to the month in which PPIC must release/order it.
+      // requiredDate is retained by MRP for the material receipt deadline.
+      const purchaseMonth = monthKey(order.orderDate);
+      if (!purchaseMonth) continue;
+      const item = ensureMonth(purchaseMonth);
+      const sourceRun = runByNumber.get(order.runNumber);
+      item.materialPurchaseQty += number(order.qty);
+      item.materialPurchaseOrderCount += 1;
+      item.materialPurchaseDates.push(order.orderDate);
+      if (order.partCode) item.materialPartCodes.add(order.partCode);
+      if (sourceRun?.mpsNumber) item.purchaseSourceMpsNumbers.add(sourceRun.mpsNumber);
+      if (order.runNumber) item.mrpRunNumbers.add(order.runNumber);
+    }
+
     const items = [...months.values()].sort((a, b) => a.month.localeCompare(b.month)).map((row) => {
       const mps = mpsByMonth.get(row.month);
-      return { ...row, forecastNumbers: [...row.forecastNumbers], customerCodes: [...row.customerCodes], partCodes: [...row.partCodes], forecastCount: row.forecastNumbers.size, customerCount: row.customerCodes.size, partCount: row.partCodes.size, mpsNumber: mps?.mpsNumber || null, mpsStatus: mps?.status || "Belum dihitung", replanRequired: Boolean(mps?.replanRequired), replanReason: mps?.replanReason || null, earliestDeliveryDate: mps?.deliveryPlans?.[0]?.plannedDate || null, deliveryPhaseCount: mps?.deliveryPlans?.length || 0 };
+      const latestMrp = mps ? latestMrpByMps.get(mps.mpsNumber) : null;
+      const deliveryDates = row.customerDeliveryDates.sort((left, right) => new Date(left) - new Date(right));
+      const purchaseDates = row.materialPurchaseDates.sort((left, right) => new Date(left) - new Date(right));
+      const consumedForecastQty = Math.min(number(row.forecastQty), number(row.actualSalesOrderQty));
+      return {
+        ...row,
+        forecastNumbers: [...row.forecastNumbers],
+        customerCodes: [...row.customerCodes],
+        partCodes: [...row.partCodes],
+        productionPartCodes: [...row.productionPartCodes],
+        materialPartCodes: [...row.materialPartCodes],
+        mpsNumbers: [...row.mpsNumbers],
+        purchaseSourceMpsNumbers: [...row.purchaseSourceMpsNumbers],
+        mrpRunNumbers: [...row.mrpRunNumbers],
+        forecastCount: row.forecastNumbers.size,
+        customerCount: row.customerCodes.size,
+        partCount: row.partCodes.size,
+        productionPartCount: row.productionPartCodes.size,
+        materialPartCount: row.materialPartCodes.size,
+        consumedForecastQty,
+        remainingForecastQty: Math.max(number(row.forecastQty) - consumedForecastQty, 0),
+        mpsNumber: mps?.mpsNumber || null,
+        mpsStatus: mps?.status || "Belum dihitung",
+        mrpRunNumber: latestMrp?.runNumber || null,
+        mrpStatus: latestMrp?.status || "Belum dijalankan",
+        replanRequired: Boolean(mps?.replanRequired),
+        replanReason: mps?.replanReason || null,
+        earliestDeliveryDate: deliveryDates[0] || null,
+        latestDeliveryDate: deliveryDates.at(-1) || null,
+        deliveryPhaseCount: deliveryDates.length,
+        earliestPurchaseDate: purchaseDates[0] || null,
+        latestPurchaseDate: purchaseDates.at(-1) || null,
+        customerDeliveryDates: undefined,
+        materialPurchaseDates: undefined,
+      };
     });
-    res.json({ items, total: items.length });
+    // Capacity preview intentionally uses the same production snapshot as the
+    // Capacity Planning page. Only the three nearest current/future buckets
+    // are calculated so Consume Forecast remains responsive.
+    const currentMonth = monthKey(new Date());
+    const capacityItems = items.filter((row) => row.month >= currentMonth && (number(row.forecastQty) > 0 || number(row.actualSalesOrderQty) > 0 || number(row.productionTargetQty) > 0)).slice(0, 3);
+    const mpsNumbers = capacityItems.map((row) => row.mpsNumber).filter(Boolean);
+    const productionPlans = mpsNumbers.length ? await prisma.monthlyProductionPlan.findMany({
+      where: {
+        isDeleted: false,
+        status: { in: ["Draft", "Confirmed", "Released", "In Progress"] },
+        sourceType: { in: mpsNumbers.map((mpsNumber) => `MPS:${mpsNumber}`) },
+      },
+      select: { planNumber: true, sourceType: true, status: true },
+    }) : [];
+    const plansByMps = new Map();
+    for (const plan of productionPlans) {
+      const sourceMpsNumber = String(plan.sourceType || "").slice(4);
+      if (!plansByMps.has(sourceMpsNumber)) plansByMps.set(sourceMpsNumber, []);
+      plansByMps.get(sourceMpsNumber).push(plan);
+    }
+    const capacityResults = await Promise.allSettled(capacityItems.map(async (row) => {
+      const startDate = String(row.month).slice(0, 10);
+      const start = new Date(`${startDate}T00:00:00.000Z`);
+      const endDate = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0)).toISOString().slice(0, 10);
+      const snapshot = await buildCapacitySnapshot(prisma, { startDate, endDate, planningMode: "PRODUCTION" });
+      const summary = snapshot.summary || {};
+      const linkedPlans = plansByMps.get(row.mpsNumber) || [];
+      const forecastIncluded = linkedPlans.length > 0;
+      const utilizationPercent = number(summary.utilizationPercent);
+      const peakCell = (snapshot.machines || []).flatMap((machine) => Object.values(machine.cells || {}).map((cell) => ({
+        machineCode: machine.machineCode,
+        date: cell.date,
+        loadPercent: number(cell.loadPercent),
+      }))).sort((left, right) => right.loadPercent - left.loadPercent)[0] || null;
+      const overloaded = number(summary.overloadedCells) > 0 || utilizationPercent > 100;
+      const unscheduled = number(summary.unscheduledCount) > 0;
+      const status = !forecastIncluded ? "NOT_PLANNED" : overloaded || unscheduled ? "NOT_ENOUGH" : utilizationPercent >= 85 ? "TIGHT" : "ENOUGH";
+      return {
+        month: row.month,
+        capacity: {
+          status,
+          forecastIncluded,
+          sufficient: forecastIncluded ? status === "ENOUGH" || status === "TIGHT" : null,
+          utilizationPercent,
+          peakLoadPercent: number(peakCell?.loadPercent),
+          bottleneckMachineCode: peakCell?.machineCode || null,
+          bottleneckDate: peakCell?.date || null,
+          totalAvailableMinutes: number(summary.totalAvailableMinutes),
+          totalLoadMinutes: number(summary.totalLoadMinutes),
+          remainingMinutes: Math.max(number(summary.totalAvailableMinutes) - number(summary.totalLoadMinutes), 0),
+          overloadedCells: number(summary.overloadedCells),
+          unscheduledCount: number(summary.unscheduledCount),
+          activeMachineCount: number(summary.activeMachineCount),
+          planLineCount: number(summary.planLineCount),
+          planNumbers: linkedPlans.map((plan) => plan.planNumber),
+        },
+      };
+    }));
+    capacityResults.forEach((result, index) => {
+      const target = capacityItems[index];
+      if (result.status === "fulfilled") target.capacity = result.value.capacity;
+      else target.capacity = { status: "UNAVAILABLE", forecastIncluded: false, sufficient: null, message: result.reason?.message || "Capacity belum dapat dihitung." };
+    });
+    res.json({ items, total: items.length, capacityHorizon: capacityItems.map((row) => row.month) });
+  } catch (error) { next(error); }
+};
+
+exports.monthlyConsumptionDetail = async (req, res, next) => {
+  try {
+    const range = consumptionMonthRange(req.params.month);
+    if (!range) return res.status(400).json({ message: "Bulan Consume Forecast harus berformat YYYY-MM." });
+    const inMonth = (value) => monthKey(value) === range.key;
+    const [forecasts, salesLines, mps, plannedPurchases] = await Promise.all([
+      prisma.forecast.findMany({
+        where: { isDeleted: false, isCurrentVersion: true, status: { not: "Obsolete" } },
+        include,
+      }),
+      prisma.salesOrderDetail.findMany({
+        where: {
+          isDeleted: false,
+          soHeader: { isDeleted: false, status: { in: ["Confirmed", "In Progress", "In Production", "Ready to Deliver", "Delivered"] } },
+          OR: [
+            { deliveryDate: { gte: range.start, lt: range.end } },
+            { deliveryDate: null, soHeader: { deliveryDate: { gte: range.start, lt: range.end } } },
+          ],
+        },
+        include: {
+          soHeader: { select: { customerCode: true, soDate: true, deliveryDate: true, status: true } },
+          part: { select: { partCode: true, partNumber: true, partName: true } },
+        },
+        orderBy: [{ deliveryDate: "asc" }, { soNumber: "asc" }, { lineNumber: "asc" }],
+      }),
+      prisma.mPS.findFirst({
+        where: { sourceKey: `MONTH:${range.key.slice(0, 7)}`, isDeleted: false },
+        include: {
+          details: { where: { isDeleted: false }, include: { part: { select: { partName: true, partNumber: true, productionUomCode: true, baseUomCode: true } } }, orderBy: { lineNumber: "asc" } },
+          deliveryPlans: { where: { isDeleted: false, status: { not: "Cancelled" }, targetType: "CUSTOMER" }, orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }] },
+        },
+      }),
+      prisma.plannedOrder.findMany({
+        where: {
+          isDeleted: false,
+          orderType: "Purchase",
+          status: { not: "Cancelled" },
+          orderDate: { gte: range.start, lt: range.end },
+          mrpRun: { is: { isDeleted: false, isCurrentPlan: true } },
+        },
+        include: {
+          part: { select: { partName: true, partNumber: true, baseUomCode: true, purchaseUomCode: true } },
+          mrpRun: { select: { runNumber: true, mpsNumber: true, status: true } },
+        },
+        orderBy: [{ orderDate: "asc" }, { partCode: "asc" }],
+      }),
+    ]);
+
+    const forecastLines = [];
+    for (const forecast of forecasts) {
+      for (const detail of toMonthlyRows(forecast.details || [])) {
+        const targets = (detail.deliveryTargets || []).filter((target) => inMonth(target.targetDate));
+        if (!inMonth(detail.forecastMonth) && !targets.length) continue;
+        const qty = targets.length ? targets.reduce((sum, target) => sum + number(target.qty), 0) : number(detail.forecastQty);
+        const targetDates = targets.map((target) => target.targetDate).sort((left, right) => new Date(left) - new Date(right));
+        forecastLines.push({
+          eventType: "FORECAST",
+          sourceNumber: forecast.forecastNumber,
+          customerCode: forecast.customerCode,
+          partCode: detail.partCode,
+          partName: detail.part?.partName || detail.part?.partNumber || null,
+          eventDate: targetDates[0] || detail.forecastMonth,
+          qty,
+          uomCode: detail.uomCode,
+          status: forecast.status,
+          phaseCount: targets.length,
+        });
+      }
+    }
+
+    const soRemainingByPart = new Map();
+    for (const line of salesLines) {
+      const group = `${line.soHeader?.customerCode || "-"}|${line.partCode}`;
+      soRemainingByPart.set(group, number(soRemainingByPart.get(group)) + number(line.qty));
+    }
+    for (const line of forecastLines) {
+      const group = `${line.customerCode || "-"}|${line.partCode}`;
+      const availableSo = number(soRemainingByPart.get(group));
+      line.consumedQty = Math.min(number(line.qty), availableSo);
+      line.remainingQty = Math.max(number(line.qty) - line.consumedQty, 0);
+      soRemainingByPart.set(group, Math.max(availableSo - line.consumedQty, 0));
+    }
+
+    const latestMrp = mps ? await prisma.mRPRun.findFirst({
+      where: { mpsNumber: mps.mpsNumber, isDeleted: false, isCurrentPlan: true },
+      select: { runNumber: true, status: true, runDate: true },
+      orderBy: { runDate: "desc" },
+    }) : null;
+    const activeMpsDetails = (mps?.details || []).filter((detail) => !isGeneratedProcess(detail));
+    const customerDeliveries = (mps?.deliveryPlans || []).filter((target) => inMonth(target.plannedDate));
+    const forecastQty = forecastLines.reduce((sum, line) => sum + number(line.qty), 0);
+    const actualSalesOrderQty = salesLines.reduce((sum, line) => sum + number(line.qty), 0);
+    const consumedForecastQty = forecastLines.reduce((sum, line) => sum + number(line.consumedQty), 0);
+    const productionTargetQty = activeMpsDetails.reduce((sum, detail) => sum + number(detail.qtyPlanned), 0);
+    const customerDeliveryQty = customerDeliveries.reduce((sum, target) => sum + number(target.qtyPlanned), 0);
+    const materialPurchaseQty = plannedPurchases.reduce((sum, order) => sum + number(order.qty), 0);
+    const lines = [
+      ...forecastLines,
+      ...salesLines.map((line) => ({ eventType: "SALES_ORDER", sourceNumber: line.soNumber, customerCode: line.soHeader?.customerCode, partCode: line.partCode, partName: line.part?.partName || line.part?.partNumber, eventDate: line.deliveryDate || line.soHeader?.deliveryDate || line.soHeader?.soDate, qty: number(line.qty), completedQty: number(line.qtyDelivered), uomCode: line.uomCode, status: line.status || line.soHeader?.status })),
+      ...activeMpsDetails.map((detail) => ({ eventType: "PRODUCTION", sourceNumber: mps.mpsNumber, customerCode: detail.customerCode, partCode: detail.partCode, partName: detail.part?.partName || detail.part?.partNumber, eventDate: detail.endDate, qty: number(detail.qtyPlanned), uomCode: detail.part?.productionUomCode || detail.part?.baseUomCode || null, status: detail.status })),
+      ...customerDeliveries.map((target) => ({ eventType: "CUSTOMER_DELIVERY", sourceNumber: mps.mpsNumber, customerCode: target.targetCode, partCode: target.partCode, partName: target.targetName, eventDate: target.plannedDate, qty: number(target.qtyPlanned), uomCode: target.uomCode, status: target.status, phaseNumber: target.phaseNumber })),
+      ...plannedPurchases.map((order) => ({ eventType: "MATERIAL_PURCHASE", sourceNumber: order.orderNumber, customerCode: null, partCode: order.partCode, partName: order.part?.partName || order.part?.partNumber, eventDate: order.orderDate, requiredDate: order.requiredDate, qty: number(order.qty), uomCode: order.part?.purchaseUomCode || order.uomCode || order.part?.baseUomCode, status: order.status, mpsNumber: order.mrpRun?.mpsNumber, mrpRunNumber: order.mrpRun?.runNumber })),
+    ].sort((left, right) => new Date(left.eventDate || range.end) - new Date(right.eventDate || range.end) || String(left.eventType).localeCompare(String(right.eventType)));
+
+    res.json({
+      viewType: "MONTHLY_CONSUMPTION",
+      month: range.key,
+      periodStart: range.start,
+      periodEnd: new Date(range.end.getTime() - 1),
+      status: latestMrp?.status || mps?.status || "Belum dibuat MPS",
+      mpsNumber: mps?.mpsNumber || null,
+      mpsStatus: mps?.status || "Belum dibuat",
+      mrpRunNumber: latestMrp?.runNumber || null,
+      mrpStatus: latestMrp?.status || "Belum dijalankan",
+      summary: {
+        forecastQty,
+        actualSalesOrderQty,
+        consumedForecastQty,
+        remainingForecastQty: Math.max(forecastQty - consumedForecastQty, 0),
+        productionTargetQty,
+        customerDeliveryQty,
+        materialPurchaseQty,
+        forecastCount: new Set(forecastLines.map((line) => line.sourceNumber)).size,
+        fgPartCount: new Set(forecastLines.map((line) => line.partCode)).size,
+        materialPartCount: new Set(plannedPurchases.map((order) => order.partCode)).size,
+        materialPurchaseOrderCount: plannedPurchases.length,
+      },
+      lines,
+    });
   } catch (error) { next(error); }
 };
 

@@ -122,6 +122,8 @@ async function attachProcurementClassification(rows, client = prisma) {
         sourcingAllocationCount: activeSourcingAllocations.length,
         sourcingSuppliers: allocationJoined("supplierCode"),
         sourcingForms: allocationJoined("purchasePackageUomCode"),
+        sourcingWidths: allocationJoined("materialWidth"),
+        sourcingLengths: allocationJoined("materialLength"),
         sourcingDeliveryDates: [...new Set(activeSourcingAllocations.map((allocation) => dayKey(allocation.deliveryDate)).filter(Boolean))].join(", ") || null,
         allocatedDemandQty,
         supplierAllocationVariance,
@@ -267,9 +269,9 @@ async function normalizeRequisitionDetails(details, client) {
       throw Object.assign(new Error(`Baris ${line}: purchaseQtyKg harus sama dengan lotCount × kgPerLot (${calculatedLotKg} KG).`), { statusCode: 400 });
     }
     const purchaseQtyKg = calculatedLotKg ?? requestedPurchaseQtyKg;
+    const requestedMaterialForm = normalize(detail.purchasePackageUomCode);
     const hasGenericConversion = [
       detail.purchasePackageQty,
-      detail.purchasePackageUomCode,
       detail.conversionUomCode,
       detail.conversionFactor,
       detail.convertedPurchaseQty,
@@ -279,8 +281,8 @@ async function normalizeRequisitionDetails(details, client) {
     const purchasePackageQty = usesPurchaseConversion
       ? num(detail.purchasePackageQty ?? lotCount ?? (isPieceMaterial ? requestedQty : 0), 0)
       : null;
-    const purchasePackageUomCode = usesPurchaseConversion
-      ? normalize(detail.purchasePackageUomCode || materialPackageUom(material))
+    const purchasePackageUomCode = category === "MATERIAL"
+      ? (requestedMaterialForm || (usesPurchaseConversion ? materialPackageUom(material) : null))
       : null;
     const conversionUomCode = usesPurchaseConversion
       ? normalize(detail.conversionUomCode || material?.defaultConversionUomCode || (purchaseQtyKg != null ? "KG" : isPieceMaterial ? "PCS" : detail.uomCode))
@@ -294,7 +296,7 @@ async function normalizeRequisitionDetails(details, client) {
     const convertedPurchaseQty = usesPurchaseConversion
       ? num(detail.convertedPurchaseQty ?? purchaseQtyKg ?? (hasGenericConversion ? calculatedConvertedQty : isPieceMaterial ? requestedQty : 0), 0)
       : null;
-    if (hasGenericConversion && !["COIL", "SHEET", "PCS"].includes(purchasePackageUomCode)) {
+    if (purchasePackageUomCode && !["COIL", "SHEET", "PCS"].includes(purchasePackageUomCode)) {
       throw Object.assign(new Error(`Baris ${line}: bentuk pembelian wajib C/COIL, S/SHEET, atau P/PCS; bukan ${purchasePackageUomCode || "-"}.`), { statusCode: 400 });
     }
     if (hasGenericConversion && (
@@ -329,11 +331,14 @@ async function normalizeRequisitionDetails(details, client) {
         const allocationPackageQty = num(allocation.purchasePackageQty ?? allocation.orderQty, 0);
         const allocationFactor = num(allocation.conversionFactor ?? allocation.kgPerLot, 0);
         const allocationConversionUom = normalize(allocation.conversionUomCode || uomCode);
-        const hasAllocationConversion = [allocationForm, allocationPackageQty, allocationFactor].some(Boolean);
-        if (category === "MATERIAL" && hasAllocationConversion) {
+        const hasAllocationForm = Boolean(allocationForm);
+        const hasAllocationConversion = [allocationPackageQty, allocationFactor].some(Boolean);
+        if (category === "MATERIAL" && hasAllocationForm) {
           if (!["SHEET", "COIL", "PCS"].includes(allocationForm)) {
             throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: pilih bentuk SHEET, COIL, atau PCS.`), { statusCode: 400 });
           }
+        }
+        if (category === "MATERIAL" && hasAllocationConversion) {
           if (!Number.isInteger(allocationPackageQty) || allocationPackageQty <= 0 || allocationFactor <= 0) {
             throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: qty bentuk harus bilangan bulat positif dan isi per bentuk harus lebih dari 0.`), { statusCode: 400 });
           }
@@ -355,7 +360,7 @@ async function normalizeRequisitionDetails(details, client) {
           demandCoveredQty,
           demandUomCode: uomCode,
           purchasePackageQty: category === "MATERIAL" && hasAllocationConversion ? allocationPackageQty : null,
-          purchasePackageUomCode: category === "MATERIAL" && hasAllocationConversion ? allocationForm : null,
+          purchasePackageUomCode: category === "MATERIAL" && hasAllocationForm ? allocationForm : null,
           conversionFactor: category === "MATERIAL" && hasAllocationConversion ? allocationFactor : null,
           conversionUomCode: category === "MATERIAL" && hasAllocationConversion ? allocationConversionUom : null,
           convertedPurchaseQty: convertedQty,
@@ -778,8 +783,8 @@ exports.confirmSuppliers = async (req, res, next) => {
       include: { details: { where: { isDeleted: false } } },
     });
     if (!pr) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." });
-    if (!["Approved", "Partially Ordered"].includes(pr.status)) {
-      return res.status(409).json({ message: "Supplier Purchasing hanya dapat dikonfirmasi setelah PR Approved." });
+    if (!["Draft", "Revising", "Rejected", "Approved", "Partially Ordered"].includes(pr.status)) {
+      return res.status(409).json({ message: "Keputusan supplier hanya dapat diedit sebelum proses order selesai dan bukan saat approval sedang berjalan." });
     }
 
     const byId = new Map(pr.details.map((row) => [row.id, row]));
@@ -792,20 +797,18 @@ exports.confirmSuppliers = async (req, res, next) => {
       const outstandingQty = Math.max(num(detail.qty) - num(detail.orderedQty), 0);
       const sourceQty = line?.sourceQty == null ? outstandingQty : num(line.sourceQty);
       const purchasePackageUomCode = normalize(line?.purchasePackageUomCode || line?.orderUomCode);
-      const purchasePackageQty = num(line?.purchasePackageQty ?? line?.orderQty, 0);
-      const conversionFactor = num(line?.conversionFactor ?? line?.kgPerLot, 0);
-      const conversionUomCode = normalize(line?.conversionUomCode || detail.conversionUomCode || detail.uomCode);
       const requestUomCode = normalize(detail.uomCode);
-      const convertedPurchaseQty = purchasePackageQty * conversionFactor;
+      const materialWidth = num(line?.materialWidth ?? detail.width, 0);
+      const materialLength = purchasePackageUomCode === "SHEET" ? num(line?.materialLength ?? detail.materialLength, 0) : null;
       if (rawMaterial) {
         if (!["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
           throw Object.assign(new Error(`Baris ${detail.lineNumber}: Purchasing wajib memilih bentuk SHEET, COIL, atau PCS.`), { statusCode: 400 });
         }
-        if (!Number.isInteger(purchasePackageQty) || purchasePackageQty <= 0 || conversionFactor <= 0) {
-          throw Object.assign(new Error(`Baris ${detail.lineNumber}: qty bentuk harus bilangan bulat positif dan isi KG/PCS per bentuk harus lebih dari 0.`), { statusCode: 400 });
+        if (materialWidth <= 0) {
+          throw Object.assign(new Error(`Baris ${detail.lineNumber}: lebar material tersedia wajib lebih dari 0.`), { statusCode: 400 });
         }
-        if (!["KG", "PCS"].includes(conversionUomCode) || conversionUomCode !== requestUomCode) {
-          throw Object.assign(new Error(`Baris ${detail.lineNumber}: satuan hasil konversi harus KG atau PCS dan sama dengan UOM kebutuhan ${requestUomCode}.`), { statusCode: 400 });
+        if (purchasePackageUomCode === "SHEET" && materialLength <= 0) {
+          throw Object.assign(new Error(`Baris ${detail.lineNumber}: panjang sheet wajib lebih dari 0 mm.`), { statusCode: 400 });
         }
       }
       if (sourceQty <= 0) {
@@ -818,10 +821,12 @@ exports.confirmSuppliers = async (req, res, next) => {
         demandUomCode: requestUomCode || null,
         rawMaterial,
         purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
-        purchasePackageQty: rawMaterial ? purchasePackageQty : null,
-        conversionUomCode: rawMaterial ? conversionUomCode : null,
-        conversionFactor: rawMaterial ? conversionFactor : null,
-        convertedPurchaseQty: rawMaterial ? convertedPurchaseQty : null,
+        purchasePackageQty: null,
+        conversionUomCode: null,
+        conversionFactor: null,
+        convertedPurchaseQty: null,
+        materialWidth: rawMaterial ? materialWidth : null,
+        materialLength: rawMaterial ? materialLength : null,
         deliveryDate: date(line?.deliveryDate || pr.requiredDate),
         currencyCode: normalize(line?.currencyCode || "IDR"),
         unitPrice: line?.unitPrice == null ? null : num(line.unitPrice),
@@ -867,12 +872,14 @@ exports.confirmSuppliers = async (req, res, next) => {
             conversionUomCode: row.conversionUomCode,
             conversionFactor: row.conversionFactor,
             convertedPurchaseQty: row.convertedPurchaseQty,
+            materialWidth: row.materialWidth,
+            materialLength: row.materialLength,
             deliveryDate: row.deliveryDate,
             currencyCode: row.currencyCode,
             unitPrice: row.unitPrice,
             totalAmount: row.unitPrice == null
               ? null
-              : row.unitPrice * num(row.purchasePackageQty || row.sourceQty),
+              : row.unitPrice * row.sourceQty,
             status: "Confirmed",
             confirmedBy,
             confirmedAt,
@@ -894,10 +901,12 @@ exports.confirmSuppliers = async (req, res, next) => {
             conversionUomCode: single?.conversionUomCode || null,
             conversionFactor: single?.conversionFactor || null,
             convertedPurchaseQty: single?.convertedPurchaseQty || null,
-            // Legacy fields are mirrored for existing reports/integrations.
-            lotCount: single?.rawMaterial && single.conversionUomCode === "KG" ? single.purchasePackageQty : null,
-            kgPerLot: single?.rawMaterial && single.conversionUomCode === "KG" ? single.conversionFactor : null,
-            purchaseQtyKg: single?.rawMaterial && single.conversionUomCode === "KG" ? single.convertedPurchaseQty : null,
+            width: single?.materialWidth || detailRows[0]?.detail.width || null,
+            materialLength: single?.materialLength || null,
+            CSP: single?.rawMaterial ? ({ COIL: "C", SHEET: "S", PCS: "P" })[single.purchasePackageUomCode] || null : detailRows[0]?.detail.CSP || null,
+            lotCount: null,
+            kgPerLot: null,
+            purchaseQtyKg: single?.rawMaterial ? single.sourceQty : null,
           },
         });
       }
@@ -940,46 +949,39 @@ exports.consolidateToPO = async (req, res, next) => {
 
     const normalizedLines = requestedLines.map((requestLine) => {
       const detail = detailById.get(String(requestLine?.prDetailId || requestLine?.id || ""));
+      const requestedAllocationId = clean(requestLine.sourcingAllocationId || requestLine.allocationId);
+      const usableAllocations = detail.sourcingAllocations.filter((allocation) => allocation.status === "Confirmed");
+      const persistedAllocation = requestedAllocationId
+        ? usableAllocations.find((allocation) => allocation.id === requestedAllocationId)
+        : usableAllocations.length === 1 ? usableAllocations[0] : null;
+      if (!persistedAllocation) {
+        throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: keputusan supplier/form belum final. Gunakan Edit Supplier & Material Form pada PR.`), { statusCode: 409 });
+      }
       const outstanding = num(detail.qty) - num(detail.orderedQty);
-      const sourceQty = requestLine.sourceQty == null && requestLine.qty == null
-        ? outstanding
-        : num(requestLine.sourceQty ?? requestLine.qty);
+      const sourceQty = Math.min(num(persistedAllocation.demandCoveredQty), outstanding);
       if (sourceQty <= 0) {
         throw Object.assign(new Error(`Qty baris ${detail.prNumber}/${detail.lineNumber} harus lebih dari 0.`), { statusCode: 400 });
       }
-      const supplierCode = String(requestLine.supplierCode || detail.confirmedSupplierCode || "").trim();
-      const vendorCode = String(requestLine.vendorCode || detail.preferredVendor || "").trim();
+      const supplierCode = String(persistedAllocation.supplierCode || detail.confirmedSupplierCode || "").trim();
+      const vendorCode = String(persistedAllocation.vendorCode || detail.preferredVendor || "").trim();
       if (!supplierCode && !vendorCode) {
         throw Object.assign(new Error(`Supplier Purchasing baris ${detail.prNumber}/${detail.lineNumber} belum dikonfirmasi.`), { statusCode: 409 });
       }
       if (supplierCode && vendorCode) {
         throw Object.assign(new Error(`Baris ${detail.prNumber}/${detail.lineNumber} tidak boleh memiliki supplier dan vendor sekaligus.`), { statusCode: 400 });
       }
-      const currencyCode = String(requestLine.currencyCode || input.currencyCode || "IDR").trim().toUpperCase();
-      const deliveryDate = dayKey(requestLine.deliveryDate || input.deliveryDate || detail.pr.requiredDate);
+      const currencyCode = String(persistedAllocation.currencyCode || input.currencyCode || "IDR").trim().toUpperCase();
+      const deliveryDate = dayKey(persistedAllocation.deliveryDate || detail.pr.requiredDate);
       const targetPoNumber = String(requestLine.targetPoNumber || input.targetPoNumber || "").trim() || null;
       const rawMaterial = Boolean(detail.materialCode);
       const purchasePackageUomCode = normalize(
-        requestLine.purchasePackageUomCode
-          || requestLine.orderUomCode
+        persistedAllocation.purchasePackageUomCode
           || detail.purchasePackageUomCode,
       );
-      const conversionFactor = num(
-        requestLine.conversionFactor
-          ?? requestLine.kgPerLot
-          ?? detail.conversionFactor,
-      );
-      const requestedPackageQty = num(
-        requestLine.purchasePackageQty
-          ?? requestLine.orderQty
-          ?? detail.purchasePackageQty,
-      );
-      const conversionUomCode = normalize(
-        requestLine.conversionUomCode
-          || detail.conversionUomCode
-          || detail.uomCode,
-      );
-      const requestUomCode = normalize(detail.uomCode);
+      const materialWidth = rawMaterial ? num(persistedAllocation.materialWidth ?? detail.width) : null;
+      const materialLength = rawMaterial && purchasePackageUomCode === "SHEET"
+        ? num(persistedAllocation.materialLength ?? detail.materialLength)
+        : null;
       if (rawMaterial) {
         if (!["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
           throw Object.assign(
@@ -987,17 +989,11 @@ exports.consolidateToPO = async (req, res, next) => {
             { statusCode: 400 },
           );
         }
-        if (!Number.isInteger(requestedPackageQty) || requestedPackageQty <= 0 || conversionFactor <= 0) {
-          throw Object.assign(
-            new Error(`${detail.prNumber}/${detail.lineNumber}: qty bentuk harus bilangan bulat positif dan isi KG/PCS per bentuk harus lebih dari 0.`),
-            { statusCode: 400 },
-          );
+        if (materialWidth <= 0) {
+          throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: lebar material pada keputusan PR belum diisi.`), { statusCode: 400 });
         }
-        if (!["KG", "PCS"].includes(conversionUomCode) || conversionUomCode !== requestUomCode) {
-          throw Object.assign(
-            new Error(`${detail.prNumber}/${detail.lineNumber}: satuan hasil konversi harus KG atau PCS dan sama dengan UOM kebutuhan ${requestUomCode}.`),
-            { statusCode: 400 },
-          );
+        if (purchasePackageUomCode === "SHEET" && materialLength <= 0) {
+          throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: panjang sheet pada keputusan PR belum diisi.`), { statusCode: 400 });
         }
       }
       return {
@@ -1011,13 +1007,15 @@ exports.consolidateToPO = async (req, res, next) => {
         targetPoNumber,
         rawMaterial,
         purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
-        purchasePackageQty: rawMaterial ? requestedPackageQty : null,
-        conversionUomCode: rawMaterial ? conversionUomCode : null,
-        conversionFactor: rawMaterial ? conversionFactor : null,
-        convertedPurchaseQty: rawMaterial ? requestedPackageQty * conversionFactor : null,
-        sourcingAllocationId: clean(requestLine.sourcingAllocationId || requestLine.allocationId),
-        unitPrice: requestLine.unitPrice == null ? null : num(requestLine.unitPrice),
-        notes: clean(requestLine.notes),
+        purchasePackageQty: null,
+        conversionUomCode: null,
+        conversionFactor: null,
+        convertedPurchaseQty: null,
+        materialWidth,
+        materialLength,
+        sourcingAllocationId: persistedAllocation.id,
+        unitPrice: persistedAllocation.unitPrice == null ? null : num(persistedAllocation.unitPrice),
+        notes: clean(persistedAllocation.notes),
       };
     });
 
@@ -1078,6 +1076,8 @@ exports.consolidateToPO = async (req, res, next) => {
           conversionUomCode: row.conversionUomCode,
           conversionFactor: row.conversionFactor,
           convertedPurchaseQty: row.convertedPurchaseQty,
+          materialWidth: row.materialWidth,
+          materialLength: row.materialLength,
           deliveryDate: date(row.deliveryDate),
           currencyCode: row.currencyCode,
           unitPrice: row.unitPrice,
@@ -1123,6 +1123,9 @@ exports.consolidateToPO = async (req, res, next) => {
             conversionUomCode: single?.conversionUomCode || null,
             conversionFactor: single?.conversionFactor || null,
             convertedPurchaseQty: single?.convertedPurchaseQty || null,
+            width: single?.materialWidth || null,
+            materialLength: single?.materialLength || null,
+            CSP: single?.rawMaterial ? ({ COIL: "C", SHEET: "S", PCS: "P" })[single.purchasePackageUomCode] || null : null,
             lotCount: single?.rawMaterial && single.conversionUomCode === "KG" ? single.purchasePackageQty : null,
             kgPerLot: single?.rawMaterial && single.conversionUomCode === "KG" ? single.conversionFactor : null,
             purchaseQtyKg: single?.rawMaterial && single.conversionUomCode === "KG" ? single.convertedPurchaseQty : null,
@@ -1166,15 +1169,15 @@ exports.consolidateToPO = async (req, res, next) => {
           const detail = row.detail;
           const explicitOrderUom = row.requestLine.orderUomCode || row.requestLine.poUomCode;
           const explicitOrderQty = num(row.requestLine.orderQty ?? row.requestLine.poQty, 0);
-          let poQty = row.rawMaterial ? row.purchasePackageQty : (explicitOrderQty || row.sourceQty);
-          let poUom = row.rawMaterial
-            ? row.purchasePackageUomCode
-            : (explicitOrderUom || detail.uomCode);
+          const poQty = row.rawMaterial ? row.sourceQty : (explicitOrderQty || row.sourceQty);
+          const poUom = row.rawMaterial ? (detail.uomCode || "KG") : (explicitOrderUom || detail.uomCode);
           let conversionSource = null;
           if (row.rawMaterial) {
-            conversionSource = `${row.conversionFactor} ${row.conversionUomCode}/${row.purchasePackageUomCode}; Purchasing confirmation`;
+            conversionSource = row.purchasePackageUomCode === "SHEET"
+              ? `bentuk SHEET; lebar ${row.materialWidth} mm; panjang ${row.materialLength} mm; order dalam ${poUom}`
+              : `bentuk ${row.purchasePackageUomCode}; lebar ${row.materialWidth} mm; order dalam ${poUom}`;
           } else if (explicitOrderUom && explicitOrderQty > 0) {
-            conversionSource = "Purchasing confirmation";
+            conversionSource = "keputusan final PR";
           }
           const totalAmount = row.unitPrice != null
             ? row.unitPrice * poQty
@@ -1199,8 +1202,9 @@ exports.consolidateToPO = async (req, res, next) => {
               description: detail.description,
               spec: detail.spec,
               thickness: detail.thickness,
-              width: detail.width,
-              CSP: detail.CSP,
+              width: row.materialWidth || detail.width,
+              materialLength: row.materialLength,
+              CSP: row.rawMaterial ? ({ COIL: "C", SHEET: "S", PCS: "P" })[row.purchasePackageUomCode] || detail.CSP : detail.CSP,
                qty: poQty,
                uomCode: poUom,
               purchasePackageQty: row.purchasePackageQty,

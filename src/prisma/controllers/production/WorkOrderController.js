@@ -1,4 +1,5 @@
 const { prisma } = require("../../index");
+const { isDiesCapacityBlockingEnabled, isPressResource } = require("../../services/planning/diesCapacityService");
 const { Prisma } = require("@prisma/client");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
@@ -131,13 +132,24 @@ function hasSetupValue(value) {
   return value !== undefined && value !== null && String(value).trim() !== "";
 }
 
-function isSetupComplete(workOrder = {}) {
+function isSetupComplete(workOrder = {}, requiresDies = true) {
   return (
     hasSetupValue(workOrder.machineId) &&
-    hasSetupValue(workOrder.diesId) &&
+    (!requiresDies || hasSetupValue(workOrder.diesId)) &&
     hasSetupValue(workOrder.shift) &&
     hasSetupValue(workOrder.operatorName)
   );
+}
+
+async function workOrderRequiresDies(client, machineId, mbomProcessId) {
+  const [machine, route] = await Promise.all([
+    machineId ? client.machine.findUnique({ where: { id: machineId } }) : null,
+    mbomProcessId ? client.mBOMProcess.findFirst({
+      where: { id: mbomProcessId, isDeleted: false },
+      include: { process: { select: { processCode: true, processName: true } } },
+    }) : null,
+  ]);
+  return isDiesCapacityBlockingEnabled() && isPressResource(machine, route);
 }
 
 function getProjectedSetup(current, updateData) {
@@ -1107,7 +1119,7 @@ exports.create = async (req, res, next) => {
     }
     if (
       (!data.status || ["Draft", "Planned"].includes(data.status)) &&
-      isSetupComplete(data)
+      isSetupComplete(data, await workOrderRequiresDies(prisma, data.machineId, data.mbomProcessId))
     ) {
       data.status = "Released";
     }
@@ -1208,7 +1220,14 @@ exports.update = async (req, res, next) => {
     if (
       (status === undefined || ["Draft", "Planned"].includes(status)) &&
       ["Draft", "Planned"].includes(current.status) &&
-      isSetupComplete(getProjectedSetup(current, updateData))
+      isSetupComplete(
+        getProjectedSetup(current, updateData),
+        await workOrderRequiresDies(
+          prisma,
+          updateData.machineId !== undefined ? updateData.machineId : current.machineId,
+          updateData.mbomProcessId !== undefined ? updateData.mbomProcessId : current.mbomProcessId,
+        ),
+      )
     ) {
       updateData.status = "Released";
     }
@@ -1519,6 +1538,7 @@ exports.start = async (req, res, next) => {
         diesId: true,
         shift: true,
         operatorName: true,
+        mbomProcessId: true,
         notes: true,
         mbomDetail: {
           select: {
@@ -1558,7 +1578,7 @@ exports.start = async (req, res, next) => {
     }
     const missingSetup = [];
     if (!existing.machineId) missingSetup.push("Machine");
-    if (!existing.diesId) missingSetup.push("Dies");
+    if (await workOrderRequiresDies(prisma, existing.machineId, existing.mbomProcessId) && !existing.diesId) missingSetup.push("Dies");
     if (!existing.shift) missingSetup.push("Shift");
     if (!existing.operatorName) missingSetup.push("Operator");
     if (missingSetup.length > 0) {

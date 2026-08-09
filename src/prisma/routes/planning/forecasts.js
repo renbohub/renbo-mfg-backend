@@ -9,6 +9,7 @@ router.get("/generate-number", authorize("forecast", "create"), ctrl.generateNum
 router.get("/planning-tool", authorize("forecast", "read"), planningTool.status);
 router.get("/demand-summary", authorize("forecast", "read"), ctrl.demandSummary);
 router.get("/monthly-consumption", authorize("forecast", "read"), ctrl.monthlyConsumption);
+router.get("/monthly-consumption/:month", authorize("forecast", "read"), ctrl.monthlyConsumptionDetail);
 router.get("/:forecastNumber/planning-tool", authorize("forecast", "read"), planningTool.status);
 router.get("/", authorize("forecast", "read"), ctrl.list);
 router.get("/:forecastNumber", authorize("forecast", "read"), ctrl.get);

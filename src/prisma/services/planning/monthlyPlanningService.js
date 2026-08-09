@@ -1,6 +1,10 @@
 const { getFormulaSet, evaluateFromSet } = require("../masterFormulaService");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
 const {
+  effectiveDemandQty: resolvePolicyDemandQty,
+  consumeDeliveryTargets,
+} = require("./demandConsumptionService");
+const {
   planningMonthKey,
   utcMonthStart,
   utcMonthEnd,
@@ -140,6 +144,7 @@ async function collectMonthlyDemand(tx, requestedMonths = null) {
                 id: true,
                 partCode: true,
                 itemType: true,
+                planningPolicy: true,
                 bufferStock: true,
                 baseUomCode: true,
                 productionUomCode: true,
@@ -175,6 +180,7 @@ async function collectMonthlyDemand(tx, requestedMonths = null) {
             id: true,
             partCode: true,
             itemType: true,
+            planningPolicy: true,
             bufferStock: true,
             baseUomCode: true,
             productionUomCode: true,
@@ -281,23 +287,11 @@ async function collectMonthlyDemand(tx, requestedMonths = null) {
 // commitment wins. This prevents a later SO date from relaxing a forecast and
 // lets an earlier SO pull production forward without duplicating the demand.
 function effectiveDeliveryTargets(bucket) {
-  const forecast = bucket.forecastTargets.map((row) => ({ ...row, remaining: number(row.qty) }));
-  const sales = bucket.soTargets.map((row) => ({ ...row, remaining: number(row.qty) }));
-  const result = [];
-  let forecastIndex = 0;
-  for (const sale of sales) {
-    while (sale.remaining > 0.000001 && forecastIndex < forecast.length) {
-      const target = forecast[forecastIndex];
-      if (target.remaining <= 0.000001) { forecastIndex += 1; continue; }
-      const qty = Math.min(sale.remaining, target.remaining);
-      const targetDate = new Date(sale.targetDate) < new Date(target.targetDate) ? sale.targetDate : target.targetDate;
-      result.push({ ...sale, qty, targetDate, sourceType: "SALES_ORDER", matchedForecastTargetId: target.id });
-      sale.remaining -= qty; target.remaining -= qty;
-    }
-    if (sale.remaining > 0.000001) result.push({ ...sale, qty: sale.remaining, sourceType: "SALES_ORDER" });
-  }
-  for (const target of forecast) if (target.remaining > 0.000001) result.push({ ...target, qty: target.remaining, sourceType: "FORECAST" });
-  return result.sort((left, right) => new Date(left.targetDate) - new Date(right.targetDate));
+  return consumeDeliveryTargets({
+    forecastTargets: bucket.forecastTargets,
+    salesOrderTargets: bucket.soTargets,
+    part: bucket.part,
+  });
 }
 
 async function nextMonthlyMpsNumber(tx, month) {
@@ -423,10 +417,15 @@ async function syncMonthlyMps(tx, options = {}) {
         forecastQty,
         bufferQty,
       }), uomCode);
-      const qtyPlanned = normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", {
+      const formulaTargetQty = normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", {
         effectiveDemandQty,
         productionPercent,
         actualSalesOrderQty,
+      }), uomCode);
+      const qtyPlanned = normalizeQuantity(resolvePolicyDemandQty({
+        forecastQty: formulaTargetQty,
+        salesOrderQty: actualSalesOrderQty,
+        part: bucket.part,
       }), uomCode);
       const customerCodes = uniq(bucket.customerCodes);
       const forecastDetailIds = uniq(bucket.forecastDetailIds);
@@ -441,6 +440,7 @@ async function syncMonthlyMps(tx, options = {}) {
         bufferQty,
         effectiveDemandQty,
         productionPercent,
+        demandPolicy: String(bucket.part?.planningPolicy || "MTO").toUpperCase() === "MTS" ? "MTS" : "MTO",
         qtyPlanned,
         startDate: utcMonthStart(month),
         endDate: utcMonthEnd(month),
@@ -466,6 +466,7 @@ async function syncMonthlyMps(tx, options = {}) {
         "forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferPercent",
         "bufferQty", "effectiveDemandQty", "productionPercent", "qtyPlanned",
       ].some((field) => Math.abs(number(existing?.[field]) - number(data[field])) > 0.000001)
+        || String(existing?.demandPolicy || "") !== String(data.demandPolicy || "")
         || String(existing?.soNumber || "") !== String(data.soNumber || "")
         || String(existing?.customerCode || "") !== String(data.customerCode || "")) {
         demandChanged = true;

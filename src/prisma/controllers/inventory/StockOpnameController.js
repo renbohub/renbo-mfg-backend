@@ -58,7 +58,7 @@ function countSummary(details = []) {
 function mapStockOpname(item) {
   const details = item.details || [];
   const summary = countSummary(details);
-  return mapDoc({
+  const mapped = mapDoc({
     ...item,
     detailCount: item._count?.details ?? summary.totalLines,
     countedCount: summary.countedLines,
@@ -68,7 +68,22 @@ function mapStockOpname(item) {
       : 0,
     countSummary: summary,
   });
+  if (["DRAFT", "COUNTING"].includes(String(item.status || "").toUpperCase())) {
+    mapped.details = (mapped.details || []).map((detail) => {
+      const { systemQty, varianceQty, varianceAmount, varianceStatus, ...blindDetail } = detail;
+      return blindDetail;
+    });
+    mapped.varianceCount = null;
+    mapped.countSummary = {
+      totalLines: summary.totalLines,
+      countedLines: summary.countedLines,
+      uncountedLines: summary.uncountedLines,
+    };
+  }
+  return mapped;
 }
+
+const normalizeIdentity = (value) => String(value || "").trim().toUpperCase();
 
 async function findItem(stoNo, db = prisma) {
   return db.stockOpnameHeader.findFirst({
@@ -182,6 +197,11 @@ exports.create = async (req, res, next) => {
             partCode: balance.partCode,
             partNumber: balance.partNumber,
             partName: balance.partName || balance.materialName,
+            // Preserve material identity in the frozen scope for dependent counting dropdowns.
+            materialId: balance.materialId,
+            materialCode: balance.materialCode,
+            materialName: balance.materialName,
+            materialType: balance.materialType,
             productId: balance.productId,
             description: balance.description || balance.materialCode,
             spec: balance.spec || balance.materialType,
@@ -264,8 +284,58 @@ exports.countDetail = async (req, res, next) => {
     if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "actualQty harus berupa angka >= 0." });
     const result = variance(detail.systemQty, actualQty);
     const updated = await prisma.stockOpnameDetail.update({ where: { id: detail.id }, data: { actualQty, varianceQty: result.value, varianceStatus: result.status, reason: req.body?.reason || null, countedBy: actor(req), countedAt: new Date() } });
-    res.json(mapDoc(updated));
+    const { systemQty, varianceQty, varianceAmount, varianceStatus, ...blindDetail } = mapDoc(updated);
+    res.json(blindDetail);
   } catch (error) { next(error); }
+};
+
+exports.blindCount = async (req, res, next) => {
+  try {
+    const item = await findItem(req.params.stoNo);
+    if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
+    statusGuard(item.status, "COUNTING");
+    const rackCode = normalizeIdentity(req.body?.rackCode);
+    const lotNumber = normalizeIdentity(req.body?.lotNumber);
+    const stockType = normalizeIdentity(req.body?.stockType);
+    const materialType = normalizeIdentity(req.body?.materialType);
+    const materialIdentity = normalizeIdentity(req.body?.materialIdentity || req.body?.materialCode || req.body?.materialName);
+    const partIdentity = normalizeIdentity(req.body?.partIdentity || req.body?.partCode || req.body?.partNumber);
+    const partName = normalizeIdentity(req.body?.partName);
+    const actualQty = Number(req.body?.actualQty);
+    if (!stockType) return res.status(400).json({ message: "Jenis stock wajib dipilih." });
+    const isMaterial = stockType === "MATERIAL";
+    if (isMaterial && (!materialType || !materialIdentity)) return res.status(400).json({ message: "Jenis material dan nama/kode material wajib dipilih." });
+    if (!isMaterial && (!partIdentity || !partName)) return res.status(400).json({ message: "Part No/Part Code dan Part Name wajib dipilih." });
+    if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "Qty hasil hitung harus berupa angka >= 0." });
+    const matches = item.details.filter((detail) =>
+      normalizeIdentity(detail.rackCode) === rackCode
+      && normalizeIdentity(detail.lotNumber) === lotNumber
+      && normalizeIdentity(detail.stockType) === stockType
+      && (isMaterial
+        ? normalizeIdentity(detail.materialType) === materialType
+          && [normalizeIdentity(detail.materialCode), normalizeIdentity(detail.materialName)].includes(materialIdentity)
+        : [normalizeIdentity(detail.partCode), normalizeIdentity(detail.partNumber)].includes(partIdentity)
+          && normalizeIdentity(detail.partName) === partName));
+    if (!matches.length) {
+      return res.status(404).json({ message: "Kombinasi jenis stock, material/part, rack, dan lot tidak termasuk scope Stock Opname ini." });
+    }
+    if (matches.length > 1) {
+      return res.status(409).json({ message: "Kombinasi rack, lot, dan part tidak unik. Gunakan identitas part yang lebih spesifik." });
+    }
+    const detail = matches[0];
+    const result = variance(detail.systemQty, actualQty);
+    await prisma.stockOpnameDetail.update({
+      where: { id: detail.id },
+      data: {
+        actualQty,
+        varianceQty: result.value,
+        varianceStatus: result.status,
+        countedBy: actor(req),
+        countedAt: new Date(),
+      },
+    });
+    res.json(mapStockOpname(await findItem(item.stoNo)));
+  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };
 
 exports.bulkCount = async (req, res, next) => {
@@ -307,9 +377,6 @@ exports.submit = async (req, res, next) => {
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
     statusGuard(item.status, "COUNTING");
     if (item.details.some((detail) => detail.actualQty == null && !detail.isDeleted)) return res.status(409).json({ message: "Semua detail harus dihitung sebelum diajukan." });
-    if (item.details.some((detail) => !detail.isDeleted && Number(detail.varianceQty || 0) !== 0 && !String(detail.reason || "").trim())) {
-      return res.status(409).json({ message: "Alasan selisih wajib diisi untuk seluruh shortage/excess." });
-    }
     const result = await prisma.$transaction(async (tx) => {
       const approvalRequest = await submitDocumentForApproval({
         moduleCode: "inventory",

@@ -19,6 +19,7 @@ const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const {
   submitDocumentForApproval,
 } = require("../../services/approvalRuleService");
+const { buildPurchaseOrderPdf } = require("../../services/purchasing/purchaseOrderPdfService");
 
 async function queuePoDirtyParts(tx, poNumber, notes) {
   const details = await tx.purchaseOrderDetail.findMany({
@@ -385,17 +386,18 @@ const attachPOSignatories = (po, userMap = new Map()) => {
     ...mapDoc(po),
     checked: userMap.get(normalizeSignatoryUsername(po.checkedBy)) || null,
     approved: userMap.get(normalizeSignatoryUsername(po.approvedBy)) || null,
+    issued: userMap.get(normalizeSignatoryUsername(po.createdBy)) || null,
   };
 };
 
 const mapPOResponse = async (po) => {
-  const userMap = await getPOSignatoryUsersByUsername([po?.checkedBy, po?.approvedBy]);
+  const userMap = await getPOSignatoryUsersByUsername([po?.checkedBy, po?.approvedBy, po?.createdBy]);
   return attachPOSignatories(po, userMap);
 };
 
 const mapPOResponses = async (items = []) => {
   const userMap = await getPOSignatoryUsersByUsername(
-    items.flatMap((po) => [po?.checkedBy, po?.approvedBy]),
+    items.flatMap((po) => [po?.checkedBy, po?.approvedBy, po?.createdBy]),
   );
 
   return items.map((po) => attachPOSignatories(po, userMap));
@@ -411,6 +413,7 @@ const PO_INCLUDE = {
       billingAddress: true,
       shippingAddress: true,
       leadTimeDays: true,
+      taxId: true,
     },
   },
   vendor: {
@@ -423,6 +426,7 @@ const PO_INCLUDE = {
       billingAddress: true,
       shippingAddress: true,
       leadTimeDays: true,
+      taxId: true,
     },
   },
   currency: {
@@ -448,6 +452,13 @@ const PO_INCLUDE = {
     include: {
       product: {
         select: { productCode: true, productName: true, description: true },
+      },
+      prDetail: {
+        select: {
+          procurementCategory: true,
+          plannedOrderNumber: true,
+          sourcePlannedOrderNumbers: true,
+        },
       },
     },
   },
@@ -1589,6 +1600,50 @@ exports.submitChecking = async (req, res, next) => {
   } catch (e) {
     if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     next(e);
+  }
+};
+
+exports.exportPdf = async (req, res, next) => {
+  try {
+    const po = await findPOByNumber(req.params.poNumber, PO_INCLUDE);
+    if (!po) return res.status(404).json({ message: "Purchase Order tidak ditemukan" });
+    const mapped = await mapPOResponse(po);
+    const sourceNumbers = [...new Set((mapped.details || []).flatMap((detail) => [
+      ...(Array.isArray(detail.prDetail?.sourcePlannedOrderNumbers) ? detail.prDetail.sourcePlannedOrderNumbers : []),
+      detail.prDetail?.plannedOrderNumber,
+    ]).map((value) => String(value || "").trim()).filter(Boolean))];
+    const sourceOrders = sourceNumbers.length ? await prisma.plannedOrder.findMany({
+      where: { orderNumber: { in: sourceNumbers }, isDeleted: false },
+      select: {
+        orderNumber: true,
+        partCode: true,
+        part: { select: { partCode: true, partNumber: true, partName: true } },
+      },
+    }) : [];
+    const sourceOrderMap = new Map(sourceOrders.map((order) => [order.orderNumber, {
+      partCode: order.part?.partCode || order.partCode,
+      partNumber: order.part?.partNumber || null,
+      partName: order.part?.partName || null,
+    }]));
+    mapped.details = (mapped.details || []).map((detail) => {
+      const detailSourceNumbers = [...new Set([
+        ...(Array.isArray(detail.prDetail?.sourcePlannedOrderNumbers) ? detail.prDetail.sourcePlannedOrderNumbers : []),
+        detail.prDetail?.plannedOrderNumber,
+      ].map((value) => String(value || "").trim()).filter(Boolean))];
+      const sourceReferences = detailSourceNumbers.map((number) => sourceOrderMap.get(number)).filter(Boolean);
+      return { ...detail, sourceReferences };
+    });
+    const pdf = await buildPurchaseOrderPdf(mapped);
+    const filename = `${String(po.poNumber).replace(/[^a-z0-9._-]+/gi, "-")}.pdf`;
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Length": String(pdf.length),
+      "Cache-Control": "private, no-store",
+    });
+    return res.send(pdf);
+  } catch (e) {
+    return next(e);
   }
 };
 

@@ -1,6 +1,7 @@
 const { randomUUID } = require("crypto");
 
 const SETTING_KEY = "CAPACITY_SIMULATION_PRESETS_V1";
+const ACTIVE_PRESET_SETTING_KEY = "CAPACITY_CURRENT_USE_PRESET_V1";
 const DEFAULT_SHIFTS = [
   { start: "08:00", end: "16:00" },
   { start: "16:00", end: "00:00" },
@@ -28,7 +29,7 @@ function normalizeDailyOverrides(value, presetMonth) {
   return Object.fromEntries(Object.entries(source).flatMap(([date, rule]) => {
     const validDate = dateKey(date);
     if (!validDate || !validDate.startsWith(`${presetMonth}-`)) return [];
-    const shiftCount = Math.round(bounded(rule?.shiftCount, 0, 3, 1));
+    const shiftCount = Math.round(bounded(rule?.shiftCount, 0, 3, 2));
     const shifts = DEFAULT_SHIFTS.map((_, index) => normalizeShift(rule?.shifts?.[index], index)).slice(0, shiftCount);
     return [[validDate, {
       dayStatus: ["WORKING", "HOLIDAY", "OVERLOAD"].includes(String(rule?.dayStatus || "").toUpperCase()) ? String(rule.dayStatus).toUpperCase() : "WORKING",
@@ -46,7 +47,7 @@ function normalizePreset(payload = {}, existing = null, actor = "system") {
   if (!month) throw Object.assign(new Error("Bulan preset wajib menggunakan format YYYY-MM."), { statusCode: 400 });
   const name = String(payload.name || existing?.name || "").trim().slice(0, 100);
   if (!name) throw Object.assign(new Error("Nama preset wajib diisi."), { statusCode: 400 });
-  const shiftCount = Math.round(bounded(payload.shiftCount ?? existing?.shiftCount, 1, 3, 1));
+  const shiftCount = Math.round(bounded(payload.shiftCount ?? existing?.shiftCount, 1, 3, 2));
   const suppliedShifts = Array.isArray(payload.shifts) ? payload.shifts : existing?.shifts;
   const shifts = DEFAULT_SHIFTS.map((_, index) => normalizeShift(suppliedShifts?.[index], index));
   const overtimeStart = time(payload.overtimeStart ?? existing?.overtimeStart);
@@ -101,6 +102,30 @@ async function findPreset(prisma, id) {
   return (await loadPresetStore(prisma)).find((preset) => preset.id === id) || null;
 }
 
+async function activePresetId(prisma) {
+  const row = await prisma.systemSetting.findFirst({
+    where: { settingKey: ACTIVE_PRESET_SETTING_KEY, isDeleted: false },
+    select: { settingValue: true },
+  });
+  return String(row?.settingValue || "").trim() || null;
+}
+
+async function findActivePreset(prisma) {
+  const id = await activePresetId(prisma);
+  return id ? findPreset(prisma, id) : null;
+}
+
+async function activatePreset(prisma, presetId, actor = "system") {
+  const preset = await findPreset(prisma, presetId);
+  if (!preset) throw Object.assign(new Error("Preset simulasi tidak ditemukan."), { statusCode: 404 });
+  await prisma.systemSetting.upsert({
+    where: { settingKey: ACTIVE_PRESET_SETTING_KEY },
+    update: { settingValue: preset.id, description: `Current Use Capacity: ${preset.name}`, updatedBy: actor, isDeleted: false },
+    create: { settingKey: ACTIVE_PRESET_SETTING_KEY, settingValue: preset.id, description: `Current Use Capacity: ${preset.name}`, updatedBy: actor },
+  });
+  return preset;
+}
+
 function shiftDurationMinutes(shift) {
   const minutes = (value) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
   const start = minutes(shift.start); const end = minutes(shift.end);
@@ -125,4 +150,4 @@ function presetCapacityQuery(preset) {
   };
 }
 
-module.exports = { SETTING_KEY, DEFAULT_SHIFTS, normalizePreset, loadPresetStore, savePresetStore, findPreset, presetCapacityQuery, shiftDurationMinutes };
+module.exports = { SETTING_KEY, ACTIVE_PRESET_SETTING_KEY, DEFAULT_SHIFTS, normalizePreset, loadPresetStore, savePresetStore, findPreset, activePresetId, findActivePreset, activatePreset, presetCapacityQuery, shiftDurationMinutes };

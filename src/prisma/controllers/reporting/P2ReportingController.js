@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const {
   calculateLiveMbomCosts,
 } = require("../../services/mbomLiveCostingService");
+const { buildFgCompStockTraceability } = require("../../services/inventory/fgCompStockTraceabilityService");
 
 const MONTH_FIELDS = [
   "january",
@@ -304,7 +305,7 @@ exports.inventory = async (req, res, next) => {
       minStock: true,
       lastMovement: true,
     };
-    const [rows, allRows, total] = await Promise.all([
+    const [rows, allRows, total, traceability] = await Promise.all([
       prisma.stockBalance.findMany({
         where,
         select,
@@ -314,6 +315,7 @@ exports.inventory = async (req, res, next) => {
       }),
       prisma.stockBalance.findMany({ where, select }),
       prisma.stockBalance.count({ where }),
+      buildFgCompStockTraceability(prisma, { q, warehouseCode: req.query.warehouseCode }),
     ]);
     const mapRow = (row) => {
       const agingDays = daysOld(row.lastMovement);
@@ -351,6 +353,10 @@ exports.inventory = async (req, res, next) => {
           (row) => row.stockStatus === "BELOW MINIMUM",
         ).length,
         agedOver90Lines: agingCounts[">90 days"] || 0,
+        fgCompTracked: traceability.summary.fgCompTracked,
+        fgCompWithReadyFg: traceability.summary.fgCompWithReadyFg,
+        fgCompWithWip: traceability.summary.fgCompWithWip,
+        fgCompWithMaterial: traceability.summary.fgCompWithMaterial,
       },
       chart: {
         labels: ["0-30 days", "31-60 days", "61-90 days", ">90 days"],
@@ -361,6 +367,7 @@ exports.inventory = async (req, res, next) => {
           agingCounts[">90 days"] || 0,
         ],
       },
+      traceability,
     });
   } catch (error) {
     next(error);
