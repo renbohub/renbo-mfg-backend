@@ -7,6 +7,7 @@ const { normalizeAssemblyPolicyOverride } = require("../../utils/assemblyPolicy"
 const { normalizeDurationUnit } = require("../../utils/duration");
 const { generateConfiguredNumber } = require("../../services/numberingService");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
+const { buildMbomReport } = require("../../services/mbomReportService");
 
 // ============================================
 // REUSABLE INCLUDES & QUERIES
@@ -797,6 +798,10 @@ function stripProcessIdentity(process) {
 
 async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
   const actor = getActor(req, headerData.createdBy);
+  const revisionNote = String(headerData.revisionNote || headerData.changeNote || "").trim();
+  if (!revisionNote) {
+    throw badRequest("Catatan revisi wajib diisi agar perubahan mBOM dapat diaudit.");
+  }
   const newNoReg = await generateNoReg();
   const convertedHeader = convertNumericFields(headerData, ["revision"]);
   const partId = convertedHeader.partId !== undefined
@@ -805,6 +810,9 @@ async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
   const effectiveDate = headerData.effectiveDate !== undefined
     ? parseLocalDateField(headerData.effectiveDate)
     : new Date();
+  if (sourceHeader.effectiveDate && effectiveDate && effectiveDate <= sourceHeader.effectiveDate) {
+    throw badRequest("Tanggal mulai revisi baru harus setelah tanggal mulai revisi sebelumnya.");
+  }
 
   const createdHeader = await tx.mBOMHeader.create({
     data: {
@@ -814,6 +822,8 @@ async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
         ? convertedHeader.uomCode || null
         : sourceHeader.uomCode || null,
       revision: await getNextRevision(partId),
+      revisionOfMbomId: sourceHeader.id,
+      revisionNote,
       effectiveDate,
       expiryDate: headerData.expiryDate !== undefined
         ? parseLocalDateField(headerData.expiryDate)
@@ -952,6 +962,11 @@ exports.get = async (req, res, next) => {
   } catch (e) {
     next(e);
   }
+};
+
+exports.report = async (req, res, next) => {
+  try { res.json(await buildMbomReport(prisma, req.params.noReg, { costingDate: req.query.costingDate })); }
+  catch (error) { next(error); }
 };
 
 exports.create = async (req, res, next) => {
@@ -1157,6 +1172,8 @@ exports.update = async (req, res, next) => {
       createNewRevision: _createNewRevision,
       revisionMode: _revisionMode,
       updateMode: _updateMode,
+      revisionNote: _revisionNote,
+      changeNote: _changeNote,
       expirePreviousRevision: _expirePreviousRevision,
       expirePrevious: _expirePrevious,
       ...rawData
@@ -1167,12 +1184,12 @@ exports.update = async (req, res, next) => {
     const data = {};
 
     // Convert numeric fields
-    const convertedRaw = convertNumericFields(rawData, ['revision']);
+    const convertedRaw = convertNumericFields(rawData, []);
     
     if (convertedRaw.partId !== undefined) data.partId = convertedRaw.partId || null;
     if (convertedRaw.uomCode !== undefined) data.uomCode = convertedRaw.uomCode || null;
-    if (convertedRaw.revision !== undefined)
-      data.revision = convertedRaw.revision;
+    // Revision identity is immutable. Structural changes must create a new
+    // MBOMHeader so historical MPS/MRP documents keep their original BOM.
     if (rawData.effectiveDate !== undefined)
       data.effectiveDate = parseLocalDateField(rawData.effectiveDate);
     if (rawData.expiryDate !== undefined)
@@ -1181,6 +1198,18 @@ exports.update = async (req, res, next) => {
     if (rawData.isDeleted !== undefined) data.isDeleted = rawData.isDeleted;
 
     const doc = await prisma.$transaction(async (tx) => {
+      if (Array.isArray(normalizedDetails)) {
+        const [mpsUsage, salesUsage] = await Promise.all([
+          tx.mPSDetail.count({ where: { mbomHeaderId: req.params.id, isDeleted: false } }),
+          tx.salesOrderDetail.count({ where: { mbomHeaderId: req.params.id, isDeleted: false, status: { not: "Cancelled" } } }),
+        ]);
+        if (mpsUsage > 0 || salesUsage > 0) {
+          const error = new Error(`Revisi BOM ini sudah dipakai ${mpsUsage} baris MPS dan ${salesUsage} baris Sales Order. Simpan perubahan struktur sebagai revisi baru agar histori tidak berubah.`);
+          error.statusCode = 409;
+          error.code = "MBOM_REVISION_REQUIRED";
+          throw error;
+        }
+      }
       const updatedHeader = await tx.mBOMHeader.update({
         where: { id: req.params.id },
         data,

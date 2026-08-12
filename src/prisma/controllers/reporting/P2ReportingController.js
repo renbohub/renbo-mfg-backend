@@ -3,6 +3,7 @@ const {
   calculateLiveMbomCosts,
 } = require("../../services/mbomLiveCostingService");
 const { buildFgCompStockTraceability } = require("../../services/inventory/fgCompStockTraceabilityService");
+const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pricing/effectivePriceService");
 
 const MONTH_FIELDS = [
   "january",
@@ -530,32 +531,38 @@ exports.costTrend = async (req, res, next) => {
     const year = Math.max(2000, Number(req.query.year) || new Date().getFullYear());
     const [partPrices, materialPrices] = await Promise.all([
       prisma.partPriceList.findMany({
-        where: { isDeleted: false, pricingYear: year },
+        where: { isDeleted: false, OR: [{ pricingYear: year }, { effectiveFrom: { lt: new Date(year + 1, 0, 1) }, OR: [{ effectiveUntil: null }, { effectiveUntil: { gte: new Date(year, 0, 1) } }] }] },
         select: Object.fromEntries([
-          ["currencyCode", true],
+          ["partId", true], ["supplierId", true], ["currencyCode", true], ["unitPrice", true], ["pricingYear", true], ["effectiveFrom", true], ["effectiveUntil", true], ["isActive", true], ["updatedAt", true],
           ...MONTH_FIELDS.map((field) => [field, true]),
         ]),
       }),
       prisma.materialPriceList.findMany({
-        where: { isDeleted: false, pricingYear: year },
+        where: { isDeleted: false, OR: [{ pricingYear: year }, { effectiveFrom: { lt: new Date(year + 1, 0, 1) }, OR: [{ effectiveUntil: null }, { effectiveUntil: { gte: new Date(year, 0, 1) } }] }] },
         select: Object.fromEntries([
-          ["currencyCode", true],
+          ["materialId", true], ["materialGradeId", true], ["supplierId", true], ["currencyCode", true], ["unitPrice", true], ["pricingYear", true], ["effectiveFrom", true], ["effectiveUntil", true], ["isActive", true], ["updatedAt", true],
           ...MONTH_FIELDS.map((field) => [field, true]),
         ]),
       }),
     ]);
-    const averages = (rows) =>
-      MONTH_FIELDS.map((field) => {
-        const values = rows.map((row) => number(row[field])).filter((value) => value > 0);
+    const averages = (rows, keyOf) => {
+      const groups = new Map();
+      rows.forEach((row) => { const key = keyOf(row); const values = groups.get(key) || []; values.push(row); groups.set(key, values); });
+      return MONTH_FIELDS.map((_field, month) => {
+        const at = new Date(year, month + 1, 0, 23, 59, 59, 999);
+        const values = [...groups.values()].map((group) => legacyPriceValue(resolveEffectiveRecord(group, at), at)).filter((value) => value > 0);
         return values.length
           ? round(values.reduce((total, value) => total + value, 0) / values.length)
           : 0;
       });
+    };
+    const partAverages = averages(partPrices, (row) => `${row.partId}|${row.supplierId}|${row.currencyCode}`);
+    const materialAverages = averages(materialPrices, (row) => `${row.materialId || row.materialGradeId}|${row.supplierId}|${row.currencyCode}`);
     res.json({
       items: MONTH_FIELDS.map((field, index) => ({
         month: field,
-        partAverage: averages(partPrices)[index],
-        materialAverage: averages(materialPrices)[index],
+        partAverage: partAverages[index],
+        materialAverage: materialAverages[index],
       })),
       total: 12,
       page: 1,
@@ -570,8 +577,8 @@ exports.costTrend = async (req, res, next) => {
           (field) => field.charAt(0).toUpperCase() + field.slice(1, 3),
         ),
         series: [
-          { name: "Part", data: averages(partPrices) },
-          { name: "Material", data: averages(materialPrices) },
+          { name: "Part", data: partAverages },
+          { name: "Material", data: materialAverages },
         ],
       },
     });

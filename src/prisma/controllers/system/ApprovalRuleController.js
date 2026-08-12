@@ -10,6 +10,15 @@ const INCLUDE = {
   _count: { select: { requests: true } },
 };
 
+const DOCUMENT_STATUS_LIFECYCLES = {
+  "purchasing/purchase-requisitions": ["Draft", "Submitted", "Approved", "Rejected", "Partially Ordered", "Completed"],
+  "purchasing/purchase-order": ["Draft", "Submitted", "Approved", "Rejected", "Sent", "Confirmed", "Partial Receipt", "Completed", "Cancelled"],
+  "purchasing/purchase-invoices": ["Draft", "Submitted", "Matched", "Need Review", "Approved", "Posted", "Paid", "Cancelled"],
+  "sales/forecasts": ["Draft", "Submitted", "Confirmed", "Rejected", "Partial Product", "Consumed", "Closed", "Obsolete"],
+  "production/production-logs": ["Open", "Submitted", "Approved", "Rejected"],
+  "inventory/stock-opname": ["DRAFT", "COUNTING", "WAITING_APPROVAL", "APPROVED", "ADJUSTED", "CLOSED", "CANCELLED", "REJECTED"],
+};
+
 function actor(req) {
   return req.user?.username || req.user?.email || "system";
 }
@@ -94,7 +103,17 @@ function normalizeRule(body, req, current = {}) {
   };
 }
 
-function normalizeSteps(value, isActive) {
+function normalizeSteps(value, isActive, rule = {}) {
+  const lifecycle = DOCUMENT_STATUS_LIFECYCLES[`${rule.moduleCode || ""}/${rule.pageCode || ""}`] || null;
+  const normalizeDocumentStatus = (value, field, index) => {
+    const status = value == null || value === "" ? null : String(value).trim();
+    if (status && lifecycle && !lifecycle.includes(status)) {
+      const error = new Error(`Step ${index + 1}: ${field} \"${status}\" tidak ada pada lifecycle aktual ${rule.moduleCode}/${rule.pageCode}. Pilihan valid: ${lifecycle.join(", ")}.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    return status;
+  };
   const steps = (Array.isArray(value) ? value : [])
     .filter((step) => step && step.isDeleted !== true)
     .map((step, index) => ({
@@ -103,9 +122,9 @@ function normalizeSteps(value, isActive) {
       approverRoleId: step.approverRoleId || null,
       permissionAction: String(step.permissionAction || "approve").trim().toLowerCase(),
       requiredApprovals: positiveInt(step.requiredApprovals, 1),
-      pendingStatus: step.pendingStatus || null,
-      approvedStatus: step.approvedStatus || null,
-      rejectedStatus: step.rejectedStatus || null,
+      pendingStatus: normalizeDocumentStatus(step.pendingStatus, "status saat menunggu", index),
+      approvedStatus: normalizeDocumentStatus(step.approvedStatus, "status setelah disetujui", index),
+      rejectedStatus: normalizeDocumentStatus(step.rejectedStatus, "status jika ditolak", index),
       slaHours: step.slaHours === "" || step.slaHours === null || step.slaHours === undefined ? null : positiveInt(step.slaHours, 1),
       canDelegate: step.canDelegate === true,
       isActive: step.isActive !== false,
@@ -223,7 +242,7 @@ exports.dashboard = async (_req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const data = normalizeRule(req.body, req);
-    const steps = normalizeSteps(req.body.steps, data.isActive);
+    const steps = normalizeSteps(req.body.steps, data.isActive, data);
     data.createdBy = actor(req);
     const rule = await prisma.approvalRule.create({
       data: { ...data, steps: { create: steps } },
@@ -241,7 +260,7 @@ exports.update = async (req, res, next) => {
     const existing = await prisma.approvalRule.findUnique({ where: { id: req.params.id } });
     if (!existing || existing.isDeleted) return res.status(404).json({ message: "Approval rule tidak ditemukan." });
     const data = normalizeRule(req.body, req, existing);
-    const steps = req.body.steps === undefined ? null : normalizeSteps(req.body.steps, data.isActive);
+    const steps = req.body.steps === undefined ? null : normalizeSteps(req.body.steps, data.isActive, data);
     const rule = await prisma.$transaction(async (tx) => {
       await tx.approvalRule.update({ where: { id: existing.id }, data });
       if (steps) {

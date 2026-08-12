@@ -2,6 +2,8 @@ const { prisma } = require("../../index");
 const { generateDocNumber, generatePONumber } = require("./utils/purchasingHelpers");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
+// Commercial PO quantity is intentionally separate from exact MRP demand pegging.
+const { resolveCommercialOrderQty } = require("../../services/purchasing/purchaseOrderQuantityService");
 
 // Keep sourcing allocations in every PR read so the UI and PO conversion use
 // the same persisted supplier/form/delivery decisions.
@@ -85,11 +87,19 @@ const classifyRequisition = (details = []) => {
 async function attachProcurementClassification(rows, client = prisma) {
   const list = Array.isArray(rows) ? rows : [rows];
   const partCodes = [...new Set(list.flatMap((row) => row?.details || []).map((detail) => detail.partCode).filter(Boolean))];
-  const parts = partCodes.length ? await client.part.findMany({
-    where: { partCode: { in: partCodes }, isDeleted: false },
-    select: { partCode: true, itemType: true, rawType: true, hasDrawing: true, procurementType: true, baseUomCode: true, purchaseUomCode: true },
-  }) : [];
+  const vendorCodes = [...new Set(list.flatMap((row) => row?.details || []).flatMap((detail) => [detail.preferredVendor, ...(detail.sourcingAllocations || []).map((allocation) => allocation.vendorCode)]).filter(Boolean))];
+  const supplierCodes = [...new Set(list.flatMap((row) => row?.details || []).flatMap((detail) => [detail.confirmedSupplierCode, detail.proposedSupplierCode, detail.preferredSupplier, ...(detail.sourcingAllocations || []).map((allocation) => allocation.supplierCode)]).filter(Boolean))];
+  const [parts, vendors, suppliers] = await Promise.all([
+    partCodes.length ? client.part.findMany({
+      where: { partCode: { in: partCodes }, isDeleted: false },
+      select: { partCode: true, itemType: true, rawType: true, hasDrawing: true, procurementType: true, baseUomCode: true, purchaseUomCode: true },
+    }) : [],
+    vendorCodes.length ? client.vendor.findMany({ where: { vendorCode: { in: vendorCodes }, isDeleted: false }, select: { vendorCode: true, vendorName: true } }) : [],
+    supplierCodes.length ? client.supplier.findMany({ where: { supplierCode: { in: supplierCodes }, isDeleted: false }, select: { supplierCode: true, supplierName: true } }) : [],
+  ]);
   const partByCode = new Map(parts.map((part) => [normalize(part.partCode), part]));
+  const vendorByCode = new Map(vendors.map((vendor) => [normalize(vendor.vendorCode), vendor]));
+  const supplierByCode = new Map(suppliers.map((supplier) => [normalize(supplier.supplierCode), supplier]));
   const classified = list.map((row) => {
     const details = (row?.details || []).map((detail) => {
       const part = partByCode.get(normalize(detail.partCode));
@@ -100,6 +110,8 @@ async function attachProcurementClassification(rows, client = prisma) {
       const activeSourcingAllocations = sourcingAllocations.filter((allocation) => normalize(allocation.status) !== "CANCELLED");
       const joined = (key) => [...new Set(sources.map((source) => source[key]).filter(Boolean))].join(", ") || null;
       const allocationJoined = (key) => [...new Set(activeSourcingAllocations.map((allocation) => allocation[key]).filter(Boolean))].join(", ") || null;
+      const metadataRows = sources.map((source) => source.metadata).filter((metadata) => metadata && typeof metadata === "object" && !Array.isArray(metadata));
+      const metadataJoined = (key) => [...new Set(metadataRows.map((metadata) => metadata[key]).filter(Boolean))].join(", ") || null;
       const allocatedDemandQty = activeSourcingAllocations
         .reduce((sum, allocation) => sum + num(allocation.demandCoveredQty), 0);
       const supplierAllocationVariance = allocatedDemandQty - num(detail.qty);
@@ -121,10 +133,20 @@ async function attachProcurementClassification(rows, client = prisma) {
         sourceDemandMonths: [...new Set(sources.map((source) => dayKey(source.demandMonth)?.slice(0, 7)).filter(Boolean))].join(", ") || null,
         sourcingAllocationCount: activeSourcingAllocations.length,
         sourcingSuppliers: allocationJoined("supplierCode"),
+        sourcingVendors: allocationJoined("vendorCode") || detail.preferredVendor || null,
         sourcingForms: allocationJoined("purchasePackageUomCode"),
         sourcingWidths: allocationJoined("materialWidth"),
         sourcingLengths: allocationJoined("materialLength"),
         sourcingDeliveryDates: [...new Set(activeSourcingAllocations.map((allocation) => dayKey(allocation.deliveryDate)).filter(Boolean))].join(", ") || null,
+        sourcePlanNumbers: metadataJoined("planNumber"),
+        sourceCapacityAllocationIds: metadataJoined("allocationId") || (sources.find((source) => source.sourceType === "CAPACITY_ALLOCATION")?.sourceNumber ?? null),
+        vendorSendDates: [...new Set(metadataRows.map((metadata) => dayKey(metadata.vendorSendDate)).filter(Boolean))].join(", ") || null,
+        vendorReturnDates: [...new Set(metadataRows.map((metadata) => dayKey(metadata.vendorReturnDate)).filter(Boolean))].join(", ") || null,
+        vendorProcessCode: metadataJoined("processCode"),
+        vendorProcessName: metadataJoined("processName"),
+        customerCodes: metadataJoined("customerCode"),
+        customerTargetDates: [...new Set(metadataRows.map((metadata) => dayKey(metadata.customerTargetDate)).filter(Boolean))].join(", ") || null,
+        vendorPriceSource: metadataJoined("priceSource"),
         allocatedDemandQty,
         supplierAllocationVariance,
         supplierAllocationStatus,
@@ -134,12 +156,18 @@ async function attachProcurementClassification(rows, client = prisma) {
       };
     });
     const procurementCategory = normalizeCategory(row.procurementGroup) || classifyRequisition(details);
+    const partnerCodes = [...new Set(details.flatMap((detail) => [detail.sourcingVendors, detail.sourcingSuppliers]).filter(Boolean).flatMap((value) => String(value).split(",").map((part) => part.trim()).filter(Boolean)))];
+    const partnerNames = partnerCodes.map((code) => vendorByCode.get(normalize(code))?.vendorName || supplierByCode.get(normalize(code))?.supplierName).filter(Boolean);
     return {
       ...row,
       details,
       procurementCategory,
       prCategory: procurementCategory,
       materialCategory: procurementCategory,
+      categoryLabel: ({ MATERIAL: "PR-Raw Material", PURCHASE_PART: "PR-Purchase Part", UNIVERSAL_PURCHASE_PART: "PR-Universal Part", VENDOR_PROCESS: "PR-Vendor Process", NON_PRODUCTION: "PR-Non Production" })[procurementCategory] || procurementCategory,
+      partnerCodes: partnerCodes.join(", ") || null,
+      partnerNames: partnerNames.join(", ") || null,
+      partnerLabel: partnerCodes.map((code) => `${code} — ${vendorByCode.get(normalize(code))?.vendorName || supplierByCode.get(normalize(code))?.supplierName || "Master partner"}`).join(", ") || null,
     };
   });
   return Array.isArray(rows) ? classified : classified[0];
@@ -358,6 +386,7 @@ async function normalizeRequisitionDetails(details, client) {
           supplierCode: allocationSupplierCode,
           vendorCode: clean(allocation.vendorCode),
           demandCoveredQty,
+          commercialQty: num(allocation.commercialQty ?? demandCoveredQty),
           demandUomCode: uomCode,
           purchasePackageQty: category === "MATERIAL" && hasAllocationConversion ? allocationPackageQty : null,
           purchasePackageUomCode: category === "MATERIAL" && hasAllocationForm ? allocationForm : null,
@@ -472,6 +501,8 @@ const withSummary = (row) => {
   }
   const qtyByUom = [...grouped.values()];
   const singleUom = qtyByUom.length === 1 ? qtyByUom[0] : null;
+  const requestedTotal = qtyByUom.reduce((sum, item) => sum + item.requestedQty, 0);
+  const orderedTotal = qtyByUom.reduce((sum, item) => sum + item.orderedQty, 0);
   return {
     ...row,
     requestedQty: singleUom?.requestedQty ?? null,
@@ -481,6 +512,8 @@ const withSummary = (row) => {
     requestedQtyLabel: qtyByUom.map((item) => `${item.requestedQty} ${item.uomCode}`).join(" + "),
     orderedQtyLabel: qtyByUom.map((item) => `${item.orderedQty} ${item.uomCode}`).join(" + "),
     lineCount: (row.details || []).length,
+    outstandingQtyLabel: qtyByUom.map((item) => `${Math.max(item.requestedQty - item.orderedQty, 0)} ${item.uomCode}`).join(" + "),
+    orderProgressPercent: requestedTotal > 0 ? Math.min(Math.round(orderedTotal / requestedTotal * 10000) / 100, 100) : 0,
   };
 };
 
@@ -532,7 +565,9 @@ exports.list = async (req, res, next) => {
       const matchingParts = masterPartWhere
         ? await prisma.part.findMany({ where: { ...masterPartWhere, isDeleted: false }, select: { partCode: true } })
         : [];
-      const legacyDetailFilter = category === "MATERIAL"
+      const legacyDetailFilter = category === "VENDOR_PROCESS"
+        ? { procurementCategory: "VENDOR_PROCESS" }
+        : category === "MATERIAL"
         ? { OR: [{ materialCode: { not: null } }, { partCode: { in: matchingParts.map((part) => part.partCode) } }] }
         : ["PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(category)
           ? { partCode: { in: matchingParts.map((part) => part.partCode) } }
@@ -724,14 +759,15 @@ exports.submit = async (req, res, next) => {
     if (!["Draft", "Revision Required", "Rejected"].includes(pr.status)) return res.status(409).json({ message: `PR berstatus ${pr.status} tidak dapat disubmit.` });
     const result = await prisma.$transaction(async (tx) => {
       const approvalRequest = await submitDocumentForApproval({ moduleCode: "purchasing", pageCode: "purchase-requisitions", actionCode: "approve", documentType: "PurchaseRequisition", documentId: pr.id, documentNumber: pr.prNumber, amount: pr.totalAmount, context: pr, requestedByUserId: req.user?.id, requestedBy: req.user?.username || req.user?.email, tx });
-      const updated = await tx.purchaseRequisition.update({ where: { prNumber: pr.prNumber }, data: { status: "Submitted" }, include });
+      const pendingStatus = approvalRequest.rule?.steps?.[0]?.pendingStatus || "Submitted";
+      const updated = await tx.purchaseRequisition.update({ where: { prNumber: pr.prNumber }, data: { status: pendingStatus }, include });
       return { updated, approvalRequest };
     });
     res.json({ ...result.updated, approvalRequest: result.approvalRequest });
   } catch (e) { if (e.statusCode) return res.status(e.statusCode).json({ message: e.message }); next(e); }
 };
-exports.approve = async (req, res, next) => { try { const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat di-approve.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Approved", approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date(), rejectedBy: null, rejectedDate: null, rejectionReason: null }, include }); res.json(pr); } catch (e) { next(e); } };
-exports.reject = async (req, res, next) => { try { const reason = String(req.body?.reason || req.body?.rejectionReason || req.body?.notes || "").trim(); if (!reason) return res.status(400).json({ message: "Alasan penolakan wajib diisi." }); const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); if (current.status !== "Submitted") return res.status(409).json({ message: `PR berstatus ${current.status} tidak dapat ditolak.` }); const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: "Rejected", rejectedBy: req.user?.username || req.user?.email || "system", rejectedDate: new Date(), rejectionReason: reason }, include }); res.json(pr); } catch (e) { next(e); } };
+exports.approve = async (req, res, next) => { try { const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); const approvedStatus = req.approval?.step?.approvedStatus || "Approved"; const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: approvedStatus, approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date(), rejectedBy: null, rejectedDate: null, rejectionReason: null }, include }); res.json(pr); } catch (e) { next(e); } };
+exports.reject = async (req, res, next) => { try { const reason = String(req.body?.reason || req.body?.rejectionReason || req.body?.notes || "").trim(); if (!reason) return res.status(400).json({ message: "Alasan penolakan wajib diisi." }); const current = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false } }); if (!current) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); const rejectedStatus = req.approval?.step?.rejectedStatus || "Rejected"; const pr = await prisma.purchaseRequisition.update({ where: { prNumber: current.prNumber }, data: { status: rejectedStatus, rejectedBy: req.user?.username || req.user?.email || "system", rejectedDate: new Date(), rejectionReason: reason }, include }); res.json(pr); } catch (e) { next(e); } };
 exports.remove = async (req, res, next) => {
   try {
     const pr = await prisma.purchaseRequisition.findFirst({
@@ -787,15 +823,22 @@ exports.confirmSuppliers = async (req, res, next) => {
       return res.status(409).json({ message: "Keputusan supplier hanya dapat diedit sebelum proses order selesai dan bukan saat approval sedang berjalan." });
     }
 
+    const vendorProcessPr = normalizeCategory(pr.procurementGroup) === "VENDOR_PROCESS" || normalize(pr.poType) === "OUT PROCESS";
     const byId = new Map(pr.details.map((row) => [row.id, row]));
     const normalizedLines = lines.map((line) => {
       const detail = byId.get(String(line?.prDetailId || line?.id || ""));
       if (!detail) throw Object.assign(new Error("Detail PR yang akan dikonfirmasi tidak ditemukan."), { statusCode: 400 });
-      const supplierCode = String(line?.supplierCode || line?.confirmedSupplierCode || "").trim();
-      if (!supplierCode) throw Object.assign(new Error(`Supplier baris ${detail.lineNumber} wajib diisi.`), { statusCode: 400 });
+      const supplierCode = vendorProcessPr ? null : String(line?.supplierCode || line?.confirmedSupplierCode || "").trim();
+      const vendorCode = vendorProcessPr ? String(line?.vendorCode || detail.preferredVendor || "").trim() : null;
+      if (!supplierCode && !vendorCode) throw Object.assign(new Error(`${vendorProcessPr ? "Vendor" : "Supplier"} baris ${detail.lineNumber} wajib diisi.`), { statusCode: 400 });
       const rawMaterial = Boolean(detail.materialCode);
       const outstandingQty = Math.max(num(detail.qty) - num(detail.orderedQty), 0);
-      const sourceQty = line?.sourceQty == null ? outstandingQty : num(line.sourceQty);
+      const sourceQty = line?.commercialQty == null
+        ? (line?.sourceQty == null ? outstandingQty : num(line.sourceQty))
+        : num(line.commercialQty);
+      const demandCoveredQty = line?.demandCoveredQty == null
+        ? Math.min(sourceQty, outstandingQty)
+        : Math.min(Math.max(num(line.demandCoveredQty), 0), sourceQty);
       const purchasePackageUomCode = normalize(line?.purchasePackageUomCode || line?.orderUomCode);
       const requestUomCode = normalize(detail.uomCode);
       const materialWidth = num(line?.materialWidth ?? detail.width, 0);
@@ -817,7 +860,9 @@ exports.confirmSuppliers = async (req, res, next) => {
       return {
         detail,
         supplierCode,
+        vendorCode,
         sourceQty,
+        demandCoveredQty,
         demandUomCode: requestUomCode || null,
         rawMaterial,
         purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
@@ -839,14 +884,16 @@ exports.confirmSuppliers = async (req, res, next) => {
     }
     // Total split supplier boleh UNDER, EXACT, atau OVER terhadap kebutuhan PR.
     // Status selisih dihitung saat response/detail ditampilkan.
-    const supplierCodes = [...new Set(normalizedLines.map((row) => row.supplierCode))];
-    const suppliers = await prisma.supplier.findMany({
-      where: { supplierCode: { in: supplierCodes }, isDeleted: false },
-      select: { supplierCode: true, supplierName: true },
-    });
+    const supplierCodes = [...new Set(normalizedLines.map((row) => row.supplierCode).filter(Boolean))];
+    const vendorCodes = [...new Set(normalizedLines.map((row) => row.vendorCode).filter(Boolean))];
+    const [suppliers, vendors] = await Promise.all([
+      supplierCodes.length ? prisma.supplier.findMany({ where: { supplierCode: { in: supplierCodes }, isDeleted: false }, select: { supplierCode: true, supplierName: true } }) : [],
+      vendorCodes.length ? prisma.vendor.findMany({ where: { vendorCode: { in: vendorCodes }, isDeleted: false }, select: { vendorCode: true, vendorName: true } }) : [],
+    ]);
     const supplierByCode = new Map(suppliers.map((row) => [row.supplierCode, row]));
-    const missing = supplierCodes.filter((code) => !supplierByCode.has(code));
-    if (missing.length) return res.status(400).json({ message: `Supplier tidak ditemukan: ${missing.join(", ")}` });
+    const vendorByCode = new Map(vendors.map((row) => [row.vendorCode, row]));
+    const missing = [...supplierCodes.filter((code) => !supplierByCode.has(code)), ...vendorCodes.filter((code) => !vendorByCode.has(code))];
+    if (missing.length) return res.status(400).json({ message: `Supplier/vendor tidak ditemukan: ${missing.join(", ")}` });
 
     const confirmedAt = new Date();
     const confirmedBy = actor(req);
@@ -865,7 +912,9 @@ exports.confirmSuppliers = async (req, res, next) => {
           data: {
             prDetailId: row.detail.id,
             supplierCode: row.supplierCode,
-            demandCoveredQty: row.sourceQty,
+            vendorCode: row.vendorCode,
+            demandCoveredQty: row.demandCoveredQty,
+            commercialQty: row.sourceQty,
             demandUomCode: row.demandUomCode,
             purchasePackageQty: row.purchasePackageQty,
             purchasePackageUomCode: row.purchasePackageUomCode,
@@ -894,6 +943,7 @@ exports.confirmSuppliers = async (req, res, next) => {
           where: { id: detailId },
           data: {
             confirmedSupplierCode: single?.supplierCode || null,
+            preferredVendor: single?.vendorCode || detailRows[0]?.detail.preferredVendor || null,
             supplierConfirmedBy: confirmedBy,
             supplierConfirmedAt: confirmedAt,
             purchasePackageQty: single?.purchasePackageQty || null,
@@ -914,7 +964,7 @@ exports.confirmSuppliers = async (req, res, next) => {
     });
     res.json({
       ...(await attachProcurementClassification(result)),
-      supplierConfirmation: { confirmedBy, confirmedAt, lineCount: normalizedLines.length },
+      supplierConfirmation: { confirmedBy, confirmedAt, lineCount: normalizedLines.length, partnerType: vendorProcessPr ? "VENDOR" : "SUPPLIER" },
     });
   } catch (e) {
     if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
@@ -958,7 +1008,12 @@ exports.consolidateToPO = async (req, res, next) => {
         throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: keputusan supplier/form belum final. Gunakan Edit Supplier & Material Form pada PR.`), { statusCode: 409 });
       }
       const outstanding = num(detail.qty) - num(detail.orderedQty);
-      const sourceQty = Math.min(num(persistedAllocation.demandCoveredQty), outstanding);
+      const sourceQty = resolveCommercialOrderQty({
+        commercialQty: persistedAllocation.commercialQty,
+        demandCoveredQty: persistedAllocation.demandCoveredQty,
+        outstandingQty: outstanding,
+        activeAllocationCount: usableAllocations.length,
+      });
       if (sourceQty <= 0) {
         throw Object.assign(new Error(`Qty baris ${detail.prNumber}/${detail.lineNumber} harus lebih dari 0.`), { statusCode: 400 });
       }
@@ -1014,6 +1069,7 @@ exports.consolidateToPO = async (req, res, next) => {
         materialWidth,
         materialLength,
         sourcingAllocationId: persistedAllocation.id,
+        demandCoveredQty: Math.min(num(persistedAllocation.demandCoveredQty), sourceQty),
         unitPrice: persistedAllocation.unitPrice == null ? null : num(persistedAllocation.unitPrice),
         notes: clean(persistedAllocation.notes),
       };
@@ -1069,7 +1125,8 @@ exports.consolidateToPO = async (req, res, next) => {
         const allocationData = {
           supplierCode: row.supplierCode,
           vendorCode: row.vendorCode,
-          demandCoveredQty: row.sourceQty,
+          demandCoveredQty: row.demandCoveredQty,
+          commercialQty: row.sourceQty,
           demandUomCode: row.detail.uomCode,
           purchasePackageUomCode: row.purchasePackageUomCode,
           purchasePackageQty: row.purchasePackageQty,

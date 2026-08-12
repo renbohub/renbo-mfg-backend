@@ -2,6 +2,8 @@ const { canonicalizeRoutingOperations, compareRoutingOperations } = require("../
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
 const { findPreset, findActivePreset, shiftDurationMinutes } = require("./capacitySimulationPresetService");
 const { isDiesCapacityBlockingEnabled, isDiesTonnageCompatible, isPressResource, maintenanceInterval } = require("./diesCapacityService");
+const { buildProductionMaterialGate, materialGateForJob } = require("./materialReadinessService");
+const { loadDemandPlanningConstraintMap, effectiveVendorLeadTime } = require("./demandPlanningConstraintService");
 
 const DAY_MINUTES = 1440;
 const EPSILON = 0.000001;
@@ -41,16 +43,76 @@ function generatedBatchQuantity(batchReceiptQty, receiptQtyBeforeBatch, factor, 
   return Math.max(after - before, 0);
 }
 
+function priorityNetBatchQuantity(batchReceiptQty, receiptQtyBeforeBatch, routeRequirementQty, receiptProductionQty, uomCode) {
+  const batchQty = Math.max(number(batchReceiptQty), 0);
+  const beforeReceipt = Math.max(number(receiptQtyBeforeBatch), 0);
+  const routeQty = Math.max(number(routeRequirementQty), 0);
+  const productionQty = Math.max(number(receiptProductionQty), EPSILON);
+  if (routeQty <= productionQty + EPSILON) {
+    const before = normalizeQuantity(Math.min(beforeReceipt, routeQty), uomCode);
+    const after = normalizeQuantity(Math.min(beforeReceipt + batchQty, routeQty), uomCode);
+    return Math.max(after - before, 0);
+  }
+  return generatedBatchQuantity(batchQty, beforeReceipt, routeQty / productionQty, uomCode);
+}
+
+function allocateStockCoverage(stockRows, requestedQty) {
+  let remaining = Math.max(number(requestedQty), 0);
+  const lines = [];
+  const sorted = [...(stockRows || [])]
+    .filter((row) => number(row.qtyAvailable) > EPSILON)
+    .sort((left, right) => dateOnly(left.lastMovement || left.updatedAt || left.createdAt) - dateOnly(right.lastMovement || right.updatedAt || right.createdAt)
+      || String(left.warehouseCode || "").localeCompare(String(right.warehouseCode || ""))
+      || String(left.rackCode || "").localeCompare(String(right.rackCode || ""))
+      || String(left.lotNumber || "").localeCompare(String(right.lotNumber || ""))
+      || String(left.id || "").localeCompare(String(right.id || "")));
+  for (const row of sorted) {
+    if (remaining <= EPSILON) break;
+    const usedQty = Math.min(number(row.qtyAvailable), remaining);
+    lines.push({
+      stockBalanceId: row.id || null,
+      warehouseCode: row.warehouseCode || null,
+      rackCode: row.rackCode || null,
+      lotNumber: row.lotNumber || null,
+      qtyOnHand: round(row.qtyOnHand),
+      qtyReserved: round(row.qtyReserved),
+      qtyQC: round(row.qtyQC),
+      qtyAvailable: round(row.qtyAvailable),
+      usedQty: round(usedQty),
+      uomCode: row.uomCode || null,
+      lastMovement: row.lastMovement instanceof Date ? row.lastMovement.toISOString() : row.lastMovement || null,
+    });
+    remaining -= usedQty;
+  }
+  return {
+    requestedQty: round(requestedQty),
+    tracedQty: round(number(requestedQty) - Math.max(remaining, 0)),
+    untracedQty: round(Math.max(remaining, 0)),
+    lines,
+  };
+}
+
 function dateOnly(value) {
   const parsed = value instanceof Date ? new Date(value) : new Date(`${String(value).slice(0, 10)}T00:00:00.000Z`);
   return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate()));
 }
 
 function dateKey(value) { return dateOnly(value).toISOString().slice(0, 10); }
-function jakartaToday() {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+function jakartaClock(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Jakarta",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(value);
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return dateOnly(`${values.year}-${values.month}-${values.day}`);
+  return {
+    date: dateOnly(`${values.year}-${values.month}-${values.day}`),
+    minuteOfDay: Number(values.hour) * 60 + Number(values.minute),
+  };
 }
 function addDays(value, days) { return new Date(dateOnly(value).getTime() + days * 86400000); }
 function dayIndex(periodStart, value) { return Math.round((dateOnly(value) - dateOnly(periodStart)) / 86400000); }
@@ -75,7 +137,9 @@ function routeMode(route) {
     : String(route.routingMode || "INHOUSE").toUpperCase();
 }
 function specificationCode(route) { return route.machineSpecificationCode || route.machine?.machineSpecificationCode || null; }
-function leadMinutes(route) {
+function leadMinutes(route, planningDecision = null) {
+  const planned = effectiveVendorLeadTime(route, planningDecision, 8);
+  if (planned.planningDays > 0) return planned.planningDays * DAY_MINUTES;
   if (number(route.vendor?.leadTimeDays) > 0) return number(route.vendor.leadTimeDays) * DAY_MINUTES;
   const value = Math.max(number(route.mbomDetail?.leadTime), 0);
   switch (String(route.mbomDetail?.leadTimeUnit || "HOUR").toUpperCase()) {
@@ -268,12 +332,12 @@ function buildCapacityRuleIndex({ globalOverrides = [], planOverrides = [] } = {
 }
 
 function withCapacityRuleIndex(preset, rules) {
-  // Auto allocation may run without a saved preset. Preserve the historical
-  // defaults while still attaching authoritative calendar rules.
+  // Keep the same default as the heatmap and preset service: weekends are
+  // closed unless PPIC explicitly opens them through a preset/calendar rule.
   return {
     ...(preset || {}),
     shiftCount: preset?.shiftCount ?? 2,
-    includeSaturday: preset?.includeSaturday ?? true,
+    includeSaturday: preset?.includeSaturday ?? false,
     includeSunday: preset?.includeSunday ?? false,
     _capacityRuleIndex: rules || buildCapacityRuleIndex(),
   };
@@ -296,7 +360,7 @@ function shiftWindows(machine, day, mode, preset, periodStart) {
   const defaults = [[480, 960], [960, 1440], [0, 480]];
   const calendarDate = addDays(periodStart, day); const dailyRule = capacityRuleForMachineDate(machine, calendarDate, preset);
   const weekDay = calendarDate.getUTCDay();
-  const includeSaturday = preset?.includeSaturday ?? true; const includeSunday = preset?.includeSunday ?? false;
+  const includeSaturday = preset?.includeSaturday ?? false; const includeSunday = preset?.includeSunday ?? false;
   const closedStatuses = new Set(["HOLIDAY", "CLOSED", "UNAVAILABLE", "OFF"]);
   if (closedStatuses.has(dailyRule?.dayStatus) || (!dailyRule && ((weekDay === 6 && !includeSaturday) || (weekDay === 0 && !includeSunday)))) return [];
   const presetShifts = dailyRule?.shifts?.length ? dailyRule.shifts : preset?.shifts;
@@ -974,7 +1038,7 @@ function buildRecommendationValidationScope({ planNumber, planningMode, scenario
   };
 }
 
-function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBeforeJob, trialUsage, trialDiesUsage, trialManualByRoute, manualCompletionByRoute, machineBySpecification, diesForRoute, mode, due, executionFloor, periodStart, periodEnd, preset }) {
+function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBeforeJob, trialUsage, trialDiesUsage, trialManualByRoute, manualCompletionByRoute, machineBySpecification, diesForRoute, mode, due, executionFloor, periodStart, periodEnd, preset, planningDecision }) {
   const allocations = [];
   const completionByRoute = new Map();
   const allocationIndexesByRoute = new Map();
@@ -986,30 +1050,32 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
     const predecessorRouteIds = [...(graph.predecessors.get(route.id) || [])];
     const predecessorEnd = Math.max(executionFloor, ...predecessorRouteIds.map((id) => number(completionByRoute.get(id))));
     const predecessorDraftIndexes = normalizeLineageIndexes(predecessorRouteIds.flatMap((id) => allocationIndexesByRoute.get(id) || []), allocations.length);
-    const factor = number(task.detail.qtyPlanned) / receiptQty;
     let receiptBefore = receiptQtyBeforeJob;
     let routeChunks = batches.map((batch) => {
-      const qty = generatedBatchQuantity(batch, receiptBefore, factor > 0 ? factor : 1, task.detail.uomCode);
+      const receiptQtyBeforeBatch = receiptBefore;
+      const qty = priorityNetBatchQuantity(batch, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptQty, task.detail.uomCode);
       receiptBefore += number(batch);
-      return qty;
-    }).filter((qty) => qty > EPSILON);
+      return { qty, generatedQty: qty, receiptBatchQty: number(batch), receiptQtyBeforeBatch, manualConsumedQty: 0 };
+    }).filter((chunk) => chunk.qty > EPSILON);
     let manualRemaining = Math.max(number(trialManualByRoute.get(route.id)), 0);
-    routeChunks = routeChunks.map((qty) => {
-      const consumed = Math.min(qty, manualRemaining);
+    routeChunks = routeChunks.map((chunk) => {
+      const consumed = Math.min(chunk.qty, manualRemaining);
       manualRemaining -= consumed;
-      return qty - consumed;
-    }).filter((qty) => qty > EPSILON);
+      return { ...chunk, qty: chunk.qty - consumed, manualConsumedQty: consumed };
+    }).filter((chunk) => chunk.qty > EPSILON);
     trialManualByRoute.set(route.id, manualRemaining);
-    const totalQty = routeChunks.reduce((sum, qty) => sum + qty, 0);
+    const totalQty = routeChunks.reduce((sum, chunk) => sum + chunk.qty, 0);
+    const totalManualConsumedQty = routeChunks.reduce((sum, chunk) => sum + chunk.manualConsumedQty, 0);
+    const combinedReceiptBatchQty = batches.reduce((sum, value) => sum + number(value), 0);
     if (totalQty <= EPSILON) {
       completionByRoute.set(route.id, Math.max(predecessorEnd, number(manualCompletionByRoute.get(route.id))));
       continue;
     }
     if (routeMode(route) === "VENDOR") {
-      const duration = Math.max(leadMinutes(route), 1);
+      const duration = Math.max(leadMinutes(route, planningDecision), 1);
       const end = predecessorEnd + duration;
       if (end > due + EPSILON) return { failed: { code: "VENDOR_LEAD_TIME_LATE", route, qty: totalQty }, allocations, usage: trialUsage, manualByRoute: trialManualByRoute, batches };
-      allocations.push({ task, qty: totalQty, start: predecessorEnd, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: 1 });
+      allocations.push({ task, qty: totalQty, start: predecessorEnd, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: 1, receiptBatchQty: combinedReceiptBatchQty, receiptQtyBeforeBatch: receiptQtyBeforeJob, manualConsumedQty: totalManualConsumedQty });
       allocationIndexesByRoute.set(route.id, [allocations.length - 1]);
       completionByRoute.set(route.id, end);
       continue;
@@ -1034,7 +1100,7 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
       if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, fullPlacement.machine.id);
       occupy(trialUsage, fullPlacement.machine.id, { ...fullPlacement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
       occupyDies(trialDiesUsage, fullPlacement.dies?.id, fullPlacement);
-      allocations.push({ task, qty: totalQty, ...fullPlacement, predecessorDraftIndexes, batchNumber: 1 });
+      allocations.push({ task, qty: totalQty, ...fullPlacement, predecessorDraftIndexes, batchNumber: 1, receiptBatchQty: combinedReceiptBatchQty, receiptQtyBeforeBatch: receiptQtyBeforeJob, manualConsumedQty: totalManualConsumedQty });
       allocationIndexesByRoute.set(route.id, [allocations.length - 1]);
       completionByRoute.set(route.id, fullPlacement.end);
       continue;
@@ -1044,7 +1110,8 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
     const routeIndexes = [];
     let earliest = predecessorEnd;
     for (let chunkIndex = 0; chunkIndex < routeChunks.length; chunkIndex += 1) {
-      const qty = routeChunks[chunkIndex];
+      const chunk = routeChunks[chunkIndex];
+      const qty = chunk.qty;
       const chunkPinnedMachineId = pinnedMachineByLane.get(laneKey) || null;
       const chunkMachines = candidateMachinesForLane(candidateMachines, cycleByMachine, chunkPinnedMachineId, pinMachineLane);
       const placement = findPlacement({ machines: chunkMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest, due, duration: (machine) => Math.max(qty * cycleByMachine(machine), 1), mode, periodStart, periodEnd, preset, scoringContext: { ...scoringContext, pinnedMachineId: chunkPinnedMachineId } });
@@ -1052,7 +1119,7 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
       if (pinMachineLane && !chunkPinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
       occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
       occupyDies(trialDiesUsage, placement.dies?.id, placement);
-      allocations.push({ task, qty, ...placement, predecessorDraftIndexes, batchNumber: chunkIndex + 1 });
+      allocations.push({ task, qty, ...placement, predecessorDraftIndexes, batchNumber: chunkIndex + 1, receiptBatchQty: chunk.receiptBatchQty, receiptQtyBeforeBatch: chunk.receiptQtyBeforeBatch, manualConsumedQty: chunk.manualConsumedQty });
       routeIndexes.push(allocations.length - 1);
       earliest = placement.end;
     }
@@ -1071,21 +1138,129 @@ function customerDemandQuantity(detail) {
   );
 }
 
-function phaseJobs(plan, details, deliveryPhases) {
+function phaseJobs(plan, details, deliveryPhases, options = {}) {
+  const stockRows = options.finishedGoodStockBalances || [];
+  const priorityRank = (value) => ({ P0: 0, P1: 1, P2: 2, P3: 3 }[String(value || "").toUpperCase()] ?? 4);
+  const demandRank = (value) => String(value || "").toUpperCase() === "SALES_ORDER" ? 0 : 1;
   const receipts = details.filter((detail) => !isGeneratedProcess(detail));
   const groups = receipts.map((receipt) => {
     const related = details.filter((detail) => detail.id === receipt.id || sourceMpsDetailId(detail) === receipt.mpsDetailId);
     const phases = deliveryPhases.filter((phase) => phase.mpsDetailId === receipt.mpsDetailId);
-    const jobs = phases.map((phase) => ({
-      id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, qty: number(phase.qtyPlanned),
+    const customerJobs = phases.map((phase) => ({
+      id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, grossDemandQty: number(phase.qtyPlanned),
       targetType: phase.targetType, targetCode: phase.targetCode,
-    }));
+      sourceDeliveryTargetId: phase.sourceDeliveryTargetId || null,
+      sourceType: phase.sourceType || receipt.demandSourceType || null,
+      sourceNumber: phase.sourceNumber || receipt.demandSourceNumber || null,
+      customerCode: phase.targetCode || receipt.customerCode || null,
+      fgRequiredDate: phase.fgRequiredDate || receipt.fgRequiredDate || null,
+      priorityScore: number(receipt.priorityScore),
+      priorityClass: receipt.priorityClass || null,
+    })).sort((left, right) => priorityRank(left.priorityClass) - priorityRank(right.priorityClass)
+      || demandRank(left.sourceType) - demandRank(right.sourceType)
+      || number(right.priorityScore) - number(left.priorityScore)
+      || dateOnly(left.due) - dateOnly(right.due)
+      || number(left.phaseNumber) - number(right.phaseNumber));
     const covered = phases.reduce((sum, phase) => sum + number(phase.qtyPlanned), 0);
     const customerDemand = customerDemandQuantity(receipt);
-    if (covered + EPSILON < customerDemand) jobs.push({ id: null, phaseNumber: null, due: receipt.requiredDate || plan.periodEnd, qty: customerDemand - covered, targetType: "CUSTOMER", targetCode: null, configurationError: phases.length ? "DELIVERY_PHASE_QTY_SHORT" : "DELIVERY_PHASE_REQUIRED" });
-    const bufferProductionQty = Math.max(number(receipt.qtyPlanned) - customerDemand, 0);
-    if (bufferProductionQty > EPSILON) jobs.push({ id: null, phaseNumber: null, due: plan.periodEnd, qty: bufferProductionQty, targetType: "INTERNAL_STOCK", targetCode: "BUFFER_STOCK", isBufferStock: true });
-    return { receipt, related, jobs };
+    if (covered + EPSILON < customerDemand) customerJobs.push({
+      id: null, phaseNumber: null, due: receipt.requiredDate || plan.periodEnd,
+      grossDemandQty: customerDemand - covered, targetType: "CUSTOMER", targetCode: null,
+      sourceType: receipt.demandSourceType || null, sourceNumber: receipt.demandSourceNumber || null,
+      priorityScore: number(receipt.priorityScore), priorityClass: receipt.priorityClass || null,
+      configurationError: phases.length ? "DELIVERY_PHASE_QTY_SHORT" : "DELIVERY_PHASE_REQUIRED",
+    });
+
+    const productionTargetQty = Math.max(number(receipt.qtyPlanned), 0);
+    const requestedBufferQty = Math.max(number(receipt.bufferQty), 0);
+    const protectedBufferQty = Math.min(requestedBufferQty, productionTargetQty);
+    const customerProductionBudget = Math.min(customerDemand, Math.max(productionTargetQty - protectedBufferQty, 0));
+    const stockCoverageTargetQty = Math.max(customerDemand - customerProductionBudget, 0);
+    const matchingStockRows = stockRows.filter((row) => row.partCode === receipt.partCode
+      && (!receipt.uomCode || !row.uomCode || String(row.uomCode).toLowerCase() === String(receipt.uomCode).toLowerCase()));
+    const availableRemaining = new Map(matchingStockRows.map((row) => [row.id, Math.max(number(row.qtyAvailable), 0)]));
+    const reservationRemaining = new Map(matchingStockRows.flatMap((row) => (row.stockReservations || []).map((reservation) => [reservation.id, Math.max(number(reservation.qtyReserved) - number(reservation.qtyReleased), 0)])));
+    const stockLine = (row, usedQty, source, reservation = null) => ({
+      stockBalanceId: row.id || null,
+      warehouseCode: row.warehouseCode || null,
+      rackCode: row.rackCode || null,
+      lotNumber: row.lotNumber || null,
+      qtyOnHand: round(row.qtyOnHand),
+      qtyReserved: round(row.qtyReserved),
+      qtyQC: round(row.qtyQC),
+      qtyAvailable: round(row.qtyAvailable),
+      usedQty: round(usedQty),
+      uomCode: row.uomCode || null,
+      lastMovement: row.lastMovement instanceof Date ? row.lastMovement.toISOString() : row.lastMovement || null,
+      coverageSource: source,
+      reservationNumber: reservation?.reservationNumber || null,
+      reservationReferenceType: reservation?.referenceType || null,
+      reservationReferenceNumber: reservation?.referenceNumber || null,
+      reservationDate: reservation?.reservationDate instanceof Date ? reservation.reservationDate.toISOString() : reservation?.reservationDate || null,
+    });
+    const takeHistory = (requested, job) => {
+      let remaining = Math.max(number(requested), 0);
+      const lines = [];
+      const sourceNumber = String(job.sourceNumber || "").trim();
+      for (const row of matchingStockRows) {
+        if (remaining <= EPSILON) break;
+        for (const reservation of row.stockReservations || []) {
+          if (remaining <= EPSILON) break;
+          const reservationSource = String(reservation.referenceNumber || "").split("#")[0];
+          if (!sourceNumber || String(reservation.referenceType || "").toUpperCase() !== "SO" || reservationSource !== sourceNumber) continue;
+          const usedQty = Math.min(number(reservationRemaining.get(reservation.id)), remaining);
+          if (usedQty <= EPSILON) continue;
+          reservationRemaining.set(reservation.id, number(reservationRemaining.get(reservation.id)) - usedQty);
+          remaining -= usedQty;
+          lines.push(stockLine(row, usedQty, "RESERVED_TO_DEMAND", reservation));
+        }
+      }
+      for (const row of matchingStockRows) {
+        if (remaining <= EPSILON) break;
+        const usedQty = Math.min(number(availableRemaining.get(row.id)), remaining);
+        if (usedQty <= EPSILON) continue;
+        availableRemaining.set(row.id, number(availableRemaining.get(row.id)) - usedQty);
+        remaining -= usedQty;
+        lines.push(stockLine(row, usedQty, "UNRESERVED_AVAILABLE"));
+      }
+      return lines;
+    };
+    let remainingStockCoverage = stockCoverageTargetQty;
+    customerJobs.forEach((job, index) => {
+      const stockCoverageQty = Math.min(number(job.grossDemandQty), remainingStockCoverage);
+      remainingStockCoverage -= stockCoverageQty;
+      job.stockCoverageQty = round(stockCoverageQty);
+      job.stockCoverageHistory = takeHistory(stockCoverageQty, job);
+      job.stockCoverageHistoryUntracedQty = round(Math.max(stockCoverageQty - job.stockCoverageHistory.reduce((sum, line) => sum + number(line.usedQty), 0), 0));
+      job.qty = round(Math.max(number(job.grossDemandQty) - stockCoverageQty, 0));
+      job.prioritySequence = index + 1;
+      job.quantityPolicy = "PRIORITY_DEMAND_MINUS_FG_STOCK";
+    });
+    const producedCustomerQty = customerJobs.reduce((sum, job) => sum + number(job.qty), 0);
+    const bufferProductionQty = Math.max(productionTargetQty - producedCustomerQty, 0);
+    const tracedStockCoverageQty = customerJobs.reduce((sum, job) => sum + (job.stockCoverageHistory || []).reduce((lineSum, line) => lineSum + number(line.usedQty), 0), 0);
+    const stockCoverageLines = customerJobs.flatMap((job) => job.stockCoverageHistory || []);
+    const jobs = [...customerJobs];
+    if (bufferProductionQty > EPSILON) jobs.push({
+      id: null, phaseNumber: null, due: plan.periodEnd, qty: round(bufferProductionQty), grossDemandQty: round(bufferProductionQty),
+      targetType: "INTERNAL_STOCK", targetCode: "BUFFER_STOCK", isBufferStock: true,
+      requestedBufferQty: round(requestedBufferQty), prioritySequence: customerJobs.length + 1,
+      quantityPolicy: "BUFFER_AFTER_PRIORITY_DEMAND",
+    });
+    return {
+      receipt, related, jobs, productionTargetQty: round(productionTargetQty),
+      stockAllocationAudit: {
+        policy: "PRIORITY_DEMAND_FIRST_BUFFER_SECOND",
+        customerDemandQty: round(customerDemand),
+        requestedBufferQty: round(requestedBufferQty),
+        productionTargetQty: round(productionTargetQty),
+        stockCoverageTargetQty: round(stockCoverageTargetQty),
+        requestedQty: round(stockCoverageTargetQty),
+        tracedQty: round(tracedStockCoverageQty),
+        untracedQty: round(Math.max(stockCoverageTargetQty - tracedStockCoverageQty, 0)),
+        lines: stockCoverageLines,
+      },
+    };
   });
   const groupedSourceIds = new Set(groups.map((group) => group.receipt.mpsDetailId).filter(Boolean));
   const orphanSources = new Map();
@@ -1101,13 +1276,75 @@ function phaseJobs(plan, details, deliveryPhases) {
     const sourcePartCode = String(related[0]?.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim() || related[0]?.partCode;
     const receipt = { id: sourceId, mpsDetailId: sourceId, partCode: sourcePartCode, qtyPlanned: qty, requiredDate: due };
     const matchingPhases = deliveryPhases.filter((phase) => phase.mpsDetailId === sourceId);
-    const orphanJobs = matchingPhases.length ? matchingPhases.map((phase) => ({ id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, qty: number(phase.qtyPlanned), targetType: phase.targetType, targetCode: phase.targetCode })) : [{ id: null, phaseNumber: null, due, qty, targetType: "CUSTOMER", targetCode: null, configurationError: "DELIVERY_PHASE_REQUIRED" }];
-    groups.push({ receipt, related, jobs: orphanJobs });
+    const orphanJobs = matchingPhases.length ? matchingPhases.map((phase) => ({ id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, qty: number(phase.qtyPlanned), targetType: phase.targetType, targetCode: phase.targetCode, sourceDeliveryTargetId: phase.sourceDeliveryTargetId || null, sourceType: phase.sourceType || null, sourceNumber: phase.sourceNumber || null, fgRequiredDate: phase.fgRequiredDate || null })) : [{ id: null, phaseNumber: null, due, qty, targetType: "CUSTOMER", targetCode: null, configurationError: "DELIVERY_PHASE_REQUIRED" }];
+    groups.push({ receipt, related, jobs: orphanJobs, productionTargetQty: qty, stockAllocationAudit: { policy: "ORPHAN_SOURCE_NO_STOCK_NETTING", customerDemandQty: qty, requestedBufferQty: 0, productionTargetQty: qty, stockCoverageTargetQty: 0, requestedQty: 0, tracedQty: 0, untracedQty: 0, lines: [] } });
   }
   return groups.flatMap((group) => group.jobs.map((job) => ({ ...job, group }))).sort((left, right) =>
     dateOnly(left.due) - dateOnly(right.due)
+    || number(right.priorityScore) - number(left.priorityScore)
     || (left.targetType === "CUSTOMER" ? 0 : 1) - (right.targetType === "CUSTOMER" ? 0 : 1)
     || left.phaseNumber - right.phaseNumber);
+}
+
+function combineSingleDeliveryBufferCampaigns(jobs = []) {
+  const candidatesByKey = new Map();
+  for (const job of jobs) {
+    const key = `${job.group?.receipt?.id || "?"}|${dateKey(job.fgRequiredDate || job.due).slice(0, 7)}`;
+    if (!candidatesByKey.has(key)) candidatesByKey.set(key, []);
+    candidatesByKey.get(key).push(job);
+  }
+  const replacements = new Map();
+  const suppressed = new Set();
+  for (const rows of candidatesByKey.values()) {
+    const productionRows = rows.filter((row) => number(row.qty) > EPSILON);
+    const customerRows = productionRows.filter((row) => row.targetType === "CUSTOMER" && !row.isBufferStock);
+    const bufferRows = productionRows.filter((row) => row.isBufferStock);
+    if (productionRows.length !== 2 || customerRows.length !== 1 || bufferRows.length !== 1) continue;
+    const customer = customerRows[0];
+    const buffer = bufferRows[0];
+    if (customer.configurationError || buffer.configurationError || dateKey(customer.due).slice(0, 7) !== dateKey(buffer.due).slice(0, 7)) continue;
+    const segment = (row) => ({
+      id: row.id || null,
+      phaseNumber: row.phaseNumber || null,
+      due: row.due,
+      fgRequiredDate: row.fgRequiredDate || null,
+      targetType: row.targetType,
+      targetCode: row.targetCode || null,
+      customerCode: row.customerCode || row.targetCode || null,
+      sourceType: row.sourceType || null,
+      sourceNumber: row.sourceNumber || null,
+      grossDemandQty: round(row.grossDemandQty ?? row.qty),
+      productionQty: round(row.qty),
+      stockCoverageQty: round(row.stockCoverageQty),
+      stockCoverageHistory: row.stockCoverageHistory || [],
+      stockCoverageHistoryUntracedQty: round(row.stockCoverageHistoryUntracedQty),
+      requestedBufferQty: round(row.requestedBufferQty),
+      isBufferStock: Boolean(row.isBufferStock),
+      prioritySequence: row.prioritySequence || null,
+      priorityClass: row.priorityClass || null,
+      priorityScore: row.priorityScore == null ? null : round(row.priorityScore, 2),
+    });
+    const campaignSegments = [segment(customer), segment(buffer)];
+    replacements.set(customer, {
+      ...customer,
+      qty: round(number(customer.qty) + number(buffer.qty)),
+      grossDemandQty: round(number(customer.grossDemandQty ?? customer.qty) + number(buffer.grossDemandQty ?? buffer.qty)),
+      stockCoverageQty: round(number(customer.stockCoverageQty) + number(buffer.stockCoverageQty)),
+      stockCoverageHistory: [...(customer.stockCoverageHistory || []), ...(buffer.stockCoverageHistory || [])],
+      stockCoverageHistoryUntracedQty: round(number(customer.stockCoverageHistoryUntracedQty) + number(buffer.stockCoverageHistoryUntracedQty)),
+      requestedBufferQty: round(number(buffer.qty)),
+      isBufferStock: false,
+      hasBufferCampaign: true,
+      quantityPolicy: "SINGLE_DELIVERY_PLUS_BUFFER_CONTINUOUS_CAMPAIGN",
+      campaignSegments,
+    });
+    suppressed.add(buffer);
+  }
+  return jobs.flatMap((job) => suppressed.has(job) ? [] : [replacements.get(job) || job]);
+}
+
+function resultSegmentsForJob(job) {
+  return Array.isArray(job.campaignSegments) && job.campaignSegments.length ? job.campaignSegments : [job];
 }
 
 async function loadContext(prisma, planNumber, options = {}) {
@@ -1124,7 +1361,8 @@ async function loadContext(prisma, planNumber, options = {}) {
   if (!plan) { const error = new Error("Monthly Production Plan tidak ditemukan."); error.statusCode = 404; throw error; }
   const mpsNumber = String(plan.sourceType || "").startsWith("MPS:") ? String(plan.sourceType).slice(4) : null;
   const horizonEndExclusive = addDays(plan.periodEnd, 1);
-  const [machines, headers, bomDetails, allRoutes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, calendarOverrides, planOverrides, downtimes] = await Promise.all([
+  const receiptPartCodes = [...new Set((plan.details || []).filter((detail) => !isGeneratedProcess(detail)).map((detail) => detail.partCode).filter(Boolean))];
+  const [machines, headers, bomDetails, allRoutes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, calendarOverrides, planOverrides, downtimes, finishedGoodStockBalances, materialGate] = await Promise.all([
     prisma.machine.findMany({ where: { isDeleted: false, status: "Active" }, orderBy: { machineCode: "asc" } }),
     prisma.mBOMHeader.findMany({ where: { isDeleted: false }, orderBy: [{ partId: "asc" }, { revision: "desc" }, { updatedAt: "desc" }], select: { noReg: true, partId: true } }),
     prisma.mBOMDetail.findMany({ where: { isDeleted: false }, select: { id: true, noReg: true, partId: true, parentDetailId: true } }),
@@ -1178,16 +1416,34 @@ async function loadContext(prisma, planNumber, options = {}) {
       select: { id: true, downtimeNumber: true, downtimeDate: true, machineCode: true, shift: true, startTime: true, endTime: true, durationMinutes: true, reason: true, category: true, status: true },
       orderBy: [{ downtimeDate: "asc" }, { downtimeNumber: "asc" }],
     }),
+    receiptPartCodes.length ? prisma.stockBalance.findMany({
+      where: { partCode: { in: receiptPartCodes }, stockType: "Finished Goods", isDeleted: false, OR: [{ qtyAvailable: { gt: 0 } }, { qtyReserved: { gt: 0 } }] },
+      select: {
+        id: true, warehouseCode: true, rackCode: true, lotNumber: true, partCode: true, uomCode: true,
+        qtyOnHand: true, qtyReserved: true, qtyQC: true, qtyAvailable: true, lastMovement: true, createdAt: true, updatedAt: true,
+        stockReservations: {
+          where: { isDeleted: false, status: "Active" },
+          select: { id: true, reservationNumber: true, reservationDate: true, qtyReserved: true, qtyReleased: true, referenceType: true, referenceNumber: true, status: true },
+          orderBy: [{ reservationDate: "asc" }, { reservationNumber: "asc" }],
+        },
+      },
+      orderBy: [{ lastMovement: "asc" }, { warehouseCode: "asc" }, { rackCode: "asc" }, { lotNumber: "asc" }],
+    }) : [],
+    buildProductionMaterialGate(prisma, plan),
   ]);
   const latest = new Map();
   headers.forEach((header) => { if (header.partId && !latest.has(header.partId)) latest.set(header.partId, header.noReg); });
   const noRegs = new Set(latest.values());
   const capacityRuleIndex = buildCapacityRuleIndex({ globalOverrides: calendarOverrides, planOverrides });
   const preset = withCapacityRuleIndex(configuredPreset, capacityRuleIndex);
+  const planningConstraintByTarget = await loadDemandPlanningConstraintMap(
+    prisma,
+    phases.map((phase) => phase.sourceDeliveryTargetId),
+  );
   return {
     plan, machines, headers: headers.filter((header) => noRegs.has(header.noReg)), bomDetails: bomDetails.filter((detail) => noRegs.has(detail.noReg)), routes: allRoutes.filter((route) => noRegs.has(route.noReg)),
-    phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes,
-    planningMode, scenarioKey, presetId: configuredPreset?.id || presetId, preset,
+    phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate,
+    planningMode, scenarioKey, presetId: configuredPreset?.id || presetId, preset, planningConstraintByTarget,
     capacityConstraintAudit: {
       rulePrecedence: ["PLAN_OVERRIDE", "SIMULATION_PRESET", "GLOBAL_CALENDAR"],
       globalCalendarRuleCount: calendarOverrides.length,
@@ -1200,7 +1456,7 @@ async function loadContext(prisma, planNumber, options = {}) {
 
 async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const context = await loadContext(prisma, planNumber, options);
-  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit } = context;
+  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit, planningConstraintByTarget } = context;
   const fgCompletionDaysBefore = Math.max(Math.trunc(number(options.flowRule?.delivery?.fgCompletionDaysBefore)), 0);
   const allowedStatuses = ["Draft", "Confirmed", "Released", "In Progress"];
   if (!allowedStatuses.includes(plan.status)) { const error = new Error(`Rekomendasi ${planningMode.toLowerCase()} tidak dapat dibuat saat MPP berstatus ${plan.status}.`); error.statusCode = 409; throw error; }
@@ -1251,8 +1507,23 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   // A calendar day that has passed is execution history. Treat historical
   // auto-allocation as firm input so re-running either Simulation or
   // Production never replaces it or schedules new work in the past.
-  const today = jakartaToday();
-  const executionFloor = Math.max(0, absoluteMinute(plan.periodStart, today, 0));
+  const currentClock = jakartaClock();
+  const today = currentClock.date;
+  const executionFloor = Math.max(0, absoluteMinute(plan.periodStart, currentClock.date, currentClock.minuteOfDay));
+  capacityConstraints.executionContext = {
+    timezone: "Asia/Jakarta",
+    asOfDate: dateKey(currentClock.date),
+    asOfTime: timeText(currentClock.minuteOfDay),
+    pastSchedulingBlocked: true,
+    currentUsePresetId: presetId || null,
+    currentUsePresetName: preset?.name || null,
+    includeSaturday: Boolean(preset?.includeSaturday),
+    includeSunday: Boolean(preset?.includeSunday),
+    existingPlanAllocationCount: existing.length,
+    externalAllocationCount: externalAllocations.length,
+    unlinkedDailyScheduleCount: unlinkedSchedules.length,
+    downtimeCount: downtimes.length,
+  };
   const planPartByLine = new Map((plan.details || []).map((detail) => [number(detail.lineNumber), detail.partCode]));
   // Once Production has released/started/completed a DPP, its originating
   // allocation becomes firm. Replanning an In Progress MPP only replaces the
@@ -1287,7 +1558,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       minuteOfDay(row.plannedEndTime, row.routingMode === "VENDOR" ? DAY_MINUTES : row.shift === "2" ? DAY_MINUTES : row.shift === "3" ? 480 : 960));
     manualCompletionByRoute.set(row.mbomProcessId, Math.max(number(manualCompletionByRoute.get(row.mbomProcessId)), completion));
   }
-  const jobs = phaseJobs(plan, plan.details, phases);
+  const jobs = combineSingleDeliveryBufferCampaigns(phaseJobs(plan, plan.details, phases, { finishedGoodStockBalances }));
   const generated = [];
   const blockers = [];
   const phaseResults = [];
@@ -1295,8 +1566,11 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const modes = ["NORMAL", preset?.algorithm?.allowParallel !== false ? "PARALLEL" : null, preset?.algorithm?.allowExtraShift !== false ? "TWO_SHIFT" : null, preset?.algorithm?.allowExtraShift !== false ? "THREE_SHIFT" : null, preset?.algorithm?.allowOvertime !== false ? "OVERTIME" : null].filter(Boolean);
 
   for (const job of jobs) {
-    const targetFgDue = job.targetType === "CUSTOMER" && fgCompletionDaysBefore > 0 ? addDays(job.due, -fgCompletionDaysBefore) : dateOnly(job.due);
+    job.planningDecision = planningConstraintByTarget.get(job.sourceDeliveryTargetId) || null;
+    const targetFgDue = job.fgRequiredDate ? dateOnly(job.fgRequiredDate) : job.targetType === "CUSTOMER" && fgCompletionDaysBefore > 0 ? addDays(job.due, -fgCompletionDaysBefore) : dateOnly(job.due);
     job.targetFgDue = targetFgDue;
+    const jobMaterialGate = materialGateForJob(materialGate, job);
+    job.materialGate = jobMaterialGate;
     if (job.configurationError) {
       blockers.push({
         phaseId: null, phaseNumber: null, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode,
@@ -1305,17 +1579,13 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           ? "Delivery Schedule MPS belum dibuat; sistem tidak membuat phase otomatis."
           : "Total qty Delivery Schedule MPS belum menutup qty MPS; lengkapi sisa qty phase.",
       });
-      phaseResults.push({ phaseId: null, phaseNumber: null, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), qty: round(job.qty), targetType: job.targetType, status: "BLOCKED", blocker: job.configurationError });
+      phaseResults.push({ phaseId: null, phaseNumber: null, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), qty: round(job.grossDemandQty ?? job.qty), productionQty: round(job.qty), stockCoverageQty: round(job.stockCoverageQty), targetType: job.targetType, status: "BLOCKED", blocker: job.configurationError });
       continue;
     }
-    // Delivery phases retain gross customer demand, while the MPP receipt
-    // target is stock-netted. Use the phase total as the distribution basis
-    // so all generated allocations add back exactly to each detail's MPP qty
-    // (for example demand 300, opening FG 20, production target 280).
-    const receiptQty = Math.max(
-      job.group.jobs.reduce((sum, phase) => sum + number(phase.qty), 0),
-      EPSILON,
-    );
+    // Customer phases are stock-netted in priority order before they reach the
+    // scheduler. Buffer is appended only after priority demand, so every route
+    // consumes the authoritative MPP production target instead of gross demand.
+    const receiptQty = Math.max(number(job.group.productionTargetQty), EPSILON);
     const groupKey = job.group.receipt.id;
     const receiptQtyBeforeJob = number(cumulativeQty.get(groupKey));
     const relatedRoutes = job.group.related.flatMap((detail) => {
@@ -1326,9 +1596,24 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     const graph = buildRouteGraph(relatedRoutes, headers, bomDetails);
     let attempt = null;
     const due = absoluteMinute(plan.periodStart, targetFgDue, DAY_MINUTES);
+    const materialReadyMinute = jobMaterialGate?.readyDate
+      ? Math.max(0, absoluteMinute(plan.periodStart, jobMaterialGate.readyDate, 0))
+      : executionFloor;
+    const materialExecutionFloor = Math.max(executionFloor, materialReadyMinute);
     const profile = String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase();
+    if (materialExecutionFloor >= due - EPSILON) {
+      attempt = {
+        failed: {
+          code: "MATERIAL_READY_AFTER_FG_DUE",
+          qty: job.qty,
+          materialReadyDate: jobMaterialGate?.readyDate || null,
+          materialReadySource: jobMaterialGate?.source || null,
+        },
+      };
+    }
     attemptModes:
     for (const mode of modes) {
+      if (attempt?.failed?.code === "MATERIAL_READY_AFTER_FG_DUE") break attemptModes;
       const configuredBatches = profile === "FULL_COMPLETION_SEQUENCE"
         ? splitTransferBatches(job.qty, 0)
         : profile === "SHIFT_CAPACITY_TRANSFER"
@@ -1338,7 +1623,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         const perRouteAttempt = scheduleFitFirstPerRoute({
           graph, batches: configuredBatches, receiptQty, receiptQtyBeforeJob,
           trialUsage: cloneUsage(usage), trialDiesUsage: cloneUsage(diesUsage), trialManualByRoute: new Map(manualByRoute), manualCompletionByRoute,
-          machineBySpecification, diesForRoute, mode, due, executionFloor, periodStart: plan.periodStart, periodEnd: plan.periodEnd, preset,
+          machineBySpecification, diesForRoute, mode, due, executionFloor: materialExecutionFloor, periodStart: plan.periodStart, periodEnd: plan.periodEnd, preset,
+          planningDecision: job.planningDecision,
         });
         if (!perRouteAttempt.failed) { attempt = { mode, ...perRouteAttempt }; break attemptModes; }
         attempt = { mode, ...perRouteAttempt };
@@ -1361,15 +1647,17 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           for (const task of graph.ordered) {
           const route = task.route;
           const predecessorRouteIds = [...(graph.predecessors.get(route.id) || [])];
-          const predecessorEnd = Math.max(executionFloor, ...predecessorRouteIds.map((id) => number(completionByRoute.get(id))));
+          const predecessorEnd = Math.max(materialExecutionFloor, ...predecessorRouteIds.map((id) => number(completionByRoute.get(id))));
           const predecessorDraftIndexes = normalizeLineageIndexes(predecessorRouteIds.map((id) => allocationIndexByRoute.get(id)), allocations.length);
-          const factor = number(task.detail.qtyPlanned) / receiptQty;
           const receiptQtyBeforeBatch = receiptQtyBeforeJob + batches.slice(0, batchIndex).reduce((sum, value) => sum + number(value), 0);
-          let qty = generatedBatchQuantity(batches[batchIndex], receiptQtyBeforeBatch, factor > 0 ? factor : 1, task.detail.uomCode);
+          const receiptBatchQty = number(batches[batchIndex]);
+          let qty = priorityNetBatchQuantity(receiptBatchQty, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptQty, task.detail.uomCode);
+          let manualConsumedQty = 0;
           const manualRemaining = Math.max(number(trialManualByRoute.get(route.id)), 0);
           if (manualRemaining > EPSILON) {
             const consumed = Math.min(qty, manualRemaining);
             qty -= consumed;
+            manualConsumedQty = consumed;
             trialManualByRoute.set(route.id, manualRemaining - consumed);
           }
           if (qty <= EPSILON) {
@@ -1377,11 +1665,11 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
             continue;
           }
           if (routeMode(route) === "VENDOR") {
-            const duration = Math.max(leadMinutes(route), 1);
+            const duration = Math.max(leadMinutes(route, job.planningDecision), 1);
             const start = predecessorEnd;
             const end = start + duration;
             if (end > due + EPSILON) { failed = { code: "VENDOR_LEAD_TIME_LATE", route, qty }; break; }
-            allocations.push({ task, qty, start, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: batchIndex + 1 });
+            allocations.push({ task, qty, start, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: batchIndex + 1, receiptBatchQty, receiptQtyBeforeBatch, manualConsumedQty });
             allocationIndexByRoute.set(route.id, allocations.length - 1);
             completionByRoute.set(route.id, end);
             continue;
@@ -1405,7 +1693,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
           occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
           occupyDies(trialDiesUsage, placement.dies?.id, placement);
-          allocations.push({ task, qty, ...placement, predecessorDraftIndexes, batchNumber: batchIndex + 1 });
+          allocations.push({ task, qty, ...placement, predecessorDraftIndexes, batchNumber: batchIndex + 1, receiptBatchQty, receiptQtyBeforeBatch, manualConsumedQty });
           allocationIndexByRoute.set(route.id, allocations.length - 1);
           completionByRoute.set(route.id, placement.end);
           }
@@ -1418,8 +1706,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       }
     }
     if (attempt.failed) {
-      blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode, code: attempt.failed.code, processCode: attempt.failed.route?.process?.processCode || null, machineSpecificationCode: attempt.failed.specificationCode || null, qty: round(attempt.failed.qty) });
-      phaseResults.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), qty: round(job.qty), targetType: job.targetType, status: "BLOCKED", blocker: attempt.failed.code });
+      blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode, code: attempt.failed.code, classification: attempt.failed.code === "CAPACITY_BEFORE_DUE_UNAVAILABLE" ? "CAPACITY_LATE" : attempt.failed.code, earliestFeasibleCompletion: null, processCode: attempt.failed.route?.process?.processCode || null, machineSpecificationCode: attempt.failed.specificationCode || null, qty: round(attempt.failed.qty), materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null });
+      for (const segment of resultSegmentsForJob(job)) phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.productionQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), targetType: segment.targetType, status: "BLOCKED", blocker: attempt.failed.code, materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null, supplierScheduleConfirmed: Boolean(jobMaterialGate?.confirmed) });
       continue;
     }
     const lanesByRoute = new Map();
@@ -1433,6 +1721,10 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     const generatedBaseIndex = generated.length;
     const phaseLineagePrefix = `phase:${job.id || `${groupKey}:${dateKey(job.due)}`}`;
     const draftLineageKeys = attempt.allocations.map((draft, index) => `${phaseLineagePrefix}:batch:${draft.batchNumber}:route:${draft.task.route.id}:allocation:${index + 1}`);
+    const allocationCountByRoute = attempt.allocations.reduce((counts, allocation) => {
+      counts.set(allocation.task.route.id, number(counts.get(allocation.task.route.id)) + 1);
+      return counts;
+    }, new Map());
     for (let draftIndex = 0; draftIndex < attempt.allocations.length; draftIndex += 1) {
       const draft = attempt.allocations[draftIndex];
       const predecessorDraftIndexes = normalizeLineageIndexes(draft.predecessorDraftIndexes, attempt.allocations.length);
@@ -1440,11 +1732,102 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const lineageKey = draftLineageKeys[draftIndex];
       const predecessorLineageKeys = predecessorDraftIndexes.map((index) => draftLineageKeys[index]).filter(Boolean);
       const baseScoreAudit = draft.recommendationScoreBreakdown || { model: SCORING_MODEL, score: null, breakdown: {}, factors: {}, context: {} };
+      const transferBatchReceiptQty = number(draft.receiptBatchQty ?? attempt.batches?.[Math.max(number(draft.batchNumber) - 1, 0)]);
+      const receiptQtyBeforeBatch = draft.receiptQtyBeforeBatch == null
+        ? receiptQtyBeforeJob + (attempt.batches || []).slice(0, Math.max(number(draft.batchNumber) - 1, 0)).reduce((sum, value) => sum + number(value), 0)
+        : number(draft.receiptQtyBeforeBatch);
+      const routeRequirementQty = number(draft.task.detail.qtyPlanned);
+      const routeFactor = routeRequirementQty / Math.max(receiptQty, EPSILON);
+      const allocationUomCode = draft.task.detail.uomCode || null;
       const recommendationScoreBreakdown = {
         ...baseScoreAudit,
         audit: {
           ...(baseScoreAudit.audit || {}),
           lineage: { key: lineageKey, predecessorKeys: predecessorLineageKeys, transferBatchNumber: draft.batchNumber },
+          demandTrace: {
+            sourceType: job.sourceType || null,
+            sourceNumber: job.sourceNumber || null,
+            customerCode: job.customerCode || job.targetCode || null,
+            deliveryPhaseId: job.id || null,
+            deliveryPhaseNumber: job.phaseNumber || null,
+            customerTargetDate: dateKey(job.due),
+            fgRequiredDate: dateKey(targetFgDue),
+            grossDemandQty: round(job.grossDemandQty ?? job.qty),
+            stockCoverageQty: round(job.stockCoverageQty),
+            productionQty: round(job.qty),
+            requestedBufferQty: round(job.requestedBufferQty),
+            isBufferStock: Boolean(job.isBufferStock),
+            prioritySequence: job.prioritySequence || null,
+            priorityClass: job.priorityClass || null,
+            priorityScore: job.priorityScore == null ? null : round(job.priorityScore, 2),
+            campaignSegments: job.campaignSegments || [],
+          },
+          quantityCalculation: {
+            allocationMethod: "PRIORITY_STOCK_FIRST_THEN_BUFFER_SHIFT_CAPACITY",
+            quantityPolicy: job.quantityPolicy || null,
+            phaseDemandQty: round(job.qty),
+            grossDemandQty: round(job.grossDemandQty ?? job.qty),
+            fgStockCoverageQty: round(job.stockCoverageQty),
+            fgStockCoverageHistory: job.stockCoverageHistory || [],
+            fgStockCoverageHistoryUntracedQty: round(job.stockCoverageHistoryUntracedQty),
+            requestedBufferQty: round(job.requestedBufferQty),
+            isBufferStock: Boolean(job.isBufferStock),
+            prioritySequence: job.prioritySequence || null,
+            totalFgReceiptBasisQty: round(receiptQty),
+            receiptQtyBeforePhase: round(receiptQtyBeforeJob),
+            receiptQtyBeforeBatch: round(receiptQtyBeforeBatch),
+            transferBatchNumber: draft.batchNumber,
+            transferBatchReceiptQty: round(transferBatchReceiptQty),
+            fgReceiptUomCode: job.group.receipt.uomCode || null,
+            routeRequirementQty: round(routeRequirementQty),
+            routeFactor: round(routeFactor, 6),
+            priorityCappedRouteNetting: routeRequirementQty <= receiptQty + EPSILON,
+            routeQtyConsumedBeforeBatch: round(routeRequirementQty <= receiptQty + EPSILON
+              ? Math.min(receiptQtyBeforeBatch, routeRequirementQty)
+              : normalizeQuantity(receiptQtyBeforeBatch * routeFactor, allocationUomCode)),
+            routeQtyRemainingBeforeBatch: round(Math.max(routeRequirementQty - (routeRequirementQty <= receiptQty + EPSILON
+              ? Math.min(receiptQtyBeforeBatch, routeRequirementQty)
+              : normalizeQuantity(receiptQtyBeforeBatch * routeFactor, allocationUomCode)), 0)),
+            generatedQtyBeforeManualAllocation: round(number(draft.qty) + number(draft.manualConsumedQty)),
+            manualAllocationConsumedQty: round(draft.manualConsumedQty),
+            calculatedAllocationQty: round(draft.qty),
+            uomCode: allocationUomCode,
+            discreteRoundingApplied: isDiscreteUom(allocationUomCode),
+            formula: `${routeRequirementQty <= receiptQty + EPSILON
+              ? "min(priority/buffer batch, remaining route net requirement)"
+              : isDiscreteUom(allocationUomCode)
+                ? "round((receipt before + transfer batch) x BOM factor) - round(receipt before x BOM factor)"
+                : "transfer batch x BOM factor"}${number(draft.manualConsumedQty) > EPSILON ? " - existing manual allocation" : ""}`,
+          },
+          scheduleDecision: {
+            algorithmProfile: String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase(),
+            attemptMode: attempt.mode,
+            capacityMode,
+            machineId: draft.machine?.id || null,
+            machineCode: draft.machine?.machineCode || null,
+            diesId: draft.dies?.id || null,
+            diesCode: draft.dies?.diesCode || null,
+            shift: draft.shift,
+            scheduleDate: dateKey(dateFromAbsolute(plan.periodStart, draft.start)),
+            plannedStartTime: timeText(draft.start),
+            completionDate: dateKey(dateFromAbsolute(plan.periodStart, draft.end)),
+            plannedEndTime: timeText(draft.end),
+            batchingPolicy: "FULL_LOT_FIRST_SPLIT_ONLY_IF_SLOT_CAPACITY_REQUIRES",
+            fullLotPreserved: number(allocationCountByRoute.get(draft.task.route.id)) === 1,
+            transferBatchCount: number(allocationCountByRoute.get(draft.task.route.id)),
+            batchingReason: number(allocationCountByRoute.get(draft.task.route.id)) === 1
+              ? (job.hasBufferCampaign
+                ? "Demand customer dan buffer dikonsolidasikan menjadi satu production campaign karena route masih muat pada satu slot/shift."
+                : "Qty demand masih muat pada satu slot/shift, sehingga batch dipertahankan utuh.")
+              : "Qty utuh pada route ini tidak memiliki slot yang cukup sebelum due date; split dipakai sebagai fallback kapasitas shift.",
+          },
+          materialReadiness: {
+            readyDate: jobMaterialGate?.readyDate || null,
+            source: jobMaterialGate?.source || null,
+            supplierScheduleConfirmed: Boolean(jobMaterialGate?.confirmed),
+            suggestionNumber: jobMaterialGate?.suggestionNumber || materialGate?.suggestionNumber || null,
+            criticalItems: jobMaterialGate?.criticalItems || [],
+          },
         },
       };
       generated.push({ ...draft, recommendationScoreBreakdown, phase: job, mode: attempt.mode, capacityMode, predecessorToken, lineageKey, predecessorLineageKeys });
@@ -1452,9 +1835,13 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     for (const [key, value] of attempt.usage) usage.set(key, value);
     for (const [key, value] of attempt.diesUsage || []) diesUsage.set(key, value);
     manualByRoute = attempt.manualByRoute;
-    cumulativeQty.set(groupKey, number(cumulativeQty.get(groupKey)) + job.qty);
     const allocationScores = attempt.allocations.map((allocation) => number(allocation.recommendationScore)).filter((score) => score > 0);
-    phaseResults.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), qty: round(job.qty), cumulativeQty: round(cumulativeQty.get(groupKey)), targetType: job.targetType, status: "COVERED", capacityMode, laneCount, algorithmProfile: String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase(), scoringModel: SCORING_MODEL, averageAllocationScore: allocationScores.length ? round(allocationScores.reduce((sum, score) => sum + score, 0) / allocationScores.length, 2) : null, minimumAllocationScore: allocationScores.length ? round(Math.min(...allocationScores), 2) : null, transferBatchCount: attempt.batches.length, transferBatchQty: round(Math.max(...attempt.batches, 0)) });
+    let runningCumulativeQty = number(cumulativeQty.get(groupKey));
+    for (const segment of resultSegmentsForJob(job)) {
+      runningCumulativeQty += number(segment.productionQty ?? segment.qty);
+      phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.productionQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), stockCoverageHistory: segment.stockCoverageHistory || [], requestedBufferQty: round(segment.requestedBufferQty), isBufferStock: Boolean(segment.isBufferStock), prioritySequence: segment.prioritySequence || null, cumulativeQty: round(runningCumulativeQty), targetType: segment.targetType, status: "COVERED", capacityMode, laneCount, algorithmProfile: String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase(), scoringModel: SCORING_MODEL, averageAllocationScore: allocationScores.length ? round(allocationScores.reduce((sum, score) => sum + score, 0) / allocationScores.length, 2) : null, minimumAllocationScore: allocationScores.length ? round(Math.min(...allocationScores), 2) : null, transferBatchCount: attempt.batches.length, transferBatchQty: round(Math.max(...attempt.batches, 0)), materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null, supplierScheduleConfirmed: Boolean(jobMaterialGate?.confirmed) });
+    }
+    cumulativeQty.set(groupKey, runningCumulativeQty);
   }
 
   const scoringSummary = summarizeAllocationScoring(generated);
@@ -1485,23 +1872,45 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         const uomCode = item.task.detail.uomCode || null;
         const plannedQty = normalizeQuantity(round(item.qty), uomCode);
         const hasRecommendationScore = Number.isFinite(Number(item.recommendationScore));
+        const materialReadyText = item.phase.materialGate?.readyDate
+          ? dateKey(item.phase.materialGate.readyDate)
+          : "tidak dibatasi";
+        const quantityReason = item.phase.hasBufferCampaign
+          ? `Campaign ${round(item.phase.qty)} = demand customer ${round(item.phase.campaignSegments?.[0]?.productionQty)} + buffer ${round(item.phase.campaignSegments?.[1]?.productionQty)}; stock FG ${round(item.phase.stockCoverageQty)} sudah dinetting sebelum produksi`
+          : `Urutan ${item.phase.prioritySequence || "buffer"}: gross ${round(item.phase.grossDemandQty ?? item.phase.qty)} - stock FG ${round(item.phase.stockCoverageQty)} = produksi ${round(item.phase.qty)}`;
         const created = await tx.productionPlanAllocation.create({ data: {
           planId: plan.id, lineNumber: item.task.detail.lineNumber, mbomProcessId: route.id, scheduleDate,
           shift: item.shift, plannedStartTime: timeText(item.start), plannedEndTime: timeText(item.end),
           machineId: item.machine?.id || null, diesId: item.dies?.id || null, routingMode: routeMode(route), vendorId: routeMode(route) === "VENDOR" ? route.vendorId : null,
           vendorSendDate: routeMode(route) === "VENDOR" ? scheduleDate : null,
           vendorReturnDate: routeMode(route) === "VENDOR" ? dateFromAbsolute(plan.periodStart, item.end) : null,
-          vendorLeadTimeDays: routeMode(route) === "VENDOR" ? Math.ceil(leadMinutes(route) / DAY_MINUTES) : null,
+          vendorLeadTimeDays: routeMode(route) === "VENDOR" ? leadMinutes(route, item.phase.planningDecision) / DAY_MINUTES : null,
           expectedReturnQty: routeMode(route) === "VENDOR" ? plannedQty : null,
           plannedQty, uomCode, status: "Draft",
           notes: `[AUTO-RECOMMENDATION:${VERSION}] ${item.phase.isBufferStock ? "Internal buffer stock" : `Delivery phase ${item.phase.phaseNumber}`}; transfer batch ${item.batchNumber}; [LINEAGE:${item.lineageKey}]`,
           allocationSource: "AUTO_RECOMMENDATION", planningMode, scenarioKey,
           recommendationScore: hasRecommendationScore ? round(item.recommendationScore, 2) : null,
-          recommendationScoreBreakdown: item.recommendationScoreBreakdown || null,
+          recommendationScoreBreakdown: routeMode(route) === "VENDOR"
+            ? {
+                ...(item.recommendationScoreBreakdown || {}),
+                audit: {
+                  ...(item.recommendationScoreBreakdown?.audit || {}),
+                  vendorPlanning: effectiveVendorLeadTime(route, item.phase.planningDecision, 8),
+                  planningDecisionTargetId: item.phase.planningDecision?.planningDecisionTargetId || null,
+                  sourceDeliveryTargetId: item.phase.sourceDeliveryTargetId || null,
+                },
+              }
+            : item.recommendationScoreBreakdown || null,
           recommendationReason: hasRecommendationScore
-            ? `Score ${round(item.recommendationScore, 2)}/100; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; ${item.capacityMode}; predecessor siap ${timeText(item.start)}`
-            : `Rule-based ${routeMode(route).toLowerCase()} allocation; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; predecessor siap ${timeText(item.start)}`,
+            ? `Score ${round(item.recommendationScore, 2)}/100; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); ${item.capacityMode}; predecessor siap ${timeText(item.start)}`
+            : `Rule-based ${routeMode(route).toLowerCase()} allocation; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); predecessor siap ${timeText(item.start)}`,
           capacityMode: item.capacityMode, deliveryPhaseId: item.phase.id, deliveryPhaseNumber: item.phase.phaseNumber,
+          demandSourceType: item.phase.sourceType || null, demandSourceNumber: item.phase.sourceNumber || null,
+          customerCode: item.phase.customerCode || null, customerTargetDate: item.phase.due || null,
+          fgRequiredDate: item.phase.targetFgDue || item.phase.fgRequiredDate || null,
+          priorityScore: item.phase.priorityScore || null, priorityClass: item.phase.priorityClass || null,
+          latestFinishDate: item.phase.targetFgDue || item.phase.due || null,
+          latestStartDate: dateFromAbsolute(plan.periodStart, Math.max(0, absoluteMinute(plan.periodStart, item.phase.targetFgDue || item.phase.due, DAY_MINUTES) - Math.max(item.end - item.start, 1))),
           transferBatchNumber: item.batchNumber, predecessorAllocationIds: predecessorIds, createdBy: options.actor || "system",
         } });
         createdIds.push(created.id); persisted.push(created);
@@ -1536,7 +1945,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       }
       const previousSummary = plan.recommendationSummary && typeof plan.recommendationSummary === "object" && !Array.isArray(plan.recommendationSummary) ? plan.recommendationSummary : {};
       const capacityFlowRule = previousSummary.capacityFlowRule || (options.flowRule ? { active: options.flowRule } : null);
-      const summary = { ...previousSummary, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS, scoringSummary, capacityConstraints, averageAllocationScore: scoringSummary.averageScore, minimumAllocationScore: scoringSummary.minimumScore, allocationCount: persisted.length, phaseCount: phaseResults.length, coveredPhaseCount: phaseResults.filter((row) => row.status === "COVERED").length, blockerCount: blockers.length, phaseResults, blockers, ...(capacityFlowRule ? { capacityFlowRule } : {}) };
+      const summary = { ...previousSummary, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS, scoringSummary, capacityConstraints, materialGate, averageAllocationScore: scoringSummary.averageScore, minimumAllocationScore: scoringSummary.minimumScore, allocationCount: persisted.length, phaseCount: phaseResults.length, coveredPhaseCount: phaseResults.filter((row) => row.status === "COVERED").length, blockerCount: blockers.length, phaseResults, blockers, ...(capacityFlowRule ? { capacityFlowRule } : {}) };
       if (planningMode === "PRODUCTION") await tx.monthlyProductionPlan.update({ where: { id: plan.id }, data: { recommendationGeneratedAt: new Date(), recommendationVersion: VERSION, recommendationSummary: summary } });
     });
   }
@@ -1546,6 +1955,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     planNumber, planningMode, scenarioKey, presetId, presetName: preset?.name || null, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS,
     scoringSummary,
     capacityConstraints,
+    materialGate,
     allocationCount: options.persist === false ? generated.length : persisted.length,
     firmAllocationCount: firmAllocationIds.size,
     preservedCompletedDppCount: (linkedSchedules || []).filter((row) => row.status === "Completed").length,
@@ -1553,6 +1963,11 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       partCode: row.task.detail.partCode, processCode: row.task.route.process?.processCode || null,
       qty: round(row.qty), phaseNumber: row.phase.phaseNumber, batchNumber: row.batchNumber,
       machineCode: row.machine?.machineCode || null, shift: row.shift,
+      scheduleDate: dateKey(dateFromAbsolute(plan.periodStart, row.start)),
+      plannedStartTime: timeText(row.start),
+      completionDate: dateKey(dateFromAbsolute(plan.periodStart, row.end)),
+      plannedEndTime: timeText(row.end),
+      materialReadyDate: row.phase.materialGate?.readyDate ? dateKey(row.phase.materialGate.readyDate) : null,
       diesCode: row.dies?.diesCode || null, recommendationScore: row.recommendationScore, recommendationScoreBreakdown: row.recommendationScoreBreakdown,
       lineageKey: row.lineageKey, predecessorLineageKeys: row.predecessorLineageKeys,
     })) } : {}),
@@ -1570,8 +1985,11 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
 module.exports = {
   recommendMonthlyCapacity,
   generatedBatchQuantity,
+  priorityNetBatchQuantity,
+  allocateStockCoverage,
   customerDemandQuantity,
   phaseJobs,
+  combineSingleDeliveryBufferCampaigns,
   splitFlowBatches,
   fitFirstBatchStrategies,
   shiftCapacityTransferQuantity,

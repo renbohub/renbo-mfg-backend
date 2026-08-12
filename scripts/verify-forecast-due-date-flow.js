@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const controller = require("../src/prisma/controllers/planning/MRPController");
 const { DEFAULT_FORMULAS, evaluateFormula } = require("../src/prisma/services/masterFormulaService");
+const { procurementSchedule } = require("../src/prisma/services/planning/procurementSchedulingService");
 
 const checks = [];
 function check(name, condition) {
@@ -29,6 +30,19 @@ check("MRP creates one bucket per forecast delivery phase", expanded.length === 
 check("MRP preserves first phase due date and quantity", expanded[0].endDate.toISOString().slice(0, 10) === "2026-08-15" && expanded[0].forecastQty === 100);
 check("MRP preserves second phase due date and quantity", expanded[1].endDate.toISOString().slice(0, 10) === "2026-08-25" && expanded[1].forecastQty === 200);
 check("MRP phase split preserves total demand", expanded.reduce((sum, row) => sum + row.forecastQty, 0) === detail.forecastQty);
+const pegging = controller.__test.demandPeggingForPhase({
+  qtyPlanned: "25.50",
+  partCode: "FG-TEST",
+  deliveryPhaseId: "target-1",
+  demandSources: [{
+    sourceType: "FORECAST",
+    sourceNumber: "FCT-TEST",
+    sourcePegging: [{ deliveryTargetId: "target-1", qty: "25.50" }],
+  }],
+});
+check("MRP delivery-phase pegging safely converts numeric quantities", pegging.length === 1 && pegging[0].qty === 25.5);
+const phasedPurchaseDates = procurementSchedule({ materialRequiredDate: "2026-09-15T00:00:00.000Z", supplierLeadTimeDays: 7, asOf: "2026-08-11T00:00:00.000Z" });
+check("Procurement schedule separates supplier arrival, PO and PR dates", phasedPurchaseDates.supplierRequiredArrivalDate.toISOString().slice(0, 10) === "2026-09-11" && phasedPurchaseDates.latestPoDate.toISOString().slice(0, 10) === "2026-09-02" && phasedPurchaseDates.latestPrDate.toISOString().slice(0, 10) === "2026-08-31");
 const materialAliasA = { itemType: "RAW", rawType: "MATERIAL", materialId: "material-1", material: { materialCode: "SPHC" } };
 const materialAliasB = { ...materialAliasA };
 check("Raw part aliases share one planning stock key", controller.__test.planningStockKey("RAW-A", materialAliasA) === controller.__test.planningStockKey("RAW-B", materialAliasB));
@@ -55,7 +69,15 @@ check("MPS exposes persisted BOM hierarchy for generated child rows", mpsSource.
 check("MPS detail renders a fixed BOM tree instead of alphabetical part groups", ppicDetailSource.includes('fixedGrouping: true') && ppicDetailSource.includes('data-bom-level='));
 check("Monthly MPS uses next forecast month as buffer look-ahead", monthlySource.includes("forecastLookahead") && monthlySource.includes("nextForecastKey"));
 check("Monthly MPS keeps unprocessed forecast periods Partial Product", monthlySource.includes("partialForecasts") && monthlySource.includes('data: { status: "Partial Product" }'));
-check("Purchase Suggestion matches the exact delivery phase date", suggestionSource.includes("matchingDeliveryPlans.length"));
+check(
+  "Purchase Suggestion matches delivery phase by target lineage, not material due date",
+  suggestionSource.includes("deliveryTargetIds.has(plan.sourceDeliveryTargetId)")
+    && !suggestionSource.includes("requirementDays.has(day(plan.plannedDate))"),
+);
+check(
+  "Purchase Suggestion routing quantity includes MPS buffer production",
+  suggestionSource.indexOf("const mpsQty") < suggestionSource.indexOf("const uniquePlans"),
+);
 
 for (const result of checks) console.log(`${result.ok ? "PASS" : "FAIL"} ${result.name}`);
 if (checks.some((result) => !result.ok)) process.exitCode = 1;

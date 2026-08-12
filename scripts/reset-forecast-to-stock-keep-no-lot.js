@@ -10,12 +10,15 @@ const { prisma } = require("../src/prisma");
 const execute = process.argv.includes("--execute");
 
 const DELETE_ALL_DELEGATES = [
+  "productionLogCarryover",
+  "productionLogCoilPhase",
   "incomingInspectionDetail",
   "incomingInspection",
   "purchaseInvoicePayment",
   "purchaseInvoiceDetail",
   "purchaseInvoicePO",
   "purchaseInvoice",
+  "goodsReceiptAllocation",
   "goodsReceiptDetail",
   "goodsReceipt",
   "purchaseOrderComment",
@@ -59,6 +62,9 @@ const DELETE_ALL_DELEGATES = [
   "mPSDeliveryPlan",
   "mPSDetail",
   "mPS",
+  "dueDateRecoveryPlan",
+  "dPPDisplacementProposal",
+  "demandPlanningDecision",
   "demandDeliveryTarget",
   "deliveryScheduleDetail",
   "deliverySchedule",
@@ -74,6 +80,9 @@ const DELETE_ALL_DELEGATES = [
 const TRANSACTION_APPROVAL_TYPES = [
   "Forecast",
   "SalesOrder",
+  "DemandPlanning",
+  "DueDateRecoveryPlan",
+  "DPPDisplacementProposal",
   "MPS",
   "MRP",
   "PurchaseSuggestion",
@@ -97,6 +106,9 @@ const TRANSACTION_APPROVAL_TYPES = [
 const TRANSACTION_NOTIFICATION_TYPES = [
   "forecast",
   "sales_order",
+  "demand_planning",
+  "due_date_recovery",
+  "dpp_displacement",
   "mps",
   "mrp",
   "purchase_suggestion",

@@ -9,6 +9,8 @@ const {
 } = require("../../utils/routingSequence");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
 const { intervalsOverlap, isDiesCapacityBlockingEnabled, isDiesTonnageCompatible, isPressResource, maintenanceInterval, plannedInterval } = require("./diesCapacityService");
+const { buildProductionMaterialGate, materialGateForJob } = require("./materialReadinessService");
+const { loadDemandPlanningConstraintMap, effectiveVendorLeadTime } = require("./demandPlanningConstraintService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 2) => Number(number(value).toFixed(digits));
@@ -263,6 +265,53 @@ function allocationStartMoment(allocation = {}) {
   return String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
     ? allocationMoment(allocation.vendorSendDate || allocation.scheduleDate, allocation.plannedStartTime, false)
     : allocationMoment(allocation.scheduleDate, allocation.plannedStartTime, false);
+}
+
+function allocationFinishMoment(allocation = {}) {
+  return String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
+    ? allocationMoment(allocation.vendorReturnDate || allocation.scheduleDate, allocation.plannedEndTime, true)
+    : allocationMoment(allocation.scheduleDate, allocation.plannedEndTime, true);
+}
+
+function resolveVendorReturnDeadline(allocation = {}, allocations = []) {
+  const directSuccessors = allocations
+    .filter((candidate) => {
+      const predecessorIds = Array.isArray(candidate?.predecessorAllocationIds)
+        ? candidate.predecessorAllocationIds.map(String)
+        : [];
+      return predecessorIds.includes(String(allocation.id))
+        && candidate?.plan?.planNumber === allocation?.plan?.planNumber;
+    })
+    .map((candidate) => ({ allocation: candidate, deadline: allocationStartMoment(candidate) }))
+    .filter((candidate) => Number.isFinite(candidate.deadline.getTime()))
+    .sort((left, right) => left.deadline - right.deadline || String(left.allocation.id).localeCompare(String(right.allocation.id)));
+
+  if (directSuccessors.length) {
+    const successor = directSuccessors[0];
+    return {
+      deadline: successor.deadline,
+      source: "SUCCESSOR_START",
+      successorAllocationId: successor.allocation.id,
+      successorProcessCode: successor.allocation.mbomProcess?.process?.processCode || null,
+    };
+  }
+
+  // Child MPP requiredDate is the beginning of the full production chain, not
+  // a vendor-return deadline. A terminal vendor route instead uses the
+  // authoritative backward-pass/FG deadline stored on the allocation.
+  const fallback = [
+    [allocation.latestFinishDate, "ROUTE_LATEST_FINISH"],
+    [allocation.fgRequiredDate, "FG_REQUIRED"],
+    [allocation.customerTargetDate, "CUSTOMER_TARGET"],
+  ].find(([value]) => value);
+  if (!fallback) return null;
+
+  return {
+    deadline: allocationMoment(fallback[0], null, true),
+    source: fallback[1],
+    successorAllocationId: null,
+    successorProcessCode: null,
+  };
 }
 
 function compareAllocationConsumptionOrder(left, right) {
@@ -620,6 +669,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   ]));
 
   const planNumbers = [...new Set(planDetails.map((detail) => detail.plan.planNumber).filter(Boolean))];
+  const selectedPlan = planNumber ? planDetails.find((detail) => detail.plan.planNumber === planNumber)?.plan : null;
+  const materialGate = selectedPlan
+    ? await buildProductionMaterialGate(prisma, selectedPlan)
+    : null;
   const sourceMpsNumbers = [...new Set(planDetails
     .map((detail) => String(detail.plan.sourceType || "").startsWith("MPS:") ? String(detail.plan.sourceType).slice(4) : null)
     .filter(Boolean))];
@@ -649,6 +702,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }],
     })
     : [];
+  const planningConstraintByTarget = await loadDemandPlanningConstraintMap(
+    prisma,
+    deliveryPhases.map((phase) => phase.sourceDeliveryTargetId),
+  );
   const productionPlanAllocations = planNumbers.length && typeof prisma.productionPlanAllocation?.findMany === "function"
     ? await prisma.productionPlanAllocation.findMany({
       where: {
@@ -688,6 +745,17 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         capacityMode: true,
         deliveryPhaseId: true,
         deliveryPhaseNumber: true,
+        demandSourceType: true,
+        demandSourceNumber: true,
+        customerCode: true,
+        customerTargetDate: true,
+        fgRequiredDate: true,
+        priorityScore: true,
+        priorityClass: true,
+        latestStartDate: true,
+        latestFinishDate: true,
+        capacityLate: true,
+        earliestFeasibleCompletion: true,
         transferBatchNumber: true,
         predecessorAllocationIds: true,
         plan: { select: { planNumber: true, status: true } },
@@ -741,6 +809,27 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     }
     if (!range.dates.includes(dateKey(allocation.scheduleDate))) {
       pushIssue(issues, { ...common, severity: "blocking", category: "CALENDAR", code: "PLAN_ALLOCATION_OUTSIDE_HORIZON", message: `Tanggal allocation ${dateKey(allocation.scheduleDate)} berada di luar horizon Capacity Planning.`, resolution: "Pindahkan allocation ke periode MPP atau perluas horizon." }, issueKeys);
+    }
+
+    const allocationMaterialGate = materialGateForJob(materialGate, {
+      id: allocation.deliveryPhaseId,
+      sourceDeliveryTargetId: deliveryPhases.find((phase) => phase.id === allocation.deliveryPhaseId)?.sourceDeliveryTargetId || null,
+    });
+    if (allocationMaterialGate?.readyDate && dateKey(allocation.scheduleDate) < dateKey(allocationMaterialGate.readyDate)) {
+      const confirmedLabel = allocationMaterialGate.confirmed
+        ? "jadwal delivery supplier terkonfirmasi"
+        : "due date sistem Purchase Suggestion (fallback karena supplier belum confirm)";
+      pushIssue(issues, {
+        ...common,
+        severity: "blocking",
+        category: "MATERIAL",
+        code: "PLAN_START_BEFORE_MATERIAL_READY",
+        message: `${detail?.partCode || "Part"} dijadwalkan mulai ${dateKey(allocation.scheduleDate)}, sebelum material siap ${dateKey(allocationMaterialGate.readyDate)} berdasarkan ${confirmedLabel}.`,
+        resolution: "Jalankan ulang Auto Allocation setelah supplier mengubah konfirmasi, atau geser proses pertama ke tanggal material siap.",
+        materialReadyDate: allocationMaterialGate.readyDate,
+        materialReadySource: allocationMaterialGate.source,
+        suggestionNumber: allocationMaterialGate.suggestionNumber || materialGate?.suggestionNumber || null,
+      }, issueKeys);
     }
 
     const vendorMode = String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR";
@@ -1189,23 +1278,40 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     }
     if (String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
       const vendor = vendorById.get(allocation.vendorId);
+      const deliveryPhase = deliveryPhases.find((phase) => phase.id === allocation.deliveryPhaseId);
+      const planningDecision = planningConstraintByTarget.get(deliveryPhase?.sourceDeliveryTargetId) || null;
+      const masterRoute = activeRoutes.find((route) => route.id === allocation.mbomProcessId) || null;
+      const vendorPlanning = effectiveVendorLeadTime(masterRoute || { vendor }, planningDecision, 8);
       const sendDate = allocation.vendorSendDate || allocation.scheduleDate;
       const returnDate = allocation.vendorReturnDate || allocation.scheduleDate;
       const plannedLeadTimeDays = Math.max(Math.ceil((parseDateOnly(returnDate) - parseDateOnly(sendDate)) / DAY_MS), 0);
-      const requiredDate = allocationDetail?.requiredDate || allocationDetail?.plan?.periodEnd;
+      const returnDeadline = resolveVendorReturnDeadline(allocation, productionPlanAllocations);
+      const requiredDate = returnDeadline?.deadline || null;
       const returnQty = number(allocation.expectedReturnQty ?? allocation.plannedQty);
-      const isLate = requiredDate && parseDateOnly(returnDate) > parseDateOnly(requiredDate);
-      const leadTimeShort = number(allocation.vendorLeadTimeDays ?? vendor?.leadTimeDays) > plannedLeadTimeDays;
+      const returnMoment = allocationFinishMoment(allocation);
+      const isLate = requiredDate && returnMoment > requiredDate;
+      const effectivePlanningLeadTimeDays = vendorPlanning.planningDays || number(allocation.vendorLeadTimeDays ?? vendor?.leadTimeDays);
+      const leadTimeShort = effectivePlanningLeadTimeDays > plannedLeadTimeDays;
       if (["Confirmed", "Released", "In Progress"].includes(allocation.plan.status) && isLate) {
+        const deadlineLabel = returnDeadline.source === "SUCCESSOR_START"
+          ? `proses berikutnya ${returnDeadline.successorProcessCode || "successor"} mulai`
+          : "batas selesai routing/FG";
         pushIssue(issues, {
           severity: "blocking",
+          category: "VENDOR",
           code: "VENDOR_RETURN_AFTER_REQUIRED_DATE",
+          allocationId: allocation.id,
           planNumber: allocation.plan.planNumber,
           lineNumber: allocation.lineNumber,
           partCode: allocationDetail?.partCode || null,
           processCode: allocation.mbomProcess?.process?.processCode || null,
           routeId: allocation.mbomProcessId,
-          message: `${allocationDetail?.partCode || "Part"} · return vendor ${dateKey(returnDate)} melewati required date ${dateKey(requiredDate)}.`,
+          successorAllocationId: returnDeadline.successorAllocationId,
+          deadlineSource: returnDeadline.source,
+          message: `${allocationDetail?.partCode || "Part"} · return vendor ${dateKey(returnDate)} melewati ${deadlineLabel} ${dateKey(requiredDate)}.`,
+          resolution: returnDeadline.source === "SUCCESSOR_START"
+            ? "Majukan vendor return atau geser proses successor setelah material vendor kembali."
+            : "Majukan vendor send/return agar selesai sebelum FG required date.",
         }, issueKeys);
       }
       if (leadTimeShort) {
@@ -1218,7 +1324,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           partCode: allocationDetail?.partCode || null,
           processCode: allocation.mbomProcess?.process?.processCode || null,
           routeId: allocation.mbomProcessId,
-          message: `Jadwal vendor ${plannedLeadTimeDays} hari lebih pendek dari Vendor Master ${number(allocation.vendorLeadTimeDays ?? vendor?.leadTimeDays)} hari.`,
+          message: `Jadwal vendor ${plannedLeadTimeDays} hari lebih pendek dari lead time planning ${effectivePlanningLeadTimeDays} hari.`,
           resolution: "Majukan tanggal kirim, mundurkan return yang realistis, atau gunakan vendor dengan lead time yang memenuhi due date.",
         }, issueKeys);
       }
@@ -1235,9 +1341,32 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         sendDate: dateKey(sendDate),
         returnDate: dateKey(returnDate),
         requiredDate: requiredDate ? dateKey(requiredDate) : null,
+        requiredDateSource: returnDeadline?.source || null,
+        successorAllocationId: returnDeadline?.successorAllocationId || null,
+        successorProcessCode: returnDeadline?.successorProcessCode || null,
         plannedLeadTimeDays,
-        masterLeadTimeDays: number(allocation.vendorLeadTimeDays ?? vendor?.leadTimeDays),
+        masterLeadTimeDays: number(vendor?.leadTimeDays ?? vendorPlanning.masterDays),
+        planningLeadTimeDays: effectivePlanningLeadTimeDays,
+        leadTimeSource: vendorPlanning.adjustmentApplied ? "DEMAND_PLANNING_CONFIRMED" : "VENDOR_MASTER",
+        planningDecisionTargetId: planningDecision?.planningDecisionTargetId || null,
+        vendorAdjustmentReason: vendorPlanning.reason,
+        deliveryPhaseId: allocation.deliveryPhaseId,
+        deliveryPhaseNumber: allocation.deliveryPhaseNumber,
+        transferBatchNumber: allocation.transferBatchNumber,
+        predecessorAllocationIds: allocation.predecessorAllocationIds || [],
+        recommendationReason: allocation.recommendationReason,
+        recommendationScore: allocation.recommendationScore,
+        recommendationScoreBreakdown: allocation.recommendationScoreBreakdown,
         partCode: allocationDetail?.partCode || null,
+        demandSourceType: allocation.demandSourceType,
+        demandSourceNumber: allocation.demandSourceNumber,
+        customerCode: allocation.customerCode,
+        customerTargetDate: allocation.customerTargetDate,
+        fgRequiredDate: allocation.fgRequiredDate,
+        priorityScore: allocation.priorityScore,
+        priorityClass: allocation.priorityClass,
+        capacityLate: allocation.capacityLate,
+        earliestFeasibleCompletion: allocation.earliestFeasibleCompletion,
         processCode: allocation.mbomProcess?.process?.processCode || null,
         processName: allocation.mbomProcess?.process?.processName || null,
         mbomProcessId: allocation.mbomProcessId,
@@ -1313,11 +1442,24 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       plannedStartTime: allocation.plannedStartTime,
       plannedEndTime: allocation.plannedEndTime,
       capacityMode: allocation.capacityMode,
+      deliveryPhaseId: allocation.deliveryPhaseId,
       deliveryPhaseNumber: allocation.deliveryPhaseNumber,
       transferBatchNumber: allocation.transferBatchNumber,
+      predecessorAllocationIds: allocation.predecessorAllocationIds || [],
       recommendationReason: allocation.recommendationReason,
       recommendationScore: allocation.recommendationScore,
       recommendationScoreBreakdown: allocation.recommendationScoreBreakdown,
+      demandSourceType: allocation.demandSourceType,
+      demandSourceNumber: allocation.demandSourceNumber,
+      customerCode: allocation.customerCode,
+      customerTargetDate: allocation.customerTargetDate,
+      fgRequiredDate: allocation.fgRequiredDate,
+      priorityScore: allocation.priorityScore,
+      priorityClass: allocation.priorityClass,
+      latestStartDate: allocation.latestStartDate,
+      latestFinishDate: allocation.latestFinishDate,
+      capacityLate: allocation.capacityLate,
+      earliestFeasibleCompletion: allocation.earliestFeasibleCompletion,
       qty: number(allocation.plannedQty),
       uomCode: allocation.uomCode,
       minutes: round(loadMinutes),
@@ -1389,10 +1531,13 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       if (effectiveRoutingMode === "VENDOR") {
         const vendorId = machineOverride?.vendorId || route.vendorId || null;
         const vendor = vendorById.get(vendorId);
+        const phaseForDetail = deliveryPhases.find((phase) => phase.mpsDetailId === detail.mpsDetailId) || null;
+        const planningDecision = planningConstraintByTarget.get(phaseForDetail?.sourceDeliveryTargetId) || null;
+        const vendorPlanning = effectiveVendorLeadTime(route, planningDecision, 8);
         const returnDate = parseDateOnly(detail.requiredDate || detail.plan.periodEnd);
         const sendDate = machineOverride?.scheduleDate
           ? parseDateOnly(machineOverride.scheduleDate)
-          : addDays(returnDate, -Math.max(number(vendor?.leadTimeDays), 0));
+          : addDays(returnDate, -Math.max(number(vendorPlanning.planningDays || vendor?.leadTimeDays), 0));
         vendorAssignments.push({
           source: "PROPOSED",
           planNumber: detail.plan.planNumber,
@@ -1403,6 +1548,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           requiredDate: dateKey(detail.requiredDate || detail.plan.periodEnd),
           plannedLeadTimeDays: Math.max(Math.ceil((returnDate - sendDate) / DAY_MS), 0),
           masterLeadTimeDays: number(vendor?.leadTimeDays),
+          planningLeadTimeDays: number(vendorPlanning.planningDays || vendor?.leadTimeDays),
+          leadTimeSource: vendorPlanning.adjustmentApplied ? "DEMAND_PLANNING_CONFIRMED" : "VENDOR_MASTER",
+          planningDecisionTargetId: planningDecision?.planningDecisionTargetId || null,
+          vendorAdjustmentReason: vendorPlanning.reason,
           partCode: detail.partCode,
           processCode: route.process?.processCode || null,
           processName: route.process?.processName || null,
@@ -1603,6 +1752,20 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     });
   }
   const detailByMpsDetailId = new Map(planDetails.filter((detail) => detail.mpsDetailId).map((detail) => [`${detail.plan.sourceType}|${detail.mpsDetailId}`, detail]));
+  const auditedStockCoverageByPhaseId = new Map();
+  const auditedStockHistoryByPhaseId = new Map();
+  for (const allocation of productionPlanAllocations) {
+    if (!allocation.deliveryPhaseId) continue;
+    const quantityAudit = allocation.recommendationScoreBreakdown?.audit?.quantityCalculation;
+    if (!quantityAudit || quantityAudit.fgStockCoverageQty == null) continue;
+    auditedStockCoverageByPhaseId.set(
+      allocation.deliveryPhaseId,
+      Math.max(number(auditedStockCoverageByPhaseId.get(allocation.deliveryPhaseId)), number(quantityAudit.fgStockCoverageQty)),
+    );
+    if (!auditedStockHistoryByPhaseId.has(allocation.deliveryPhaseId) && Array.isArray(quantityAudit.fgStockCoverageHistory)) {
+      auditedStockHistoryByPhaseId.set(allocation.deliveryPhaseId, quantityAudit.fgStockCoverageHistory);
+    }
+  }
   const initialStockQtyByDetailId = new Map();
   const remainingFinishedGoodStock = new Map(availableFinishedGoodByPartUom);
   const directReceiptDetails = planDetails
@@ -1701,7 +1864,14 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           : number(allocation.plannedQty));
       }, 0)
       : 0;
-    const initialStockQty = number(initialStockQtyByDetailId.get(directDetail.id));
+    const coveredPhaseRows = deliveryPhases.filter((candidate) => coveredAutoPhaseIds.has(candidate.id));
+    const hasAuditedStockCoverage = coveredPhaseRows.some((candidate) => auditedStockCoverageByPhaseId.has(candidate.id));
+    const initialStockQty = hasAuditedStockCoverage
+      ? coveredPhaseRows.reduce((sum, candidate) => sum + number(auditedStockCoverageByPhaseId.get(candidate.id)), 0)
+      : number(initialStockQtyByDetailId.get(directDetail.id));
+    const initialStockHistory = hasAuditedStockCoverage
+      ? coveredPhaseRows.flatMap((candidate) => auditedStockHistoryByPhaseId.get(candidate.id) || [])
+      : [];
     // Published recommendation rows and DPP firm schedules can describe the
     // same production output. Use the larger coverage, never their sum.
     const plannedQtyByDueDate = initialStockQty + Math.max(firmQtyByDueDate, autoTerminalQtyByDueDate) + legacyDraftQtyByDueDate;
@@ -1722,6 +1892,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       phaseQty: number(phase.qtyPlanned),
       cumulativeRequiredQty: capacityQty(cumulativeRequiredQty, phase.uomCode || detail.uomCode),
       initialStockQty: capacityQty(initialStockQty, phase.uomCode || detail.uomCode),
+      initialStockHistory,
       plannedQtyByDueDate: capacityQty(plannedQtyByDueDate, phase.uomCode || detail.uomCode),
       shortageQty: capacityQty(shortageQty, phase.uomCode || detail.uomCode),
       uomCode: phase.uomCode || detail.uomCode || null,
@@ -1866,6 +2037,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     },
     fgReceipts,
     vendorAssignments,
+    materialGate,
     processLoad: [...processLoads.values()].map((item) => ({
       ...item,
       machineCodes: [...item.machineCodes].sort(),
@@ -1903,4 +2075,6 @@ module.exports = {
   reservePredecessorGroupOutput,
   predecessorGroupReadiness,
   compareAllocationConsumptionOrder,
+  allocationFinishMoment,
+  resolveVendorReturnDeadline,
 };

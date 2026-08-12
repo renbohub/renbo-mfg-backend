@@ -23,6 +23,9 @@ function phasesForRow(row, sourceType, fallbackDate) {
     targetDate: validDate(phase.targetDate || phase.deliveryDate || phase.date),
     qty: number(phase.qty ?? phase.deliveryQty),
     notes: String(phase.notes || "").trim() || null,
+    consumesForecastTargetId: sourceType === "SALES_ORDER"
+      ? (String(phase.consumesForecastTargetId || phase.forecastTargetId || "").trim() || null)
+      : null,
   }));
   if (normalized.some((phase) => !phase.targetDate || phase.qty <= 0)) {
     throw Object.assign(new Error("Setiap phase delivery wajib memiliki tanggal valid dan qty lebih dari 0."), { statusCode: 400 });
@@ -108,13 +111,38 @@ async function replaceDeliveryTargets(tx, options) {
         qty: phase.qty,
         uomCode: line.uomCode || "PCS",
         notes: phase.notes,
+        consumesForecastTargetId: phase.consumesForecastTargetId,
         createdBy: user || null,
         updatedBy: user || null,
       });
     }
   });
+  const selectedForecastIds = [...new Set(data.map((row) => row.consumesForecastTargetId).filter(Boolean))];
+  if (selectedForecastIds.length) {
+    const selectedForecasts = await tx.demandDeliveryTarget.findMany({
+      where: {
+        id: { in: selectedForecastIds },
+        sourceType: "FORECAST",
+        status: "ACTIVE",
+        isDeleted: false,
+      },
+      include: { forecastDetail: { include: { forecast: true } } },
+    });
+    const byId = new Map(selectedForecasts.map((row) => [row.id, row]));
+    for (const row of data.filter((item) => item.consumesForecastTargetId)) {
+      const forecast = byId.get(row.consumesForecastTargetId);
+      if (!forecast || forecast.forecastDetail?.isDeleted || forecast.forecastDetail?.forecast?.isDeleted
+        || !forecast.forecastDetail?.forecast?.isCurrentVersion || forecast.forecastDetail?.forecast?.status === "Obsolete") {
+        throw Object.assign(new Error("Forecast target yang dipilih sudah tidak aktif. Muat ulang pilihan Forecast."), { statusCode: 409, code: "FORECAST_TARGET_INACTIVE" });
+      }
+      if (String(forecast.partCode).toUpperCase() !== String(row.partCode).toUpperCase()
+        || String(forecast.customerCode || "").toUpperCase() !== String(row.customerCode || "").toUpperCase()) {
+        throw Object.assign(new Error("Forecast target harus mempunyai customer dan part yang sama dengan phase Sales Order."), { statusCode: 400, code: "FORECAST_TARGET_MISMATCH" });
+      }
+    }
+  }
   if (data.length) await tx.demandDeliveryTarget.createMany({ data });
-  const auditRows = (rows) => rows.map((row) => ({ partCode: row.partCode, phaseNumber: row.phaseNumber, targetDate: validDate(row.targetDate)?.toISOString().slice(0, 10) || null, qty: number(row.qty), customerCode: row.customerCode || null })).sort((a, b) => `${a.partCode}|${a.phaseNumber}`.localeCompare(`${b.partCode}|${b.phaseNumber}`));
+  const auditRows = (rows) => rows.map((row) => ({ partCode: row.partCode, phaseNumber: row.phaseNumber, targetDate: validDate(row.targetDate)?.toISOString().slice(0, 10) || null, qty: number(row.qty), customerCode: row.customerCode || null, consumesForecastTargetId: row.consumesForecastTargetId || null })).sort((a, b) => `${a.partCode}|${a.phaseNumber}`.localeCompare(`${b.partCode}|${b.phaseNumber}`));
   const oldAudit = auditRows(oldTargets);
   const newAudit = auditRows(data);
   if (trackChange && JSON.stringify(oldAudit) !== JSON.stringify(newAudit)) {

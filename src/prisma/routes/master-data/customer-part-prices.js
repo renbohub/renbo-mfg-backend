@@ -1,0 +1,11 @@
+"use strict";
+const router=require("express").Router();
+const ctrl=require("../../controllers/master-data/CustomerPartPriceController");
+const {authorize}=require("../../middleware/auth");
+const {logger}=require("../../middleware/logger");
+router.get("/",authorize("priceList","read"),ctrl.list);
+router.get("/:id",authorize("priceList","read"),ctrl.get);
+router.post("/",authorize("priceList","create"),logger("customerPartPrice","create"),ctrl.create);
+router.patch("/:id",authorize("priceList","update"),logger("customerPartPrice","update"),ctrl.update);
+router.patch("/:id/remove",authorize("priceList","delete"),logger("customerPartPrice","delete"),ctrl.remove);
+module.exports=router;

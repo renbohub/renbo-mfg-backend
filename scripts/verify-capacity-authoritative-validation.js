@@ -3,6 +3,7 @@ const {
   buildAuthoritativePhaseResults,
   mergeAuthoritativeRecommendationSummary,
   uniqueBlockers,
+  visibleStoredRecommendationBlockers,
 } = require("../src/prisma/services/planning/capacityRecommendationValidationService");
 
 const algorithmBlocker = { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", phaseId: "phase-1", phaseNumber: 1 };
@@ -56,4 +57,19 @@ assert.strictEqual(readySummary.blockerCount, 0);
 assert.strictEqual(readySummary.coveredPhaseCount, 1);
 assert.strictEqual(readySummary.authoritativeValidation.status, "READY");
 
-console.log("Capacity authoritative post-validation checks passed: 14/14 cases");
+const stalePlan = {
+  replanRequired: true,
+  recommendationSummary: {
+    blockers: [{ code: "VENDOR_RETURN_AFTER_REQUIRED_DATE", partCode: "C002-C004-020" }],
+  },
+};
+assert.deepStrictEqual(visibleStoredRecommendationBlockers(stalePlan, {
+  readiness: { ok: true },
+  deliveryCoverage: { ready: true },
+}), [], "Fresh authoritative READY snapshot must suppress a stale persisted validator blocker");
+assert.strictEqual(visibleStoredRecommendationBlockers(stalePlan, {
+  readiness: { ok: false },
+  deliveryCoverage: { ready: true },
+}).length, 1, "Stored blocker must remain visible while the live snapshot is still blocked");
+
+console.log("Capacity authoritative post-validation checks passed: 16/16 cases");

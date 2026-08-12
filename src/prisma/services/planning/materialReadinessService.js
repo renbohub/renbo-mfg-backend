@@ -6,6 +6,15 @@ const ACTIVE_PO_STATUSES = new Set([
   "Partial Receipt",
   "Completed",
 ]);
+const CONFIRMED_SUGGESTION_STATUSES = new Set([
+  "Available",
+  "Partially Available",
+  "Alternative Quantity Offered",
+  "Alternative Delivery Date",
+  "Confirmed",
+]);
+const { subtractWorkingDays } = require("./procurementSchedulingService");
+const { loadDemandPlanningConstraintMap, applyDecisionToRoutingMetric } = require("./demandPlanningConstraintService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 3) => Number(number(value).toFixed(digits));
@@ -440,4 +449,282 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
   };
 }
 
-module.exports = { buildMaterialReadinessSnapshot };
+function suggestionSources(item) {
+  return Array.isArray(item?.sourceRequirements)
+    ? item.sourceRequirements.filter((source) => source && typeof source === "object")
+    : [];
+}
+
+function confirmedSuggestionAllocation(allocation) {
+  return allocation?.deliveryDate
+    && number(allocation?.confirmedQty) > 0
+    && (String(allocation?.status || "").toLowerCase() === "confirmed"
+      || CONFIRMED_SUGGESTION_STATUSES.has(String(allocation?.confirmationStatus || "")));
+}
+
+/**
+ * Resolve the earliest date on which the quantity represented by one Purchase
+ * Suggestion line can be treated as available for the first production step.
+ * Supplier confirmation is authoritative. An unconfirmed remainder keeps the
+ * system-generated material due date as an explicit fallback instead of
+ * silently pretending that the whole quantity was confirmed.
+ */
+function suggestionSystemMaterialDate(item, planningConstraintByTarget = new Map(), routingMetric = null) {
+  const stored = item?.materialRequiredDate || item?.plannedProductionStart;
+  const delivery = item?.customerDeliveryDate;
+  const breakdown = routingMetric || item?.productionLeadTimeBreakdown;
+  if (!delivery || !breakdown || typeof breakdown !== "object") return stored ? new Date(stored) : null;
+  const targetIds = suggestionSources(item).map((source) => source.deliveryTargetId).filter(Boolean);
+  const decision = targetIds.map((targetId) => planningConstraintByTarget.get(targetId)).find(Boolean) || null;
+  const adjusted = applyDecisionToRoutingMetric(breakdown, decision).metric || breakdown;
+  const queueDays = Math.ceil(number(adjusted.queueBufferHours ?? breakdown.queueBufferHours) / 8);
+  const scheduledDays = Math.max(number(adjusted.productionLeadTimeDays) + queueDays, 0);
+  if (scheduledDays <= 0) return stored ? new Date(stored) : new Date(delivery);
+  return subtractWorkingDays(delivery, scheduledDays);
+}
+
+function resolveSuggestionMaterialGate(item, systemDateOverride = null) {
+  const systemDate = day(systemDateOverride || item?.materialRequiredDate || item?.plannedProductionStart);
+  const requiredQty = Math.max(number(item?.netRequirement), number(item?.recommendedPurchaseQty), 0);
+  const allocations = (item?.supplierAllocations || [])
+    .filter(confirmedSuggestionAllocation)
+    .map((allocation) => ({
+      qty: number(allocation.confirmedQty),
+      date: day(allocation.deliveryDate),
+      supplierCode: allocation.supplierCode || null,
+      supplierName: allocation.supplierName || null,
+    }))
+    .filter((allocation) => allocation.date)
+    .sort((left, right) => left.date - right.date || String(left.supplierCode || "").localeCompare(String(right.supplierCode || "")));
+
+  let coveredQty = 0;
+  let confirmedReadyDate = null;
+  for (const allocation of allocations) {
+    coveredQty += allocation.qty;
+    confirmedReadyDate = allocation.date;
+    if (requiredQty <= 0 || coveredQty + 0.000001 >= requiredQty) break;
+  }
+
+  const headerConfirmed = item?.confirmedDeliveryDate
+    && CONFIRMED_SUGGESTION_STATUSES.has(String(item?.confirmationStatus || ""));
+  if (!confirmedReadyDate && headerConfirmed) {
+    confirmedReadyDate = day(item.confirmedDeliveryDate);
+    coveredQty = Math.max(coveredQty, number(item.confirmedQty));
+  }
+
+  const fullyConfirmed = Boolean(confirmedReadyDate)
+    && (requiredQty <= 0 || coveredQty + 0.000001 >= requiredQty || (headerConfirmed && item.confirmedQty == null));
+  if (fullyConfirmed) {
+    return {
+      readyDate: confirmedReadyDate,
+      source: "SUPPLIER_CONFIRMED_DELIVERY",
+      confirmed: true,
+      confirmedQty: round(coveredQty),
+      requiredQty: round(requiredQty),
+      systemDueDate: systemDate,
+      supplierCodes: [...new Set(allocations.map((allocation) => allocation.supplierCode).filter(Boolean))],
+      supplierNames: [...new Set(allocations.map((allocation) => allocation.supplierName).filter(Boolean))],
+    };
+  }
+
+  const readyDate = [confirmedReadyDate, systemDate].filter(Boolean).sort((left, right) => right - left)[0] || null;
+  return {
+    readyDate,
+    source: confirmedReadyDate ? "PARTIAL_CONFIRMATION_SYSTEM_DUE_FALLBACK" : "PURCHASE_SUGGESTION_SYSTEM_DUE",
+    confirmed: false,
+    confirmedQty: round(coveredQty),
+    requiredQty: round(requiredQty),
+    systemDueDate: systemDate,
+    supplierCodes: [...new Set(allocations.map((allocation) => allocation.supplierCode).filter(Boolean))],
+    supplierNames: [...new Set(allocations.map((allocation) => allocation.supplierName).filter(Boolean))],
+  };
+}
+
+function summarizeMaterialGates(items = [], identity = {}) {
+  const dated = items.filter((item) => item.readyDate);
+  const latest = dated.sort((left, right) => right.readyDate - left.readyDate)[0] || null;
+  const confirmedCount = items.filter((item) => item.confirmed).length;
+  return {
+    ...identity,
+    readyDate: latest?.readyDate || null,
+    source: latest?.source || (items.length ? "PURCHASE_SUGGESTION_SYSTEM_DUE" : "NO_PURCHASE_REQUIREMENT"),
+    confirmed: items.length > 0 && confirmedCount === items.length,
+    itemCount: items.length,
+    confirmedItemCount: confirmedCount,
+    fallbackItemCount: items.length - confirmedCount,
+    criticalItems: latest
+      ? items.filter((item) => item.readyDate?.getTime() === latest.readyDate.getTime()).map((item) => ({
+        suggestionItemId: item.suggestionItemId,
+        partCode: item.partCode,
+        materialCode: item.materialCode,
+        readyDate: item.readyDate,
+        source: item.source,
+        confirmed: item.confirmed,
+        supplierCodes: item.supplierCodes,
+        supplierNames: item.supplierNames,
+      }))
+      : [],
+  };
+}
+
+async function buildProductionMaterialGate(prisma, planOrNumber) {
+  const plan = typeof planOrNumber === "string"
+    ? await prisma.monthlyProductionPlan.findFirst({
+      where: { planNumber: planOrNumber, isDeleted: false },
+      select: { id: true, planNumber: true, sourceType: true, periodStart: true, periodEnd: true },
+    })
+    : planOrNumber;
+  if (!plan) throw Object.assign(new Error("Monthly Production Plan tidak ditemukan."), { status: 404 });
+
+  const mpsNumber = String(plan.sourceType || "").startsWith("MPS:")
+    ? String(plan.sourceType).slice(4)
+    : null;
+  const empty = (source, extra = {}) => ({
+    planNumber: plan.planNumber,
+    mpsNumber,
+    mrpRunNumber: null,
+    suggestionNumber: null,
+    readyDate: null,
+    source,
+    confirmed: false,
+    itemCount: 0,
+    confirmedItemCount: 0,
+    fallbackItemCount: 0,
+    criticalItems: [],
+    phaseGates: {},
+    items: [],
+    ...extra,
+  });
+  if (!mpsNumber || typeof prisma.mRPRun?.findMany !== "function" || typeof prisma.purchaseSuggestion?.findFirst !== "function") {
+    return empty("PURCHASE_SUGGESTION_NOT_AVAILABLE");
+  }
+
+  const currentRuns = await prisma.mRPRun.findMany({
+    where: { isDeleted: false, isCurrentPlan: true, status: "Completed" },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+    select: { runNumber: true, mpsNumber: true, scenarioAssumptions: true, createdAt: true },
+  });
+  const run = currentRuns.find((candidate) => candidate.mpsNumber === mpsNumber
+    || (Array.isArray(candidate.scenarioAssumptions?.sourceMpsNumbers)
+      && candidate.scenarioAssumptions.sourceMpsNumbers.includes(mpsNumber)));
+  if (!run) return empty("MRP_NOT_COMPLETED");
+
+  const suggestion = await prisma.purchaseSuggestion.findFirst({
+    where: { runNumber: run.runNumber, isDeleted: false, status: { not: "Cancelled" } },
+    orderBy: { createdAt: "desc" },
+    select: {
+      suggestionNumber: true,
+      status: true,
+      items: {
+        where: { isDeleted: false, status: { not: "Cancelled" }, netRequirement: { gt: 0 } },
+        select: {
+          id: true,
+          mrpRequirementId: true,
+          partCode: true,
+          materialCode: true,
+          sourceRequirements: true,
+          customerDeliveryDate: true,
+          plannedProductionStart: true,
+          materialRequiredDate: true,
+          productionLeadTimeBreakdown: true,
+          netRequirement: true,
+          recommendedPurchaseQty: true,
+          confirmationStatus: true,
+          confirmedQty: true,
+          confirmedDeliveryDate: true,
+          supplierAllocations: {
+            where: { isDeleted: false },
+            select: { supplierCode: true, supplierName: true, confirmationStatus: true, status: true, confirmedQty: true, deliveryDate: true },
+          },
+        },
+      },
+    },
+  });
+  if (!suggestion) return empty("PURCHASE_SUGGESTION_NOT_GENERATED", { mrpRunNumber: run.runNumber });
+
+  const sourceTargetIds = [...new Set(suggestion.items.flatMap((item) =>
+    suggestionSources(item).map((source) => source.deliveryTargetId)).filter(Boolean))];
+  const planningConstraintByTarget = await loadDemandPlanningConstraintMap(prisma, sourceTargetIds);
+  const requirementIds = [...new Set(suggestion.items.flatMap((item) => [
+    item.mrpRequirementId,
+    ...suggestionSources(item).filter((source) => source.allocationType !== "MOQ_PULL_FORWARD").map((source) => source.id),
+  ]).filter(Boolean))];
+  const schedulingRequirements = requirementIds.length && typeof prisma.mRPRequirement?.findMany === "function"
+    ? await prisma.mRPRequirement.findMany({
+      where: { id: { in: requirementIds }, runNumber: run.runNumber, isDeleted: false, mpsDetailId: { not: null } },
+      select: { id: true, mpsDetailId: true, mpsDetail: { select: { mbomHeaderId: true, qtyPlanned: true } } },
+    })
+    : [];
+  const schedulingRequirementById = new Map(schedulingRequirements.map((row) => [row.id, row]));
+  const routingRequestByItemId = new Map();
+  for (const item of suggestion.items) {
+    const directSources = suggestionSources(item).filter((source) => source.allocationType !== "MOQ_PULL_FORWARD");
+    const sourceRows = directSources.length ? directSources : suggestionSources(item);
+    const linked = [...new Set([item.mrpRequirementId, ...sourceRows.map((source) => source.id)].filter(Boolean))]
+      .map((id) => schedulingRequirementById.get(id))
+      .filter(Boolean);
+    const headerId = linked.find((row) => row.mpsDetail?.mbomHeaderId)?.mpsDetail?.mbomHeaderId || null;
+    const uniqueDetails = new Map(linked.filter((row) => row.mpsDetailId).map((row) => [row.mpsDetailId, row.mpsDetail]));
+    routingRequestByItemId.set(item.id, {
+      headerId,
+      scheduleQty: round([...uniqueDetails.values()].reduce((sum, detail) => sum + number(detail?.qtyPlanned), 0)),
+    });
+  }
+  let routingMetrics = new Map();
+  let routingMetricKey = () => null;
+  if (routingRequestByItemId.size) {
+    // Use the same qty-aware critical-path calculator as the Purchase
+    // Suggestion popup. The lazy import avoids a controller/service load cycle.
+    const purchaseSuggestionController = require("../../controllers/purchasing/PurchaseSuggestionController");
+    routingMetricKey = purchaseSuggestionController.routingMetricKey;
+    routingMetrics = await purchaseSuggestionController.routingMetricsForRequests(prisma, [...routingRequestByItemId.values()]);
+  }
+
+  const items = suggestion.items.flatMap((item) => {
+    const sources = suggestionSources(item).filter((source) => !source.mpsNumber || source.mpsNumber === mpsNumber);
+    if (!sources.length && suggestionSources(item).length) return [];
+    const routingRequest = routingRequestByItemId.get(item.id) || {};
+    const authoritativeRoutingMetric = routingRequest.headerId
+      ? routingMetrics.get(routingMetricKey(routingRequest.headerId, routingRequest.scheduleQty))
+      : null;
+    const calculatedSystemDate = suggestionSystemMaterialDate(item, planningConstraintByTarget, authoritativeRoutingMetric);
+    const gate = resolveSuggestionMaterialGate(item, calculatedSystemDate);
+    return [{
+      suggestionItemId: item.id,
+      partCode: item.partCode,
+      materialCode: item.materialCode,
+      deliveryTargetIds: [...new Set(sources.map((source) => source.deliveryTargetId).filter(Boolean))],
+      storedSystemDueDate: day(item.materialRequiredDate || item.plannedProductionStart),
+      calculationSource: calculatedSystemDate ? "PURCHASE_SUGGESTION_BACKWARD_DUE" : "PURCHASE_SUGGESTION_STORED_DUE",
+      ...gate,
+    }];
+  });
+  const identity = {
+    planNumber: plan.planNumber,
+    mpsNumber,
+    mrpRunNumber: run.runNumber,
+    suggestionNumber: suggestion.suggestionNumber,
+    suggestionStatus: suggestion.status,
+  };
+  const overall = summarizeMaterialGates([...items], identity);
+  const targetIds = [...new Set(items.flatMap((item) => item.deliveryTargetIds))];
+  const phaseGates = Object.fromEntries(targetIds.map((targetId) => [
+    targetId,
+    summarizeMaterialGates(items.filter((item) => item.deliveryTargetIds.includes(targetId)), { ...identity, deliveryTargetId: targetId }),
+  ]));
+  return { ...overall, phaseGates, items };
+}
+
+function materialGateForJob(gate, job = {}) {
+  const targetId = job.sourceDeliveryTargetId || job.deliveryTargetId || job.id || null;
+  return (targetId && gate?.phaseGates?.[targetId]) || gate || null;
+}
+
+module.exports = {
+  buildMaterialReadinessSnapshot,
+  buildProductionMaterialGate,
+  materialGateForJob,
+  resolveSuggestionMaterialGate,
+  suggestionSystemMaterialDate,
+};

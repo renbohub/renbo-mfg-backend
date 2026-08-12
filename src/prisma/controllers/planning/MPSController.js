@@ -8,7 +8,9 @@ const {
   nextPlanningMonthKey,
 } = require("../../utils/planningMonth");
 const { compareRoutingOperations } = require("../../utils/routingSequence");
-const { syncMonthlyMps } = require("../../services/planning/monthlyPlanningService");
+const { syncMonthlyMps, previewMonthlyMbomSelections, normalizeMpsRunSelection } = require("../../services/planning/monthlyPlanningService");
+const { planningAnchorMonth } = require("../../services/planning/demandPlanningService");
+const { resolveMbomRevision, selectedRevisionId } = require("../../services/planning/mbomRevisionService");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
@@ -259,11 +261,27 @@ async function buildActualSalesOrderByMpsBucket(tx, details = []) {
 
 exports.generateNumber = async (_req, res, next) => { try { res.json({ mpsNumber: await nextNumber() }); } catch (error) { next(error); } };
 
+exports.mbomRevisionOptions = async (req, res, next) => {
+  try {
+    const months = String(req.query.months || "").split(",").map((value) => value.trim()).filter(Boolean);
+    const selectedDeliveryTargetIds = String(req.query.selectedDeliveryTargetIds || "").split(",").map((value) => value.trim()).filter(Boolean);
+    const anchor = text(req.query.planningAnchorMonth) || months[0] || planningAnchorMonth(new Date());
+    const items = await previewMonthlyMbomSelections(prisma, {
+      months: months.length ? months : undefined,
+      planningAnchorMonth: anchor,
+      selectedDeliveryTargetIds,
+    });
+    return res.json({ items, planningAnchorMonth: anchor });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.list = async (req, res, next) => {
   try {
     const page = Math.max(number(req.query.page) || 1, 1); const limit = Math.min(Math.max(number(req.query.limit) || 20, 1), 500); const q = text(req.query.q || req.query.search);
     const where = { isDeleted: false, ...(String(req.query.includeLegacy || "").toLowerCase() === "true" ? {} : { status: { not: "Superseded" } }), ...(q ? { OR: [{ mpsNumber: { contains: q, mode: "insensitive" } }, { mpsName: { contains: q, mode: "insensitive" } }, { forecastNumber: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
-    const [items, total] = await Promise.all([prisma.mPS.findMany({ where, include, orderBy: [{ periodStart: "desc" }, { createdAt: "desc" }], skip: (page - 1) * limit, take: limit }), prisma.mPS.count({ where })]);
+    const [items, total] = await Promise.all([prisma.mPS.findMany({ where, include, orderBy: [{ periodStart: "asc" }, { createdAt: "asc" }], skip: (page - 1) * limit, take: limit }), prisma.mPS.count({ where })]);
     res.json({ items: items.map((item) => {
       const receiptLines = item.details.filter((row) => !isGeneratedProcess(row));
       const processLines = item.details.filter((row) => isGeneratedProcess(row) && String(row.part?.itemType || "").toUpperCase() !== "FG");
@@ -272,6 +290,14 @@ exports.list = async (req, res, next) => {
         return captured.split(",").map((value) => value.trim()).filter((value) => value && value !== "-");
       }))];
       const soNumbers = [...new Set(receiptLines.flatMap((row) => String(row.soNumber || "").split(",").map((value) => value.trim()).filter(Boolean)))];
+      const targetDates = receiptLines.flatMap((row) => [row.customerTargetDate, ...(row.demandSources || []).map((source) => source.targetDeliveryDate)]).filter(Boolean).sort((left, right) => new Date(left) - new Date(right));
+      const fgRequiredDates = receiptLines.flatMap((row) => [row.fgRequiredDate, ...(row.demandSources || []).map((source) => source.fgRequiredDate)]).filter(Boolean).sort((left, right) => new Date(left) - new Date(right));
+      const customerCodes = [...new Set(receiptLines.flatMap((row) => [row.customerCode, ...(row.demandSources || []).map((source) => source.customerCode)]).filter((value) => value && value !== "MULTI"))];
+      const deliveryTargetIds = [...new Set(receiptLines.flatMap((row) => [row.deliveryPhaseId, ...(row.demandSources || []).flatMap((source) => [source.deliveryTargetId, ...((Array.isArray(source.sourcePegging) ? source.sourcePegging : []).map((pegging) => pegging.deliveryTargetId))])]).filter(Boolean))];
+      const priorityClasses = [...new Set(receiptLines.flatMap((row) => [row.priorityClass, ...(row.demandSources || []).map((source) => source.priorityClass)]).filter(Boolean))].sort();
+      const bucketMonth = monthKey(item.periodStart);
+      const targetMonths = [...new Set(targetDates.map(monthKey).filter(Boolean))];
+      const bucketAligned = targetMonths.length === 0 || targetMonths.every((month) => month === bucketMonth);
       return {
         ...item,
         forecastNumbers,
@@ -280,6 +306,15 @@ exports.list = async (req, res, next) => {
         partCount: new Set(receiptLines.map((row) => row.partCode)).size,
         receiptLineCount: receiptLines.length,
         processLineCount: processLines.length,
+        targetDeliveryStart: targetDates[0] || item.periodStart,
+        targetDeliveryEnd: targetDates.at(-1) || item.periodEnd,
+        fgRequiredStart: fgRequiredDates[0] || null,
+        fgRequiredEnd: fgRequiredDates.at(-1) || null,
+        customerCount: customerCodes.length,
+        deliveryPhaseCount: deliveryTargetIds.length,
+        priorityClasses,
+        bucketAligned,
+        targetMonths,
       };
     }), total, page, limit });
   } catch (error) { next(error); }
@@ -537,7 +572,39 @@ exports.get = async (req, res, next) => {
         orderBy: { customerCode: "asc" },
       }),
     ]);
-    res.json({ ...doc, productionPlans, deliveryPlans, deliveryCatalogs: { customers }, readiness });
+    const cycleEnd = new Date(doc.periodStart);
+    cycleEnd.setUTCMonth(cycleEnd.getUTCMonth() + 2, 0);
+    cycleEnd.setUTCHours(23, 59, 59, 999);
+    const followingDocuments = await prisma.mPS.findMany({
+      where: {
+        isDeleted: false,
+        mpsNumber: { not: doc.mpsNumber },
+        periodStart: { gt: doc.periodStart, lte: cycleEnd },
+        status: { notIn: ["Superseded", "Cancelled"] },
+      },
+      include,
+      orderBy: { periodStart: "asc" },
+    });
+    const cycleDocuments = [{ ...doc, deliveryPlans }, ...followingDocuments].slice(0, 2);
+    const followingNumbers = cycleDocuments.slice(1).map((row) => row.mpsNumber);
+    const followingDeliveryPlans = followingNumbers.length && typeof prisma.mPSDeliveryPlan?.findMany === "function"
+      ? await prisma.mPSDeliveryPlan.findMany({
+        where: { mpsNumber: { in: followingNumbers }, targetType: "CUSTOMER", isDeleted: false },
+        orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }],
+      })
+      : [];
+    for (const cycleDocument of cycleDocuments.slice(1)) {
+      cycleDocument.deliveryPlans = followingDeliveryPlans.filter((row) => row.mpsNumber === cycleDocument.mpsNumber);
+    }
+    const planningCycle = {
+      anchorMonth: monthKey(doc.periodStart),
+      periodStart: cycleDocuments[0]?.periodStart || doc.periodStart,
+      periodEnd: cycleDocuments.at(-1)?.periodEnd || doc.periodEnd,
+      mpsNumbers: cycleDocuments.map((row) => row.mpsNumber),
+      status: cycleDocuments.every((row) => ["Confirmed", "Released"].includes(row.status)) ? "LOCKED" : "DRAFT",
+      documents: cycleDocuments,
+    };
+    res.json({ ...doc, productionPlans, deliveryPlans, deliveryCatalogs: { customers }, readiness, planningCycle });
   } catch (error) { next(error); }
 };
 
@@ -629,7 +696,6 @@ async function createFromForecastLegacy(req, res, next) {
                 mbomHeaders: {
                   where: { isDeleted: false },
                   orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
-                  take: 1,
                 },
               },
             },
@@ -709,8 +775,11 @@ async function createFromForecastLegacy(req, res, next) {
             const normalizedBufferQty = normalizeQuantity(bufferQty, uomCode);
             const normalizedEffectiveDemandQty = normalizeQuantity(normalizedForecastQty + normalizedBufferQty, uomCode);
             const normalizedSoQty = normalizeQuantity(outstandingSoQty, uomCode);
+            const mbomSelectionDate = periodStart;
+            const mbomResolution = resolveMbomRevision({ revisions: row.part?.mbomHeaders || [], selectionDate: mbomSelectionDate, selectedId: selectedRevisionId(req.body.mbomSelections, periodKey, row.partCode) });
             return {
-              lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: row.part?.mbomHeaders?.[0]?.id || null,
+              lineNumber: index + 1, partCode: row.partCode, partId: row.partId || row.part?.id || null, mbomHeaderId: mbomResolution.revision?.id || null,
+              mbomSelectionMode: mbomResolution.mode, mbomSelectionDate, mbomRevisionSnapshot: mbomResolution.revision?.revision ?? null, mbomNoRegSnapshot: mbomResolution.revision?.noReg || null, mbomSelectionWarning: mbomResolution.warning,
               forecastQty: normalizedForecastQty, actualSalesOrderQty: normalizedSoQty, bufferBaseQty: normalizeQuantity(bufferBaseQty, uomCode), bufferPercent, bufferQty: normalizedBufferQty, effectiveDemandQty: normalizedEffectiveDemandQty, productionPercent,
               qtyPlanned: normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty: normalizedEffectiveDemandQty, productionPercent, actualSalesOrderQty: normalizedSoQty }), uomCode), uomCode, startDate: periodStart, endDate: utcMonthEnd(periodStart), priority: 1, status: "Planned", customerCode: forecast.customerCode,
               forecastDetailId: row.id, forecastPeriodOffset: offset, notes: `${FG_RECEIPT_PREFIX} Generated from forecast ${forecast.forecastNumber}`,
@@ -769,6 +838,13 @@ async function createFromForecastLegacy(req, res, next) {
 async function syncMonthlyDemand(req, res, next, requireForecast = false) {
   try {
     req.body = req.body || {};
+    const explicitSelection = Array.isArray(req.body.selectedDeliveryTargetIds);
+    const selectedDeliveryTargetIds = explicitSelection
+      ? [...new Set(req.body.selectedDeliveryTargetIds.map((value) => String(value || "").trim()).filter(Boolean))]
+      : [];
+    if (explicitSelection && !selectedDeliveryTargetIds.length) {
+      return res.status(400).json({ message: "Pilih minimal satu delivery target untuk membuat MPS." });
+    }
     const forecastNumber = text(req.body.forecastNumber);
     if (requireForecast && !forecastNumber) {
       return res.status(400).json({ message: "Forecast wajib dipilih" });
@@ -785,6 +861,7 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
               M1Forecast: true, M1Qty: true,
               M2Forecast: true, M2Qty: true,
               M3Forecast: true, M3Qty: true,
+              deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, select: { targetDate: true, qty: true } },
             },
           },
         },
@@ -796,18 +873,33 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
         });
       }
       if (!Array.isArray(req.body.months) || !req.body.months.length) {
-        req.body.months = [...new Set(forecast.details.flatMap((row) => [
+        const targetMonths = forecast.details.flatMap((row) => (row.deliveryTargets || [])
+          .filter((target) => number(target.qty) > 0)
+          .map((target) => monthKey(target.targetDate))).filter(Boolean);
+        req.body.months = targetMonths.length ? [...new Set(targetMonths)] : [...new Set(forecast.details.flatMap((row) => [
           number(row.M1Qty) > 0 ? monthKey(row.M1Forecast) : null,
           number(row.M2Qty) > 0 ? monthKey(row.M2Forecast) : null,
           number(row.M3Qty) > 0 ? monthKey(row.M3Forecast) : null,
         ]).filter(Boolean))];
       }
     }
-    if (!requireForecast && (!Array.isArray(req.body.months) || req.body.months.length !== 1)) {
-      return res.status(400).json({ message: "Pilih satu bulan yang akan dihitung menjadi MPS." });
+    if (!requireForecast && (!Array.isArray(req.body.months) || !req.body.months.length)) {
+      const anchor = text(req.body.planningAnchorMonth) || planningAnchorMonth(new Date());
+      req.body.months = [anchor, nextPlanningMonthKey(anchor), nextPlanningMonthKey(nextPlanningMonthKey(anchor))];
     }
+    const normalizedSelection = normalizeMpsRunSelection({
+      months: req.body.months,
+      selectedDeliveryTargetIds,
+      selectionRequired: explicitSelection,
+    });
     const result = await prisma.$transaction((tx) => syncMonthlyMps(tx, {
-      months: Array.isArray(req.body.months) ? req.body.months : undefined,
+      months: normalizedSelection.months.length ? normalizedSelection.months : undefined,
+      planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(new Date()),
+      simulationOnly: req.body.simulationOnly === true,
+      selectedDeliveryTargetIds: normalizedSelection.selectedDeliveryTargetIds,
+      mbomSelections: req.body.mbomSelections && typeof req.body.mbomSelections === "object"
+        ? req.body.mbomSelections
+        : undefined,
       runBy: req.user?.username || req.user?.email || "system",
     }));
     if (!result.docs.length) {
@@ -893,7 +985,7 @@ exports.confirm = async (req, res, next) => {
       code: "MPS_READINESS_BLOCKED",
       readiness,
     });
-    const updated = await prisma.mPS.update({ where: { mpsNumber: doc.mpsNumber }, data: { status: "Confirmed", approvedBy: req.user?.username || req.user?.email || null, approvedDate: new Date() }, include });
+    const updated = await prisma.mPS.update({ where: { mpsNumber: doc.mpsNumber }, data: { status: "Confirmed", lifecycleStatus: "REVIEWED", simulationOnly: false, approvedBy: req.user?.username || req.user?.email || null, approvedDate: new Date() }, include });
     res.json(updated);
   } catch (error) { next(error); }
 };

@@ -8,6 +8,7 @@ const mpsApproval = approvalGate({ moduleCode: "planning-ppic", pageCode: "maste
 
 router.get("/generate-number", authorize("mps", "create"), ctrl.generateNumber);
 router.get("/monthly-summary", authorize("mps", "read"), ctrl.monthlySummary);
+router.get("/mbom-revision-options", authorize("mps", "read"), ctrl.mbomRevisionOptions);
 router.post("/from-forecast", authorize("mps", "create"), logger("mps", "create-from-forecast"), ctrl.createFromForecast);
 router.post("/monthly-sync", authorize("mps", "create"), logger("mps", "sync-monthly-demand"), ctrl.syncMonthly);
 router.get("/:mpsNumber/readiness", authorize("mps", "read"), ctrl.readiness);

@@ -415,13 +415,27 @@ async function prepareDppMaterialIssueSources(tx, issue) {
     const qtyToIssue = Number(detail.qtyIssued || 0);
     if (qtyToIssue <= 0) continue;
     const identity = await resolveMaterialIssueIdentity(tx, detail);
+    const noteTokens = materialIssueNoteTokens(detail.notes);
+    const materialCode = String(noteTokens.material || "").trim() || null;
+    const sourceIdentityFilters = [
+      detail.stockBalanceId ? { id: detail.stockBalanceId } : null,
+      materialCode ? { materialCode: { equals: materialCode, mode: "insensitive" } } : null,
+      // Raw MBOM requirements carry a part code for traceability, while the
+      // physical balance is keyed by material code. When material lineage is
+      // available, do not accidentally fall back to WIP/FG sharing the same
+      // drawing/part identity. Non-raw/manual lines retain normal identity
+      // fallback and can still be reallocated from a depleted selected lot.
+      !materialCode ? buildIdentityWhere(identity) : null,
+    ].filter(Boolean);
     const balances = await tx.stockBalance.findMany({
       where: {
         warehouseCode: issue.warehouseCode,
-        ...buildIdentityWhere(identity),
         ...(detail.uomCode ? { uomCode: { equals: detail.uomCode, mode: "insensitive" } } : {}),
         isDeleted: false,
-        AND: [buildExcludeSpecialRackCondition()],
+        AND: [
+          buildExcludeSpecialRackCondition(),
+          { OR: sourceIdentityFilters },
+        ],
       },
       orderBy: [{ qtyAvailable: "desc" }, { lastMovement: "asc" }],
       select: {

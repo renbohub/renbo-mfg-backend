@@ -3,6 +3,10 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertPriceListFields } = require("../../utils/numericConverter");
 const { deleteQuotationFile } = require("../../middleware/uploads");
+const {
+  normalizeEffectivePriceInput,
+  createEffectiveVersion,
+} = require("../../services/pricing/effectivePriceService");
 
 const MONTH_FIELDS = [
   "january",
@@ -80,6 +84,13 @@ const sanitizeVendorPriceListData = (data) => {
       sanitized.isDeleted === "true" || sanitized.isDeleted === true;
   }
 
+  if (sanitized.effectiveFrom !== undefined || sanitized.effectiveUntil !== undefined) {
+    sanitized = normalizeEffectivePriceInput(sanitized, {
+      requireEffective: sanitized.effectiveFrom !== undefined,
+      actor: sanitized.createdBy,
+    });
+  }
+
   return sanitized;
 };
 
@@ -114,6 +125,8 @@ const sanitizeVendorPriceListDetails = (rawDetails) => {
       return {
         vendorProcessId: data.vendorProcessId || data.id,
         sequence: Number(data.sequence) || index + 1,
+        unitPrice: Number.isFinite(Number(data.unitPrice)) ? Number(data.unitPrice) : null,
+        uomCode: data.uomCode || null,
         january: data.january ?? null,
         february: data.february ?? null,
         march: data.march ?? null,
@@ -259,7 +272,10 @@ exports.create = async (req, res, next) => {
   try {
     const { details: rawDetails, ...priceListData } = req.body;
     const details = sanitizeVendorPriceListDetails(rawDetails);
-    const data = sanitizeVendorPriceListData(priceListData);
+    const data = sanitizeVendorPriceListData({
+      ...priceListData,
+      createdBy: req.user?.username || req.user?.email || "system",
+    });
 
     // Map uploaded quotation files ke JSON array
     if (req.files?.quotationFiles?.length > 0) {
@@ -272,8 +288,20 @@ exports.create = async (req, res, next) => {
       };
     }
 
-    const doc = await prisma.vendorPriceList.create({
+    if (!data.effectiveFrom) return res.status(400).json({ message: "Tanggal berlaku mulai wajib diisi." });
+    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+      model: "vendorPriceList",
       data,
+      scopeWhere: {
+        vendorId: data.vendorId || null,
+        partId: data.partId || null,
+        customerId: data.customerId || null,
+        category: data.category,
+        currencyCode: data.currencyCode || "IDR",
+      },
+    }));
+    const doc = await prisma.vendorPriceList.findUnique({
+      where: { id: saved.id },
       include: includeVendorPriceList,
     });
 
@@ -428,7 +456,10 @@ exports.bulkCreate = async (req, res, next) => {
         const details = sanitizeVendorPriceListDetails(rawDetails || treatments);
 
         // Sanitize data (convert numeric fields)
-        const data = sanitizeVendorPriceListData(dataWithoutDetails);
+        const data = sanitizeVendorPriceListData({
+          ...dataWithoutDetails,
+          ...(dataWithoutDetails.effectiveFrom ? { createdBy: req.user?.username || req.user?.email || "system" } : {}),
+        });
 
         // Resolve vendorId dari vendorCode jika vendorId kosong
         if (!data.vendorId && data.vendorCode) {
@@ -470,10 +501,14 @@ exports.bulkCreate = async (req, res, next) => {
         }
 
         // Create vendor price list baru
-        const doc = await prisma.vendorPriceList.create({
-          data,
-          include: includeVendorPriceList,
-        });
+        const saved = data.effectiveFrom
+          ? await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+              model: "vendorPriceList",
+              data,
+              scopeWhere: { vendorId: data.vendorId || null, partId: data.partId || null, customerId: data.customerId || null, category: data.category, currencyCode: data.currencyCode || "IDR" },
+            }))
+          : await prisma.vendorPriceList.create({ data });
+        const doc = await prisma.vendorPriceList.findUnique({ where: { id: saved.id }, include: includeVendorPriceList });
 
         results.success.push(formatVendorPriceList(doc));
       } catch (error) {

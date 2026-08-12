@@ -16,6 +16,8 @@ router.get("/", authorize("mrp", "read"), ctrl.list);
 router.post("/run", authorize("mrp", "create"), logger("mrp", "run"), ctrl.runMRP);
 router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);
 router.get("/:runNumber/requirements", authorize("mrp", "read"), ctrl.getRequirements);
+router.get("/:runNumber/procurement-view", authorize("mrp", "read"), ctrl.procurementView);
+router.get("/:runNumber/customer-pegging-view", authorize("mrp", "read"), ctrl.customerPeggingView);
 router.patch("/:runNumber/requirements/buffer", authorize("mrp", "update"), logger("mrp", "update-buffer"), ctrl.updateRequirementBuffer);
 router.patch("/:runNumber/requirements/order-percent", authorize("mrp", "update"), logger("mrp", "update-order-percent"), ctrl.updateRequirementBuffer);
 router.post("/:runNumber/output/purchase-suggestions", authorize("mrp", "release"), logger("mrp", "generate-purchase-suggestions"), purchaseSuggestionCtrl.generate);

@@ -24,8 +24,9 @@ function netTimePhasedDemand({ openingQty = 0, supplyEvents = [], demandEvents =
     .sort((left, right) => at(left.requiredDate) - at(right.requiredDate) || left._index - right._index);
   let expectedBalance = Math.max(number(openingQty), 0);
   let firmBalance = expectedBalance;
+  let openingBalance = expectedBalance;
   let supplyIndex = 0;
-  const appliedSupply = [];
+  const availableSupply = [];
   const results = [];
 
   for (const demand of demands) {
@@ -34,7 +35,7 @@ function netTimePhasedDemand({ openingQty = 0, supplyEvents = [], demandEvents =
       const supply = supplies[supplyIndex++];
       expectedBalance += supply.qty;
       if (supply.confidence === "FIRM") firmBalance += supply.qty;
-      appliedSupply.push(supply);
+      availableSupply.push({ supply, remainingQty: supply.qty });
       newlyAvailable.push(supply);
     }
     const expectedBefore = expectedBalance;
@@ -45,6 +46,24 @@ function netTimePhasedDemand({ openingQty = 0, supplyEvents = [], demandEvents =
     const rawFirmAfter = firmBefore - demand.qty;
     expectedBalance = Math.max(rawExpectedAfter, 0);
     firmBalance = Math.max(rawFirmAfter, 0);
+
+    // Allocate the expected coverage once, FIFO. Previously every demand row
+    // received the complete history of eligible receipts, so the same PO/PR/
+    // planned order appeared at full quantity on every requirement even though
+    // the numeric balance itself had already been consumed.
+    let uncoveredQty = demand.qty;
+    const openingAllocatedQty = Math.min(openingBalance, uncoveredQty);
+    openingBalance -= openingAllocatedQty;
+    uncoveredQty -= openingAllocatedQty;
+    const allocatedSupply = [];
+    for (const available of availableSupply) {
+      if (uncoveredQty <= 0) break;
+      if (available.remainingQty <= 0) continue;
+      const allocatedQty = Math.min(available.remainingQty, uncoveredQty);
+      available.remainingQty -= allocatedQty;
+      uncoveredQty -= allocatedQty;
+      allocatedSupply.push({ ...available.supply, qty: allocatedQty });
+    }
     results.push({
       ...demand,
       expectedAvailableBefore: expectedBefore,
@@ -55,7 +74,8 @@ function netTimePhasedDemand({ openingQty = 0, supplyEvents = [], demandEvents =
       projectedAvailableAfter: rawExpectedAfter,
       firmProjectedAvailableAfter: rawFirmAfter,
       newlyAvailableSupply: newlyAvailable,
-      eligibleSupply: appliedSupply.slice(),
+      openingAllocatedQty,
+      eligibleSupply: allocatedSupply,
     });
   }
   return results.sort((left, right) => left._index - right._index).map(({ _index, ...row }) => row);

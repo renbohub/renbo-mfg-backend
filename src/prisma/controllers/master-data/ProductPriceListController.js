@@ -2,6 +2,10 @@ const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertPriceListFields } = require("../../utils/numericConverter");
+const {
+  normalizeEffectivePriceInput,
+  createEffectiveVersion,
+} = require("../../services/pricing/effectivePriceService");
 
 // Include config untuk product price list
 const includeProductPriceList = {
@@ -87,9 +91,24 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const convertedData = convertPriceListFields(req.body);
-    const doc = await prisma.productPriceList.create({
+    const convertedData = normalizeEffectivePriceInput(convertPriceListFields(req.body), {
+      actor: req.user?.username || req.user?.email || "system",
+    });
+    if (!convertedData.productId || convertedData.unitPrice === undefined) {
+      return res.status(400).json({ message: "Barang dan harga satuan wajib diisi." });
+    }
+    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+      model: "productPriceList",
       data: convertedData,
+      scopeWhere: {
+        productId: convertedData.productId,
+        supplierId: convertedData.supplierId || null,
+        currencyCode: convertedData.currencyCode || "IDR",
+        uomCode: convertedData.uomCode || null,
+      },
+    }));
+    const doc = await prisma.productPriceList.findUnique({
+      where: { id: saved.id },
       include: includeProductPriceList,
     });
     res.status(201).json(mapDoc(doc));
@@ -100,7 +119,12 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const convertedData = convertPriceListFields(req.body);
+    const current = await prisma.productPriceList.findFirst({ where: { id: req.params.id, isDeleted: false } });
+    if (!current) return res.status(404).json({ message: "ProductPriceList tidak ditemukan" });
+    const convertedData = normalizeEffectivePriceInput(convertPriceListFields({ ...current, ...req.body, id: undefined, createdAt: undefined, updatedAt: undefined }), {
+      requireEffective: Boolean(current.effectiveFrom || req.body.effectiveFrom || req.body.unitPrice !== undefined),
+    });
+    delete convertedData.createdBy;
     const doc = await prisma.productPriceList.update({
       where: { id: req.params.id },
       data: convertedData,
@@ -167,7 +191,10 @@ exports.bulkCreate = async (req, res, next) => {
 
     for (const priceListData of productPriceLists) {
       try {
-        const convertedData = convertPriceListFields(priceListData);
+        let convertedData = convertPriceListFields(priceListData);
+        if (convertedData.effectiveFrom !== undefined || convertedData.unitPrice !== undefined) {
+          convertedData = normalizeEffectivePriceInput(convertedData, { actor: req.user?.username || req.user?.email || "system" });
+        }
 
         // Resolve supplierId dari supplierCode jika supplierId kosong
         if (!convertedData.supplierId && convertedData.supplierCode) {
@@ -191,10 +218,14 @@ exports.bulkCreate = async (req, res, next) => {
           }
         }
 
-        const doc = await prisma.productPriceList.create({
-          data: convertedData,
-          include: includeProductPriceList,
-        });
+        const saved = convertedData.effectiveFrom
+          ? await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+              model: "productPriceList",
+              data: convertedData,
+              scopeWhere: { productId: convertedData.productId, supplierId: convertedData.supplierId || null, currencyCode: convertedData.currencyCode || "IDR", uomCode: convertedData.uomCode || null },
+            }))
+          : await prisma.productPriceList.create({ data: convertedData });
+        const doc = await prisma.productPriceList.findUnique({ where: { id: saved.id }, include: includeProductPriceList });
 
         results.success.push(mapDoc(doc));
       } catch (error) {

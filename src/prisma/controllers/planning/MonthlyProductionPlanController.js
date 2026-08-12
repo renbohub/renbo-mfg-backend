@@ -3,6 +3,7 @@ const { buildCapacitySnapshot } = require("../../services/planning/capacityPlann
 const { recommendMonthlyCapacity } = require("../../services/planning/capacityRecommendationService");
 const {
   uniqueBlockers: uniqueCapacityBlockers,
+  visibleStoredRecommendationBlockers,
   buildAuthoritativePhaseResults,
   mergeAuthoritativeRecommendationSummary,
 } = require("../../services/planning/capacityRecommendationValidationService");
@@ -16,6 +17,9 @@ const {
 const {
   buildMaterialReadinessSnapshot,
 } = require("../../services/planning/materialReadinessService");
+const {
+  syncVendorProcessDraftPrForPlan,
+} = require("../../services/planning/vendorProcessPrService");
 const {
   planningMonthKey: monthKey,
   utcMonthStart: monthStart,
@@ -139,6 +143,9 @@ function requireFreezeOverride(plan, allocationDate, planningMode, body) {
   if (planningMode !== "PRODUCTION" || !allocationDate || allocationDate > freezeFenceDate(plan.freezeFenceDays)) return null;
   const reason = text(body?.freezeOverrideReason || body?.overrideReason);
   if (!reason || reason.length < 10) throw Object.assign(new Error(`Tanggal berada dalam freeze fence ${number(plan.freezeFenceDays)} hari. Isi alasan override minimal 10 karakter.`), { statusCode: 409, code: "CAPACITY_FREEZE_FENCE" });
+  if (plan.status === "Released" && plan.capacityOverrideApproved !== true && body?.freezeOverrideApproved !== true) {
+    throw Object.assign(new Error("Released DPP dalam freeze fence memerlukan override approval sebelum jadwal diubah."), { statusCode: 409, code: "DPP_FREEZE_OVERRIDE_APPROVAL_REQUIRED" });
+  }
   return reason;
 }
 const isGeneratedProcess = (row) => String(row?.notes || "").includes("[MRP-PRODUCTION]");
@@ -222,6 +229,14 @@ function detailFromMps(row, lineNumber) {
     uomCode,
     requiredDate: row.endDate,
     priority: number(row.priority) || 1,
+    deliveryPhaseId: row.deliveryPhaseId || null,
+    customerCode: row.customerCode || null,
+    customerTargetDate: row.customerTargetDate || row.endDate || null,
+    fgRequiredDate: row.fgRequiredDate || row.endDate || null,
+    priorityScore: row.priorityScore ?? null,
+    priorityClass: row.priorityClass || null,
+    latestStartDate: row.startDate || null,
+    latestFinishDate: row.fgRequiredDate || row.endDate || null,
     status: "Planned",
     notes: `[MPS-LINE:${row.lineNumber}] ${row.notes || ""}`.trim(),
   };
@@ -620,11 +635,7 @@ function buildPlanReadiness(plan, capacity, materialReadiness) {
     partName: issue.partName || materialPartNames.get(issue.partCode) || null,
     source: "MATERIAL",
   }));
-  const recommendationBlockers = (
-    plan.replanRequired === true && Array.isArray(plan.recommendationSummary?.blockers)
-      ? plan.recommendationSummary.blockers
-      : []
-  ).map((blocker) => ({
+  const recommendationBlockers = visibleStoredRecommendationBlockers(plan, capacity).map((blocker) => ({
     ...blocker,
     severity: "blocking",
     source: "RECOMMENDATION",
@@ -964,7 +975,7 @@ exports.recommendCapacity = async (req, res, next) => {
     await prisma.monthlyProductionPlan.update({ where: { planNumber: req.params.planNumber }, data: { planningGranularity, rollingLookbackWeeks, freezeFenceDays } });
     const storedPlan = await prisma.monthlyProductionPlan.findFirst({
       where: { planNumber: req.params.planNumber, isDeleted: false },
-      select: { recommendationSummary: true, sourceType: true, periodStart: true, periodEnd: true },
+      select: { id: true, recommendationSummary: true, sourceType: true, periodStart: true, periodEnd: true },
     });
     const storedSummary = storedPlan?.recommendationSummary && typeof storedPlan.recommendationSummary === "object" && !Array.isArray(storedPlan.recommendationSummary) ? storedPlan.recommendationSummary : {};
     const rawFlowRule = req.body?.flowRule || storedSummary.capacityFlowRule?.active || null;
@@ -1045,6 +1056,11 @@ exports.recommendCapacity = async (req, res, next) => {
       if (recommendation.ready && sourceMpsNumber) {
         await prisma.$transaction((tx) => refreshDraftForMps(tx, sourceMpsNumber, req.user?.username || req.user?.email || "system"));
       }
+      recommendation.vendorProcessPr = await prisma.$transaction((tx) => syncVendorProcessDraftPrForPlan(
+        tx,
+        storedPlan.id,
+        req.user?.username || req.user?.email || "system",
+      ));
     }
     res.json(recommendation);
   } catch (error) {
@@ -1159,7 +1175,8 @@ exports.adoptCapacitySimulation = async (req, res, next) => {
       return { adoptedCount: idMap.size, appliedCalendarDays: plan.periodEnd < calendarStart ? 0 : Math.floor((plan.periodEnd - calendarStart) / 86400000) + 1, appliedMachineCount: simulationMachineIds.length, cancelledDppCount: replaceableSchedules.length, replacedProductionCount: productionIds.length, lockedPastAllocationCount: preservedProduction.length, lockedPastDppCount: firmSchedules.length, preservedCompletedDppCount: firmSchedules.filter((row) => row.status === "Completed").length };
     });
     await activatePreset(prisma, preset.id, actor);
-    res.json({ planNumber: plan.planNumber, scenarioKey, currentPresetId: preset.id, currentPresetName: preset.name, planningMode: "PRODUCTION", ...result, message: "Preset berhasil ditetapkan sebagai Current Use Capacity. Auto recommendation MPP berikutnya akan memakai preset ini; hari yang sudah lewat tetap dikunci sebagai histori." });
+    const vendorProcessPr = await prisma.$transaction((tx) => syncVendorProcessDraftPrForPlan(tx, plan.id, actor));
+    res.json({ planNumber: plan.planNumber, scenarioKey, currentPresetId: preset.id, currentPresetName: preset.name, planningMode: "PRODUCTION", ...result, vendorProcessPr, message: "Preset berhasil ditetapkan sebagai Current Use Capacity. Auto recommendation MPP berikutnya akan memakai preset ini; hari yang sudah lewat tetap dikunci sebagai histori." });
   } catch (error) { next(error); }
 };
 
@@ -1182,7 +1199,6 @@ exports.release = async (req, res, next) => {
     if (plan.status !== "Confirmed") return res.status(409).json({ message: `Production Plan harus Confirmed sebelum release, status saat ini ${plan.status}.` });
     if (plan.replanRequired) return res.status(409).json({ message: plan.replanReason || "Production Plan harus direplan setelah perubahan target delivery.", code: "DELIVERY_REPLAN_REQUIRED" });
     const capacity = await buildCapacitySnapshot(prisma, {
-      ...(req.body || {}),
       planNumber: plan.planNumber,
       startDate: plan.periodStart,
       endDate: plan.periodEnd,
@@ -1318,6 +1334,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
       select: { id: true, notes: true },
     }) : [];
     const sourceMpsById = new Map(sourceMpsDetails.map((row) => [row.id, row]));
+    const currentMrp = sourceMpsNumber ? await prisma.mRPRun.findFirst({ where: { mpsNumber: sourceMpsNumber, isDeleted: false, isCurrentPlan: true }, orderBy: { planRevision: "desc" }, select: { runNumber: true } }) : null;
     const planDetailByMpsId = new Map(plan.details.filter((row) => row.mpsDetailId).map((row) => [row.mpsDetailId, row]));
     const parentLineByLine = new Map();
     for (const detail of plan.details) {
@@ -1556,6 +1573,20 @@ exports.convertToDailyPlans = async (req, res, next) => {
             deliveryPhaseNumber: item.allocation.deliveryPhaseNumber || null,
             transferBatchNumber: item.allocation.transferBatchNumber || null,
             predecessorAllocationIds: item.allocation.predecessorAllocationIds || null,
+            demandSourceType: item.allocation.demandSourceType || null,
+            demandSourceNumber: item.allocation.demandSourceNumber || null,
+            customerCode: item.allocation.customerCode || null,
+            customerTargetDate: item.allocation.customerTargetDate || null,
+            fgRequiredDate: item.allocation.fgRequiredDate || null,
+            priorityScore: item.allocation.priorityScore || null,
+            priorityClass: item.allocation.priorityClass || null,
+            materialReadinessStatus: "READY_AT_MPP_RELEASE",
+            predecessorStatus: Array.isArray(item.allocation.predecessorAllocationIds) && item.allocation.predecessorAllocationIds.length ? "PLANNED" : "NOT_REQUIRED",
+            vendorStatus: item.allocation.routingMode === "VENDOR" ? "PLANNED" : "NOT_REQUIRED",
+            lateRisk: item.allocation.fgRequiredDate && scheduleDate > new Date(item.allocation.fgRequiredDate) ? "LATE" : "ON_TIME",
+            mrpRunNumber: currentMrp?.runNumber || null,
+            mpsNumber: sourceMpsNumber,
+            mppNumber: plan.planNumber,
             status: "Draft",
             notes: `${marker} mode ${item.allocation.routingMode}${item.allocation.vendorId ? `; vendor ${item.allocation.vendorId}` : ""}${item.allocation.vendorSendDate ? `; send ${String(item.allocation.vendorSendDate).slice(0, 10)}` : ""}${item.allocation.vendorReturnDate ? `; return ${String(item.allocation.vendorReturnDate).slice(0, 10)}` : ""}${item.allocation.expectedReturnQty != null ? `; expected return ${item.allocation.expectedReturnQty}` : ""}${item.allocation.notes ? `; ${item.allocation.notes}` : ""}`,
             createdBy: req.user?.username || req.user?.email || null,
@@ -2025,15 +2056,29 @@ exports.createManualDailyPlan = async (req, res, next) => {
         status: "Draft",
         planningMode,
         scenarioKey,
+        demandSourceType: line.deliveryPhaseId ? "DELIVERY_PHASE" : null,
+        customerCode: line.customerCode || null,
+        customerTargetDate: line.customerTargetDate || null,
+        fgRequiredDate: line.fgRequiredDate || null,
+        priorityScore: line.priorityScore || null,
+        priorityClass: line.priorityClass || null,
+        latestStartDate: line.latestStartDate || null,
+        latestFinishDate: line.latestFinishDate || null,
+        capacityLate: Boolean(line.fgRequiredDate && (vendorReturnDate || scheduleDate) > dateOnly(line.fgRequiredDate)),
+        lateConstraintCode: line.fgRequiredDate && (vendorReturnDate || scheduleDate) > dateOnly(line.fgRequiredDate) ? "CAPACITY_LATE" : null,
         notes: [notes, freezeOverrideReason ? `[FREEZE-OVERRIDE] ${freezeOverrideReason}` : null].filter(Boolean).join("; ") || null,
         createdBy: req.user?.username || req.user?.email || null,
       },
     });
+    const vendorProcessPr = planningMode === "PRODUCTION"
+      ? await prisma.$transaction((tx) => syncVendorProcessDraftPrForPlan(tx, plan.id, req.user?.username || req.user?.email || "system"))
+      : null;
     res.status(201).json({
       planNumber: plan.planNumber,
       planningMode,
       scenarioKey,
       allocation,
+      vendorProcessPr,
       summary: {
         createdCount: 1,
         plannedQty: normalizedQty,
@@ -2137,10 +2182,15 @@ exports.updateManualAllocation = async (req, res, next) => {
         vendorId: routingMode === "VENDOR" ? vendorId : null,
         vendorSendDate: routingMode === "VENDOR" ? scheduleDate : null,
         vendorReturnDate, vendorLeadTimeDays: routingMode === "VENDOR" ? Math.max(number(selectedVendor?.leadTimeDays), 0) : null,
+        capacityLate: Boolean((line.fgRequiredDate || allocation.fgRequiredDate) && (vendorReturnDate || scheduleDate) > dateOnly(line.fgRequiredDate || allocation.fgRequiredDate)),
+        lateConstraintCode: (line.fgRequiredDate || allocation.fgRequiredDate) && (vendorReturnDate || scheduleDate) > dateOnly(line.fgRequiredDate || allocation.fgRequiredDate) ? "CAPACITY_LATE" : null,
         expectedReturnQty, notes: [text(req.body?.notes), freezeOverrideReason ? `[FREEZE-OVERRIDE] ${freezeOverrideReason}` : null].filter(Boolean).join("; ") || null,
       },
     });
-    res.json({ planNumber: allocation.plan.planNumber, allocation: updated, message: "Allocation berhasil diperbarui." });
+    const vendorProcessPr = allocation.planningMode === "PRODUCTION"
+      ? await prisma.$transaction((tx) => syncVendorProcessDraftPrForPlan(tx, allocation.planId, req.user?.username || req.user?.email || "system"))
+      : null;
+    res.json({ planNumber: allocation.plan.planNumber, allocation: updated, vendorProcessPr, message: "Allocation berhasil diperbarui." });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code, details: error.details });
     next(error);
@@ -2166,7 +2216,10 @@ exports.removeManualAllocation = async (req, res, next) => {
       where: { id: allocation.id },
       data: { status: "Cancelled", isDeleted: true },
     });
-    res.json({ planNumber: plan.planNumber, allocation: updated });
+    const vendorProcessPr = allocation.planningMode === "PRODUCTION"
+      ? await prisma.$transaction((tx) => syncVendorProcessDraftPrForPlan(tx, plan.id, req.user?.username || req.user?.email || "system"))
+      : null;
+    res.json({ planNumber: plan.planNumber, allocation: updated, vendorProcessPr });
   } catch (error) { next(error); }
 };
 

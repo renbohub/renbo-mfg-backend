@@ -84,6 +84,42 @@ const mainBusinessRelation = (ids) => ({
   create: ids.map((mainBusinessId) => ({ mainBusinessId })),
 });
 
+function supplierLeadTimeChanged(currentValue, nextValue) {
+  if (nextValue === undefined) return false;
+  const current = currentValue == null ? null : Number(currentValue);
+  const next = nextValue == null || nextValue === "" ? null : Number(nextValue);
+  return current !== next;
+}
+
+async function updateSupplierAndInheritedItemLeadTime(db, supplierId, currentSupplier, updateData) {
+  const shouldCascade = supplierLeadTimeChanged(currentSupplier.leadTimeDays, updateData.leadTimeDays);
+  const previousLeadTimeDays = currentSupplier.leadTimeDays == null ? null : Number(currentSupplier.leadTimeDays);
+  const nextLeadTimeDays = updateData.leadTimeDays == null || updateData.leadTimeDays === "" ? null : Number(updateData.leadTimeDays);
+  return db.$transaction(async (tx) => {
+    let synchronizedSupplierItemCount = 0;
+    if (shouldCascade) {
+      const synchronized = await tx.supplierItem.updateMany({
+        where: {
+          supplierId,
+          isActive: true,
+          OR: [
+            { leadTimeDays: null },
+            ...(previousLeadTimeDays == null ? [] : [{ leadTimeDays: previousLeadTimeDays }]),
+          ],
+        },
+        data: { leadTimeDays: nextLeadTimeDays },
+      });
+      synchronizedSupplierItemCount = synchronized.count;
+    }
+    const supplier = await tx.supplier.update({
+      where: { id: supplierId },
+      data: { ...updateData, ...(shouldCascade ? { leadTimeDays: nextLeadTimeDays } : {}) },
+      include: includeSupplierMainBusinesses,
+    });
+    return { supplier, synchronizedSupplierItemCount };
+  });
+}
+
 exports.generateCode = async (req, res, next) => {
   try {
     // Ambil semua supplier codes
@@ -288,14 +324,8 @@ exports.update = async (req, res, next) => {
       };
     }
 
-    // Sekarang baru update
-    const doc = await prisma.supplier.update({
-      where: { id: req.params.id },
-      data: updateData,
-      include: includeSupplierMainBusinesses,
-    });
-
-    res.json(formatSupplierWithMainBusiness(doc));
+    const { supplier: doc, synchronizedSupplierItemCount } = await updateSupplierAndInheritedItemLeadTime(prisma, req.params.id, currentSupplier, updateData);
+    res.json({ ...formatSupplierWithMainBusiness(doc), synchronizedSupplierItemCount });
   } catch (e) {
     if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     if (e.code === "P2003") {
@@ -304,6 +334,9 @@ exports.update = async (req, res, next) => {
     next(e);
   }
 };
+
+exports.supplierLeadTimeChanged = supplierLeadTimeChanged;
+exports.updateSupplierAndInheritedItemLeadTime = updateSupplierAndInheritedItemLeadTime;
 
 exports.remove = async (req, res, next) => {
   try {

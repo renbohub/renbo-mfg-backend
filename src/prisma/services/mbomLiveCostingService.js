@@ -1,37 +1,11 @@
-const MONTH_FIELDS = [
-  "january",
-  "february",
-  "march",
-  "april",
-  "may",
-  "june",
-  "july",
-  "august",
-  "september",
-  "october",
-  "november",
-  "december",
-];
+const {
+  legacyPriceValue,
+  resolveEffectiveRecord,
+} = require("./pricing/effectivePriceService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 
-const latest = (records) =>
-  [...records].sort(
-    (left, right) =>
-      number(right.pricingYear) - number(left.pricingYear) ||
-      new Date(right.updatedAt || 0).getTime() -
-        new Date(left.updatedAt || 0).getTime(),
-  )[0];
-
-const priceValue = (record, costingDate) => {
-  const month = costingDate.getMonth();
-  for (let offset = 0; offset < 12; offset += 1) {
-    const field = MONTH_FIELDS[(month - offset + 12) % 12];
-    const value = number(record?.[field]);
-    if (value > 0) return value;
-  }
-  return 0;
-};
+const priceValue = (record, costingDate) => legacyPriceValue(record, costingDate);
 
 const emptyEstimate = () => ({
   total: 0,
@@ -94,6 +68,7 @@ const COSTING_HEADER_SELECT = {
           cycleTime: true,
           machine: {
             select: {
+              id: true,
               costingRate: true,
               costingRateType: true,
               currencyCode: true,
@@ -113,7 +88,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
     ? new Date()
     : requestedDate;
 
-  const [headers, partPrices, materialPrices, vendorPrices, currencies] =
+  const [headers, partPrices, materialPrices, vendorPrices, machineCostRates, currencies] =
     await Promise.all([
       prisma.mBOMHeader.findMany({
         where: { isDeleted: false },
@@ -126,6 +101,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
         where: { isDeleted: false },
         include: { details: { where: { isDeleted: false } } },
       }),
+      prisma.machineCostRate.findMany({ where: { isDeleted: false } }),
       prisma.currency.findMany({
         where: { isDeleted: false },
         select: { currencyCode: true, exchangeRate: true },
@@ -164,8 +140,9 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
 
   const directPrice = (row) => {
     if (row.category === "Vendor") {
-      const list = latest(
+      const list = resolveEffectiveRecord(
         vendorPrices.filter((item) => item.partId === row.partId),
+        costingDate,
       );
       const values = (list?.details || [])
         .map((detail) => priceValue(detail, costingDate))
@@ -180,8 +157,9 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       };
     }
 
-    const partPrice = latest(
+    const partPrice = resolveEffectiveRecord(
       partPrices.filter((item) => item.partId === row.partId),
+      costingDate,
     );
     const partValue = priceValue(partPrice, costingDate);
     if (partValue > 0) {
@@ -203,7 +181,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
         (!item.CSP || item.CSP === formSymbol)
       );
     });
-    const materialPrice = latest(candidates);
+    const materialPrice = resolveEffectiveRecord(candidates, costingDate);
     const materialValue = priceValue(materialPrice, costingDate);
     if (materialValue > 0) {
       return {
@@ -221,9 +199,13 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       (result, process) => {
         const seconds = number(process.cycleTime);
         const machine = process.machine || {};
-        const rate = toIdr(machine.costingRate, machine.currencyCode);
+        const effectiveRate = resolveEffectiveRecord(
+          machineCostRates.filter((item) => item.machineId === machine.id),
+          costingDate,
+        );
+        const rate = toIdr(effectiveRate?.unitPrice ?? machine.costingRate, effectiveRate?.currencyCode || machine.currencyCode);
         const rateType = String(
-          machine.costingRateType || "PER_HOUR",
+          effectiveRate?.costingRateType || machine.costingRateType || "PER_HOUR",
         ).toUpperCase();
         let costPerSecond = 0;
         if (rate > 0) {

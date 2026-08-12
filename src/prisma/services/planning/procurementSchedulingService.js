@@ -20,6 +20,17 @@ function subtractWorkingDays(value, days, holidays = []) {
   return result;
 }
 
+function addWorkingDays(value, days, holidays = []) {
+  const result = new Date(value);
+  const holidayKeys = new Set(holidays.map(dateKey));
+  let remaining = Math.max(Math.ceil(number(days)), 0);
+  while (remaining > 0) {
+    result.setUTCDate(result.getUTCDate() + 1);
+    if (isWorkingDay(result, holidayKeys)) remaining -= 1;
+  }
+  return result;
+}
+
 function monthOffset(from, to) {
   const left = new Date(from);
   const right = new Date(to);
@@ -50,14 +61,41 @@ function procurementSchedule({
   holidays = [],
   asOf = new Date(),
 }) {
-  const totalLeadTimeDays = [supplierLeadTimeDays, prApprovalDays, poProcessingDays, transitDays, receivingQcDays, safetyLeadTimeDays]
-    .reduce((sum, value) => sum + Math.max(number(value), 0), 0);
-  const latestPrDate = subtractWorkingDays(materialRequiredDate, totalLeadTimeDays, holidays);
+  const leadTimeBreakdown = {
+    prApprovalDays: Math.max(number(prApprovalDays), 0),
+    poProcessingDays: Math.max(number(poProcessingDays), 0),
+    supplierLeadTimeDays: Math.max(number(supplierLeadTimeDays), 0),
+    transitDays: Math.max(number(transitDays), 0),
+    receivingQcDays: Math.max(number(receivingQcDays), 0),
+    safetyLeadTimeDays: Math.max(number(safetyLeadTimeDays), 0),
+  };
+  const totalLeadTimeDays = Object.values(leadTimeBreakdown).reduce((sum, value) => sum + value, 0);
+  // Keep every backward-scheduling milestone explicit so PPIC can distinguish
+  // customer delivery, production start, supplier arrival, PO release and PR.
+  const supplierRequiredArrivalDate = subtractWorkingDays(
+    materialRequiredDate,
+    leadTimeBreakdown.receivingQcDays + leadTimeBreakdown.safetyLeadTimeDays,
+    holidays,
+  );
+  const latestPoDate = subtractWorkingDays(
+    supplierRequiredArrivalDate,
+    leadTimeBreakdown.supplierLeadTimeDays + leadTimeBreakdown.transitDays,
+    holidays,
+  );
+  const latestPrDate = subtractWorkingDays(
+    latestPoDate,
+    leadTimeBreakdown.prApprovalDays + leadTimeBreakdown.poProcessingDays,
+    holidays,
+  );
   return {
+    materialRequiredDate: new Date(materialRequiredDate),
+    supplierRequiredArrivalDate,
+    latestPoDate,
     latestPrDate,
     totalLeadTimeDays,
-    procurementWindow: classifyProcurementWindow({ materialRequiredDate, latestPrDate, asOf }),
+    leadTimeBreakdown,
+    procurementWindow: classifyProcurementWindow({ materialRequiredDate: supplierRequiredArrivalDate, latestPrDate, asOf }),
   };
 }
 
-module.exports = { isWorkingDay, subtractWorkingDays, classifyProcurementWindow, procurementSchedule };
+module.exports = { isWorkingDay, subtractWorkingDays, addWorkingDays, classifyProcurementWindow, procurementSchedule };

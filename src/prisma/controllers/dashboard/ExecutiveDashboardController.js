@@ -1,6 +1,7 @@
 const { prisma } = require("../../index");
 const { calculateLiveMbomCosts } = require("../../services/mbomLiveCostingService");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
+const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pricing/effectivePriceService");
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -587,7 +588,6 @@ async function inventoryDashboard(year, options = {}) {
   let valuationRows = balances.map((row) => ({ ...row, unitPrice: 0, onHandValue: 0, availableValue: 0, reservedQcValue: 0, priceSource: "Belum ada harga" }));
   if (options.includeValuation !== false && balances.length) {
     const costingDate = year === new Date().getFullYear() ? new Date() : new Date(year, 11, 31);
-    const monthFields = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
     const partCodes = [...new Set(balances.map((row) => row.partCode).filter(Boolean))];
     const partNumbers = [...new Set(balances.map((row) => row.partNumber).filter(Boolean))];
     const materialIds = [...new Set(balances.map((row) => row.materialId).filter(Boolean))];
@@ -606,16 +606,8 @@ async function inventoryDashboard(year, options = {}) {
     ]);
     const currencyRates = new Map(currencies.map((row) => [String(row.currencyCode).toUpperCase(), number(row.exchangeRate) || 1]));
     const toIdr = (value, currencyCode) => number(value) * (String(currencyCode || "IDR").toUpperCase() === "IDR" ? 1 : currencyRates.get(String(currencyCode).toUpperCase()) || 1);
-    const latestPrice = (rows) => [...rows]
-      .filter((row) => !row.pricingYear || number(row.pricingYear) <= year)
-      .sort((left, right) => number(right.pricingYear) - number(left.pricingYear) || new Date(right.updatedAt || 0) - new Date(left.updatedAt || 0))[0];
-    const monthlyPrice = (row) => {
-      for (let offset = 0; offset < 12; offset += 1) {
-        const value = number(row?.[monthFields[(costingDate.getMonth() - offset + 12) % 12]]);
-        if (value > 0) return toIdr(value, row.currencyCode);
-      }
-      return 0;
-    };
+    const latestPrice = (rows) => resolveEffectiveRecord(rows, costingDate);
+    const monthlyPrice = (row) => toIdr(legacyPriceValue(row, costingDate), row?.currencyCode);
     const partByCode = new Map(parts.map((part) => [part.partCode, part]));
     const partByNumber = new Map(parts.filter((part) => part.partNumber).map((part) => [part.partNumber, part]));
     const bomByPart = new Map();

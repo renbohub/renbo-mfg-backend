@@ -235,7 +235,22 @@ function incompleteSteps(request) {
   return request.rule.steps.filter((step) => (counts.get(step.stepOrder)?.size || 0) < step.requiredApprovals);
 }
 
-async function processApprovalAction({ requestId, requestNumber: number, user, decision = "Approved", notes, metadata, tx = prisma }) {
+async function applyIntermediateDocumentStatus(request, status, tx = prisma) {
+  if (!status || !request?.documentId) return;
+  const modelByType = {
+    purchaserequisition: "purchaseRequisition",
+    purchaseorder: "purchaseOrder",
+    purchaseinvoice: "purchaseInvoice",
+    forecast: "forecast",
+    productionlog: "productionLog",
+    stockopnameheader: "stockOpnameHeader",
+  };
+  const model = modelByType[normalize(request.documentType)];
+  if (!model || typeof tx[model]?.updateMany !== "function") return;
+  await tx[model].updateMany({ where: { id: request.documentId, isDeleted: false }, data: { status } });
+}
+
+async function processApprovalAction({ requestId, requestNumber: number, user, decision = "Approved", notes, metadata, deferFinalDocumentStatus = false, tx = prisma }) {
   const request = await tx.approvalRequest.findFirst({
     where: {
       isDeleted: false,
@@ -284,6 +299,7 @@ async function processApprovalAction({ requestId, requestNumber: number, user, d
   });
 
   if (normalizedDecision === "Rejected") {
+    if (!deferFinalDocumentStatus) await applyIntermediateDocumentStatus(request, step.rejectedStatus || "Rejected", tx);
     const updated = await tx.approvalRequest.update({
       where: { id: request.id },
       data: { status: "Rejected", completedAt: new Date(), currentStep: step.stepOrder },
@@ -301,6 +317,12 @@ async function processApprovalAction({ requestId, requestNumber: number, user, d
     data: { status: final ? "Approved" : "In Approval", currentStep: nextStep, completedAt: final ? new Date() : null },
     include: REQUEST_INCLUDE,
   });
+  if (!final) {
+    const activeStep = refreshed.rule.steps.find((item) => item.stepOrder === nextStep);
+    await applyIntermediateDocumentStatus(request, activeStep?.pendingStatus || step.approvedStatus, tx);
+  } else if (!deferFinalDocumentStatus) {
+    await applyIntermediateDocumentStatus(request, step.approvedStatus || "Approved", tx);
+  }
   return { request: updated, step, final, decision: normalizedDecision, shouldContinue: final };
 }
 
@@ -363,6 +385,7 @@ function approvalGate(config) {
         decision: config.decision || "Approved",
         notes: req.body?.approvalNotes || req.body?.notes,
         metadata: req.body?.approvalMetadata,
+        deferFinalDocumentStatus: true,
         tx,
       }));
       req.approval = result;

@@ -456,8 +456,17 @@ const PO_INCLUDE = {
       prDetail: {
         select: {
           procurementCategory: true,
+          qty: true,
+          orderedQty: true,
+          uomCode: true,
+          notes: true,
           plannedOrderNumber: true,
           sourcePlannedOrderNumbers: true,
+          sources: {
+            where: { isDeleted: false },
+            orderBy: { createdAt: "asc" },
+            select: { qty: true, uomCode: true, partCode: true, requiredDate: true, metadata: true },
+          },
         },
       },
     },

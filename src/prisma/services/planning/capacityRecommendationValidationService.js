@@ -16,6 +16,19 @@ function uniqueBlockers(blockers = []) {
   return [...new Map((blockers || []).map((issue) => [blockerKey(issue), issue])).values()];
 }
 
+function visibleStoredRecommendationBlockers(plan = {}, capacity = {}) {
+  if (plan.replanRequired !== true || !Array.isArray(plan.recommendationSummary?.blockers)) return [];
+
+  // The detail endpoint calculates a fresh authoritative capacity snapshot.
+  // When that snapshot and its delivery coverage are both ready, an older
+  // persisted validation result must not be rendered as a current blocker.
+  // This commonly happens after validator rules are corrected without
+  // regenerating otherwise-valid allocations.
+  const liveSnapshotReady = capacity?.readiness?.ok === true
+    && capacity?.deliveryCoverage?.ready === true;
+  return liveSnapshotReady ? [] : plan.recommendationSummary.blockers;
+}
+
 function phaseReference(value = {}) {
   return {
     id: value.phaseId || value.deliveryPhaseId || value.id || null,
@@ -123,6 +136,7 @@ function mergeAuthoritativeRecommendationSummary(currentSummary, {
 module.exports = {
   blockerKey,
   uniqueBlockers,
+  visibleStoredRecommendationBlockers,
   buildAuthoritativePhaseResults,
   mergeAuthoritativeRecommendationSummary,
 };

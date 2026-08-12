@@ -17,6 +17,7 @@ router.delete("/drafts/:id", authorize("mbom", "delete"), drafts.remove);
 
 // Standard CRUD (logger untuk semua CUD operations)
 router.get("/", authorize("mbom", "read"), c.list);
+router.get("/:noReg/report", authorize("mbom", "export"), c.report);
 router.get("/:noReg", authorize("mbom", "read"), c.get);
 router.post("/", authorize("mbom", "create"), logger("mbom", "create"), c.create);
 router.patch("/:id", authorize("mbom", "update"), logger("mbom", "update", { 

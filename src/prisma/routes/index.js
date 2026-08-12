@@ -29,11 +29,13 @@ const materialFormsRouter = require("./master-data/material-forms");
 const processesRouter = require("./master-data/processes");
 const paymentTermsRouter = require("./master-data/payment-terms");
 const priceListRouter = require("./master-data/price-list");
+const customerPartPricesRouter = require("./master-data/customer-part-prices");
 const diesRouter = require("./master-data/dies");
 const diesPartsRouter = require("./master-data/dies-parts");
 const diesMaintenanceRouter = require("./master-data/dies-maintenance");
 const diesUsageRouter = require("./master-data/dies-usage");
 const machinesRouter = require("./master-data/machines");
+const machineCostRatesRouter = require("./master-data/machine-cost-rates");
 const subProcessesRouter = require("./master-data/sub-processes");
 const departmentsRouter = require("./master-data/departments");
 const divisionsRouter = require("./master-data/divisions");
@@ -83,6 +85,7 @@ const mrpRouter = require("./planning/mrp");
 const monthlyProductionPlansRouter = require("./planning/monthly-production-plans");
 const reportingRouter = require("./reporting");
 const capacityPlanningRouter = require("./planning/capacity-planning");
+const demandPlanningRouter = require("./planning/demand-planning");
 
 const manufacturingOrdersRouter = require("./production/manufacturing-orders");
 const workOrdersRouter = require("./production/work-orders");
@@ -104,6 +107,7 @@ const masterFormulasRouter = require("./system/master-formulas");
 const excelImportsRouter = require("./system/excel-imports");
 const approvalsRouter = require("./system/approvals");
 const maintenanceRouter = require("./system/maintenance");
+const tableDocumentsRouter = require("./system/table-documents");
 
 const BASE_PATH = "/api";
 
@@ -145,6 +149,7 @@ function registerRoutes(app) {
   api.use("/system/excel-imports", auth, excelImportsRouter);
   api.use("/approvals", auth, approvalsRouter);
   api.use("/maintenance", auth, maintenanceRouter);
+  api.use("/system/table-documents", auth, tableDocumentsRouter);
 
   // Master Data routes
   api.use("/master-data/customers", auth, customersRouter);
@@ -167,11 +172,13 @@ function registerRoutes(app) {
   api.use("/master-data/processes", auth, processesRouter);
   api.use("/master-data/payment-terms", auth, paymentTermsRouter);
   api.use("/master-data/price-list", auth, priceListRouter);
+  api.use("/master-data/customer-part-prices", auth, customerPartPricesRouter);
   api.use("/master-data/dies", auth, diesRouter);
   api.use("/master-data/dies-part", auth, diesPartsRouter);
   api.use("/master-data/dies-maintenance", auth, diesMaintenanceRouter);
   api.use("/master-data/dies-usage", auth, diesUsageRouter);
   api.use("/master-data/machines", auth, machinesRouter);
+  api.use("/master-data/machine-cost-rates", auth, machineCostRatesRouter);
   api.use("/master-data/sub-processes", auth, subProcessesRouter);
   api.use("/master-data/departments", auth, departmentsRouter);
   api.use("/master-data/divisions", auth, divisionsRouter);
@@ -211,6 +218,7 @@ function registerRoutes(app) {
   api.use("/planning/monthly-production-plans", auth, monthlyProductionPlansRouter);
   api.use("/reports", auth, reportingRouter);
   api.use("/planning/capacity-planning", auth, capacityPlanningRouter);
+  api.use("/planning/demand-planning", auth, demandPlanningRouter);
 
   // Purchasing routes
   api.use("/purchasing/purchase-order", auth, purchaseOrderRouter);

@@ -86,6 +86,10 @@ assert.strictEqual(sunday.length, 1, "An explicit WORKING calendar rule must ope
 const noSundayRulePreset = withCapacityRuleIndex(configuredPreset, buildCapacityRuleIndex());
 assert.deepStrictEqual(shiftWindows(machine, 6, "NORMAL", noSundayRulePreset, periodStart), [], "Weekend flags must remain effective without an override");
 
+const defaultCalendarPreset = withCapacityRuleIndex(null, buildCapacityRuleIndex());
+assert.deepStrictEqual(shiftWindows(machine, 5, "NORMAL", defaultCalendarPreset, periodStart), [], "Saturday must be closed when auto allocation runs without a saved preset");
+assert.deepStrictEqual(shiftWindows(machine, 6, "NORMAL", defaultCalendarPreset, periodStart), [], "Sunday must be closed when auto allocation runs without a saved preset");
+
 const derivedDays = buildDerivedCapacityDays([
   { machine, mode: "PARALLEL", shift: "1", start: 480, end: 540, overtime: false },
   { machine, mode: "THREE_SHIFT", shift: "3", start: 1440 + 60, end: 1440 + 120, overtime: false },

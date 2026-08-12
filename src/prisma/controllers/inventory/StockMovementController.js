@@ -287,7 +287,10 @@ exports.list = async (req, res, next) => {
       return [part.partCode, { partNumber: part.partNumber, processName: bomProcess?.occurrenceCode || bomProcess?.process?.processName || part.process?.processName || null }];
     }));
     res.json({ items: mappedItems.map((item) => ({ ...item, partNumber: partInfoByCode.get(item.partCode)?.partNumber || item.partNumber || null, mbomProcessName: partInfoByCode.get(item.partCode)?.processName || null })), total, page, limit });
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.get = async (req, res, next) => {
@@ -315,19 +318,14 @@ function materialPieceAuditNote(input, conversion) {
   return [text(input.notes), audit].filter(Boolean).join("\n");
 }
 
-exports.create = async (req, res, next) => {
-  try {
-    const input = req.body || {};
+async function createMovementInTransaction(tx, input, actor, formulas) {
     const usesMaterialPieceConversion = String(input.inputMode || "").toUpperCase() === MATERIAL_PIECE_MODE;
     const movementType = String(input.movementType || "").toUpperCase();
-    if (!MOVEMENT_TYPES.has(movementType)) return res.status(400).json({ message: "movementType harus IN, OUT, TRANSFER, atau ADJUSTMENT." });
+    if (!MOVEMENT_TYPES.has(movementType)) throw Object.assign(new Error("movementType harus IN, OUT, TRANSFER, atau ADJUSTMENT."), { statusCode: 400 });
     const warehouseCode = text(input.warehouseCode);
-    if (!warehouseCode) return res.status(400).json({ message: "warehouseCode wajib diisi." });
+    if (!warehouseCode) throw Object.assign(new Error("warehouseCode wajib diisi."), { statusCode: 400 });
     const requestedQty = number(usesMaterialPieceConversion ? input.sourceQtyPcs : input.qty, usesMaterialPieceConversion ? "Qty sumber PCS" : "Qty");
-    if (movementType === "TRANSFER" && !text(input.destinationWarehouseCode)) return res.status(400).json({ message: "destinationWarehouseCode wajib untuk transfer." });
-    const formulas = await getFormulaSet(prisma, "inventory");
-    const result = await prisma.$transaction(async (tx) => {
-      const actor = input.performedBy || req.user?.username || req.user?.email || "system";
+    if (movementType === "TRANSFER" && !text(input.destinationWarehouseCode)) throw Object.assign(new Error("destinationWarehouseCode wajib untuk transfer."), { statusCode: 400 });
       await assertInventoryLocation(tx, warehouseCode, input.rackCode);
       if (movementType === "TRANSFER") {
         await assertInventoryLocation(tx, text(input.destinationWarehouseCode), input.destinationRackCode);
@@ -383,9 +381,45 @@ exports.create = async (req, res, next) => {
         notes: "Stock movement mengubah net availability MRP.",
       });
       return { items: [movement], conversion };
+}
+
+exports.create = async (req, res, next) => {
+  try {
+    const request = req.body || {};
+    const rawItems = Array.isArray(request.items) ? request.items : null;
+    if (rawItems && (rawItems.length < 1 || rawItems.length > 100)) {
+      return res.status(400).json({ message: "Batch Stock Movement harus berisi 1 sampai 100 item." });
+    }
+    const actor = request.performedBy || req.user?.username || req.user?.email || "system";
+    const formulas = await getFormulaSet(prisma, "inventory");
+    const result = await prisma.$transaction(async (tx) => {
+      const inputs = rawItems || [request];
+      const outputs = [];
+      for (let index = 0; index < inputs.length; index += 1) {
+        const input = rawItems ? { ...request, ...inputs[index], items: undefined } : inputs[index];
+        try {
+          outputs.push(await createMovementInTransaction(tx, input, actor, formulas));
+        } catch (error) {
+          if (rawItems) error.message = `Baris ${index + 1}: ${error.message}`;
+          throw error;
+        }
+      }
+      return outputs;
     });
-    res.status(201).json({ items: result.items.map(mapDoc), transferGroupId: result.transferGroupId || null, conversion: result.conversion || null });
-  } catch (error) { next(error); }
+    const movements = result.flatMap((entry) => entry.items).map(mapDoc);
+    const conversions = result.map((entry) => entry.conversion).filter(Boolean);
+    res.status(201).json({
+      items: movements,
+      transferGroupId: rawItems ? null : result[0]?.transferGroupId || null,
+      transferGroupIds: result.map((entry) => entry.transferGroupId).filter(Boolean),
+      conversion: rawItems ? null : result[0]?.conversion || null,
+      conversions,
+      batch: rawItems ? { requestedLines: rawItems.length, processedLines: result.length, movementCount: movements.length } : null,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 module.exports = exports;

@@ -2,6 +2,10 @@ const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertPriceListFields } = require("../../utils/numericConverter");
+const {
+  normalizeEffectivePriceInput,
+  createEffectiveVersion,
+} = require("../../services/pricing/effectivePriceService");
 
 // Include config untuk materialpricelist
 const includeMaterialPriceList = {
@@ -25,7 +29,10 @@ const mapMaterialPrice = (doc) => {
 };
 
 async function normalizeMaterialPriceData(input) {
-  const data = convertPriceListFields(input);
+  const data = normalizeEffectivePriceInput(convertPriceListFields(input), {
+    requireEffective: input.effectiveFrom !== undefined || input.unitPrice !== undefined,
+    actor: input.createdBy,
+  });
   if (data.thickness !== undefined && data.thickness !== null && data.thickness !== "") {
     data.thickness = Number(data.thickness);
   }
@@ -39,6 +46,9 @@ async function normalizeMaterialPriceData(input) {
         materialGradeId: true,
         thickness: true,
         CSP: true,
+        materialForm: true,
+        defaultPurchaseUomCode: true,
+        materialFormRef: { select: { symbol: true, defaultPurchaseUomCode: true } },
       },
     });
     if (!material) throw Object.assign(new Error("Material tidak ditemukan."), { status: 400 });
@@ -46,6 +56,8 @@ async function normalizeMaterialPriceData(input) {
     data.materialGradeId ??= material.materialGradeId;
     data.thickness ??= material.thickness;
     data.CSP ??= material.CSP;
+    data.purchasePackageUomCode ??= material.materialFormRef?.symbol || material.materialForm;
+    data.uomCode ??= material.defaultPurchaseUomCode || material.materialFormRef?.defaultPurchaseUomCode;
   }
 
   if (data.materialGradeId) {
@@ -171,9 +183,34 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const convertedData = await normalizeMaterialPriceData(req.body);
-    const doc = await prisma.materialPriceList.create({
+    const convertedData = await normalizeMaterialPriceData({
+      ...req.body,
+      createdBy: req.user?.username || req.user?.email || "system",
+    });
+    if (!convertedData.supplierId || convertedData.unitPrice === undefined) {
+      return res.status(400).json({ message: "Supplier dan harga satuan wajib diisi." });
+    }
+    const identity = convertedData.materialId
+      ? { materialId: convertedData.materialId }
+      : {
+          materialId: null,
+          materialSubstanceId: convertedData.materialSubstanceId,
+          materialGradeId: convertedData.materialGradeId,
+          thickness: convertedData.thickness,
+          CSP: convertedData.CSP || null,
+        };
+    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+      model: "materialPriceList",
       data: convertedData,
+      scopeWhere: {
+        ...identity,
+        supplierId: convertedData.supplierId,
+        currencyCode: convertedData.currencyCode || "IDR",
+        uomCode: convertedData.uomCode || null,
+      },
+    }));
+    const doc = await prisma.materialPriceList.findUnique({
+      where: { id: saved.id },
       include: includeMaterialPriceList,
     });
 
@@ -188,6 +225,7 @@ exports.update = async (req, res, next) => {
     const current = await prisma.materialPriceList.findUnique({ where: { id: req.params.id } });
     if (!current) return res.status(404).json({ message: "MaterialPriceList not found" });
     const convertedData = await normalizeMaterialPriceData({ ...current, ...req.body, id: undefined, createdAt: undefined, updatedAt: undefined });
+    delete convertedData.createdBy;
     const doc = await prisma.materialPriceList.update({
       where: { id: req.params.id },
       data: convertedData,
@@ -282,13 +320,23 @@ exports.bulkCreate = async (req, res, next) => {
             convertedData.materialId = material.id;
           }
         }
-        const normalizedData = await normalizeMaterialPriceData(convertedData);
+        const normalizedData = await normalizeMaterialPriceData({
+          ...convertedData,
+          ...(convertedData.effectiveFrom || convertedData.unitPrice !== undefined ? { createdBy: req.user?.username || req.user?.email || "system" } : {}),
+        });
 
         // Create material price list baru
-        const doc = await prisma.materialPriceList.create({
-          data: normalizedData,
-          include: includeMaterialPriceList,
-        });
+        const identity = normalizedData.materialId
+          ? { materialId: normalizedData.materialId }
+          : { materialId: null, materialSubstanceId: normalizedData.materialSubstanceId, materialGradeId: normalizedData.materialGradeId, thickness: normalizedData.thickness, CSP: normalizedData.CSP || null };
+        const saved = normalizedData.effectiveFrom
+          ? await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+              model: "materialPriceList",
+              data: normalizedData,
+              scopeWhere: { ...identity, supplierId: normalizedData.supplierId || null, currencyCode: normalizedData.currencyCode || "IDR", uomCode: normalizedData.uomCode || null },
+            }))
+          : await prisma.materialPriceList.create({ data: normalizedData });
+        const doc = await prisma.materialPriceList.findUnique({ where: { id: saved.id }, include: includeMaterialPriceList });
 
         results.success.push(mapMaterialPrice(doc));
       } catch (error) {

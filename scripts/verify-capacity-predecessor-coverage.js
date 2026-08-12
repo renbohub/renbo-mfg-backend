@@ -5,10 +5,14 @@ const {
   reservePredecessorGroupOutput,
   predecessorGroupReadiness,
   compareAllocationConsumptionOrder,
+  allocationFinishMoment,
+  resolveVendorReturnDeadline,
 } = require("../src/prisma/services/planning/capacityPlanningService");
 const {
   generatedBatchQuantity,
+  priorityNetBatchQuantity,
   phaseJobs,
+  combineSingleDeliveryBufferCampaigns,
   fitFirstBatchStrategies,
   scorePlacementCandidate,
   SCORING_MODEL,
@@ -176,10 +180,24 @@ assert.strictEqual(duplicateLinkGroup.linkedOutputQty, 60, "ID predecessor yang 
 
 const bufferJobs = phaseJobs(
   { periodEnd: new Date("2026-08-31T00:00:00.000Z") },
-  [{ id: "receipt-1", mpsDetailId: "mps-detail-1", partCode: "FG-001", qtyPlanned: 430, actualSalesOrderQty: 300, forecastQty: 300, effectiveDemandQty: 450, bufferQty: 150, requiredDate: new Date("2026-08-31T00:00:00.000Z"), notes: "" }],
-  [{ id: "phase-1", mpsDetailId: "mps-detail-1", phaseNumber: 1, plannedDate: new Date("2026-08-30T00:00:00.000Z"), qtyPlanned: 300, targetType: "CUSTOMER", targetCode: "C001" }],
+  [{ id: "receipt-1", mpsDetailId: "mps-detail-1", partCode: "FG-001", uomCode: "pcs", qtyPlanned: 430, actualSalesOrderQty: 300, forecastQty: 300, effectiveDemandQty: 450, bufferQty: 150, requiredDate: new Date("2026-08-31T00:00:00.000Z"), notes: "" }],
+  [{ id: "phase-1", mpsDetailId: "mps-detail-1", phaseNumber: 1, plannedDate: new Date("2026-08-30T00:00:00.000Z"), qtyPlanned: 300, targetType: "CUSTOMER", targetCode: "C001", sourceType: "SALES_ORDER", sourceNumber: "SO-001" }],
+  { finishedGoodStockBalances: [{ id: "stock-1", partCode: "FG-001", uomCode: "pcs", warehouseCode: "FG", rackCode: "R01", lotNumber: "LOT-001", qtyOnHand: 20, qtyReserved: 20, qtyQC: 0, qtyAvailable: 0, lastMovement: new Date("2026-07-31T00:00:00.000Z"), stockReservations: [{ id: "reservation-1", reservationNumber: "RSV-001", reservationDate: new Date("2026-07-31T00:00:00.000Z"), qtyReserved: 20, qtyReleased: 0, referenceType: "SO", referenceNumber: "SO-001#1", status: "Active" }] }] },
 );
-assert.deepStrictEqual(bufferJobs.map((job) => [job.targetType, job.qty, job.configurationError || null]), [["CUSTOMER", 300, null], ["INTERNAL_STOCK", 130, null]], "Buffer produksi harus menjadi target internal dan tidak boleh memicu shortage Delivery Schedule customer");
+assert.deepStrictEqual(bufferJobs.map((job) => [job.targetType, job.qty, job.stockCoverageQty || 0, job.configurationError || null]), [["CUSTOMER", 280, 20, null], ["INTERNAL_STOCK", 150, 0, null]], "Priority 1 harus mengonsumsi stock FG lebih dulu, sedangkan buffer tetap diproduksi setelah demand customer");
+assert.deepStrictEqual(bufferJobs[0].stockCoverageHistory.map((line) => [line.warehouseCode, line.rackCode, line.lotNumber, line.usedQty, line.coverageSource, line.reservationNumber]), [["FG", "R01", "LOT-001", 20, "RESERVED_TO_DEMAND", "RSV-001"]], "Audit priority demand harus menyimpan asal warehouse, rack, lot, reservation SO, dan qty stock yang dipakai");
+
+const continuousCampaign = combineSingleDeliveryBufferCampaigns(bufferJobs);
+assert.strictEqual(continuousCampaign.length, 1, "Satu delivery customer dan buffer dengan FG due yang sama harus menjadi satu production campaign");
+assert.strictEqual(continuousCampaign[0].qty, 430, "Campaign harus memproduksi total 280 customer + 150 buffer tanpa memecah eksekusi route");
+assert.deepStrictEqual(continuousCampaign[0].campaignSegments.map((segment) => [segment.targetType, segment.productionQty, segment.stockCoverageQty]), [["CUSTOMER", 280, 20], ["INTERNAL_STOCK", 150, 0]], "Pegging customer dan buffer harus tetap terpisah walaupun eksekusi mesin dikonsolidasikan");
+
+const priorityRoutePhase1 = priorityNetBatchQuantity(280, 0, 341, 430, "pcs");
+const priorityRouteBuffer = priorityNetBatchQuantity(150, 280, 341, 430, "pcs");
+assert.deepStrictEqual([priorityRoutePhase1, priorityRouteBuffer], [280, 61], "Route net requirement harus diberikan ke priority demand dahulu, bukan dibagi proporsional dengan route factor");
+const priorityShift1 = priorityNetBatchQuantity(150, 0, 341, 430, "pcs");
+const priorityShift2 = priorityNetBatchQuantity(130, 150, 341, 430, "pcs");
+assert.deepStrictEqual([priorityShift1, priorityShift2], [150, 130], "Sisa priority demand harus pindah ke batch/shift berikutnya sebelum buffer memakai sisa kebutuhan route");
 
 const fitFirst = fitFirstBatchStrategies(400, [100, 100, 100, 100]);
 assert.deepStrictEqual(fitFirst, [[400], [100, 100, 100, 100]], "Auto allocation harus mencoba qty 400 sebagai satu blok sebelum memakai split kapasitas");
@@ -213,4 +231,33 @@ assert(strongCandidate.score > weakCandidate.score, "Mesin cepat, kosong, tanpa 
 const scoreTotal = Object.values(strongCandidate.breakdown).reduce((sum, weightedScore) => sum + weightedScore, 0);
 assert(Math.abs(scoreTotal - strongCandidate.score) < 0.1, "Total breakdown scoring harus konsisten dengan recommendation score");
 
-console.log("Capacity predecessor, cumulative WIP reservation, allocation, buffer, fit-first, and scoring checks passed: 27/27 cases");
+const vendorAllocation = {
+  id: "VENDOR-PAINT",
+  plan: { planNumber: "MPP-202609-001" },
+  routingMode: "VENDOR",
+  vendorSendDate: "2026-09-16",
+  vendorReturnDate: "2026-09-21",
+  plannedStartTime: "12:12",
+  plannedEndTime: "12:12",
+  latestFinishDate: "2026-09-29",
+  fgRequiredDate: "2026-09-29",
+};
+const vendorSuccessor = {
+  id: "INSP-PACK",
+  plan: { planNumber: "MPP-202609-001" },
+  routingMode: "INHOUSE",
+  scheduleDate: "2026-09-21",
+  plannedStartTime: "12:12",
+  predecessorAllocationIds: [vendorAllocation.id],
+  mbomProcess: { process: { processCode: "INSP-PACK" } },
+};
+const vendorDeadline = resolveVendorReturnDeadline(vendorAllocation, [vendorAllocation, vendorSuccessor]);
+assert.strictEqual(vendorDeadline.source, "SUCCESSOR_START", "Vendor route harus dinilai terhadap start successor, bukan start seluruh production chain");
+assert.strictEqual(vendorDeadline.deadline.toISOString(), "2026-09-21T12:12:00.000Z");
+assert(allocationFinishMoment(vendorAllocation) <= vendorDeadline.deadline, "Return vendor tepat saat successor mulai harus valid");
+
+const terminalVendorDeadline = resolveVendorReturnDeadline(vendorAllocation, [vendorAllocation]);
+assert.strictEqual(terminalVendorDeadline.source, "ROUTE_LATEST_FINISH", "Vendor terminal harus memakai latest finish dari backward routing pass");
+assert.strictEqual(terminalVendorDeadline.deadline.toISOString(), "2026-09-29T23:59:00.000Z");
+
+console.log("Capacity predecessor, cumulative WIP reservation, vendor deadline, priority stock, allocation, buffer, fit-first, and scoring checks passed: 36/36 cases");
