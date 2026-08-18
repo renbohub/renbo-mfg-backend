@@ -8,6 +8,11 @@ const {
   processMatches,
   effectiveVendorRate,
 } = require("../src/prisma/services/planning/vendorProcessPrService");
+const {
+  capacityDetailAppliesToJob,
+  capacityTaskBatchQuantity,
+  buildPriorCampaignCompletionByPhase,
+} = require("../src/prisma/services/planning/capacityRecommendationService");
 
 let passed = 0;
 function check(name, test) {
@@ -45,5 +50,54 @@ check("PR confirmation supports vendorCode", () => {
   assert(source.includes("const vendorProcessPr"));
   assert(source.includes("vendorCode: row.vendorCode"));
 });
+check("auto recommendation synchronizes current MPS/MRP snapshot before capacity allocation", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/planning/MonthlyProductionPlanController.js"), "utf8");
+  const syncCall = source.indexOf("const sourcePlanSync = await syncDraftPlanWithCurrentMps");
+  const recommendationCall = source.indexOf("const recommendation = await recommendMonthlyCapacity", syncCall);
+  assert(syncCall >= 0, "Capacity recommendation harus menyinkronkan detail MPP Draft dari MPS current");
+  assert(recommendationCall > syncCall, "Sinkronisasi MPS→MPP harus selesai sebelum graph capacity dibentuk");
+  assert(source.includes("sourceMrpRunNumber: completedMrp.runNumber"), "Audit sync harus menyimpan MRP run sumber");
+  assert(source.includes("createdPartCodes"), "Audit sync harus mencatat part baru seperti Painting");
+  assert(source.includes("splitPlanDetailsByMrpExecutionMonth"), "MPP harus dipecah memakai order date hasil netting MRP");
+  assert(source.includes("[MRP-TARGET:"), "Baris MPP process harus menyimpan target delivery sumber formula");
+  assert(source.includes("[MRP-ORDER-MONTH:"), "Baris MPP process harus menyimpan bucket execution month");
+});
 
-console.log(`Vendor Process PR checks passed: ${passed}/7 cases`);
+check("capacity applies MRP process only to its pegged delivery target", () => {
+  const detail = { notes: "[MRP-PRODUCTION] [MRP-TARGET:target-14]" };
+  assert(capacityDetailAppliesToJob(detail, { sourceDeliveryTargetId: "target-14" }));
+  assert(!capacityDetailAppliesToJob(detail, { sourceDeliveryTargetId: "target-12" }));
+  assert(capacityDetailAppliesToJob({ notes: "[MRP-PRODUCTION]" }, { sourceDeliveryTargetId: "target-12" }));
+});
+
+check("phase scoped batch quantity ignores prior delivery cumulative quantity", () => {
+  const task = { phasePlannedQty: 40, phaseReceiptQty: 20, detail: { qtyPlanned: 40, uomCode: "PCS" } };
+  assert.equal(capacityTaskBatchQuantity(task, 10, 200, 443, 200), 20);
+  assert.equal(capacityTaskBatchQuantity(task, 10, 210, 443, 200), 20);
+});
+
+check("prior month vendor return becomes next month execution gate", () => {
+  const gates = buildPriorCampaignCompletionByPhase(new Date("2026-09-01T00:00:00Z"), [
+    {
+      id: "paint-aug", deliveryPhaseId: "phase-6", routingMode: "VENDOR",
+      scheduleDate: new Date("2026-08-28T00:00:00Z"), vendorReturnDate: new Date("2026-09-02T00:00:00Z"), plannedEndTime: "00:00",
+    },
+    {
+      id: "old-inhouse", deliveryPhaseId: "phase-6", routingMode: "INHOUSE",
+      scheduleDate: new Date("2026-09-01T00:00:00Z"), plannedEndTime: "10:00",
+    },
+  ]);
+  assert.equal(gates.get("PHASE:phase-6").minute, 1440);
+  assert.deepEqual(gates.get("PHASE:phase-6").allocationIds, ["paint-aug"]);
+});
+
+check("FG receipt is split by independent MRP target and supports receipt milestone", () => {
+  const controller = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/planning/MonthlyProductionPlanController.js"), "utf8");
+  const capacity = fs.readFileSync(path.join(__dirname, "../src/prisma/services/planning/capacityRecommendationService.js"), "utf8");
+  assert(controller.includes('requirementType: { in: ["Independent", "Dependent"] }'));
+  assert(controller.includes("detailSourceId(detail)"));
+  assert(capacity.includes('capacityMode: "FG_RECEIPT_MILESTONE"'));
+});
+
+
+console.log(`Vendor Process PR checks passed: ${passed}/12 cases`);

@@ -9,6 +9,7 @@ const { generatePONumber, calcTotal } = require("./utils/purchasingHelpers");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { resolveItemIdentityInput, hasItemIdentity, buildIdentityWhere, normalizeText } = require("../inventory/utils/itemIdentity");
 const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { autoAllocateMaterialReceipt } = require("../inventory/utils/autoPartAllocation");
 const {
   convertPODetailNumericFields,
 } = require("./utils/purchasingNumericConverter");
@@ -1920,9 +1921,10 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
     const usesMaterialMaster = Boolean(identity.materialId || identity.materialCode);
     const stockType = usesMaterialMaster ? "Material" : getDirectStockType(po.poType);
 
+    const movementNumber = await generateMovementNumber("IN", tx);
     await tx.stockMovement.create({
       data: {
-        movementNumber: await generateMovementNumber("IN", tx), movementDate,
+        movementNumber, movementDate,
         movementType: "IN", direction: "IN", transactionType: "PURCHASE_RECEIVE",
         warehouseCode, rackCode: rackCode || null, lotNumber: null,
         materialId: identity.materialId || null, materialCode: identity.materialCode || null,
@@ -1949,12 +1951,20 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
       uomCode: detail.uomCode || null, stockType, qtyOnHand: qtyAfter, qtyReserved,
       qtyQC, qtyAvailable: Math.max(0, qtyAfter - qtyReserved - qtyQC), lastMovement: movementDate,
     };
+    let postedBalance;
     if (existing) {
       await assertStockBalanceNotFrozen(tx, existing.id);
-      await tx.stockBalance.update({ where: { id: existing.id }, data: balanceData });
+      postedBalance = await tx.stockBalance.update({ where: { id: existing.id }, data: balanceData });
     } else {
-      await tx.stockBalance.create({ data: { warehouseCode, rackCode: rackCode || null, lotNumber: null, partCode: identity.partCode || null, ...balanceData } });
+      postedBalance = await tx.stockBalance.create({ data: { warehouseCode, rackCode: rackCode || null, lotNumber: null, partCode: identity.partCode || null, ...balanceData } });
     }
+    await autoAllocateMaterialReceipt(tx, {
+      stockBalanceId: postedBalance.id,
+      receivedQty: qty,
+      reservationDate: movementDate,
+      sourceType: "PURCHASE_RECEIVE",
+      sourceNumber: movementNumber,
+    });
     await tx.purchaseOrderDetail.update({ where: { id: detail.id }, data: { qtyReceived: { increment: qty } } });
   }
 }

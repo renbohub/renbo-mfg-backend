@@ -638,7 +638,11 @@ async function generateForRun(tx, runNumber, user, options = {}) {
     // full compatible supply graph (generic material, WIP and existing open
     // supply). Re-netting gross demand here double counts the shortage.
     const netRequirement = round(Math.max(number(order.qty) - number(order.qtyReleased), 0));
-    const moq = number(effectiveMaterialPrice?.moq ?? supplierItem?.moq);
+    const configuredMoq = number(effectiveMaterialPrice?.moq ?? supplierItem?.moq);
+    const rawMaterialPurchase = Boolean(material) || String(order.uomCode || "").trim().toLowerCase() === "kg";
+    const fallbackMoq = rawMaterialPurchase ? 200 : 1000;
+    const moq = configuredMoq > 0 ? configuredMoq : fallbackMoq;
+    const moqSource = configuredMoq > 0 ? "PURCHASING_MASTER" : rawMaterialPurchase ? "SYSTEM_DEFAULT_RAW_200_KG" : "SYSTEM_DEFAULT_PART_1000_PCS";
     const orderMultiple = number(effectiveMaterialPrice?.orderMultiple ?? supplierItem?.orderMultiple);
     const recommendedPurchaseQty = roundedPurchaseQty(netRequirement, moq, orderMultiple);
     const excessQty = round(Math.max(recommendedPurchaseQty - netRequirement, 0));
@@ -707,6 +711,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
         masterPurchasingLeadTimeDays,
         effectivePurchasingLeadTimeDays: purchasingLeadTimeDays,
         capacityReferenceStartDate: capacityProductionStart || null,
+        lotSizing: { netRequirement, moq, orderMultiple, recommendedPurchaseQty, excessQty, moqSource },
       },
       purchasingLeadTimeDays,
       setupTimeMinutes: round(routing.setupMinutes),

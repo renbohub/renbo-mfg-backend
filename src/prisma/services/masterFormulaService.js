@@ -1,8 +1,12 @@
 const DEFAULT_FORMULAS = Object.freeze({
-  // MPS is gross demand; available FG stock is netted once by MRP.
+  // MPS v2 produces a rolling net production schedule before BOM explosion.
   MPS_BUFFER_QTY: "round(bufferBaseQty * bufferPercent / 100, 6)",
   MPS_EFFECTIVE_DEMAND: "forecastQty + bufferQty",
   MPS_TARGET_QTY: "max(effectiveDemandQty * productionPercent / 100, actualSalesOrderQty)",
+  MPS_NET_PRODUCTION_QTY: "max(max(grossDemandQty + targetEndingStockQty - openingAvailableQty - firmScheduledReceiptQty, 0) * productionPercent / 100, max(actualSalesOrderQty - openingAvailableQty - firmScheduledReceiptQty, 0))",
+  MPS_PROJECTED_ENDING_STOCK: "max(openingAvailableQty + firmScheduledReceiptQty + plannedProductionQty - grossDemandQty, 0)",
+  MPS_AVAILABLE_BEFORE_PRODUCTION: "openingAvailableQty + firmScheduledReceiptQty",
+  MPS_FIRM_SO_SHORTAGE: "max(actualSalesOrderQty - openingAvailableQty - firmScheduledReceiptQty, 0)",
   MRP_NET_REQUIREMENT: "max(grossRequirement - projectedAvailable, 0)",
   MRP_ADJUSTED_ORDER: "max(netRequirement * orderPercent / 100, soConsumedQty)",
   LINE_AFTER_DISCOUNT: "qty * unitPrice * (1 - discount / 100)",

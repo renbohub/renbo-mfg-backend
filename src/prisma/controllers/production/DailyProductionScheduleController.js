@@ -429,7 +429,9 @@ async function attachScheduleMachines(client, schedules = []) {
   const machineIds = [...new Set(items.map((row) => row?.machineId).filter(Boolean))];
   const processIds = [...new Set(items.map((row) => row?.processId).filter(Boolean))];
   const diesIds = [...new Set(items.map((row) => row?.diesId).filter(Boolean))];
-  const [machines, processes, dies] = await Promise.all([
+  const partIds = [...new Set(items.map((row) => row?.partId).filter(Boolean))];
+  const partCodes = [...new Set(items.map((row) => row?.partCode).filter(Boolean))];
+  const [machines, processes, dies, parts] = await Promise.all([
     machineIds.length
       ? client.machine.findMany({ where: { id: { in: machineIds } }, select: machineSelect })
       : [],
@@ -442,15 +444,30 @@ async function attachScheduleMachines(client, schedules = []) {
     diesIds.length
       ? client.dies.findMany({ where: { id: { in: diesIds }, isDeleted: false }, select: { id: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true, status: true } })
       : [],
+    partIds.length || partCodes.length
+      ? client.part.findMany({
+          where: {
+            isDeleted: false,
+            OR: [
+              ...(partIds.length ? [{ id: { in: partIds } }] : []),
+              ...(partCodes.length ? [{ partCode: { in: partCodes } }] : []),
+            ],
+          },
+          select: { id: true, partCode: true, partNumber: true, partName: true },
+        })
+      : [],
   ]);
   const machineById = new Map(machines.map((row) => [row.id, row]));
   const processById = new Map(processes.map((row) => [row.id, row]));
   const diesById = new Map(dies.map((row) => [row.id, row]));
+  const partById = new Map(parts.map((row) => [row.id, row]));
+  const partByCode = new Map(parts.map((row) => [row.partCode, row]));
   const hydrated = items.map((row) => row ? {
     ...row,
     machine: machineById.get(row.machineId) || null,
     process: processById.get(row.processId) || null,
     dies: diesById.get(row.diesId) || null,
+    part: partByCode.get(row.partCode) || partById.get(row.partId) || null,
   } : row);
   return Array.isArray(schedules) ? hydrated : hydrated[0];
 }
@@ -470,6 +487,9 @@ function mapScheduleDoc(schedule) {
     machineLocation: doc.machine?.location || null,
     processCode: doc.process?.processCode || null,
     processName: doc.process?.processName || null,
+    partCode: doc.part?.partCode || doc.partCode || null,
+    partNumber: doc.part?.partNumber || null,
+    partName: doc.part?.partName || null,
     sourceModule: ppicMarker ? "PPIC" : "Production",
     monthlyProductionPlanNumber: doc.productionPlan?.planNumber || ppicMarker?.[1] || null,
     monthlyProductionPlanLineNumber: doc.productionPlanAllocation?.lineNumber || (ppicMarker ? Number(ppicMarker[2]) : null),

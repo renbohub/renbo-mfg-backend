@@ -6,6 +6,7 @@ const {
   predecessorGroupReadiness,
   compareAllocationConsumptionOrder,
   allocationFinishMoment,
+  crossPlanPredecessorStatus,
   resolveVendorReturnDeadline,
 } = require("../src/prisma/services/planning/capacityPlanningService");
 const {
@@ -260,4 +261,23 @@ const terminalVendorDeadline = resolveVendorReturnDeadline(vendorAllocation, [ve
 assert.strictEqual(terminalVendorDeadline.source, "ROUTE_LATEST_FINISH", "Vendor terminal harus memakai latest finish dari backward routing pass");
 assert.strictEqual(terminalVendorDeadline.deadline.toISOString(), "2026-09-29T23:59:00.000Z");
 
-console.log("Capacity predecessor, cumulative WIP reservation, vendor deadline, priority stock, allocation, buffer, fit-first, and scoring checks passed: 36/36 cases");
+const augustPainting = {
+  plan: { planNumber: "MPP-202608-002", sourceType: "MPS:MPS-202609" },
+  routingMode: "VENDOR",
+  vendorReturnDate: "2026-09-02",
+  plannedEndTime: "00:00",
+};
+const septemberSuccessor = {
+  plan: { planNumber: "MPP-202609-001", sourceType: "MPS:MPS-202609" },
+  routingMode: "INHOUSE",
+  scheduleDate: "2026-09-02",
+  plannedStartTime: "08:00",
+};
+assert.strictEqual(crossPlanPredecessorStatus(augustPainting, septemberSuccessor), "READY", "Vendor return bulan lalu sebelum successor harus valid");
+assert.strictEqual(crossPlanPredecessorStatus(augustPainting, { ...septemberSuccessor, scheduleDate: "2026-09-01" }), "LATE", "Successor tidak boleh mulai sebelum vendor return bulan lalu");
+assert.strictEqual(crossPlanPredecessorStatus(
+  augustPainting,
+  { ...septemberSuccessor, plan: { ...septemberSuccessor.plan, sourceType: "MPS:MPS-LAIN" } },
+), "SOURCE_MISMATCH", "Cross-MPP predecessor wajib berasal dari source MPS yang sama");
+
+console.log("Capacity predecessor, cumulative WIP reservation, vendor deadline, priority stock, allocation, buffer, fit-first, scoring, and cross-MPP checks passed: 39/39 cases");

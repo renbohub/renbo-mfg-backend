@@ -11,6 +11,7 @@ const { compareRoutingOperations } = require("../../utils/routingSequence");
 const { syncMonthlyMps, previewMonthlyMbomSelections, normalizeMpsRunSelection } = require("../../services/planning/monthlyPlanningService");
 const { planningAnchorMonth } = require("../../services/planning/demandPlanningService");
 const { resolveMbomRevision, selectedRevisionId } = require("../../services/planning/mbomRevisionService");
+const { getMpsWorkbench } = require("../../services/planning/mpsWorkbenchService");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
@@ -21,8 +22,8 @@ const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith(GENERATED_PROCESS_PREFIX);
 function evaluateMpsBuffer(formulas, variables) {
   const result = evaluateFromSet(formulas, "MPS_BUFFER_QTY", variables);
-  // MPS defines gross demand. Inventory is netted exactly once in MRP; using
-  // FG stock here would reduce the same stock again during MRP explosion.
+  // Buffer is the target ending FG balance. Inventory is handled by the
+  // rolling MPS netting and must not reduce this target itself.
   return Math.max(result, 0);
 }
 const sourceKeyFor = (forecastNumber, periodKey, attempt = 0) => `FORECAST:${forecastNumber}:${periodKey}${attempt > 0 ? `:PARTIAL-${attempt}` : ""}`;
@@ -317,6 +318,20 @@ exports.list = async (req, res, next) => {
         targetMonths,
       };
     }), total, page, limit });
+  } catch (error) { next(error); }
+};
+
+exports.workbench = async (req, res, next) => {
+  try {
+    res.json(await getMpsWorkbench(prisma, {
+      month: req.query.month,
+      q: req.query.q,
+      status: req.query.status,
+      page: req.query.page,
+      pageSize: req.query.pageSize,
+      includeSimulation: req.query.includeSimulation,
+      detailId: req.query.detailId,
+    }));
   } catch (error) { next(error); }
 };
 
@@ -966,6 +981,15 @@ exports.updateAdjustments = async (req, res, next) => {
         where: { id: row.id },
         data: { bufferPercent, bufferQty, bufferOverridden: true, bufferReferenceScope: scope, effectiveDemandQty, productionPercent, productionOverridden: true, actualSalesOrderQty, soNumber: [...new Set(actual.soNumbers)].join(",") || row.soNumber || null, qtyPlanned },
       });
+    }));
+    // Rebuild the complete rolling horizon after persisting the override.
+    // This prevents the edited month from reusing opening FG independently
+    // and keeps every following bucket, trace, MRP input, and MPP aligned.
+    const planningAnchor = monthKey(doc.planningAnchorMonth || doc.periodStart);
+    const horizonMonths = [planningAnchor, nextPlanningMonthKey(planningAnchor), nextPlanningMonthKey(nextPlanningMonthKey(planningAnchor))];
+    await prisma.$transaction((tx) => syncMonthlyMps(tx, {
+      months: horizonMonths, planningAnchorMonth: planningAnchor,
+      runBy: req.user?.username || req.user?.email || "system",
     }));
     const updated = await prisma.mPS.findFirst({ where: { mpsNumber: doc.mpsNumber }, include });
     res.json(updated);

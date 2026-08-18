@@ -9,11 +9,15 @@ const { submitDocumentForApproval } = require("../../services/approvalRuleServic
 const FROZEN_STATUSES = ["COUNTING", "WAITING_APPROVAL", "APPROVED"];
 const STO_STOCK_TYPES = {
   MATERIAL: ["Material", "Purchase Part"],
-  WIP: ["WIP", "Semi-Finished"],
+  WIP: ["WIP", "WP", "Semi-Finished"],
   FG: ["Finished Goods", "FG"],
 };
 const fail = (message, statusCode = 400) => { const error = new Error(message); error.statusCode = statusCode; throw error; };
 const actor = (req) => req.user?.username || req.user?.email || "system";
+const counterName = (req, fallback = true) => {
+  const value = String(req.body?.countedBy || req.body?.counterName || "").trim();
+  return value || (fallback ? actor(req) : "");
+};
 
 function statusGuard(current, expected) {
   if (Array.isArray(expected) ? !expected.includes(current) : current !== expected) fail(`Status STO ${current} tidak dapat diproses untuk aksi ini.`, 409);
@@ -161,13 +165,30 @@ exports.create = async (req, res, next) => {
     if (requestedStockType && !STO_STOCK_TYPES[stoType].includes(requestedStockType)) {
       return res.status(400).json({ message: `Stock type ${requestedStockType} tidak sesuai dengan STO ${stoType}.` });
     }
+    const purchasePartCodes = stoType === "MATERIAL"
+      ? (await prisma.part.findMany({
+          where: { isDeleted: false, itemType: "RAW", rawType: "PURCHASE_PART" },
+          select: { partCode: true },
+        })).map((part) => part.partCode)
+      : [];
+    const canonicalStockTypeWhere = requestedStockType
+      ? requestedStockType === "Purchase Part"
+        ? { OR: [
+            { stockType: "Purchase Part" },
+            { stockType: "Part", partCode: { in: purchasePartCodes } },
+          ] }
+        : { stockType: requestedStockType }
+      : stoType === "MATERIAL"
+        ? { OR: [
+            { stockType: { in: STO_STOCK_TYPES.MATERIAL } },
+            { stockType: "Part", partCode: { in: purchasePartCodes } },
+          ] }
+        : { stockType: { in: STO_STOCK_TYPES[stoType] } };
     const balances = await prisma.stockBalance.findMany({
       where: {
         warehouseCode,
         isDeleted: false,
-        stockType: requestedStockType
-          ? requestedStockType
-          : { in: STO_STOCK_TYPES[stoType] },
+        ...canonicalStockTypeWhere,
         ...(body.rackCode ? { rackCode: String(body.rackCode) } : {}),
         ...(body.lotNumber ? { lotNumber: String(body.lotNumber) } : {}),
       },
@@ -281,9 +302,11 @@ exports.countDetail = async (req, res, next) => {
     if (detail.header.stoNo !== req.params.stoNo) return res.status(409).json({ message: "Detail bukan bagian dari dokumen Stock Opname ini." });
     statusGuard(detail.header.status, "COUNTING");
     const actualQty = Number(req.body?.actualQty);
+    const countedBy = counterName(req, false);
     if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "actualQty harus berupa angka >= 0." });
+    if (!countedBy) return res.status(400).json({ message: "Nama petugas hitung wajib diisi." });
     const result = variance(detail.systemQty, actualQty);
-    const updated = await prisma.stockOpnameDetail.update({ where: { id: detail.id }, data: { actualQty, varianceQty: result.value, varianceStatus: result.status, reason: req.body?.reason || null, countedBy: actor(req), countedAt: new Date() } });
+    const updated = await prisma.stockOpnameDetail.update({ where: { id: detail.id }, data: { actualQty, varianceQty: result.value, varianceStatus: result.status, reason: req.body?.reason || null, countedBy, countedAt: new Date() } });
     const { systemQty, varianceQty, varianceAmount, varianceStatus, ...blindDetail } = mapDoc(updated);
     res.json(blindDetail);
   } catch (error) { next(error); }
@@ -302,11 +325,13 @@ exports.blindCount = async (req, res, next) => {
     const partIdentity = normalizeIdentity(req.body?.partIdentity || req.body?.partCode || req.body?.partNumber);
     const partName = normalizeIdentity(req.body?.partName);
     const actualQty = Number(req.body?.actualQty);
+    const countedBy = counterName(req, false);
     if (!stockType) return res.status(400).json({ message: "Jenis stock wajib dipilih." });
     const isMaterial = stockType === "MATERIAL";
     if (isMaterial && (!materialType || !materialIdentity)) return res.status(400).json({ message: "Jenis material dan nama/kode material wajib dipilih." });
     if (!isMaterial && (!partIdentity || !partName)) return res.status(400).json({ message: "Part No/Part Code dan Part Name wajib dipilih." });
     if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "Qty hasil hitung harus berupa angka >= 0." });
+    if (!countedBy) return res.status(400).json({ message: "Nama petugas hitung wajib diisi." });
     const matches = item.details.filter((detail) =>
       normalizeIdentity(detail.rackCode) === rackCode
       && normalizeIdentity(detail.lotNumber) === lotNumber
@@ -330,7 +355,7 @@ exports.blindCount = async (req, res, next) => {
         actualQty,
         varianceQty: result.value,
         varianceStatus: result.status,
-        countedBy: actor(req),
+        countedBy,
         countedAt: new Date(),
       },
     });
@@ -344,6 +369,7 @@ exports.bulkCount = async (req, res, next) => {
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
     statusGuard(item.status, "COUNTING");
     const counts = Array.isArray(req.body?.counts) ? req.body.counts : [];
+    const defaultCountedBy = counterName(req, false);
     if (!counts.length) return res.status(400).json({ message: "counts wajib berisi minimal satu baris." });
     const detailById = new Map(item.details.map((detail) => [detail.id, detail]));
     const normalized = counts.map((count) => {
@@ -352,9 +378,11 @@ exports.bulkCount = async (req, res, next) => {
       const actualQty = Number(count.actualQty);
       if (!Number.isFinite(actualQty) || actualQty < 0) fail("Semua actualQty harus berupa angka >= 0.");
       const result = variance(detail.systemQty, actualQty);
-      return { detail, actualQty, result, reason: String(count.reason || "").trim() || null };
+      const countedBy = String(count.countedBy || defaultCountedBy || "").trim();
+      if (!countedBy) fail("Nama petugas hitung wajib diisi untuk semua baris.");
+      return { detail, actualQty, result, reason: String(count.reason || "").trim() || null, countedBy };
     });
-    await prisma.$transaction(normalized.map(({ detail, actualQty, result, reason }) =>
+    await prisma.$transaction(normalized.map(({ detail, actualQty, result, reason, countedBy }) =>
       prisma.stockOpnameDetail.update({
         where: { id: detail.id },
         data: {
@@ -362,7 +390,7 @@ exports.bulkCount = async (req, res, next) => {
           varianceQty: result.value,
           varianceStatus: result.status,
           reason,
-          countedBy: actor(req),
+          countedBy,
           countedAt: new Date(),
         },
       }),

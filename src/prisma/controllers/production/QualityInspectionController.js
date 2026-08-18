@@ -2500,6 +2500,8 @@ exports.list = async (req, res, next) => {
             select: {
               logNumber: true,
               shift: true,
+              operatorName: true,
+              qualityCheckMode: true,
               qtyProduced: true,
               qtyGood: true,
               qtyReject: true,
@@ -2623,6 +2625,7 @@ exports.get = async (req, res, next) => {
       include: {
         manufacturingOrder: {
           select: {
+            id: true,
             moNumber: true,
             status: true,
             qtyPlanned: true,
@@ -2630,13 +2633,16 @@ exports.get = async (req, res, next) => {
             part: { select: { partCode: true, partNumber: true, partName: true } },
           },
         },
-        workOrder: { select: { woNumber: true, machineId: true, shift: true, uomCode: true, machine: { select: { machineCode: true, machineName: true } } } },
+        workOrder: { select: { id: true, woNumber: true, moId: true, sequence: true, machineId: true, shift: true, uomCode: true, machine: { select: { machineCode: true, machineName: true } } } },
         productionLog: {
           select: {
             id: true,
+            dpsId: true,
             logNumber: true,
             shift: true,
             machineCode: true,
+            operatorName: true,
+            qualityCheckMode: true,
             qtyProduced: true,
             qtyGood: true,
             qtyReject: true,
@@ -2682,6 +2688,25 @@ exports.get = async (req, res, next) => {
     }
     mappedDoc.qcSourceLocation = toLocationSnapshot(sourceMovements.goodSource);
     mappedDoc.qcRejectSourceLocation = toLocationSnapshot(sourceMovements.rejectSource);
+    if (sourceMovements.goodSource?.partCode) {
+      mappedDoc.part = {
+        ...(mappedDoc.part || {}),
+        partCode: sourceMovements.goodSource.partCode,
+        partNumber: sourceMovements.goodSource.partNumber || null,
+        partName: sourceMovements.goodSource.partName || null,
+      };
+      mappedDoc.sourceStockType = sourceMovements.goodSource.stockType || null;
+    }
+    const accepted = doc.status === "Completed"
+      && ["ACCEPTED", "CONDITIONAL ACCEPT", "CONDITIONAL_ACCEPT"].includes(String(doc.decision || "").trim().toUpperCase());
+    const fgReceiptRow = accepted ? await buildFgReceiptRow(prisma, doc) : null;
+    mappedDoc.fgReceiptEligible = Boolean(fgReceiptRow?.actionable);
+    mappedDoc.fgReceiptPendingQty = Number(fgReceiptRow?.qtyPending || 0);
+    mappedDoc.outputReleaseStatus = accepted
+      ? fgReceiptRow?.actionable
+        ? "WAITING_FG_RECEIPT"
+        : "WIP_STOCK_RELEASED"
+      : "WAITING_QC";
 
     res.json(mappedDoc);
   } catch (e) {

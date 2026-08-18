@@ -30,6 +30,15 @@ check("MRP creates one bucket per forecast delivery phase", expanded.length === 
 check("MRP preserves first phase due date and quantity", expanded[0].endDate.toISOString().slice(0, 10) === "2026-08-15" && expanded[0].forecastQty === 100);
 check("MRP preserves second phase due date and quantity", expanded[1].endDate.toISOString().slice(0, 10) === "2026-08-25" && expanded[1].forecastQty === 200);
 check("MRP phase split preserves total demand", expanded.reduce((sum, row) => sum + row.forecastQty, 0) === detail.forecastQty);
+const bufferedDetail = { ...detail, forecastQty: 300, bufferBaseQty: 400, bufferQty: 120, effectiveDemandQty: 420, qtyPlanned: 420 };
+const bufferedExpanded = controller.__test.expandMpsDetailsByDeliveryPhases([bufferedDetail], phases);
+check("MRP keeps exact customer phases and creates one internal buffer bucket", bufferedExpanded.length === 3 && bufferedExpanded[0].qtyPlanned === 100 && bufferedExpanded[1].qtyPlanned === 200 && bufferedExpanded[2].qtyPlanned === 120 && bufferedExpanded[2]._isBufferPhase === true);
+check("MRP buffer no longer inflates forecast delivery phases", bufferedExpanded[0].forecastQty === 100 && bufferedExpanded[1].forecastQty === 200 && bufferedExpanded[2].forecastQty === 0 && bufferedExpanded.reduce((sum, row) => sum + row.qtyPlanned, 0) === bufferedDetail.qtyPlanned);
+const multiPhaseSoDemand = { "FG-TEST": [{ dueDate: new Date("2026-08-31T00:00:00.000Z"), remainingQty: 300, sourceNumber: "SO-TEST#1" }] };
+const soPhaseDetail = { ...detail, partCode: "FG-TEST", _deliveryPhaseId: "so-phase-1", _deliveryPhaseSourceType: "SALES_ORDER", qtyPlanned: 100, demandSources: [{ sourceType: "SALES_ORDER", sourceNumber: "SO-TEST" }] };
+const firstSoPhase = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(multiPhaseSoDemand, soPhaseDetail, null);
+const secondSoPhase = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(multiPhaseSoDemand, { ...soPhaseDetail, _deliveryPhaseId: "so-phase-2", qtyPlanned: 200 }, null);
+check("MRP consumes multi-phase SO quantity per phase instead of all at phase one", firstSoPhase.consumedQty === 100 && secondSoPhase.consumedQty === 200 && multiPhaseSoDemand["FG-TEST"][0].remainingQty === 0);
 const pegging = controller.__test.demandPeggingForPhase({
   qtyPlanned: "25.50",
   partCode: "FG-TEST",
@@ -53,7 +62,7 @@ check(
 
 const mrpSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MRPController.js"), "utf8");
 const explodeStart = mrpSource.indexOf("async function explodeMBOM");
-const explodeSource = mrpSource.slice(explodeStart, explodeStart + 18000);
+const explodeSource = mrpSource.slice(explodeStart, explodeStart + 30000);
 const hybridSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/hybridMrpService.js"), "utf8");
 const monthlySource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
 const mpsSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MPSController.js"), "utf8");

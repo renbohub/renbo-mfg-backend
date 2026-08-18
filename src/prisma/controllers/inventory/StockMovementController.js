@@ -15,6 +15,7 @@ const {
   resolveMaterialPieceConversion,
 } = require("../../services/inventory/materialPieceConversionService");
 const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
+const { autoAllocateMaterialReceipt } = require("./utils/autoPartAllocation");
 
 const MOVEMENT_TYPES = new Set(["IN", "OUT", "TRANSFER", "ADJUSTMENT"]);
 const MATERIAL_PIECE_MODE = "MATERIAL_FROM_PART_PCS";
@@ -363,24 +364,40 @@ async function createMovementInTransaction(tx, input, actor, formulas) {
         const inNumber = await generateMovementNumber("IN", tx);
         const out = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: source.before, qtyAfter: source.after }, outNumber, "TRANSFER", "OUT", warehouseCode, input.rackCode, qty, -qty, transferGroupId) });
         const incoming = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: destination.before, qtyAfter: destination.after }, inNumber, "TRANSFER", "IN", input.destinationWarehouseCode, input.destinationRackCode, qty, qty, transferGroupId) });
+        const autoAllocation = await autoAllocateMaterialReceipt(tx, {
+          stockBalanceId: destination.balance.id,
+          receivedQty: qty,
+          reservationDate: incoming.movementDate,
+          sourceType: "STOCK_TRANSFER",
+          sourceNumber: inNumber,
+        });
         await queueDirtyPartCodes(tx, [conversion?.sourcePartCode || payload.partCode], {
           reason: "STOCK",
           sourceNumber: transferGroupId,
           notes: "Transfer stock mengubah net availability MRP.",
         });
-        return { items: [out, incoming], transferGroupId, conversion };
+        return { items: [out, incoming], transferGroupId, conversion, autoAllocation };
       }
       const adjustmentDecrease = movementType === "ADJUSTMENT" && (String(input.adjustmentType || "").toUpperCase() === "DECREASE" || Number(input.deltaQty) < 0);
       const direction = movementType === "OUT" || adjustmentDecrease ? "OUT" : "IN";
       const balance = await findOrCreateBalance(tx, payload, warehouseCode, input.rackCode, qty, direction, formulas);
       const movementNumber = await generateMovementNumber(movementType, tx);
       const movement = await tx.stockMovement.create({ data: movementData({ ...payload, qtyBefore: balance.before, qtyAfter: balance.after, adjustmentType: movementType === "ADJUSTMENT" ? (direction === "OUT" ? "DECREASE" : "INCREASE") : input.adjustmentType }, movementNumber, movementType, direction, warehouseCode, input.rackCode, qty, direction === "OUT" ? -qty : qty) });
+      const autoAllocation = direction === "IN"
+        ? await autoAllocateMaterialReceipt(tx, {
+            stockBalanceId: balance.balance.id,
+            receivedQty: qty,
+            reservationDate: movement.movementDate,
+            sourceType: movementType === "ADJUSTMENT" ? "STOCK_ADJUSTMENT_IN" : "STOCK_MOVEMENT_IN",
+            sourceNumber: movementNumber,
+          })
+        : { allocated: false, reason: "OUTGOING_MOVEMENT" };
       await queueDirtyPartCodes(tx, [conversion?.sourcePartCode || payload.partCode], {
         reason: "STOCK",
         sourceNumber: movementNumber,
         notes: "Stock movement mengubah net availability MRP.",
       });
-      return { items: [movement], conversion };
+      return { items: [movement], conversion, autoAllocation };
 }
 
 exports.create = async (req, res, next) => {
@@ -414,6 +431,8 @@ exports.create = async (req, res, next) => {
       transferGroupIds: result.map((entry) => entry.transferGroupId).filter(Boolean),
       conversion: rawItems ? null : result[0]?.conversion || null,
       conversions,
+      autoAllocation: rawItems ? null : result[0]?.autoAllocation || null,
+      autoAllocations: result.map((entry) => entry.autoAllocation).filter((entry) => entry?.allocated),
       batch: rawItems ? { requestedLines: rawItems.length, processedLines: result.length, movementCount: movements.length } : null,
     });
   } catch (error) {

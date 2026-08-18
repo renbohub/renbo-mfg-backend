@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { prisma } = require("../../index");
 const { buildSoLineReferenceNumber } = require("../../services/production/sales-order/soReservationService");
 const { syncOperationalSalesOrderStatus } = require("../../services/production/sales-order/soStatusService");
+const { resolveDeliveryReadiness } = require("../../services/outgoing/deliveryReadinessService");
 const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const scheduleNumber = () => `DS-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -9,7 +10,13 @@ async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy
   let remaining = Number(qty || 0);
   const referenceNumber = buildSoLineReferenceNumber(soNumber, soDetail.lineNumber);
   const reservations = await tx.stockReservation.findMany({
-    where: { referenceType: "SO", referenceNumber, status: "Active", isDeleted: false },
+    where: {
+      referenceType: "SO",
+      referenceNumber,
+      status: "Active",
+      isDeleted: false,
+      stockBalance: { is: { stockType: { in: ["Finished Goods", "FG"] }, isDeleted: false } },
+    },
     orderBy: { createdAt: "asc" },
     include: { stockBalance: true },
   });
@@ -70,7 +77,25 @@ exports.createSchedule = async (req, res, next) => {
 
 exports.markShipment = async (req, res, next) => {
   try {
-    const item = await transitionSchedule(req.params.scheduleNumber, "On Process", { status: "In Transit", actualDate: new Date(), shippedAt: new Date(), trackingNumber: req.body.trackingNumber || null, shippingMethod: req.body.shippingMethod || undefined, vehicle: req.body.vehicle || null, driver: req.body.driver || null, carrier: req.body.carrier || null, deliveredBy: req.user?.username || req.user?.email || null });
+    const item = await prisma.$transaction(async (tx) => {
+      const schedule = await tx.deliverySchedule.findFirst({
+        where: { scheduleNumber: req.params.scheduleNumber, status: "On Process", isDeleted: false },
+      });
+      if (!schedule) {
+        throw Object.assign(new Error("Delivery Schedule must be On Process before this action"), { statusCode: 409 });
+      }
+      const readiness = await resolveDeliveryReadiness(tx, schedule.scheduleNumber, {
+        reserveShortage: true,
+        performedBy: req.user?.username || req.user?.email || "system",
+      });
+      if (!readiness.fgReady) {
+        throw Object.assign(new Error(readiness.fgReadinessMessage), { statusCode: 409 });
+      }
+      return tx.deliverySchedule.update({
+        where: { id: schedule.id },
+        data: { status: "In Transit", actualDate: new Date(), shippedAt: new Date(), trackingNumber: req.body.trackingNumber || null, shippingMethod: req.body.shippingMethod || undefined, vehicle: req.body.vehicle || null, driver: req.body.driver || null, carrier: req.body.carrier || null, deliveredBy: req.user?.username || req.user?.email || null },
+      });
+    });
     res.json(item);
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };

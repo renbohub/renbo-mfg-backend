@@ -7,6 +7,7 @@ const {
   assertWarehouseNotFrozen,
 } = require("../inventory/utils/stockOpnameFreezeGuard");
 const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
+const { autoAllocateMaterialReceipt } = require("../inventory/utils/autoPartAllocation");
 const {
   ensureDefaultNumberingRule,
   generateConfiguredNumber,
@@ -24,6 +25,13 @@ const allocationType = (value) => String(value || "DEMAND").trim().toUpperCase()
 const dayKey = (value) => {
   const date = value ? new Date(value) : null;
   return date && !Number.isNaN(date.getTime()) ? date.toISOString().slice(0, 10) : null;
+};
+
+const normalizeInventoryStockType = (value) => {
+  const normalized = String(value || "").trim().toUpperCase().replace(/[ _-]+/g, "_");
+  if (["PART", "PURCHASE_PART", "PURCHASEPART"].includes(normalized)) return "Purchase Part";
+  if (["MATERIAL", "RAW_MATERIAL", "RAWMATERIAL"].includes(normalized)) return "Material";
+  return String(value || "").trim() || null;
 };
 
 exports.receivePurchaseOrder = async (req, res, next) => {
@@ -159,7 +167,7 @@ exports.receivePurchaseOrder = async (req, res, next) => {
         receiptDetails.push({ lineNumber: index + 1, poDetailId: poDetail.id, qtyOrdered: poDetail.qty, qtyReceived: Number(line.qtyReceived), deliveryNoteNumber: line.deliveryNoteNumber || deliveryNoteNumber || null, lotNumber, supplierLotNumber: String(line.supplierLotNumber || "").trim() || null, rackCode: String(line.rackCode || "").trim() || null, uomCode: poDetail.uomCode, unitPrice: poDetail.unitPrice, totalPrice: Number(line.qtyReceived) * Number(poDetail.unitPrice || 0), notes: [line.notes, varianceQty > 0 ? `Over receipt ${varianceQty} ${poDetail.uomCode || ""}`.trim() : null].filter(Boolean).join(" | ") || null, allocations: { create: allocationCreates } });
         receivedInRequest.set(poDetail.id, previouslyReceivedInRequest + Number(line.qtyReceived));
       }
-      const gr = await tx.goodsReceipt.create({ data: { grNumber, poNumber, poType: po.poType, stockType: po.poType, warehouseCode, deliveryNoteNumber: deliveryNoteNumber || null, receivedBy: req.user?.username || req.user?.email || null, receivedDate: new Date(), status: "Received Pending Inspection", notes: notes || null, details: { create: receiptDetails } }, include: { details: { include: { allocations: true } } } });
+      const gr = await tx.goodsReceipt.create({ data: { grNumber, poNumber, poType: po.poType, stockType: normalizeInventoryStockType(po.poType), warehouseCode, deliveryNoteNumber: deliveryNoteNumber || null, receivedBy: req.user?.username || req.user?.email || null, receivedDate: new Date(), status: "Received Pending Inspection", notes: notes || null, details: { create: receiptDetails } }, include: { details: { include: { allocations: true } } } });
       await Promise.all(receiptDetails.map((detail) => tx.purchaseOrderDetail.update({ where: { id: detail.poDetailId }, data: { qtyReceived: { increment: detail.qtyReceived } } })));
       const updatedPoDetails = await tx.purchaseOrderDetail.findMany({
         where: { poNumber, isDeleted: false },
@@ -511,6 +519,17 @@ exports.putawayAccepted = async (req, res, next) => {
         const materialCode = materialMaster?.materialCode || detail.poDetail.materialCode || null;
         const materialName = materialMaster?.materialName || detail.poDetail.materialName || null;
         const materialType = materialMaster?.materialType || detail.poDetail.materialType || null;
+        const partMaster = !usesMaterialMaster && detail.poDetail.partCode
+          ? await tx.part.findFirst({
+              where: { partCode: detail.poDetail.partCode, isDeleted: false },
+              select: { rawType: true },
+            })
+          : null;
+        const inventoryStockType = usesMaterialMaster
+          ? "Material"
+          : String(partMaster?.rawType || "").toUpperCase() === "PURCHASE_PART"
+            ? "Purchase Part"
+            : normalizeInventoryStockType(inspection.gr.stockType || inspection.gr.poType);
         const identity = {
           warehouseCode: inspection.gr.warehouseCode,
           rackCode: detail.rackCode || null,
@@ -526,7 +545,7 @@ exports.putawayAccepted = async (req, res, next) => {
           CSP: detail.poDetail.CSP || null,
           partNumber: usesMaterialMaster ? null : detail.poDetail.partNumber || null,
           uomCode: stockUomCode || null,
-          stockType: usesMaterialMaster ? "Material" : inspection.gr.stockType,
+          stockType: inventoryStockType,
           isDeleted: false,
         };
         await lockStockBalanceIdentity(tx, identity);
@@ -554,14 +573,22 @@ exports.putawayAccepted = async (req, res, next) => {
         }
         const balance = await tx.stockBalance.findFirst({ where: identity }); const before = Number(balance?.qtyOnHand || 0); const after = before + stockQty;
         const movementNumber = await generateMovementNumber("IN", tx);
-        await tx.stockMovement.create({ data: { movementNumber, movementType: "IN", direction: "IN", transactionType: "QUALITY_RELEASE", warehouseCode: identity.warehouseCode, rackCode: identity.rackCode, lotNumber: identity.lotNumber, materialId: identity.materialId, materialCode: identity.materialCode, materialName, materialType, partCode: identity.partCode, partNumber: identity.partNumber, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, productId: identity.productId, description: identity.description, spec: identity.spec, thickness: identity.thickness, width: identity.width, CSP: identity.CSP, stockType: usesMaterialMaster ? "Material" : inspection.gr.stockType, qty: stockQty, deltaQty: stockQty, qtyBefore: before, qtyAfter: after, uomCode: identity.uomCode, qualityBucket: "AVAILABLE", referenceType: "INCOMING_INSPECTION", referenceNumber: inspection.inspectionNumber, notes: usesPurchaseConversion ? `Putaway ${accepted} ${detail.uomCode} x ${conversionFactor} ${stockUomCode}/${detail.uomCode}` : null, performedBy: req.user?.username || req.user?.email || null } });
+        await tx.stockMovement.create({ data: { movementNumber, movementType: "IN", direction: "IN", transactionType: "QUALITY_RELEASE", warehouseCode: identity.warehouseCode, rackCode: identity.rackCode, lotNumber: identity.lotNumber, materialId: identity.materialId, materialCode: identity.materialCode, materialName, materialType, partCode: identity.partCode, partNumber: identity.partNumber, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, productId: identity.productId, description: identity.description, spec: identity.spec, thickness: identity.thickness, width: identity.width, CSP: identity.CSP, stockType: inventoryStockType, qty: stockQty, deltaQty: stockQty, qtyBefore: before, qtyAfter: after, uomCode: identity.uomCode, qualityBucket: "AVAILABLE", referenceType: "INCOMING_INSPECTION", referenceNumber: inspection.inspectionNumber, notes: usesPurchaseConversion ? `Putaway ${accepted} ${detail.uomCode} x ${conversionFactor} ${stockUomCode}/${detail.uomCode}` : null, performedBy: req.user?.username || req.user?.email || null } });
+        let postedBalance;
         if (balance) {
           await assertStockBalanceNotFrozen(tx, balance.id);
-          await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: after, qtyAvailable: after - Number(balance.qtyReserved || 0) - Number(balance.qtyQC || 0), lastMovement: new Date() } });
+          postedBalance = await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: after, qtyAvailable: after - Number(balance.qtyReserved || 0) - Number(balance.qtyQC || 0), lastMovement: new Date() } });
         } else {
           await assertWarehouseNotFrozen(tx, identity.warehouseCode);
-          await tx.stockBalance.create({ data: { ...identity, isDeleted: false, materialName, materialType, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, stockType: usesMaterialMaster ? "Material" : inspection.gr.stockType, qtyOnHand: stockQty, qtyAvailable: stockQty, qtyQC: 0, lastMovement: new Date() } });
+          postedBalance = await tx.stockBalance.create({ data: { ...identity, isDeleted: false, materialName, materialType, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, stockType: inventoryStockType, qtyOnHand: stockQty, qtyAvailable: stockQty, qtyQC: 0, lastMovement: new Date() } });
         }
+        await autoAllocateMaterialReceipt(tx, {
+          stockBalanceId: postedBalance.id,
+          receivedQty: stockQty,
+          reservationDate: new Date(),
+          sourceType: "INCOMING_INSPECTION",
+          sourceNumber: inspection.inspectionNumber,
+        });
         movements.push(movementNumber);
         await tx.incomingInspectionDetail.update({ where: { id: inspectionDetail.id }, data: { qtyAcceptedPutaway: { increment: accepted } } });
       }

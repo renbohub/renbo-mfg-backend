@@ -17,6 +17,8 @@ const DEMAND_RESET_DELEGATES = [
   "stockReservation",
   "deliveryScheduleDetail", "deliverySchedule", "salesOrderAttachment", "salesOrderDetail", "salesOrderHeader",
   "mRPPegging", "mRPDirtyItem", "mRPPartialSnapshot", "plannedOrder", "mRPRequirement", "mRPRun",
+  "demandExceptionAction", "demandException",
+  "monthlyDemandSnapshot",
   "mPSDetail", "mPS", "forecastDetail", "forecast",
 ];
 

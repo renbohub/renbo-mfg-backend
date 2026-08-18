@@ -20,6 +20,36 @@ function resolveCommercialOrderQty({ commercialQty, demandCoveredQty, outstandin
   return round(Math.min(Math.max(number(demandCoveredQty), 0), outstanding));
 }
 
+/**
+ * Compatibility bridge for manual PRs created before sourcing allocations
+ * became the canonical PO-conversion decision. It copies the already saved
+ * supplier/material-form decision; callers still persist it as an allocation
+ * in the same PO transaction for auditability.
+ */
+function buildManualPrSourcingDecision({ detail = {}, requestLine = {}, currencyCode = "IDR" }) {
+  const text = (value) => String(value ?? "").trim() || null;
+  const outstandingQty = Math.max(number(detail.qty) - number(detail.orderedQty), 0);
+  return {
+    id: null,
+    supplierCode: text(requestLine.supplierCode || detail.confirmedSupplierCode || detail.proposedSupplierCode || detail.preferredSupplier),
+    vendorCode: text(requestLine.vendorCode || detail.preferredVendor),
+    demandCoveredQty: outstandingQty,
+    commercialQty: requestLine.sourceQty ?? requestLine.commercialQty ?? outstandingQty,
+    demandUomCode: detail.uomCode || null,
+    purchasePackageQty: requestLine.purchasePackageQty ?? detail.purchasePackageQty ?? null,
+    purchasePackageUomCode: requestLine.purchasePackageUomCode || detail.purchasePackageUomCode || null,
+    conversionFactor: requestLine.conversionFactor ?? detail.conversionFactor ?? null,
+    conversionUomCode: requestLine.conversionUomCode || detail.conversionUomCode || null,
+    convertedPurchaseQty: requestLine.convertedPurchaseQty ?? detail.convertedPurchaseQty ?? null,
+    materialWidth: requestLine.materialWidth ?? detail.width ?? null,
+    materialLength: requestLine.materialLength ?? detail.materialLength ?? null,
+    deliveryDate: requestLine.deliveryDate || detail.pr?.requiredDate || null,
+    currencyCode: text(currencyCode) || "IDR",
+    unitPrice: requestLine.unitPrice ?? detail.estimatedPrice ?? null,
+    notes: "[MANUAL_PR_ADAPTER] Keputusan supplier dan bentuk diambil dari detail PR manual.",
+  };
+}
+
 function summarizePurchaseOrderAllocation({ poQty, sources = [] }) {
   const orderedQty = Math.max(number(poQty), 0);
   const demandQty = round(sources.reduce((sum, source) => {
@@ -39,4 +69,4 @@ function summarizePurchaseOrderAllocation({ poQty, sources = [] }) {
   };
 }
 
-module.exports = { resolveCommercialOrderQty, summarizePurchaseOrderAllocation };
+module.exports = { resolveCommercialOrderQty, buildManualPrSourcingDecision, summarizePurchaseOrderAllocation };

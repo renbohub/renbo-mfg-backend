@@ -3,7 +3,10 @@ const { generateDocNumber, generatePONumber } = require("./utils/purchasingHelpe
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 // Commercial PO quantity is intentionally separate from exact MRP demand pegging.
-const { resolveCommercialOrderQty } = require("../../services/purchasing/purchaseOrderQuantityService");
+const {
+  resolveCommercialOrderQty,
+  buildManualPrSourcingDecision,
+} = require("../../services/purchasing/purchaseOrderQuantityService");
 
 // Keep sourcing allocations in every PR read so the UI and PO conversion use
 // the same persisted supplier/form/delivery decisions.
@@ -35,6 +38,10 @@ const normalize = (v) => String(v || "").trim().toUpperCase();
 const clean = (v) => {
   const value = String(v ?? "").trim();
   return value || null;
+};
+const positiveNumberOrNull = (v) => {
+  const value = num(v);
+  return value > 0 ? value : null;
 };
 const actor = (req) => req.user?.username || req.user?.email || req.user?.id || "system";
 const dayKey = (value) => {
@@ -1001,9 +1008,22 @@ exports.consolidateToPO = async (req, res, next) => {
       const detail = detailById.get(String(requestLine?.prDetailId || requestLine?.id || ""));
       const requestedAllocationId = clean(requestLine.sourcingAllocationId || requestLine.allocationId);
       const usableAllocations = detail.sourcingAllocations.filter((allocation) => allocation.status === "Confirmed");
-      const persistedAllocation = requestedAllocationId
+      let persistedAllocation = requestedAllocationId
         ? usableAllocations.find((allocation) => allocation.id === requestedAllocationId)
         : usableAllocations.length === 1 ? usableAllocations[0] : null;
+      const manualPr = normalize(detail.pr.sourceType) === "MANUAL";
+      // Manual PR stores its commercial decision directly on the PR detail.
+      // Do not force users to reopen the split-sourcing editor merely to copy
+      // the same supplier/form into a separate allocation record. The adapter
+      // below is persisted as a Confirmed allocation in the transaction, so PO
+      // conversion and audit still use the canonical sourcing model.
+      if (!persistedAllocation && !requestedAllocationId && manualPr && usableAllocations.length === 0) {
+        persistedAllocation = buildManualPrSourcingDecision({
+          detail,
+          requestLine,
+          currencyCode: input.currencyCode || "IDR",
+        });
+      }
       if (!persistedAllocation) {
         throw Object.assign(new Error(`${detail.prNumber}/${detail.lineNumber}: keputusan supplier/form belum final. Gunakan Edit Supplier & Material Form pada PR.`), { statusCode: 409 });
       }
@@ -1062,13 +1082,21 @@ exports.consolidateToPO = async (req, res, next) => {
         targetPoNumber,
         rawMaterial,
         purchasePackageUomCode: rawMaterial ? purchasePackageUomCode : null,
-        purchasePackageQty: null,
-        conversionUomCode: null,
-        conversionFactor: null,
-        convertedPurchaseQty: null,
+        purchasePackageQty: rawMaterial
+          ? positiveNumberOrNull(persistedAllocation.purchasePackageQty ?? detail.purchasePackageQty)
+          : null,
+        conversionUomCode: rawMaterial
+          ? clean(persistedAllocation.conversionUomCode || detail.conversionUomCode)
+          : null,
+        conversionFactor: rawMaterial
+          ? positiveNumberOrNull(persistedAllocation.conversionFactor ?? detail.conversionFactor)
+          : null,
+        convertedPurchaseQty: rawMaterial
+          ? positiveNumberOrNull(persistedAllocation.convertedPurchaseQty ?? detail.convertedPurchaseQty)
+          : null,
         materialWidth,
         materialLength,
-        sourcingAllocationId: persistedAllocation.id,
+        sourcingAllocationId: persistedAllocation.id || null,
         demandCoveredQty: Math.min(num(persistedAllocation.demandCoveredQty), sourceQty),
         unitPrice: persistedAllocation.unitPrice == null ? null : num(persistedAllocation.unitPrice),
         notes: clean(persistedAllocation.notes),

@@ -530,6 +530,23 @@ function planningStockKey(partCode, part = {}) {
   return normalizePartCode(partCode);
 }
 
+function buildTargetedReservationPool(reservations = []) {
+  const pool = {};
+  for (const reservation of reservations) {
+    const targetPartCode = normalizePartCode(reservation.targetPartCode || reservation.referenceNumber);
+    const stock = reservation.stockBalance || {};
+    const materialIdentity = stock.materialId || stock.materialCode || reservation.materialId || reservation.materialCode;
+    const stockKey = materialIdentity
+      ? `MATERIAL:${String(materialIdentity).trim().toUpperCase()}`
+      : normalizePartCode(stock.partCode || reservation.partCode);
+    const openQty = Math.max(Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0), 0);
+    if (!stockKey || !targetPartCode || openQty <= 0) continue;
+    const key = `${stockKey}|${targetPartCode}`;
+    pool[key] = Number(pool[key] || 0) + openQty;
+  }
+  return pool;
+}
+
 function isPieceMaterialPart(part) {
   return isRawMaterialPart(part) && normalizeUomCode(part?.material?.materialForm) === "pcs";
 }
@@ -1394,40 +1411,96 @@ function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
     const leadTimeMs = Number.isNaN(originalStart.getTime()) || Number.isNaN(originalEnd.getTime())
       ? 0
       : Math.max(originalEnd - originalStart, 0);
-    const proportionalFields = ["forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferQty", "effectiveDemandQty", "qtyPlanned"];
-    const allocated = Object.fromEntries(proportionalFields.map((field) => [field, 0]));
-
-    return phases.map((phase, index) => {
+    const plannedTotal = Math.max(Number(detail.qtyPlanned || 0), 0);
+    // Marketing phases represent customer commitments only. MPS buffer is an
+    // internal ending-stock target and must not inflate every customer phase.
+    // If PPIC intentionally lowers production below customer demand, reduce
+    // the customer phases proportionally; otherwise preserve their exact qty.
+    const customerPlannedTotal = Math.min(phaseTotal, plannedTotal);
+    const customerScale = phaseTotal > 0 ? customerPlannedTotal / phaseTotal : 0;
+    let allocatedCustomerQty = 0;
+    const customerRows = phases.map((phase, index) => {
       const isLast = index === phases.length - 1;
-      const ratio = Number(phase.qtyPlanned || 0) / phaseTotal;
-      const values = {};
-      for (const field of proportionalFields) {
-        const total = Number(detail[field] || 0);
-        const value = isLast ? roundPlanningQty(total - allocated[field]) : roundPlanningQty(total * ratio);
-        allocated[field] = roundPlanningQty(allocated[field] + value);
-        values[field] = value;
-      }
+      const phaseQty = isLast
+        ? roundPlanningQty(customerPlannedTotal - allocatedCustomerQty)
+        : roundPlanningQty(Number(phase.qtyPlanned || 0) * customerScale);
+      allocatedCustomerQty = roundPlanningQty(allocatedCustomerQty + phaseQty);
       const dueDate = new Date(phase.fgRequiredDate || phase.plannedDate);
       const phaseStart = new Date(dueDate.getTime() - leadTimeMs);
+      const phaseSourceType = String(phase.sourceType || "").trim().toUpperCase();
       return {
         ...detail,
-        ...values,
+        forecastQty: phaseSourceType === "SALES_ORDER" ? 0 : phaseQty,
+        actualSalesOrderQty: phaseSourceType === "SALES_ORDER" ? phaseQty : 0,
+        bufferBaseQty: 0,
+        bufferQty: 0,
+        effectiveDemandQty: phaseQty,
+        productionPercent: 100,
+        qtyPlanned: phaseQty,
         lineNumber: Number(detail.lineNumber || 0) * 1000 + Number(phase.phaseNumber || index + 1),
         startDate: phaseStart,
         endDate: dueDate,
         _deliveryPhaseId: phase.id,
         _deliveryPhaseNumber: phase.phaseNumber || index + 1,
         _deliveryPhaseSourceType: phase.sourceType || null,
+        _deliveryPhaseSourceNumber: phase.sourceNumber || null,
         _deliveryTargetId: phase.sourceDeliveryTargetId || null,
+        _customerCode: phase.targetCode || null,
         _customerTargetDate: phase.plannedDate || null,
         _fgRequiredDate: phase.fgRequiredDate || phase.plannedDate || null,
         _fgFinishSplitNumber: phase.fgFinishSplitNumber || null,
+        _isBufferPhase: false,
       };
     });
+
+    const bufferPlannedQty = roundPlanningQty(Math.max(plannedTotal - customerPlannedTotal, 0));
+    if (bufferPlannedQty <= 0) return customerRows;
+    const bufferDueDate = new Date(detail.endDate);
+    const bufferStart = new Date(bufferDueDate.getTime() - leadTimeMs);
+    return [...customerRows, {
+      ...detail,
+      forecastQty: 0,
+      actualSalesOrderQty: 0,
+      bufferQty: bufferPlannedQty,
+      effectiveDemandQty: bufferPlannedQty,
+      productionPercent: 100,
+      qtyPlanned: bufferPlannedQty,
+      lineNumber: Number(detail.lineNumber || 0) * 1000 + 999,
+      startDate: bufferStart,
+      endDate: bufferDueDate,
+      customerCode: null,
+      deliveryPhaseId: null,
+      customerTargetDate: null,
+      fgRequiredDate: bufferDueDate,
+      priorityScore: null,
+      priorityClass: null,
+      _deliveryPhaseId: null,
+      _deliveryPhaseNumber: null,
+      _deliveryPhaseSourceType: "BUFFER",
+      _deliveryPhaseSourceNumber: detail._sourceMpsNumber || detail.mpsNumber || null,
+      _deliveryTargetId: null,
+      _customerCode: null,
+      _customerTargetDate: bufferDueDate,
+      _fgRequiredDate: bufferDueDate,
+      _fgFinishSplitNumber: null,
+      _isBufferPhase: true,
+    }];
   });
 }
 
 function demandPeggingForPhase(detail) {
+  if (detail._isBufferPhase) {
+    return [{
+      sourceType: "BUFFER",
+      sourceNumber: detail._sourceMpsNumber || detail.mpsNumber || null,
+      customerCode: null,
+      deliveryTargetId: null,
+      targetDeliveryDate: detail.endDate,
+      fgRequiredDate: detail.endDate,
+      fgPartCode: detail.partCode,
+      qty: number(detail.qtyPlanned),
+    }];
+  }
   const targetId = detail._deliveryTargetId || detail.deliveryPhaseId || null;
   const rows = (detail.demandSources || []).flatMap((source) => {
     const sourceRows = Array.isArray(source.sourcePegging) ? source.sourcePegging : [];
@@ -2491,12 +2564,18 @@ function explicitSalesOrderNumbersForMpsDetail(detail = {}) {
 }
 
 function consumeSalesOrdersAlreadyRepresentedByMps(demandByPart, mpsDetail, soDemandTimeFence) {
+  if (mpsDetail._isBufferPhase) return { consumedQty: 0, sources: [] };
   const explicitSoNumbers = explicitSalesOrderNumbersForMpsDetail(mpsDetail);
+  const phaseTargetQty = mpsDetail._deliveryPhaseId
+    ? (mpsDetail.qtyPlanned == null
+      ? Number.MAX_SAFE_INTEGER
+      : Math.max(Number(mpsDetail.qtyPlanned || 0), 0))
+    : Number.MAX_SAFE_INTEGER;
   return consumeSoDemandForPart(
     demandByPart,
     mpsDetail.partCode,
     explicitSoNumbers.size ? null : mpsDetail.endDate,
-    Number.MAX_SAFE_INTEGER,
+    phaseTargetQty,
     {
       canConsume: (row) => {
         const sourceNumber = String(row.sourceNumber || "").split("#")[0];
@@ -3306,7 +3385,48 @@ exports.get = async (req, res, next) => {
                 },
               },
             },
-            mbomDetail: { select: { uomCode: true, grossWeight: true, category: true } },
+            mbomDetail: {
+              select: {
+                id: true,
+                noReg: true,
+                qty: true,
+                uomCode: true,
+                grossWeight: true,
+                category: true,
+                mbomHeader: {
+                  select: {
+                    noReg: true,
+                    part: { select: { partCode: true, partNumber: true, partName: true } },
+                  },
+                },
+                parentDetail: {
+                  select: {
+                    id: true,
+                    part: { select: { partCode: true, partNumber: true, partName: true } },
+                    mbomProcesses: {
+                      where: { isDeleted: false },
+                      orderBy: [{ sequence: "asc" }],
+                      select: {
+                        sequence: true,
+                        occurrenceCode: true,
+                        routingMode: true,
+                        process: { select: { processCode: true, processName: true } },
+                      },
+                    },
+                  },
+                },
+                mbomProcesses: {
+                  where: { isDeleted: false },
+                  orderBy: [{ sequence: "asc" }],
+                  select: {
+                    sequence: true,
+                    occurrenceCode: true,
+                    routingMode: true,
+                    process: { select: { processCode: true, processName: true } },
+                  },
+                },
+              },
+            },
             mpsDetail: { select: { partCode: true, customerCode: true, startDate: true, endDate: true } },
           },
         },
@@ -3340,11 +3460,18 @@ exports.get = async (req, res, next) => {
         grossRequirement: true,
         onHandQty: true,
         allocatedQty: true,
+        firmSupplyQty: true,
+        atRiskSupplyQty: true,
+        supplyTimeline: true,
         netRequirement: true,
         plannedOrderQty: true,
         adjustedOrderQty: true,
         orderType: true,
         mpsDetailId: true,
+        customerCode: true,
+        fgPartCode: true,
+        targetDeliveryDate: true,
+        deliveryTargetId: true,
         part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, rawType: true, baseUomCode: true, productionUomCode: true, stockUomCode: true } },
         mbomDetail: {
           select: {
@@ -3362,6 +3489,26 @@ exports.get = async (req, res, next) => {
               select: {
                 id: true,
                 part: { select: { partCode: true, partNumber: true, partName: true } },
+                mbomProcesses: {
+                  where: { isDeleted: false },
+                  orderBy: [{ sequence: "asc" }],
+                  select: {
+                    sequence: true,
+                    occurrenceCode: true,
+                    routingMode: true,
+                    process: { select: { processCode: true, processName: true } },
+                  },
+                },
+              },
+            },
+            mbomProcesses: {
+              where: { isDeleted: false },
+              orderBy: [{ sequence: "asc" }],
+              select: {
+                sequence: true,
+                occurrenceCode: true,
+                routingMode: true,
+                process: { select: { processCode: true, processName: true } },
               },
             },
           },
@@ -3483,7 +3630,23 @@ exports.get = async (req, res, next) => {
           { sourcePlannedOrderNumbers: { not: Prisma.DbNull } },
         ],
       },
-      select: { plannedOrderNumber: true, sourcePlannedOrderNumbers: true, prNumber: true, pr: { select: { status: true } } },
+      select: {
+        id: true,
+        plannedOrderNumber: true,
+        sourcePlannedOrderNumbers: true,
+        prNumber: true,
+        qty: true,
+        orderedQty: true,
+        uomCode: true,
+        pr: { select: { status: true } },
+        poDetails: {
+          where: { isDeleted: false, po: { isDeleted: false, status: { not: "Cancelled" } } },
+          select: {
+            id: true, poNumber: true, qty: true, qtyReceived: true, uomCode: true, deliveryDate: true,
+            po: { select: { status: true, supplierCode: true, supplierName: true, deliveryDate: true } },
+          },
+        },
+      },
     }) : [];
     const releasedOrderSet = new Set(releasedOrderNumbers);
     const prByPlannedOrder = new Map();
@@ -3493,7 +3656,28 @@ exports.get = async (req, res, next) => {
         : [];
       for (const orderNumber of [row.plannedOrderNumber, ...sourceNumbers].filter(Boolean)) {
         if (releasedOrderSet.has(orderNumber)) {
-          prByPlannedOrder.set(orderNumber, { prNumber: row.prNumber, status: row.pr.status });
+          const current = prByPlannedOrder.get(orderNumber) || [];
+          current.push({
+            prDetailId: row.id,
+            prNumber: row.prNumber,
+            status: row.pr.status,
+            requestedQty: Number(row.qty || 0),
+            orderedQty: Number(row.orderedQty || 0),
+            uomCode: row.uomCode,
+            purchaseOrders: row.poDetails.map((detail) => ({
+              poDetailId: detail.id,
+              poNumber: detail.poNumber,
+              status: detail.po.status,
+              supplierCode: detail.po.supplierCode,
+              supplierName: detail.po.supplierName,
+              orderedQty: Number(detail.qty || 0),
+              receivedQty: Number(detail.qtyReceived || 0),
+              outstandingQty: Math.max(Number(detail.qty || 0) - Number(detail.qtyReceived || 0), 0),
+              uomCode: detail.uomCode,
+              deliveryDate: detail.deliveryDate || detail.po.deliveryDate,
+            })),
+          });
+          prByPlannedOrder.set(orderNumber, current);
         }
       }
     }
@@ -3536,7 +3720,7 @@ exports.get = async (req, res, next) => {
       requirementTrace,
       productionScheduleTrace,
       requirements: groupedRequirements,
-      plannedOrders: enrichedPlannedOrders.map((row) => ({ ...row, purchaseRequest: prByPlannedOrder.get(row.orderNumber) || null })),
+      plannedOrders: enrichedPlannedOrders.map((row) => ({ ...row, purchaseRequests: prByPlannedOrder.get(row.orderNumber) || [], purchaseRequest: prByPlannedOrder.get(row.orderNumber)?.[0] || null })),
     }));
   } catch (e) {
     next(e);
@@ -3953,6 +4137,25 @@ exports.runMRP = async (req, res, next) => {
         const purchaseInitialActualAvailableMap = {};
         const purchaseInitialAllocatedMap = {};
         const purchaseInitialStockAvailableMap = {};
+        const manualPartReservations = await tx.stockReservation.findMany({
+          where: {
+            isDeleted: false,
+            status: "Active",
+            referenceType: "PART_ALLOCATION",
+            OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
+          },
+          select: {
+            partCode: true,
+            materialId: true,
+            materialCode: true,
+            targetPartCode: true,
+            referenceNumber: true,
+            qtyReserved: true,
+            qtyReleased: true,
+            stockBalance: { select: { partCode: true, materialId: true, materialCode: true, uomCode: true } },
+          },
+        });
+        const targetedReservationPool = buildTargetedReservationPool(manualPartReservations);
         const mbomHeaderByPartCode = {};
         const uomCodeByPartCode = {};
         const soSourcesByRequirement = new Map();
@@ -4064,11 +4267,7 @@ exports.runMRP = async (req, res, next) => {
           // it explicitly carries an SO source, consume that exact SO even if
           // Marketing's original date differs by a day from the effective
           // Forecast target. It must not reappear as an extra SO-only demand.
-          const soConsumption = consumeSalesOrdersAlreadyRepresentedByMps(
-            openSoDemandByPart,
-            mpsDetail,
-            soDemandTimeFence,
-          );
+          const soConsumption = consumeSalesOrdersAlreadyRepresentedByMps(openSoDemandByPart, mpsDetail, soDemandTimeFence);
 
           if (soConsumption.consumedQty > 0) {
             const partCode = normalizePartCode(mpsDetail.partCode);
@@ -4105,23 +4304,25 @@ exports.runMRP = async (req, res, next) => {
             mpsDetail.id,
             roundPlanningQty(Number(soConsumedByMpsDetail.get(mpsDetail.id) || 0) + soQtyInBucket),
           );
+          const mpsUsesNetProduction = Number(mpsDetail.calculationTrace?.version || 0) >= 2;
           // qtyPlanned is synchronized to the net production target after MRP,
           // so it cannot be reused as gross input on the next run. Rebuild the
           // pre-stock target from effective demand and production policy to
           // keep recalculation idempotent.
-          const forecastDemandWithBuffer = evaluateFromSet(formulas, "MPS_TARGET_QTY", {
-            effectiveDemandQty: Number(mpsDetail.effectiveDemandQty ?? mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0) * scenarioDemandMultiplier,
-            productionPercent: Number(mpsDetail.productionPercent ?? 100),
-            actualSalesOrderQty: soQtyInBucket,
-          });
+          const forecastDemandWithBuffer = mpsUsesNetProduction
+            ? Number(mpsDetail.qtyPlanned || 0) * scenarioDemandMultiplier
+            : evaluateFromSet(formulas, "MPS_TARGET_QTY", {
+                effectiveDemandQty: Number(mpsDetail.effectiveDemandQty ?? mpsDetail.forecastQty ?? mpsDetail.qtyPlanned ?? 0) * scenarioDemandMultiplier,
+                productionPercent: Number(mpsDetail.productionPercent ?? 100),
+                actualSalesOrderQty: soQtyInBucket,
+              });
           // Policy MTO/MTS sudah diselesaikan secara authoritative saat MPS
           // dibentuk. Nilai ini juga membawa target ending buffer, sehingga MRP
           // tidak boleh menerapkan policy untuk kedua kalinya dan membuang
           // buffer pada MTO. SO aktual tetap menjadi batas minimum firm demand.
-          const grossRequirementAfterSo = Math.max(
-            Number(forecastDemandWithBuffer || 0),
-            Number(soQtyInBucket || 0),
-          );
+          const grossRequirementAfterSo = mpsUsesNetProduction
+            ? Number(forecastDemandWithBuffer || 0)
+            : Math.max(Number(forecastDemandWithBuffer || 0), Number(soQtyInBucket || 0));
 
           // MPS is monthly demand; its period start is not a production due
           // date. Use the same MBOM critical path and reviewed vendor-process
@@ -4167,9 +4368,9 @@ exports.runMRP = async (req, res, next) => {
             sourceType: "MPS",
             sourceNumber: mpsDetail._sourceMpsNumber || mpsNumber,
             rootDemandSourceType: mpsDetail._deliveryPhaseSourceType || mpsDetail.demandSources?.[0]?.sourceType || "MPS",
-            rootDemandSourceNumber: mpsDetail.demandSources?.[0]?.sourceNumber || mpsDetail._sourceMpsNumber || mpsNumber,
+            rootDemandSourceNumber: mpsDetail._deliveryPhaseSourceNumber || mpsDetail.demandSources?.[0]?.sourceNumber || mpsDetail._sourceMpsNumber || mpsNumber,
             deliveryTargetId: mpsDetail._deliveryTargetId || mpsDetail.deliveryPhaseId || null,
-            customerCode: mpsDetail.customerCode || mpsDetail.demandSources?.[0]?.customerCode || null,
+            customerCode: mpsDetail._customerCode || mpsDetail.customerCode || mpsDetail.demandSources?.[0]?.customerCode || null,
             fgPartCode: mpsDetail.partCode,
             targetDeliveryDate: productionDates.customerTargetDate,
             parentRequiredDate: null,
@@ -4196,9 +4397,11 @@ exports.runMRP = async (req, res, next) => {
             orderType: "Production",
             leadTime: leadTimeDays,
             orderDate,
-            notes: mpsDetail._deliveryPhaseId
-              ? `MPS delivery phase ${mpsDetail._deliveryPhaseNumber} (${mpsDetail._deliveryPhaseId})`
-              : null,
+            notes: mpsDetail._isBufferPhase
+              ? "MPS internal buffer stock"
+              : mpsDetail._deliveryPhaseId
+                ? `MPS delivery phase ${mpsDetail._deliveryPhaseNumber} (${mpsDetail._deliveryPhaseId})`
+                : null,
             _partBufferPercent: Number(mpsDetail.part?.bufferStock || 0),
             _productionScheduleQty: grossRequirementAfterSo,
           };
@@ -4208,10 +4411,13 @@ exports.runMRP = async (req, res, next) => {
           const allocatedQty = stockAllocatedMap[fgPartCode] || 0;
           requirement.onHandQty = actualOnHandBefore;
           requirement.allocatedQty = allocatedQty;
-          requirement.netRequirement = evaluateFromSet(formulas, "MRP_NET_REQUIREMENT", {
-            grossRequirement: requirement.grossRequirement,
-            projectedAvailable: availableBefore,
-          });
+          // Net MPS already consumed FG stock and ending-stock target.
+          requirement.netRequirement = mpsUsesNetProduction
+            ? requirement.grossRequirement
+            : evaluateFromSet(formulas, "MRP_NET_REQUIREMENT", {
+                grossRequirement: requirement.grossRequirement,
+                projectedAvailable: availableBefore,
+              });
           requirement.plannedOrderQty = requirement.netRequirement;
           if (requirement.orderType === "Purchase" && purchaseInitialAvailableMap[fgPartCode] === undefined) {
             purchaseInitialAvailableMap[fgPartCode] = availableBefore;
@@ -4236,10 +4442,12 @@ exports.runMRP = async (req, res, next) => {
           requirement._productionScheduleQty = productionExplosionQty;
 
           // Kurangi projected stock dengan gross requirement pada bucket ini.
-          projectedAvailableMap[fgPartCode] = Math.max(
-            availableBefore - requirement.grossRequirement,
-            0
-          );
+          projectedAvailableMap[fgPartCode] = mpsUsesNetProduction
+            ? 0
+            : Math.max(
+                availableBefore - requirement.grossRequirement,
+                0
+              );
           projectedMppSupplyMap[fgPartCode] = Math.max(
             mppAvailableBefore - mppDrivenQty,
             0,
@@ -4302,6 +4510,7 @@ exports.runMRP = async (req, res, next) => {
                   initialActualAvailableMap: purchaseInitialActualAvailableMap,
                   initialAllocatedMap: purchaseInitialAllocatedMap,
                   initialStockAvailableMap: purchaseInitialStockAvailableMap,
+                  targetedReservationPool,
                   formulas,
                   parentBufferPercent: Number(mpsDetail.bufferPercent ?? mpsDetail.part?.bufferStock ?? 0),
                   // Forecast dan buffer harus tetap terpisah di setiap level BOM.
@@ -4491,6 +4700,7 @@ exports.runMRP = async (req, res, next) => {
                 initialActualAvailableMap: purchaseInitialActualAvailableMap,
                 initialAllocatedMap: purchaseInitialAllocatedMap,
                 initialStockAvailableMap: purchaseInitialStockAvailableMap,
+                targetedReservationPool,
                 formulas,
                 parentBufferPercent: partBufferStock,
                 forecastDemandQty: 0,
@@ -4502,6 +4712,7 @@ exports.runMRP = async (req, res, next) => {
                 parentRequirementId: requirement.id,
                 rootRequirementId: requirement.rootRequirementId,
                 parentTreePath: requirement.treePath,
+                fgPartCode: requirement.fgPartCode || fgPartCode,
               },
             );
             requirements.push(...mbomExploded.requirements);
@@ -5077,20 +5288,41 @@ async function explodeMBOM(
     if (partCode && detailUomCode) {
       uomCodeByPartCode[partCode] = detailUomCode;
     }
-    const availableBefore = projectedAvailableMap[stockKey] || 0;
+    const freeAvailableBefore = Number(projectedAvailableMap[stockKey] || 0);
+    const targetCandidates = [...new Set([
+      normalizePartCode(detail.part?.partCode),
+      normalizePartCode(mbomHeader.part?.partCode),
+      normalizePartCode(options.fgPartCode),
+    ].filter(Boolean))];
+    let targetedReservationKey = null;
+    let targetedReservedBefore = 0;
+    for (const targetPartCode of targetCandidates) {
+      const key = `${stockKey}|${targetPartCode}`;
+      const qty = Number(options.targetedReservationPool?.[key] || 0);
+      if (qty > 0) {
+        targetedReservationKey = key;
+        targetedReservedBefore = qty;
+        break;
+      }
+    }
+    const availableBefore = freeAvailableBefore + targetedReservedBefore;
     const actualAvailableBefore = projectedActualAvailableMap[stockKey] || 0;
     const onHandQty = actualAvailableBefore;
-    const allocatedQty = projectedAllocatedMap[stockKey] || 0;
+    const allocatedQty = isRawMaterialPart(detail.part)
+      ? targetedReservedBefore
+      : targetedReservedBefore || projectedAllocatedMap[stockKey] || 0;
     const netRequirement = evaluateFromSet(options.formulas, "MRP_NET_REQUIREMENT", {
       grossRequirement,
       projectedAvailable: availableBefore,
     });
 
     // Kurangi projected stock komponen agar demand berikutnya tidak pakai stok awal yang sama.
-    projectedAvailableMap[stockKey] = Math.max(
-      availableBefore - grossRequirement,
-      0,
-    );
+    const targetedReservedUsed = Math.min(targetedReservedBefore, grossRequirement);
+    if (targetedReservationKey) {
+      options.targetedReservationPool[targetedReservationKey] = Math.max(targetedReservedBefore - targetedReservedUsed, 0);
+    }
+    const freeStockUsed = Math.max(grossRequirement - targetedReservedUsed, 0);
+    projectedAvailableMap[stockKey] = Math.max(freeAvailableBefore - freeStockUsed, 0);
     projectedActualAvailableMap[stockKey] = Math.max(
       actualAvailableBefore - grossRequirement,
       0,
@@ -5140,7 +5372,10 @@ async function explodeMBOM(
     const leadTime = durationToWorkingDays(detail.leadTime, detail.leadTimeUnit);
     const orderDate = new Date(requiredDate);
     orderDate.setDate(orderDate.getDate() - leadTime);
-    const vendorLeadTimeDays = (detail.mbomProcesses || []).filter((route) => String(route.routingMode || "").toUpperCase() === "VENDOR").reduce((max, route) => Math.max(max, Number(route.vendor?.leadTimeDays || 0)), 0);
+    const vendorLeadTimeDays = (detail.mbomProcesses || [])
+      .filter((route) => String(route.routingMode || "").toUpperCase() === "VENDOR"
+        || (String(detail.category || "").toUpperCase() === "VENDOR" && Boolean(route.vendorId || route.vendor)))
+      .reduce((max, route) => Math.max(max, Number(route.vendor?.leadTimeDays || detail.leadTime || 0)), 0);
     const vendorReturnDate = vendorLeadTimeDays > 0 ? new Date(requiredDate) : null;
     const vendorSendDate = vendorReturnDate ? new Date(vendorReturnDate.getTime() - vendorLeadTimeDays * 86400000) : null;
 
@@ -5225,7 +5460,9 @@ async function explodeMBOM(
       mpsDetailId: options.mpsDetailId || null,
       leadTime,
       orderDate,
-      notes: null,
+      notes: targetedReservedUsed > 0
+        ? `Manual stock reservation ${targetedReservedUsed} untuk ${targetedReservationKey?.split("|").pop() || options.fgPartCode || "part"}`
+        : null,
       // Seluruh turunan BOM mewarisi buffer master parent/FG. Buffer child
       // tidak boleh mengganti policy demand dari parent plan.
       _partBufferPercent: Number(

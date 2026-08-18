@@ -2,7 +2,6 @@ const { getFormulaSet, evaluateFromSet } = require("../masterFormulaService");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
 const {
   effectiveDemandQty: resolvePolicyDemandQty,
-  effectiveDemandWithBuffer,
   consumeDeliveryTargets,
 } = require("./demandConsumptionService");
 const {
@@ -17,6 +16,7 @@ const {
   resolveMbomRevision,
   selectedRevisionId,
 } = require("./mbomRevisionService");
+const { netMpsBucket, buildMpsCalculationTrace } = require("./mpsNettingService");
 
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const MONTHLY_SOURCE_PREFIX = "MONTH:";
@@ -117,7 +117,7 @@ function groupTargetsByDeliveryMonth(targets = [], anchorMonth = null) {
 
 function evaluateBuffer(formulas, variables) {
   const result = evaluateFromSet(formulas, "MPS_BUFFER_QTY", variables);
-  // Keep MPS as gross demand. Stock coverage belongs to MRP netting only.
+  // Buffer is an ending-stock target, not independent demand.
   return Math.max(result, 0);
 }
 
@@ -533,9 +533,9 @@ async function syncMonthlyMps(tx, options = {}) {
   // Line selection limits which delivery targets become MPS rows, but buffer
   // must keep reading the complete next-month Forecast horizon. Otherwise
   // unchecking October would incorrectly erase September's look-ahead buffer.
-  const completeDemand = selection.selectedDeliveryTargetIds.length
-    ? await collectMonthlyDemand(tx, null, anchorMonth)
-    : selectedDemand;
+  // Always load it so rolling stock and coverage warnings use one complete
+  // horizon even when PPIC explicitly selects only part of the demand.
+  const completeDemand = await collectMonthlyDemand(tx, null, anchorMonth);
   const { buckets, forecasts } = selectedDemand;
   const forecastLookahead = completeDemand.forecastLookahead;
   const deliveryTargetIds = uniq([...buckets.values()].flatMap((bucket) => [...bucket.forecastTargets, ...bucket.soTargets].map((target) => target.id)));
@@ -556,6 +556,63 @@ async function syncMonthlyMps(tx, options = {}) {
     })
     : [];
   const stockByPart = new Map(stockRows.map((row) => [row.partCode, Math.max(number(row._sum?.qtyAvailable), 0)]));
+  // qtyAvailable excludes every active reservation. Add back only the balance
+  // explicitly pegged to an SO in this MPS horizon. Other reservations stay protected.
+  const reservationRows = partCodes.length
+    ? await tx.stockReservation.findMany({
+      where: {
+        partCode: { in: partCodes }, isDeleted: false,
+        status: { equals: "Active", mode: "insensitive" },
+        warehouse: { isDeleted: false, availableForProduction: true },
+      },
+      select: { reservationNumber: true, partCode: true, referenceType: true, referenceNumber: true, qtyReserved: true, qtyReleased: true },
+    })
+    : [];
+  const reservationByPartSo = new Map();
+  for (const row of reservationRows) {
+    if (!["SO", "SALES_ORDER", "SALES ORDER"].includes(String(row.referenceType || "").trim().toUpperCase())) continue;
+    const remainingQty = Math.max(number(row.qtyReserved) - number(row.qtyReleased), 0);
+    if (remainingQty <= 0) continue;
+    const key = `${row.partCode}|${String(row.referenceNumber || "").trim()}`;
+    const current = reservationByPartSo.get(key) || { qty: 0, rows: [] };
+    current.qty += remainingQty;
+    current.rows.push({ reservationNumber: row.reservationNumber, referenceType: row.referenceType, referenceNumber: row.referenceNumber, qty: remainingQty });
+    reservationByPartSo.set(key, current);
+  }
+  const projectedFgByPart = new Map(stockByPart);
+  // Open MO is a firm FG receipt. It is time-phased once into its due month;
+  // produced/rejected quantity is excluded because that balance is already
+  // reflected in physical stock or no longer usable supply.
+  const openManufacturingOrders = partCodes.length && monthKeys.length
+    ? await tx.manufacturingOrder.findMany({
+      where: {
+        isDeleted: false,
+        AND: [{
+          OR: [
+            { status: { in: ["Released", "In Progress", "Completed"] } },
+            { status: "Draft", referenceType: { in: ["MRPPlannedOrder", "MonthlyProductionPlan"] } },
+          ],
+        }],
+        part: { partCode: { in: partCodes } },
+      },
+      select: {
+        qtyPlanned: true, qtyProduced: true, qtyGood: true, qtyReject: true,
+        plannedEndDate: true, part: { select: { partCode: true } },
+      },
+    })
+    : [];
+  const firmReceiptByPartMonth = new Map();
+  const firstPlanningMonth = monthKeys[0];
+  for (const order of openManufacturingOrders) {
+    const fulfilledQty = Math.max(number(order.qtyGood), number(order.qtyProduced));
+    const remainingQty = Math.max(number(order.qtyPlanned) - fulfilledQty - number(order.qtyReject), 0);
+    if (remainingQty <= 0) continue;
+    const scheduledMonth = order.plannedEndDate ? planningMonthKey(order.plannedEndDate) : firstPlanningMonth;
+    const receiptMonth = monthKeys.find((candidate) => candidate >= scheduledMonth) || null;
+    if (!receiptMonth) continue;
+    const key = `${receiptMonth}|${order.part?.partCode || ""}`;
+    firmReceiptByPartMonth.set(key, number(firmReceiptByPartMonth.get(key)) + remainingQty);
+  }
   const docs = [];
   const changedMpsNumbers = [];
   const coveredSoNumbers = new Set();
@@ -636,40 +693,53 @@ async function syncMonthlyMps(tx, options = {}) {
         || "pcs";
       const forecastQty = normalizeQuantity(bucket.forecastQty, uomCode);
       const actualSalesOrderQty = normalizeQuantity(bucket.actualSalesOrderQty, uomCode);
+      const effectiveTargets = effectiveDeliveryTargets(bucket);
+      const consumedDemandQty = normalizeQuantity(effectiveTargets.reduce((sum, target) => sum + number(target.qty), 0), uomCode);
       const bufferQty = normalizeQuantity(evaluateBuffer(formulas, {
         bufferBaseQty,
         bufferPercent,
         stockAvailableQty: stockByPart.get(bucket.partCode) || 0,
       }), uomCode);
-      // MTO replaces provisional Forecast with firm SO, while MTS keeps the
-      // larger signal. Buffer is an ending-inventory target and is therefore
-      // added after that policy resolution; it must never be swallowed by the
-      // MTO max(Forecast, SO) rule.
-      const policyDemandQty = normalizeQuantity(resolvePolicyDemandQty({
-        forecastQty,
-        salesOrderQty: actualSalesOrderQty,
-        part: bucket.part,
-      }), uomCode);
+      // Effective targets contain firm SO plus only the unconsumed Forecast
+      // remainder. This is the authoritative gross customer demand.
+      const policyDemandQty = consumedDemandQty || normalizeQuantity(resolvePolicyDemandQty({ forecastQty, salesOrderQty: actualSalesOrderQty, part: bucket.part }), uomCode);
       const formulaEffectiveDemandQty = normalizeQuantity(evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", {
         forecastQty: policyDemandQty,
         bufferQty,
       }), uomCode);
-      const effectiveDemandQty = Math.max(formulaEffectiveDemandQty, normalizeQuantity(effectiveDemandWithBuffer({
-        forecastQty,
-        salesOrderQty: actualSalesOrderQty,
-        bufferQty,
-        part: bucket.part,
-      }), uomCode));
-      const formulaTargetQty = normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", {
-        effectiveDemandQty,
-        productionPercent,
-        actualSalesOrderQty,
-      }), uomCode);
-      const qtyPlanned = formulaTargetQty;
+      const effectiveDemandQty = Math.max(formulaEffectiveDemandQty, normalizeQuantity(policyDemandQty + bufferQty, uomCode));
+      const openingFreeQty = normalizeQuantity(projectedFgByPart.get(bucket.partCode) || 0, uomCode);
+      let reservationDemandRemaining = actualSalesOrderQty;
+      let peggedReservationQty = 0;
+      const appliedReservationRows = [];
+      for (const soNumber of uniq(bucket.soSources)) {
+        if (reservationDemandRemaining <= 0.000001) break;
+        const key = `${bucket.partCode}|${String(soNumber || "").trim()}`;
+        const pool = reservationByPartSo.get(key);
+        if (!pool || pool.qty <= 0.000001) continue;
+        const usedQty = Math.min(pool.qty, reservationDemandRemaining);
+        peggedReservationQty += usedQty;
+        reservationDemandRemaining -= usedQty;
+        pool.qty -= usedQty;
+        let traceRemaining = usedQty;
+        for (const reservation of pool.rows) {
+          if (traceRemaining <= 0.000001) break;
+          const appliedQty = Math.min(number(reservation.qty), traceRemaining);
+          if (appliedQty <= 0) continue;
+          appliedReservationRows.push({ ...reservation, appliedQty });
+          reservation.qty = Math.max(number(reservation.qty) - appliedQty, 0);
+          traceRemaining -= appliedQty;
+        }
+      }
+      peggedReservationQty = normalizeQuantity(peggedReservationQty, uomCode);
+      const openingAvailableQty = normalizeQuantity(openingFreeQty + peggedReservationQty, uomCode);
+      const firmScheduledReceiptQty = normalizeQuantity(firmReceiptByPartMonth.get(`${month}|${bucket.partCode}`) || 0, uomCode);
+      const netting = netMpsBucket({ openingAvailableQty, firmScheduledReceiptQty, grossDemandQty: policyDemandQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty });
+      const qtyPlanned = normalizeQuantity(netting.plannedProductionQty, uomCode);
+      projectedFgByPart.set(bucket.partCode, normalizeQuantity(netting.projectedEndingStockQty, uomCode));
       const customerCodes = uniq(bucket.customerCodes);
       const forecastDetailIds = uniq(bucket.forecastDetailIds);
       const offsets = uniq(bucket.forecastOffsets);
-      const effectiveTargets = effectiveDeliveryTargets(bucket);
       const decisionForTarget = (target) => decisionByTarget.get(target.matchedForecastTargetId || target.id) || decisionByTarget.get(target.id);
       const targetDecisions = effectiveTargets.map((target) => ({ target, decision: decisionForTarget(target) })).filter((row) => row.decision);
       const leadingDecision = [...targetDecisions].sort((left, right) => number(right.decision.finalPriorityScore) - number(left.decision.finalPriorityScore))[0]?.decision || null;
@@ -700,6 +770,15 @@ async function syncMonthlyMps(tx, options = {}) {
         effectiveDemandQty,
         productionPercent,
         demandPolicy: String(bucket.part?.planningPolicy || "MTO").toUpperCase() === "MTS" ? "MTS" : "MTO",
+        openingAvailableQty: netting.openingAvailableQty,
+        firmScheduledReceiptQty: netting.firmScheduledReceiptQty,
+        targetEndingStockQty: netting.targetEndingStockQty,
+        projectedEndingStockQty: netting.projectedEndingStockQty,
+        calculationTrace: buildMpsCalculationTrace({
+          month, partCode: bucket.partCode, policy: String(bucket.part?.planningPolicy || "MTO").toUpperCase(),
+          forecastQty, actualSalesOrderQty, bufferBaseQty, bufferPercent, openingFreeQty, peggedReservationQty,
+          reservationRows: appliedReservationRows, netting, sourceRows: bucket.sourceRows,
+        }),
         qtyPlanned,
         startDate: utcMonthStart(month),
         endDate: utcMonthEnd(month),
@@ -734,6 +813,7 @@ async function syncMonthlyMps(tx, options = {}) {
       const lineChanged = !existing || [
         "forecastQty", "actualSalesOrderQty", "bufferBaseQty", "bufferPercent",
         "bufferQty", "effectiveDemandQty", "productionPercent", "qtyPlanned",
+        "openingAvailableQty", "firmScheduledReceiptQty", "targetEndingStockQty", "projectedEndingStockQty",
       ].some((field) => Math.abs(number(existing?.[field]) - number(data[field])) > 0.000001)
         || String(existing?.demandPolicy || "") !== String(data.demandPolicy || "")
         || String(existing?.soNumber || "") !== String(data.soNumber || "")

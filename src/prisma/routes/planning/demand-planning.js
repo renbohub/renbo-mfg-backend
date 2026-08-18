@@ -2,10 +2,31 @@
 
 const router = require("express").Router();
 const ctrl = require("../../controllers/planning/DemandPlanningController");
+const yearlyCtrl = require("../../controllers/planning/YearlyDemandController");
+const monthlyCtrl = require("../../controllers/planning/MonthlyDemandReviewController");
+const exceptionCtrl = require("../../controllers/planning/DemandExceptionWorkbenchController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
 router.get("/", authorize("mps", "read"), ctrl.list);
+router.get("/yearly", authorize("mps", "read"), yearlyCtrl.list);
+router.get("/monthly-review", authorize("mps", "read"), monthlyCtrl.list);
+router.post("/monthly-review/snapshots", authorize("mps", "create"), logger("monthlyDemandSnapshot", "create"), monthlyCtrl.create);
+router.post("/monthly-review/snapshots/:snapshotId/refresh", authorize("mps", "update"), logger("monthlyDemandSnapshot", "refresh"), monthlyCtrl.refresh);
+router.post("/monthly-review/snapshots/:snapshotId/review", authorize("mps", "update"), logger("monthlyDemandSnapshot", "review"), monthlyCtrl.transition("review"));
+router.post("/monthly-review/snapshots/:snapshotId/approve", authorize("mps", "approve"), logger("monthlyDemandSnapshot", "approve"), monthlyCtrl.transition("approve"));
+router.post("/monthly-review/snapshots/:snapshotId/freeze", authorize("mps", "approve"), logger("monthlyDemandSnapshot", "freeze"), monthlyCtrl.transition("freeze"));
+router.post("/monthly-review/snapshots/:snapshotId/revisions", authorize("mps", "create"), logger("monthlyDemandSnapshot", "revise"), monthlyCtrl.revise);
+router.get("/exception-workbench", authorize("mps", "read"), exceptionCtrl.list);
+router.post("/exception-workbench/sync", authorize("mps", "create"), logger("demandException", "sync"), exceptionCtrl.sync);
+router.get("/exception-workbench/:exceptionId", authorize("mps", "read"), exceptionCtrl.detail);
+router.patch("/exception-workbench/:exceptionId/assignment", authorize("mps", "update"), logger("demandException", "assign"), exceptionCtrl.assign);
+router.post("/exception-workbench/:exceptionId/notes", authorize("mps", "update"), logger("demandException", "note"), exceptionCtrl.note);
+router.post("/exception-workbench/:exceptionId/acknowledge", authorize("mps", "update"), logger("demandException", "acknowledge"), exceptionCtrl.transition("acknowledge"));
+router.post("/exception-workbench/:exceptionId/start", authorize("mps", "update"), logger("demandException", "start"), exceptionCtrl.transition("start"));
+router.post("/exception-workbench/:exceptionId/resolve", authorize("mps", "update"), logger("demandException", "resolve"), exceptionCtrl.transition("resolve"));
+router.post("/exception-workbench/:exceptionId/close", authorize("mps", "approve"), logger("demandException", "close"), exceptionCtrl.transition("close"));
+router.post("/exception-workbench/:exceptionId/reopen", authorize("mps", "update"), logger("demandException", "reopen"), exceptionCtrl.transition("reopen"));
 router.post("/feasibility", authorize("mps", "read"), ctrl.feasibility);
 router.get("/:deliveryTargetId/recovery-plan", authorize("mps", "read"), ctrl.getRecoveryPlan);
 router.put("/:deliveryTargetId/recovery-plan", authorize("mps", "update"), logger("demandPlanning", "save-due-date-recovery"), ctrl.saveRecoveryPlan);

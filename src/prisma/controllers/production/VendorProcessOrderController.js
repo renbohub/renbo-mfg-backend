@@ -1016,7 +1016,7 @@ async function findWorkOrderOutputSource(tx, order, body = {}) {
 function getRollbackableVendorSendStatus(order = {}) {
   const qtySent = roundQuantity(toNumber(order.qtySent));
   if (qtySent <= QUANTITY_TOLERANCE) {
-    return order.vendorCode ? "Ready to Send" : "Planned";
+    return order.vendorCode ? "Waiting Material" : "Planned";
   }
   return "Sent";
 }
@@ -1459,7 +1459,7 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
         uomCode: operation.detail.uomCode || mo.uomCode || null,
         ...costSnapshot,
         dueDate: mo.plannedEndDate || null,
-        status: operation.vendor?.vendorCode ? "Ready to Send" : "Planned",
+        status: operation.vendor?.vendorCode ? "Waiting Material" : "Planned",
         createdBy,
         notes: `Generated from MBOM ${mbomHeader.noReg} vendor routing for ${operation.outputPart?.partCode || "output"}`,
       },
@@ -1576,7 +1576,7 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
           uomCode: operation.uomCode || mo.uomCode || null,
           ...costSnapshot,
           dueDate,
-          status: allocation.vendor?.vendorCode ? "Ready to Send" : "Planned",
+          status: allocation.vendor?.vendorCode ? "Waiting Material" : "Planned",
           createdBy,
           notes: `${marker} Internal BOM process dialihkan ke vendor dari Capacity Planning; phase ${JSON.stringify(phase)}`,
         },
@@ -1585,6 +1585,72 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
   }
 
   return { created, existing, mbomNoReg: mbomHeader.noReg };
+}
+
+async function resolveVendorSendReadiness(tx, order) {
+  const terminalStatuses = new Set(["Sent", "Partial Received", "QC Hold", "Completed", "Closed", "Cancelled"]);
+  const storedStatus = order?.status || null;
+  const materialRequiredQty = roundQuantity(Math.max(0, toNumber(order?.qtyPlanned) - toNumber(order?.qtySent)));
+  const base = {
+    materialRequiredQty,
+    materialAvailableQty: 0,
+    materialShortageQty: materialRequiredQty,
+    materialReady: false,
+    materialReadinessCode: "WAITING_MATERIAL",
+    materialReadinessMessage: `Menunggu WIP ${order?.inputPartCode || "input vendor"} tersedia ${materialRequiredQty} ${order?.uomCode || ""}.`.trim(),
+  };
+
+  if (terminalStatuses.has(storedStatus) || materialRequiredQty <= QUANTITY_TOLERANCE) {
+    return {
+      ...base,
+      status: storedStatus,
+      materialAvailableQty: materialRequiredQty,
+      materialShortageQty: 0,
+      materialReady: materialRequiredQty <= QUANTITY_TOLERANCE,
+      materialReadinessCode: "NOT_APPLICABLE",
+      materialReadinessMessage: "Pengiriman vendor sudah diproses atau tidak memiliki sisa qty.",
+    };
+  }
+
+  if (!order?.vendorCode) {
+    return {
+      ...base,
+      status: "Planned",
+      materialReadinessCode: "VENDOR_NOT_SELECTED",
+      materialReadinessMessage: "Vendor belum dipilih.",
+    };
+  }
+
+  try {
+    await assertVendorProcessSequenceReady(tx, order);
+  } catch (error) {
+    return {
+      ...base,
+      status: "Waiting Material",
+      materialReadinessCode: "PREDECESSOR_NOT_READY",
+      materialReadinessMessage: error.message,
+    };
+  }
+
+  const balances = await findPreviousWipBalances(tx, order);
+  const materialAvailableQty = roundQuantity(
+    balances.reduce((sum, balance) => sum + toNumber(balance.qtyAvailable), 0),
+  );
+  const materialShortageQty = roundQuantity(Math.max(0, materialRequiredQty - materialAvailableQty));
+  const materialReady = materialShortageQty <= QUANTITY_TOLERANCE;
+  return {
+    ...base,
+    status: materialReady
+      ? (toNumber(order.qtySent) > QUANTITY_TOLERANCE ? "Partial Sent" : "Ready to Send")
+      : "Waiting Material",
+    materialAvailableQty,
+    materialShortageQty,
+    materialReady,
+    materialReadinessCode: materialReady ? "READY" : "WAITING_MATERIAL",
+    materialReadinessMessage: materialReady
+      ? `WIP ${order.inputPartCode || "input vendor"} cukup: ${materialAvailableQty} ${order.uomCode || ""} tersedia untuk ${materialRequiredQty} ${order.uomCode || ""}.`.trim()
+      : `WIP ${order.inputPartCode || "input vendor"} belum cukup: tersedia ${materialAvailableQty}, dibutuhkan ${materialRequiredQty}, kurang ${materialShortageQty} ${order.uomCode || ""}.`.trim(),
+  };
 }
 
 exports.list = async (req, res, next) => {
@@ -1648,11 +1714,17 @@ exports.list = async (req, res, next) => {
       inspectedGroups.map((row) => [row.vendorProcessOrderId, Number(row._sum.qtyInspected || 0)]),
     );
 
+    const readinessByOrderId = new Map(await Promise.all(items.map(async (item) => [
+      item.id,
+      await resolveVendorSendReadiness(prisma, item),
+    ])));
+
     res.json({
       items: items.map((item) => {
         const enrichedItem = enrichVendorProcessOrder(item, mbomDetailMaps, mbomProcessesById, partIdentityMaps);
         return {
           ...mapDoc(enrichedItem),
+          ...readinessByOrderId.get(item.id),
           qcInspectedQty: inspectedByOrderId.get(item.id) || 0,
           qcRemainingQty: Math.max(0, Number(item.qtyReceived || 0) - (inspectedByOrderId.get(item.id) || 0)),
         };
@@ -1680,7 +1752,11 @@ exports.get = async (req, res, next) => {
       loadMbomProcessMap(prisma, [item.mbomProcessId]),
       loadPartIdentityMaps(prisma, [item]),
     ]);
-    res.json(mapDoc(enrichVendorProcessOrder(item, mbomDetailMaps, mbomProcessesById, partIdentityMaps)));
+    const readiness = await resolveVendorSendReadiness(prisma, item);
+    res.json({
+      ...mapDoc(enrichVendorProcessOrder(item, mbomDetailMaps, mbomProcessesById, partIdentityMaps)),
+      ...readiness,
+    });
   } catch (err) {
     next(err);
   }
@@ -1795,7 +1871,10 @@ exports.send = async (req, res, next) => {
           statusCode: 400,
         });
       }
-      await assertVendorProcessSequenceReady(tx, order);
+      const readiness = await resolveVendorSendReadiness(tx, order);
+      if (!readiness.materialReady) {
+        throw Object.assign(new Error(readiness.materialReadinessMessage), { statusCode: 409 });
+      }
 
       const qty = roundQuantity(toNumber(req.body?.qtySent || req.body?.qty));
       if (qty <= 0) {

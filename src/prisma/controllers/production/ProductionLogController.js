@@ -29,6 +29,10 @@ const {
 } = require("./services/productionRealtimeService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
+const {
+  ensureDefaultNumberingRule,
+  generateConfiguredNumber,
+} = require("../../services/numberingService");
 const { assertQuantity } = require("../../utils/uomQuantity");
 const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
 const {
@@ -495,10 +499,38 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
     durationMinutes,
     reason,
     category: entry.category || null,
+    hmiDowntimeId: Number.isInteger(Number(entry.hmiDowntimeId)) && Number(entry.hmiDowntimeId) > 0 ? Number(entry.hmiDowntimeId) : null,
+    hmiDowntimeSubId: Number.isInteger(Number(entry.hmiDowntimeSubId)) && Number(entry.hmiDowntimeSubId) > 0 ? Number(entry.hmiDowntimeSubId) : null,
     notes: entry.notes || null,
     status: entry.status || "Open",
   };
 }
+
+exports.hmiReasons = async (req, res, next) => {
+  try {
+    const requestedAreaId = Number(req.query.areaId);
+    const areaFilter = Number.isInteger(requestedAreaId) && requestedAreaId > 0
+      ? ` WHERE area_id = ${requestedAreaId}`
+      : "";
+    const [rejections, rejectionSubs, downtimes, downtimeSubs] = await Promise.all([
+      prisma.$queryRawUnsafe(`SELECT rejection_id AS id, rejection_desc AS description, area_id AS \"areaId\" FROM hmi_list_rejection${areaFilter} ORDER BY rejection_desc, rejection_id`),
+      prisma.$queryRawUnsafe('SELECT rejection_sub_id AS id, rejection_sub_desc AS description, rejection_id AS "parentId" FROM hmi_list_rejection_sub ORDER BY rejection_sub_desc, rejection_sub_id'),
+      prisma.$queryRawUnsafe(`SELECT downtime_id AS id, downtime_desc AS description, area_id AS \"areaId\" FROM hmi_list_downtime${areaFilter} ORDER BY downtime_desc, downtime_id`),
+      prisma.$queryRawUnsafe('SELECT downtime_sub_id AS id, downtime_sub_desc AS description, downtime_id AS "parentId" FROM hmi_list_downtime_sub ORDER BY downtime_sub_desc, downtime_sub_id'),
+    ]);
+    const nest = (parents, children) => parents.map((parent) => ({
+      ...parent,
+      children: children.filter((child) => Number(child.parentId) === Number(parent.id)),
+    }));
+    res.json({
+      source: "HMI_DATABASE",
+      rejections: nest(rejections, rejectionSubs),
+      downtimes: nest(downtimes, downtimeSubs),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 
 function summarizeDowntimeEntries(entries = [], parentLog = {}) {
   const normalizedEntries = entries.map((entry) => normalizeDowntimeEntry(entry, parentLog));
@@ -569,7 +601,7 @@ function normalizeApprovalQtyPayload(log = {}, body = {}) {
       qtyProduced: body.qtyProduced !== undefined ? toNumber(body.qtyProduced) : basePassedQty,
       qtyGood: Math.max(0, remainingQtyGood),
       qtyReject,
-      qtyRework: 0,
+      qtyRework: toNumber(log.qtyRework),
     };
     validateProductionLogQty(normalized);
     return normalized;
@@ -578,16 +610,13 @@ function normalizeApprovalQtyPayload(log = {}, body = {}) {
   const qtyGood = body.qtyGood !== undefined
     ? toNumber(body.qtyGood)
     : toNumber(log.qtyGood);
-  const qtyRework = 0;
+  const qtyRework = toNumber(log.qtyRework);
   const qtyProduced = body.qtyProduced !== undefined
     ? toNumber(body.qtyProduced)
     : qtyGood + qtyReject;
 
   const normalized = { qtyProduced, qtyGood, qtyReject, qtyRework };
   validateProductionLogQty(normalized);
-  if (Number(normalized.qtyReject || 0) > 0 && !hasText(normalized.rejectReason)) {
-    throw Object.assign(new Error("Reject reason wajib diisi jika qty reject lebih dari 0."), { statusCode: 400 });
-  }
   return normalized;
 }
 
@@ -900,6 +929,7 @@ async function resolveProductionOutputContext(tx, log) {
     const operationPart = await tx.part.findFirst({
       where: { partCode: operationPartCode, isDeleted: false },
       select: {
+        id: true,
         partCode: true,
         partNumber: true,
         partName: true,
@@ -930,6 +960,7 @@ async function resolveWorkOrderOutputPart(tx, workOrder, fallbackPart = null) {
   return tx.part.findFirst({
     where: { partCode: operationPartCode, isDeleted: false },
     select: {
+      id: true,
       partCode: true,
       partNumber: true,
       partName: true,
@@ -1411,6 +1442,22 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
       statusCode: 400,
     });
   }
+  normalized.qualityCheckMode = String(normalized.qualityCheckMode || "SEPARATE_QC").trim().toUpperCase();
+  if (!new Set(["SEPARATE_QC", "OPERATOR_SELF_CHECK"]).has(normalized.qualityCheckMode)) {
+    throw Object.assign(new Error("Mode pemeriksaan hasil produksi tidak valid."), { statusCode: 400 });
+  }
+  normalized.selfCheckNotes = hasText(normalized.selfCheckNotes)
+    ? normalized.selfCheckNotes.trim()
+    : null;
+  if (normalized.qualityCheckMode === "OPERATOR_SELF_CHECK" && !normalized.selfCheckNotes) {
+    throw Object.assign(
+      new Error("Catatan self-check operator wajib diisi agar skip QC memiliki audit trail."),
+      { statusCode: 400 },
+    );
+  }
+  // These audit fields are authoritative and may only be stamped by approval.
+  delete normalized.selfCheckedBy;
+  delete normalized.selfCheckedAt;
 
   for (const field of ["qtyPlanned", "qtyProduced", "qtyGood", "qtyReject"]) {
     if (normalized[field] !== undefined && normalized[field] !== null && normalized[field] !== "") {
@@ -1851,7 +1898,6 @@ async function autoCompleteWorkOrderIfReady(tx, woId, performedBy = "system") {
 async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy = "system") {
   const warehouseCode = normalizeOptionalText(stockTarget?.warehouseCode);
   const rackCode = normalizeOptionalText(stockTarget?.rackCode);
-  const lotNumber = normalizeOptionalText(stockTarget?.lotNumber);
   const qtyGood = toNumber(log.qtyGood);
   const qtyQcHold = qtyGood;
   const qtyProduced = toNumber(log.qtyProduced);
@@ -1885,6 +1931,66 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
       statusCode: 400,
     });
   }
+
+  // A production output must never enter QC/inventory without traceable lot
+  // identity. Draft coil phases historically use `${logNumber}-PROD` only as a
+  // UI placeholder; replace it with the configured WIP/FG numbering rule when
+  // the log becomes authoritative (Approved). An explicitly supplied lot is
+  // still respected for compatibility with manual production flows.
+  let lotNumber = normalizeOptionalText(stockTarget?.lotNumber);
+  if (!lotNumber) {
+    const priorOutput = await tx.stockMovement.findFirst({
+      where: {
+        referenceType: "PRODUCTION_LOG",
+        referenceNumber: log.logNumber,
+        transactionType: "QC_HOLD",
+        qualityBucket: "GOOD",
+        isDeleted: false,
+        lotNumber: { not: null },
+      },
+      orderBy: { createdAt: "asc" },
+      select: { lotNumber: true },
+    });
+    lotNumber = normalizeOptionalText(priorOutput?.lotNumber);
+  }
+  if (!lotNumber) {
+    const phases = await tx.productionLogCoilPhase.findMany({
+      where: { productionLogId: log.id, isDeleted: false },
+      orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+      select: { productionLotNumber: true },
+    });
+    const draftPlaceholder = `${log.logNumber}-PROD`;
+    lotNumber = normalizeOptionalText(
+      phases.find((phase) => {
+        const candidate = normalizeOptionalText(phase.productionLotNumber);
+        return candidate && candidate !== draftPlaceholder;
+      })?.productionLotNumber,
+    );
+  }
+  if (!lotNumber) {
+    const ruleKey = stockType === "Finished Goods" ? "LOT_PRODUCTION" : "LOT_WIP";
+    const prefix = ruleKey === "LOT_PRODUCTION" ? "FGLOT" : "WIPLOT";
+    // Lot date follows the actual posting/approval time, not a possibly future
+    // planned DPP/log date. This also keeps DAILY numbering buckets monotonic.
+    const productionDate = new Date();
+    await ensureDefaultNumberingRule(ruleKey, tx);
+    lotNumber = await generateConfiguredNumber(ruleKey, {
+      db: tx,
+      date: productionDate,
+      context: { code: part.partCode || "" },
+      fallback: () => `${prefix}-${productionDate.toISOString().slice(0, 10).replace(/-/g, "")}-${log.logNumber}`,
+    });
+  }
+  if (!lotNumber) {
+    throw Object.assign(new Error("Lot hasil produksi gagal dibuat. Periksa Numbering Rule LOT_WIP/LOT_PRODUCTION."), {
+      statusCode: 409,
+    });
+  }
+
+  await tx.productionLogCoilPhase.updateMany({
+    where: { productionLogId: log.id, isDeleted: false },
+    data: { productionLotNumber: lotNumber },
+  });
 
   const now = new Date();
   const stockIdentity = resolvePartStockIdentity(part);
@@ -1945,9 +2051,10 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
     },
   });
 
+  let outputBalance;
   if (existingBalance) {
     await assertStockBalanceNotFrozen(tx, existingBalance.id);
-    await tx.stockBalance.update({
+    outputBalance = await tx.stockBalance.update({
       where: { id: existingBalance.id },
       data: {
         qtyOnHand: qtyAfter,
@@ -1958,7 +2065,7 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
       },
     });
   } else {
-    await tx.stockBalance.create({
+    outputBalance = await tx.stockBalance.create({
       data: {
         warehouseCode,
         rackCode,
@@ -1981,11 +2088,131 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
   return {
     movementNumber,
     consumedWipMovementNumbers,
+    stockBalanceId: outputBalance?.id || null,
+    warehouseCode,
+    rackCode,
+    lotNumber,
+    partId: part.id || null,
+    partCode: part.partCode,
+    stockType,
+    uomCode: mo?.uomCode || log.workOrder?.uomCode || null,
   };
 }
 
-async function createProductionRejectDisposition(tx, log, stockTarget, performedBy = "system") {
-  const qtyReject = toNumber(log.qtyReject);
+async function ensureProductionQualityInspection(tx, log, outputMovement, performedBy = "system") {
+  const qtyGood = toNumber(log.qtyGood);
+  if (qtyGood <= QUANTITY_TOLERANCE || !outputMovement?.movementNumber) return null;
+
+  const existing = await tx.qualityInspection.findFirst({
+    where: { productionLogId: log.id, isDeleted: false },
+    orderBy: { createdAt: "asc" },
+  });
+  if (existing) return existing;
+
+  const selfCheck = log.qualityCheckMode === "OPERATOR_SELF_CHECK";
+  const now = new Date();
+  const inspectionNumber = await generateDailyNumber(
+    tx,
+    "qualityInspection",
+    "inspectionNumber",
+    "QC",
+  );
+  const inspection = await tx.qualityInspection.create({
+    data: {
+      inspectionNumber,
+      inspectionDate: now,
+      moId: log.manufacturingOrder.id,
+      woId: log.workOrder?.id || null,
+      productionLogId: log.id,
+      partId: outputMovement.partId || log.manufacturingOrder.partId || null,
+      batchNumber: outputMovement.lotNumber || null,
+      sampleSize: 1,
+      qtyInspected: qtyGood,
+      qtyPassed: qtyGood,
+      qtyFailed: 0,
+      qtyRework: 0,
+      decision: selfCheck ? "Accepted" : "Pending",
+      inspectedBy: log.operatorName,
+      approvedBy: selfCheck ? performedBy : null,
+      approvedAt: selfCheck ? now : null,
+      status: selfCheck ? "Completed" : "Draft",
+      notes: selfCheck
+        ? `Operator self-check dari ${log.logNumber}. ${log.selfCheckNotes || ""}`.trim()
+        : `QC otomatis dari Production Log ${log.logNumber}; release stock setelah inspeksi selesai.`,
+    },
+  });
+
+  if (!selfCheck || !outputMovement.stockBalanceId) return inspection;
+
+  const balance = await tx.stockBalance.findUnique({
+    where: { id: outputMovement.stockBalanceId },
+    select: { id: true, qtyOnHand: true, qtyReserved: true, qtyQC: true },
+  });
+  if (!balance || toNumber(balance.qtyQC) + QUANTITY_TOLERANCE < qtyGood) {
+    throw Object.assign(new Error("Stock QC Hold tidak cukup untuk operator self-check release."), { statusCode: 409 });
+  }
+  await assertStockBalanceNotFrozen(tx, balance.id);
+  const qtyOnHand = toNumber(balance.qtyOnHand);
+  const qtyReserved = toNumber(balance.qtyReserved);
+  const qtyQCBefore = toNumber(balance.qtyQC);
+  const qtyQCAfter = Math.max(0, qtyQCBefore - qtyGood);
+  await tx.stockBalance.update({
+    where: { id: balance.id },
+    data: {
+      qtyQC: qtyQCAfter,
+      qtyAvailable: Math.max(0, qtyOnHand - qtyReserved - qtyQCAfter),
+      lastMovement: now,
+    },
+  });
+
+  const sourceMovement = await tx.stockMovement.findUnique({
+    where: { movementNumber: outputMovement.movementNumber },
+  });
+  const releaseMovementNumber = await generateMovementNumber("ADJUSTMENT", tx);
+  await tx.stockMovement.create({
+    data: {
+      movementNumber: releaseMovementNumber,
+      movementDate: now,
+      movementType: "ADJUSTMENT",
+      direction: "IN",
+      transactionType: "QUALITY_RELEASE",
+      warehouseCode: outputMovement.warehouseCode,
+      rackCode: outputMovement.rackCode,
+      destinationWarehouseCode: outputMovement.warehouseCode,
+      destinationRackCode: outputMovement.rackCode,
+      lotNumber: outputMovement.lotNumber,
+      partCode: outputMovement.partCode,
+      partNumber: sourceMovement?.partNumber || null,
+      partName: sourceMovement?.partName || null,
+      materialId: sourceMovement?.materialId || null,
+      materialCode: sourceMovement?.materialCode || null,
+      materialName: sourceMovement?.materialName || null,
+      materialType: sourceMovement?.materialType || null,
+      spec: sourceMovement?.spec || null,
+      thickness: sourceMovement?.thickness || null,
+      width: sourceMovement?.width || null,
+      CSP: sourceMovement?.CSP || null,
+      productId: sourceMovement?.productId || null,
+      description: sourceMovement?.description || null,
+      stockType: outputMovement.stockType,
+      qty: qtyGood,
+      deltaQty: 0,
+      qtyBefore: qtyQCBefore,
+      qtyAfter: qtyQCAfter,
+      uomCode: outputMovement.uomCode,
+      qualityBucket: "GOOD",
+      referenceType: "QUALITY_INSPECTION",
+      referenceNumber: inspection.inspectionNumber,
+      notes: `Operator self-check release ${log.logNumber}; stok tersedia tanpa antrean QC terpisah.`,
+      performedBy: log.operatorName || performedBy,
+    },
+  });
+
+  return { ...inspection, releaseMovementNumber };
+}
+
+async function createProductionRejectDisposition(tx, log, stockTarget, performedBy = "system", finalRejectQty = null) {
+  const qtyReject = finalRejectQty == null ? toNumber(log.qtyReject) : toNumber(finalRejectQty);
   if (qtyReject <= 0) return null;
 
   const dispositionRows = Array.isArray(stockTarget)
@@ -2008,15 +2235,27 @@ async function createProductionRejectDisposition(tx, log, stockTarget, performed
         },
       ];
 
+  let normalizedDispositionRows = dispositionRows;
   const allocatedQty = dispositionRows.reduce((sum, row) => sum + row.qty, 0);
-  if (Math.abs(allocatedQty - qtyReject) > QUANTITY_TOLERANCE) {
+  if (Array.isArray(stockTarget) && allocatedQty > qtyReject + QUANTITY_TOLERANCE) {
+    let remainingQty = qtyReject;
+    normalizedDispositionRows = dispositionRows
+      .map((row) => {
+        const qty = Math.min(row.qty, remainingQty);
+        remainingQty -= qty;
+        return { ...row, qty };
+      })
+      .filter((row) => row.qty > QUANTITY_TOLERANCE);
+  }
+  const normalizedAllocatedQty = normalizedDispositionRows.reduce((sum, row) => sum + row.qty, 0);
+  if (Math.abs(normalizedAllocatedQty - qtyReject) > QUANTITY_TOLERANCE) {
     throw Object.assign(
-      new Error("Qty NG harus sama dengan Qty Reject Production Log."),
+      new Error("Qty tujuan reject harus sama dengan hasil final reject dari judgment QC."),
       { statusCode: 400 },
     );
   }
 
-  const missingWarehouse = dispositionRows.find((row) => !row.warehouseCode);
+  const missingWarehouse = normalizedDispositionRows.find((row) => !row.warehouseCode);
   if (missingWarehouse) {
     throw Object.assign(
       new Error("Warehouse wajib diisi saat approve Production Log dengan Qty NG."),
@@ -2035,7 +2274,7 @@ async function createProductionRejectDisposition(tx, log, stockTarget, performed
   const now = new Date();
   const movementNumbers = [];
   const stockIdentity = resolvePartStockIdentity(part);
-  for (const row of dispositionRows) {
+  for (const row of normalizedDispositionRows) {
     const balanceWhere = {
       warehouseCode: row.warehouseCode,
       rackCode: row.rackCode,
@@ -2348,6 +2587,7 @@ exports.get = async (req, res, next) => {
         coilPhases: {
           where: { isDeleted: false },
           orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+          include: { ngReasons: { where: { isDeleted: false }, orderBy: { createdAt: "asc" } } },
         },
         dailyProductionSchedule: {
           select: {
@@ -2450,10 +2690,31 @@ function normalizeProductionCoilPhases(entries, logNumber) {
     const qtyInput = Math.max(toNumber(entry?.qtyInput), 0);
     const qtyGood = Math.max(toNumber(entry?.qtyGood), 0);
     const qtyReject = Math.max(toNumber(entry?.qtyReject), 0);
+    const ngReasons = (Array.isArray(entry?.ngReasons) ? entry.ngReasons : [])
+      .map((reason, reasonIndex) => ({
+        hmiRejectionId: Number.isInteger(Number(reason?.hmiRejectionId)) && Number(reason.hmiRejectionId) > 0 ? Number(reason.hmiRejectionId) : null,
+        hmiRejectionSubId: Number.isInteger(Number(reason?.hmiRejectionSubId)) && Number(reason.hmiRejectionSubId) > 0 ? Number(reason.hmiRejectionSubId) : null,
+        reason: String(reason?.reason || "").trim(),
+        subReason: String(reason?.subReason || "").trim() || null,
+        qtyNg: Math.max(toNumber(reason?.qtyNg), 0),
+        reasonIndex: reasonIndex + 1,
+      }))
+      .filter((reason) => reason.qtyNg > QUANTITY_TOLERANCE || reason.reason);
     if (!inputLotNumber) throw Object.assign(new Error(`Lot coil/material wajib diisi pada phase ${index + 1}.`), { statusCode: 400 });
     if (qtyGood + qtyReject <= 0) throw Object.assign(new Error(`Qty OK atau reject wajib diisi pada phase ${index + 1}.`), { statusCode: 400 });
     if (qtyInput > 0 && qtyGood + qtyReject > qtyInput + 0.000001) {
       throw Object.assign(new Error(`Total output phase ${index + 1} tidak boleh melebihi qty input.`), { statusCode: 400 });
+    }
+    if (qtyReject > QUANTITY_TOLERANCE) {
+      if (!ngReasons.length || ngReasons.some((reason) => !reason.reason || reason.qtyNg <= QUANTITY_TOLERANCE)) {
+        throw Object.assign(new Error(`Setiap Qty NG pada phase ${index + 1} wajib memiliki reason dan qty.`), { statusCode: 400 });
+      }
+      const allocatedNg = ngReasons.reduce((sum, reason) => sum + reason.qtyNg, 0);
+      if (Math.abs(allocatedNg - qtyReject) > QUANTITY_TOLERANCE) {
+        throw Object.assign(new Error(`Total qty reason NG phase ${index + 1} harus sama dengan Qty NG (${qtyReject}).`), { statusCode: 400 });
+      }
+    } else if (ngReasons.length) {
+      throw Object.assign(new Error(`Reason NG phase ${index + 1} tidak boleh diisi ketika Qty NG nol.`), { statusCode: 400 });
     }
     const startedAt = entry?.startedAt ? new Date(entry.startedAt) : null;
     const endedAt = entry?.endedAt ? new Date(entry.endedAt) : null;
@@ -2467,6 +2728,7 @@ function normalizeProductionCoilPhases(entries, logNumber) {
       qtyInput,
       qtyGood,
       qtyReject,
+      ngReasons,
       productionLotNumber: String(entry?.productionLotNumber || defaultProductionLot).trim() || defaultProductionLot,
       startedAt,
       endedAt,
@@ -2494,6 +2756,9 @@ exports.create = async (req, res, next) => {
       data.qtyGood = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyGood, 0);
       data.qtyReject = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyReject, 0);
       data.qtyProduced = data.qtyGood + data.qtyReject;
+      data.rejectReason = normalizedCoilPhases
+        .flatMap((row) => row.ngReasons.map((reason) => `${reason.reason}${reason.subReason ? ` / ${reason.subReason}` : ""}: ${reason.qtyNg}`))
+        .join("; ") || null;
     }
 
     const doc = await prisma.$transaction(async (tx) => {
@@ -2573,9 +2838,22 @@ exports.create = async (req, res, next) => {
       });
 
       if (normalizedCoilPhases.length) {
-        await tx.productionLogCoilPhase.createMany({
-          data: normalizedCoilPhases.map((row) => ({ ...row, productionLogId: productionLog.id })),
-        });
+        for (const row of normalizedCoilPhases) {
+          const { ngReasons, ...phaseData } = row;
+          const phase = await tx.productionLogCoilPhase.create({
+            data: { ...phaseData, productionLogId: productionLog.id },
+          });
+          if (ngReasons.length) {
+            await tx.productionLogNgReason.createMany({
+              data: ngReasons.map(({ reasonIndex: _reasonIndex, ...reason }) => ({
+                ...reason,
+                productionLogId: productionLog.id,
+                coilPhaseId: phase.id,
+                phaseNumber: phase.phaseNumber,
+              })),
+            });
+          }
+        }
       }
 
       if (Array.isArray(downtimes) && downtimes.length > 0) {
@@ -2596,6 +2874,7 @@ exports.create = async (req, res, next) => {
           coilPhases: {
             where: { isDeleted: false },
             orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+            include: { ngReasons: { where: { isDeleted: false }, orderBy: { createdAt: "asc" } } },
           },
           dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
@@ -2609,6 +2888,7 @@ exports.create = async (req, res, next) => {
               materialRequirementUomMode: true,
               part: {
                 select: {
+                  id: true,
                   partCode: true,
                   partNumber: true,
                   partName: true,
@@ -2720,6 +3000,9 @@ exports.update = async (req, res, next) => {
         data.qtyGood = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyGood, 0);
         data.qtyReject = normalizedCoilPhases.reduce((sum, row) => sum + row.qtyReject, 0);
         data.qtyProduced = data.qtyGood + data.qtyReject;
+        data.rejectReason = normalizedCoilPhases
+          .flatMap((row) => row.ngReasons.map((reason) => `${reason.reason}${reason.subReason ? ` / ${reason.subReason}` : ""}: ${reason.qtyNg}`))
+          .join("; ") || null;
       }
       const updateData = await normalizeProductionLogInput(tx, data);
       if (logDate !== undefined)
@@ -2756,9 +3039,20 @@ exports.update = async (req, res, next) => {
       if (coilPhasePayloadSupplied) {
         await tx.productionLogCoilPhase.deleteMany({ where: { productionLogId: existing.id } });
         if (normalizedCoilPhases.length) {
-          await tx.productionLogCoilPhase.createMany({
-            data: normalizedCoilPhases.map((row) => ({ ...row, productionLogId: existing.id })),
-          });
+          for (const row of normalizedCoilPhases) {
+            const { ngReasons, ...phaseData } = row;
+            const phase = await tx.productionLogCoilPhase.create({ data: { ...phaseData, productionLogId: existing.id } });
+            if (ngReasons.length) {
+              await tx.productionLogNgReason.createMany({
+                data: ngReasons.map(({ reasonIndex: _reasonIndex, ...reason }) => ({
+                  ...reason,
+                  productionLogId: existing.id,
+                  coilPhaseId: phase.id,
+                  phaseNumber: phase.phaseNumber,
+                })),
+              });
+            }
+          }
         }
       }
 
@@ -2784,6 +3078,7 @@ exports.update = async (req, res, next) => {
           coilPhases: {
             where: { isDeleted: false },
             orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+            include: { ngReasons: { where: { isDeleted: false }, orderBy: { createdAt: "asc" } } },
           },
           dailyProductionSchedule: { select: { scheduleNumber: true, productionPlan: { select: { planNumber: true } } } },
           manufacturingOrder: {
@@ -2805,6 +3100,7 @@ exports.update = async (req, res, next) => {
                   levelComponent: true,
                   part: {
                     select: {
+                      id: true,
                       partCode: true,
                       partNumber: true,
                       partName: true,
@@ -3183,15 +3479,47 @@ exports.approve = async (req, res, next) => {
           qtyGood: true,
           qtyReject: true,
           qtyRework: true,
+          operatorName: true,
+          qualityCheckMode: true,
+          selfCheckNotes: true,
         },
       });
-      const approvedQty = normalizeApprovalQtyPayload(currentLog, req.body || {});
+      const ngJudgments = await tx.productionLogNgReason.findMany({
+        where: { productionLogId: existing.id, isDeleted: false },
+        select: { status: true, qtyNg: true, qtyRework: true, qtyReject: true },
+      });
+      const pendingNgJudgments = ngJudgments.filter((row) => row.status === "PENDING_QC");
+      const recordedNgQty = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyNg), 0);
+      if (toNumber(currentLog.qtyReject) > QUANTITY_TOLERANCE) {
+        if (!ngJudgments.length || Math.abs(recordedNgQty - toNumber(currentLog.qtyReject)) > QUANTITY_TOLERANCE) {
+          throw Object.assign(new Error("Detail reason NG belum lengkap. Lengkapi reason per phase sebelum approval."), { statusCode: 409 });
+        }
+        if (pendingNgJudgments.length) {
+          throw Object.assign(
+            new Error(`${pendingNgJudgments.length} reason NG masih menunggu judgment QC. Selesaikan di QC Rework Judgment terlebih dahulu.`),
+            { statusCode: 409 },
+          );
+        }
+      }
+      const judgmentQtyRework = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyRework), 0);
+      const judgmentQtyReject = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyReject), 0);
+      currentLog.qtyRework = judgmentQtyRework;
+      const approvalPayload = ngJudgments.length
+        ? { ...(req.body || {}), qtyReject: currentLog.qtyReject }
+        : (req.body || {});
+      const approvedQty = normalizeApprovalQtyPayload(currentLog, approvalPayload);
 
       const updated = await tx.productionLog.update({
         where: { id: existing.id },
         data: {
           ...approvedQty,
           status: "Approved",
+          ...(currentLog.qualityCheckMode === "OPERATOR_SELF_CHECK"
+            ? {
+                selfCheckedBy: currentLog.operatorName,
+                selfCheckedAt: new Date(),
+              }
+            : { selfCheckedBy: null, selfCheckedAt: null }),
           ...(relatedSchedule ? { dpsId: relatedSchedule.id } : {}),
         },
         include: {
@@ -3206,6 +3534,7 @@ exports.approve = async (req, res, next) => {
               materialRequirementUomMode: true,
               part: {
                 select: {
+                  id: true,
                   partCode: true,
                   partNumber: true,
                   partName: true,
@@ -3233,11 +3562,16 @@ exports.approve = async (req, res, next) => {
               machineRateType: true,
               machineCurrency: true,
               uomCode: true,
+              outputPartId: true,
+              outputPartCode: true,
+              outputPartNumber: true,
+              outputPartName: true,
               mbomDetail: {
                 select: {
                   levelComponent: true,
                   part: {
                     select: {
+                      id: true,
                       partCode: true,
                       partNumber: true,
                       partName: true,
@@ -3273,10 +3607,22 @@ exports.approve = async (req, res, next) => {
         goodStockTarget,
         req.user?.username || "system",
       );
+      const qualityInspection = await ensureProductionQualityInspection(
+        tx,
+        updated,
+        outputMovement,
+        req.user?.username || "system",
+      );
       const rejectMovement = await createProductionRejectDisposition(
         tx,
         updated,
         rejectStockTarget,
+        req.user?.username || "system",
+        judgmentQtyReject,
+      );
+      const reworkWorkOrder = await createProductionReworkWorkOrder(
+        tx,
+        updated,
         req.user?.username || "system",
       );
 
@@ -3311,7 +3657,7 @@ exports.approve = async (req, res, next) => {
         }
 
         // WO completion is gated by completed QC, not by log approval.
-        automation = { outputMovement, rejectMovement, subAssemblyMovementNumbers };
+        automation = { outputMovement, qualityInspection, rejectMovement, reworkWorkOrder, subAssemblyMovementNumbers };
       }
 
       const syncedMo = existing.woId
@@ -3364,6 +3710,86 @@ exports.approve = async (req, res, next) => {
   } catch (e) {
     if (e.statusCode)
       return res.status(e.statusCode).json({ message: e.message });
+    next(e);
+  }
+};
+
+// Recovery/compatibility action for Approved logs created before automatic QC queueing.
+exports.ensureQcRelease = async (req, res, next) => {
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const log = await tx.productionLog.findFirst({
+        where: { logNumber: req.params.logNumber, isDeleted: false },
+        include: {
+          manufacturingOrder: {
+            select: { id: true, partId: true, uomCode: true },
+          },
+          workOrder: {
+            select: { id: true, uomCode: true, outputPartId: true },
+          },
+        },
+      });
+      if (!log) throw Object.assign(new Error("Production Log tidak ditemukan."), { statusCode: 404 });
+      if (log.status !== "Approved") {
+        throw Object.assign(new Error("QC Release hanya dapat dibuat dari Production Log Approved."), { statusCode: 409 });
+      }
+      if (toNumber(log.qtyGood) <= QUANTITY_TOLERANCE) {
+        throw Object.assign(new Error("Production Log tidak memiliki Qty Good untuk direlease."), { statusCode: 409 });
+      }
+
+      const sourceMovement = await tx.stockMovement.findFirst({
+        where: {
+          referenceType: "PRODUCTION_LOG",
+          referenceNumber: log.logNumber,
+          transactionType: "QC_HOLD",
+          qualityBucket: "GOOD",
+          isDeleted: false,
+        },
+        orderBy: { createdAt: "asc" },
+      });
+      if (!sourceMovement) {
+        throw Object.assign(new Error("Stock movement QC Hold hasil OK tidak ditemukan."), { statusCode: 409 });
+      }
+      const balance = await tx.stockBalance.findFirst({
+        where: {
+          warehouseCode: sourceMovement.warehouseCode,
+          rackCode: sourceMovement.rackCode || null,
+          lotNumber: sourceMovement.lotNumber || null,
+          partCode: sourceMovement.partCode,
+          uomCode: sourceMovement.uomCode || null,
+          stockType: sourceMovement.stockType,
+          isDeleted: false,
+        },
+        select: { id: true },
+      });
+      const inspection = await ensureProductionQualityInspection(
+        tx,
+        log,
+        {
+          movementNumber: sourceMovement.movementNumber,
+          stockBalanceId: balance?.id || null,
+          warehouseCode: sourceMovement.warehouseCode,
+          rackCode: sourceMovement.rackCode || null,
+          lotNumber: sourceMovement.lotNumber || null,
+          partId: log.workOrder?.outputPartId || log.manufacturingOrder.partId || null,
+          partCode: sourceMovement.partCode,
+          stockType: sourceMovement.stockType,
+          uomCode: sourceMovement.uomCode || log.workOrder?.uomCode || log.manufacturingOrder.uomCode || null,
+        },
+        req.user?.username || req.user?.email || "system",
+      );
+      return inspection;
+    });
+
+    res.json({
+      message: result.status === "Completed"
+        ? "Self-check selesai dan stok hasil OK sudah direlease."
+        : "Antrean QC Release Stock berhasil dibuat.",
+      inspection: mapDoc(result),
+      href: `/modules/production/quality-inspections/${encodeURIComponent(result.inspectionNumber)}`,
+    });
+  } catch (e) {
+    if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
     next(e);
   }
 };

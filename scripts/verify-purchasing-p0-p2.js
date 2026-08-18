@@ -5,6 +5,7 @@ const root = path.resolve(__dirname, "..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const po = read("src/prisma/controllers/purchasing/PurchaseOrderController.js");
 const pr = read("src/prisma/controllers/purchasing/PurchaseRequisitionController.js");
+const purchaseQtyService = read("src/prisma/services/purchasing/purchaseOrderQuantityService.js");
 const mrp = read("src/prisma/controllers/planning/MRPController.js");
 const poRoutes = read("src/prisma/routes/purchasing/purchase-orders.js");
 const invoiceRoutes = read("src/prisma/routes/purchasing/purchase-invoices.js");
@@ -33,11 +34,14 @@ const contracts = [
   ["Legacy conversion delegates to safe consolidation", pr.includes("return exports.consolidateToPO(req, res, next)")],
   ["Raw material only allows supplier forms", pr.includes('["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)')],
   ["Supplier conversion is persisted atomically", pr.includes('supplierProposalSource: "PURCHASING"')],
+  ["Manual PR can use its detail decision without redundant sourcing form", purchaseQtyService.includes("[MANUAL_PR_ADAPTER]") && pr.includes('const manualPr = normalize(detail.pr.sourceType) === "MANUAL"')],
+  ["Manual PR material package metadata reaches PO", pr.includes("persistedAllocation.purchasePackageQty ?? detail.purchasePackageQty") && pr.includes("persistedAllocation.convertedPurchaseQty ?? detail.convertedPurchaseQty")],
   ["PR delete checks linked PO", pr.includes("PR sudah terhubung ke Purchase Order")],
   ["PR summary is grouped by UOM", pr.includes("qtyByUom") && pr.includes("mixedUom")],
   ["Purchase Invoice CRUD/workflow route exists", invoiceRoutes.includes("/:invoiceNumber/approve") && invoiceRoutes.includes("/:invoiceNumber/pay")],
   ["Purchasing report is analytical", reports.includes("exports.purchasing") && reports.includes("receiptCoveragePercent")],
   ["Supplier conversion uses structured modal", frontendDetail.includes("ops-purchase-conversion-form")],
+  ["Manual PR frontend builds PO lines from the saved detail decision", frontendDetail.includes('const manualPr = String(currentRecord?.sourceType || "").toUpperCase() === "MANUAL"') && frontendDetail.includes("detail?.proposedSupplierCode")],
   ["PR to PO is one frontend transaction", !frontendDetail.includes('/confirm-suppliers`, { method: "PATCH"')],
   ["Draft MRP PR remains editable", frontendDetail.includes('prEditLink.classList.toggle("d-none", !editableStatus)')],
   ["MRP PR edit preserves source and planned-order trace", frontendPrForm.includes('sourceType: state.record?.sourceType || "MANUAL"') && frontendPrForm.includes("plannedOrderNumber: source.plannedOrderNumber || null")],

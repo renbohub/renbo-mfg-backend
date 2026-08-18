@@ -663,13 +663,53 @@ exports.list = async (req, res, next) => {
           },
           warehouse: { select: { warehouseCode: true, warehouseName: true } },
           _count: { select: { details: true } },
+          details: { where: { isDeleted: false }, select: { qtyRequired: true, qtyIssued: true } },
         },
       }),
       prisma.materialIssue.count({ where }),
     ]);
 
+    const scheduleNumbers = [...new Set(items.map((item) => String(item.notes || "").match(/\[DPS-CONSUME:([^\]]+)\]/)?.[1]).filter(Boolean))];
+    const schedules = scheduleNumbers.length
+      ? await prisma.dailyProductionSchedule.findMany({
+          where: { scheduleNumber: { in: scheduleNumbers }, isDeleted: false },
+          select: { scheduleNumber: true, scheduleDate: true, shift: true, machineId: true },
+        })
+      : [];
+    const machineIds = [...new Set(schedules.map((schedule) => schedule.machineId).filter(Boolean))];
+    const machines = machineIds.length
+      ? await prisma.machine.findMany({
+          where: { id: { in: machineIds }, isDeleted: false },
+          select: { id: true, machineCode: true },
+        })
+      : [];
+    const machineCodeById = new Map(machines.map((machine) => [machine.id, machine.machineCode]));
+    const scheduleByNumber = new Map(schedules.map((schedule) => [schedule.scheduleNumber, schedule]));
+    const preparationStatus = (statusValue) => ({
+      Draft: "TO_PREPARE",
+      Issued: "ISSUED_TO_PRODUCTION",
+      "Partially Returned": "PARTIALLY_RETURNED",
+      Closed: "COMPLETED",
+      Cancelled: "CANCELLED",
+    }[statusValue] || String(statusValue || "UNKNOWN").toUpperCase());
+
     res.json({
-      items: items.map(mapDoc),
+      items: items.map((item) => {
+        const requiredScheduleNumber = String(item.notes || "").match(/\[DPS-CONSUME:([^\]]+)\]/)?.[1] || null;
+        const schedule = scheduleByNumber.get(requiredScheduleNumber);
+        return mapDoc({
+          ...item,
+          requiredScheduleNumber,
+          requiredDate: schedule?.scheduleDate || item.issueDate,
+          requiredShift: schedule?.shift || null,
+          requiredMachineCode: machineCodeById.get(schedule?.machineId) || null,
+          materialLineCount: item._count?.details || item.details.length,
+          totalRequiredQty: item.details.reduce((sum, detail) => sum + Number(detail.qtyRequired || 0), 0),
+          totalIssuedQty: item.details.reduce((sum, detail) => sum + Number(detail.qtyIssued || 0), 0),
+          preparationStatus: preparationStatus(item.status),
+          preparationRequired: item.status === "Draft",
+        });
+      }),
       total,
       page: Number(page),
       limit: Number(limit),

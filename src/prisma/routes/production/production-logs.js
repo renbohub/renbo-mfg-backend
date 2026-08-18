@@ -7,11 +7,13 @@ const productionLogApproval = approvalGate({ moduleCode: "production", pageCode:
 
 // Helper routes HARUS di atas /:logNumber
 router.get("/generate-number", authorize("productionLogs", "create"), ctrl.generateNumber);
+router.get("/hmi-reasons", authorize("productionLogs", "read"), ctrl.hmiReasons);
 router.patch("/bulk-remove", authorize("productionLogs", "delete"), logger("productionLogs", "bulk-remove", { modelName: "ProductionLog" }), ctrl.bulkRemove);
 
 // Status transitions
 router.patch("/:logNumber/submit",  authorize("productionLogs", "submit"), logger("productionLogs", "submit",  { modelName: "ProductionLog" }), ctrl.submit);
 router.patch("/:logNumber/approve", authorize("productionLogs", "approve"), productionLogApproval, logger("productionLogs", "approve", { modelName: "ProductionLog" }), ctrl.approve);
+router.patch("/:logNumber/ensure-qc", authorize("qualityInspections", "create"), logger("qualityInspections", "ensure-production-qc"), ctrl.ensureQcRelease);
 
 // Standard CRUD
 router.get("/",          authorize("productionLogs", "read"),   ctrl.list);

@@ -131,6 +131,57 @@ function sourceMpsDetailId(detail) {
   return String(detail.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1] || detail.mpsDetailId || null;
 }
 function isGeneratedProcess(detail) { return String(detail.notes || "").includes("[MRP-PRODUCTION]"); }
+function mrpTargetKey(detail) {
+  return String(detail?.notes || "").match(/\[MRP-TARGET:([^\]]+)\]/)?.[1] || null;
+}
+function capacityJobTargetKey(job) {
+  if (job?.sourceDeliveryTargetId) return String(job.sourceDeliveryTargetId);
+  if (job?.isBufferStock) return "BUFFER:" + dateKey(job.due);
+  return null;
+}
+function capacityDetailAppliesToJob(detail, job) {
+  const targetKey = mrpTargetKey(detail);
+  return !targetKey || targetKey === capacityJobTargetKey(job);
+}
+function capacityTaskBatchQuantity(task, batchReceiptQty, receiptQtyBeforeBatch, receiptProductionQty, receiptQtyBeforeJob = 0) {
+  if (task.phasePlannedQty != null) {
+    const withinJobBefore = Math.max(number(receiptQtyBeforeBatch) - number(receiptQtyBeforeJob), 0);
+    const factor = number(task.phasePlannedQty) / Math.max(number(task.phaseReceiptQty), EPSILON);
+    return generatedBatchQuantity(batchReceiptQty, withinJobBefore, factor, task.detail.uomCode);
+  }
+  return priorityNetBatchQuantity(
+    batchReceiptQty, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptProductionQty, task.detail.uomCode,
+  );
+}
+function priorCampaignGateKey(value) {
+  if (value?.deliveryPhaseId || value?.id) return "PHASE:" + (value.deliveryPhaseId || value.id);
+  const targetDate = value?.customerTargetDate || value?.fgRequiredDate || value?.due;
+  return targetDate ? "DATE:" + dateKey(targetDate) : null;
+}
+function buildPriorCampaignCompletionByPhase(periodStart, allocations = []) {
+  const result = new Map();
+  for (const allocation of allocations) {
+    const key = priorCampaignGateKey(allocation);
+    if (!key) continue;
+    const isVendor = String(allocation.routingMode || "").toUpperCase() === "VENDOR";
+    const completionDate = isVendor
+      ? allocation.vendorReturnDate || allocation.scheduleDate
+      : allocation.scheduleDate;
+    if (!completionDate) continue;
+    const completionMinute = absoluteMinute(
+      periodStart,
+      completionDate,
+      minuteOfDay(allocation.plannedEndTime, isVendor ? 0 : DAY_MINUTES),
+    );
+    const current = result.get(key);
+    if (!current || completionMinute > current.minute + EPSILON) {
+      result.set(key, { minute: completionMinute, allocationIds: [allocation.id], completionDate });
+    } else if (Math.abs(completionMinute - current.minute) <= EPSILON) {
+      current.allocationIds.push(allocation.id);
+    }
+  }
+  return result;
+}
 function routeMode(route) {
   return String(route.mbomDetail?.category || "").toUpperCase() === "VENDOR"
     ? "VENDOR"
@@ -274,7 +325,9 @@ function shiftCapacityTransferQuantity(jobQty, graph, receiptQty, machineBySpeci
     if (routeMode(task.route) === "VENDOR") return [];
     const eligible = machineBySpecification.get(specificationCode(task.route)) || [];
     const cycles = eligible.map((machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85)).filter((value) => value > 0);
-    const factor = number(task.detail.qtyPlanned) / Math.max(number(receiptQty), EPSILON);
+    const factor = task.phasePlannedQty != null
+      ? number(task.phasePlannedQty) / Math.max(number(task.phaseReceiptQty), EPSILON)
+      : number(task.detail.qtyPlanned) / Math.max(number(receiptQty), EPSILON);
     if (!cycles.length || factor <= EPSILON) return [];
     return [Math.floor(shiftMinutes / Math.min(...cycles) / factor)];
   }).filter((value) => value > 0);
@@ -1053,7 +1106,7 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
     let receiptBefore = receiptQtyBeforeJob;
     let routeChunks = batches.map((batch) => {
       const receiptQtyBeforeBatch = receiptBefore;
-      const qty = priorityNetBatchQuantity(batch, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptQty, task.detail.uomCode);
+      const qty = capacityTaskBatchQuantity(task, batch, receiptQtyBeforeBatch, receiptQty, receiptQtyBeforeJob);
       receiptBefore += number(batch);
       return { qty, generatedQty: qty, receiptBatchQty: number(batch), receiptQtyBeforeBatch, manualConsumedQty: 0 };
     }).filter((chunk) => chunk.qty > EPSILON);
@@ -1144,8 +1197,10 @@ function phaseJobs(plan, details, deliveryPhases, options = {}) {
   const demandRank = (value) => String(value || "").toUpperCase() === "SALES_ORDER" ? 0 : 1;
   const receipts = details.filter((detail) => !isGeneratedProcess(detail));
   const groups = receipts.map((receipt) => {
+    const receiptTargetKey = mrpTargetKey(receipt);
     const related = details.filter((detail) => detail.id === receipt.id || sourceMpsDetailId(detail) === receipt.mpsDetailId);
-    const phases = deliveryPhases.filter((phase) => phase.mpsDetailId === receipt.mpsDetailId);
+    const phases = deliveryPhases.filter((phase) => phase.mpsDetailId === receipt.mpsDetailId
+      && (!receiptTargetKey || receiptTargetKey === String(phase.sourceDeliveryTargetId || "")));
     const customerJobs = phases.map((phase) => ({
       id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, grossDemandQty: number(phase.qtyPlanned),
       targetType: phase.targetType, targetCode: phase.targetCode,
@@ -1262,20 +1317,28 @@ function phaseJobs(plan, details, deliveryPhases, options = {}) {
       },
     };
   });
-  const groupedSourceIds = new Set(groups.map((group) => group.receipt.mpsDetailId).filter(Boolean));
   const orphanSources = new Map();
   for (const detail of details.filter(isGeneratedProcess)) {
     const sourceId = sourceMpsDetailId(detail);
-    if (!sourceId || groupedSourceIds.has(sourceId)) continue;
-    if (!orphanSources.has(sourceId)) orphanSources.set(sourceId, []);
-    orphanSources.get(sourceId).push(detail);
+    const detailTargetKey = mrpTargetKey(detail);
+    if (!sourceId) continue;
+    const matchedReceipt = groups.some((group) => {
+      if (group.receipt.mpsDetailId !== sourceId) return false;
+      const receiptTargetKey = mrpTargetKey(group.receipt);
+      return !detailTargetKey || !receiptTargetKey || detailTargetKey === receiptTargetKey;
+    });
+    if (matchedReceipt) continue;
+    const orphanKey = sourceId + "|" + (detailTargetKey || "LEGACY");
+    if (!orphanSources.has(orphanKey)) orphanSources.set(orphanKey, { sourceId, targetKey: detailTargetKey, related: [] });
+    orphanSources.get(orphanKey).related.push(detail);
   }
-  for (const [sourceId, related] of orphanSources) {
+  for (const { sourceId, targetKey, related } of orphanSources.values()) {
     const qty = Math.max(...related.map((detail) => number(detail.qtyPlanned)), 0);
     const due = related.reduce((latest, detail) => !latest || dateOnly(detail.requiredDate || plan.periodEnd) > dateOnly(latest) ? (detail.requiredDate || plan.periodEnd) : latest, null) || plan.periodEnd;
     const sourcePartCode = String(related[0]?.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim() || related[0]?.partCode;
     const receipt = { id: sourceId, mpsDetailId: sourceId, partCode: sourcePartCode, qtyPlanned: qty, requiredDate: due };
-    const matchingPhases = deliveryPhases.filter((phase) => phase.mpsDetailId === sourceId);
+    const matchingPhases = deliveryPhases.filter((phase) => phase.mpsDetailId === sourceId
+      && (!targetKey || targetKey === String(phase.sourceDeliveryTargetId || "")));
     const orphanJobs = matchingPhases.length ? matchingPhases.map((phase) => ({ id: phase.id, phaseNumber: phase.phaseNumber, due: phase.plannedDate, qty: number(phase.qtyPlanned), targetType: phase.targetType, targetCode: phase.targetCode, sourceDeliveryTargetId: phase.sourceDeliveryTargetId || null, sourceType: phase.sourceType || null, sourceNumber: phase.sourceNumber || null, fgRequiredDate: phase.fgRequiredDate || null })) : [{ id: null, phaseNumber: null, due, qty, targetType: "CUSTOMER", targetCode: null, configurationError: "DELIVERY_PHASE_REQUIRED" }];
     groups.push({ receipt, related, jobs: orphanJobs, productionTargetQty: qty, stockAllocationAudit: { policy: "ORPHAN_SOURCE_NO_STOCK_NETTING", customerDemandQty: qty, requestedBufferQty: 0, productionTargetQty: qty, stockCoverageTargetQty: 0, requestedQty: 0, tracedQty: 0, untracedQty: 0, lines: [] } });
   }
@@ -1362,7 +1425,7 @@ async function loadContext(prisma, planNumber, options = {}) {
   const mpsNumber = String(plan.sourceType || "").startsWith("MPS:") ? String(plan.sourceType).slice(4) : null;
   const horizonEndExclusive = addDays(plan.periodEnd, 1);
   const receiptPartCodes = [...new Set((plan.details || []).filter((detail) => !isGeneratedProcess(detail)).map((detail) => detail.partCode).filter(Boolean))];
-  const [machines, headers, bomDetails, allRoutes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, calendarOverrides, planOverrides, downtimes, finishedGoodStockBalances, materialGate] = await Promise.all([
+  const [machines, headers, bomDetails, allRoutes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, calendarOverrides, planOverrides, downtimes, finishedGoodStockBalances, materialGate] = await Promise.all([
     prisma.machine.findMany({ where: { isDeleted: false, status: "Active" }, orderBy: { machineCode: "asc" } }),
     prisma.mBOMHeader.findMany({ where: { isDeleted: false }, orderBy: [{ partId: "asc" }, { revision: "desc" }, { updatedAt: "desc" }], select: { noReg: true, partId: true } }),
     prisma.mBOMDetail.findMany({ where: { isDeleted: false }, select: { id: true, noReg: true, partId: true, parentDetailId: true } }),
@@ -1393,6 +1456,20 @@ async function loadContext(prisma, planNumber, options = {}) {
         scheduleDate: { gte: plan.periodStart, lte: plan.periodEnd }, routingMode: "INHOUSE", machineId: { not: null },
       },
       include: { mbomProcess: { select: { diesId: true, process: { select: { processCode: true } }, mbomDetail: { select: { part: { select: { partCode: true } } } } } } },
+    }),
+    prisma.productionPlanAllocation.findMany({
+      where: {
+        planId: { not: plan.id },
+        isDeleted: false,
+        status: { in: ["Draft", "Published"] },
+        planningMode: "PRODUCTION",
+        plan: {
+          isDeleted: false,
+          sourceType: plan.sourceType,
+          planMonth: { lt: plan.planMonth },
+        },
+      },
+      select: { id: true, deliveryPhaseId: true, customerTargetDate: true, fgRequiredDate: true, scheduleDate: true, plannedEndTime: true, vendorReturnDate: true, routingMode: true },
     }),
     prisma.dailyProductionSchedule.findMany({
       where: {
@@ -1442,7 +1519,7 @@ async function loadContext(prisma, planNumber, options = {}) {
   );
   return {
     plan, machines, headers: headers.filter((header) => noRegs.has(header.noReg)), bomDetails: bomDetails.filter((detail) => noRegs.has(detail.noReg)), routes: allRoutes.filter((route) => noRegs.has(route.noReg)),
-    phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate,
+    phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate,
     planningMode, scenarioKey, presetId: configuredPreset?.id || presetId, preset, planningConstraintByTarget,
     capacityConstraintAudit: {
       rulePrecedence: ["PLAN_OVERRIDE", "SIMULATION_PRESET", "GLOBAL_CALENDAR"],
@@ -1456,7 +1533,7 @@ async function loadContext(prisma, planNumber, options = {}) {
 
 async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const context = await loadContext(prisma, planNumber, options);
-  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit, planningConstraintByTarget } = context;
+  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit, planningConstraintByTarget } = context;
   const fgCompletionDaysBefore = Math.max(Math.trunc(number(options.flowRule?.delivery?.fgCompletionDaysBefore)), 0);
   const allowedStatuses = ["Draft", "Confirmed", "Released", "In Progress"];
   if (!allowedStatuses.includes(plan.status)) { const error = new Error(`Rekomendasi ${planningMode.toLowerCase()} tidak dapat dibuat saat MPP berstatus ${plan.status}.`); error.statusCode = 409; throw error; }
@@ -1510,6 +1587,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const currentClock = jakartaClock();
   const today = currentClock.date;
   const executionFloor = Math.max(0, absoluteMinute(plan.periodStart, currentClock.date, currentClock.minuteOfDay));
+  const priorCampaignCompletionByPhase = buildPriorCampaignCompletionByPhase(plan.periodStart, priorCampaignAllocations);
   capacityConstraints.executionContext = {
     timezone: "Asia/Jakarta",
     asOfDate: dateKey(currentClock.date),
@@ -1588,18 +1666,51 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     const receiptQty = Math.max(number(job.group.productionTargetQty), EPSILON);
     const groupKey = job.group.receipt.id;
     const receiptQtyBeforeJob = number(cumulativeQty.get(groupKey));
-    const relatedRoutes = job.group.related.flatMap((detail) => {
+    const matchingDetails = job.group.related.filter((detail) => capacityDetailAppliesToJob(detail, job));
+    const relatedRoutes = matchingDetails.flatMap((detail) => {
       const key = detail.partId || detail.partCode;
-      return canonicalizeRoutingOperations(routesByPart.get(key) || []).map((route) => ({ detail, route }));
+      const phaseScoped = Boolean(mrpTargetKey(detail));
+      return canonicalizeRoutingOperations(routesByPart.get(key) || []).map((route) => ({
+        detail,
+        route,
+        phasePlannedQty: phaseScoped ? number(detail.qtyPlanned) : null,
+        phaseReceiptQty: phaseScoped ? Math.max(number(job.qty), EPSILON) : null,
+      }));
     });
-    if (!relatedRoutes.length) continue;
+    if (!relatedRoutes.length) {
+      const receiptMilestone = matchingDetails.some((detail) =>
+        detail.id === job.group.receipt.id && !isGeneratedProcess(detail));
+      if (!receiptMilestone) {
+        blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode, code: "ROUTING_MISSING", qty: round(job.qty) });
+        for (const segment of resultSegmentsForJob(job)) phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), targetType: segment.targetType, status: "BLOCKED", blocker: "ROUTING_MISSING" });
+        continue;
+      }
+      let runningCumulativeQty = receiptQtyBeforeJob;
+      for (const segment of resultSegmentsForJob(job)) {
+        runningCumulativeQty += number(segment.productionQty ?? segment.qty);
+        phaseResults.push({
+          phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due),
+          targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.qty),
+          productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty),
+          stockCoverageHistory: segment.stockCoverageHistory || [], targetType: segment.targetType,
+          status: "COVERED", capacityMode: "FG_RECEIPT_MILESTONE", cumulativeQty: round(runningCumulativeQty),
+        });
+      }
+      cumulativeQty.set(groupKey, runningCumulativeQty);
+      continue;
+    }
     const graph = buildRouteGraph(relatedRoutes, headers, bomDetails);
     let attempt = null;
     const due = absoluteMinute(plan.periodStart, targetFgDue, DAY_MINUTES);
+    const priorCampaignGate = priorCampaignCompletionByPhase.get(priorCampaignGateKey(job));
+    job.priorCampaignGate = priorCampaignGate ? {
+      completionDate: dateKey(priorCampaignGate.completionDate),
+      allocationIds: priorCampaignGate.allocationIds,
+    } : null;
     const materialReadyMinute = jobMaterialGate?.readyDate
       ? Math.max(0, absoluteMinute(plan.periodStart, jobMaterialGate.readyDate, 0))
       : executionFloor;
-    const materialExecutionFloor = Math.max(executionFloor, materialReadyMinute);
+    const materialExecutionFloor = Math.max(executionFloor, materialReadyMinute, number(priorCampaignGate?.minute));
     const profile = String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase();
     if (materialExecutionFloor >= due - EPSILON) {
       attempt = {
@@ -1651,7 +1762,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           const predecessorDraftIndexes = normalizeLineageIndexes(predecessorRouteIds.map((id) => allocationIndexByRoute.get(id)), allocations.length);
           const receiptQtyBeforeBatch = receiptQtyBeforeJob + batches.slice(0, batchIndex).reduce((sum, value) => sum + number(value), 0);
           const receiptBatchQty = number(batches[batchIndex]);
-          let qty = priorityNetBatchQuantity(receiptBatchQty, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptQty, task.detail.uomCode);
+          let qty = capacityTaskBatchQuantity(task, receiptBatchQty, receiptQtyBeforeBatch, receiptQty, receiptQtyBeforeJob);
           let manualConsumedQty = 0;
           const manualRemaining = Math.max(number(trialManualByRoute.get(route.id)), 0);
           if (manualRemaining > EPSILON) {
@@ -1731,6 +1842,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const predecessorToken = predecessorDraftIndexes.map((index) => generatedBaseIndex + index);
       const lineageKey = draftLineageKeys[draftIndex];
       const predecessorLineageKeys = predecessorDraftIndexes.map((index) => draftLineageKeys[index]).filter(Boolean);
+      const priorCampaignPredecessorIds = predecessorDraftIndexes.length
+        ? [] : job.priorCampaignGate?.allocationIds || [];
       const baseScoreAudit = draft.recommendationScoreBreakdown || { model: SCORING_MODEL, score: null, breakdown: {}, factors: {}, context: {} };
       const transferBatchReceiptQty = number(draft.receiptBatchQty ?? attempt.batches?.[Math.max(number(draft.batchNumber) - 1, 0)]);
       const receiptQtyBeforeBatch = draft.receiptQtyBeforeBatch == null
@@ -1830,7 +1943,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           },
         },
       };
-      generated.push({ ...draft, recommendationScoreBreakdown, phase: job, mode: attempt.mode, capacityMode, predecessorToken, lineageKey, predecessorLineageKeys });
+      generated.push({ ...draft, recommendationScoreBreakdown, phase: job, mode: attempt.mode, capacityMode, predecessorToken, priorCampaignPredecessorIds, lineageKey, predecessorLineageKeys });
     }
     for (const [key, value] of attempt.usage) usage.set(key, value);
     for (const [key, value] of attempt.diesUsage || []) diesUsage.set(key, value);
@@ -1868,7 +1981,10 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         const item = generated[index];
         const route = item.task.route;
         const scheduleDate = dateFromAbsolute(plan.periodStart, item.start);
-        const predecessorIds = item.predecessorToken.map((token) => createdIds[token]).filter(Boolean);
+        const predecessorIds = [...new Set([
+          ...(item.priorCampaignPredecessorIds || []),
+          ...item.predecessorToken.map((token) => createdIds[token]).filter(Boolean),
+        ])];
         const uomCode = item.task.detail.uomCode || null;
         const plannedQty = normalizeQuantity(round(item.qty), uomCode);
         const hasRecommendationScore = Number.isFinite(Number(item.recommendationScore));
@@ -1986,6 +2102,12 @@ module.exports = {
   recommendMonthlyCapacity,
   generatedBatchQuantity,
   priorityNetBatchQuantity,
+  mrpTargetKey,
+  capacityJobTargetKey,
+  capacityDetailAppliesToJob,
+  capacityTaskBatchQuantity,
+  priorCampaignGateKey,
+  buildPriorCampaignCompletionByPhase,
   allocateStockCoverage,
   customerDemandQuantity,
   phaseJobs,

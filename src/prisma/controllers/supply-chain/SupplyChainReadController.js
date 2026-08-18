@@ -1,4 +1,5 @@
 const { prisma } = require("../../index");
+const { resolveDeliveryReadiness } = require("../../services/outgoing/deliveryReadinessService");
 
 const pageArgs = (req) => {
   const page = Math.max(Number(req.query.page || 1), 1);
@@ -17,7 +18,7 @@ async function sendList(req, res, next, options) {
       options.delegate.findMany({ where, include: options.include, orderBy: options.orderBy, skip, take: limit }),
       options.delegate.count({ where }),
     ]);
-    res.json({ items: options.map ? items.map(options.map) : items, total, page, limit });
+    res.json({ items: options.map ? await Promise.all(items.map(options.map)) : items, total, page, limit });
   } catch (error) { next(error); }
 }
 
@@ -26,7 +27,7 @@ async function sendDetail(req, res, next, options) {
     const value = req.params[options.param];
     const item = await options.delegate.findFirst({ where: { [options.key]: value, ...(options.notDeleted ? { isDeleted: false } : {}) }, include: options.include });
     if (!item) return res.status(404).json({ message: `${options.label} tidak ditemukan.` });
-    res.json(options.map ? options.map(item) : item);
+    res.json(options.map ? await options.map(item) : item);
   } catch (error) { next(error); }
 }
 
@@ -152,9 +153,16 @@ const deliveryOrderMap = (row) => ({ ...row, deliveryOrderNumber: row.soNumber, 
 exports.listDeliveryOrders = (req, res, next) => sendList(req, res, next, { delegate: prisma.salesOrderHeader, where: deliveryOrderWhere, include: { details: { where: { isDeleted: false }, select: { qty: true, qtyDelivered: true } }, deliverySchedules: { where: { isDeleted: false }, select: { scheduleNumber: true, status: true, plannedDate: true } } }, orderBy: { deliveryDate: "desc" }, map: deliveryOrderMap });
 exports.getDeliveryOrder = (req, res, next) => sendDetail(req, res, next, { delegate: prisma.salesOrderHeader, key: "soNumber", param: "soNumber", label: "Delivery Order", notDeleted: true, include: { customer: true, details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } }, deliverySchedules: { where: { isDeleted: false }, include: { details: true }, orderBy: { plannedDate: "asc" } } }, map: deliveryOrderMap });
 
-const scheduleInclude = { soHeader: { select: { customerCode: true, customerName: true, shippingAddress: true } }, details: { where: { isDeleted: false }, select: { qty: true, qtyDelivered: true } } };
+const scheduleInclude = { soHeader: { select: { customerCode: true, customerName: true, shippingAddress: true } }, details: { where: { isDeleted: false }, include: { soDetail: true } } };
 const scheduleDetailInclude = { soHeader: { include: { customer: true } }, details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { soDetail: true } } };
-const scheduleMap = (row) => ({ ...row, customerCode: row.soHeader?.customerCode, customerName: row.soHeader?.customerName, plannedQty: totalQty(row.details, "qty"), deliveredQty: totalQty(row.details, "qtyDelivered") });
+const scheduleMap = async (row) => ({
+  ...row,
+  customerCode: row.soHeader?.customerCode,
+  customerName: row.soHeader?.customerName,
+  plannedQty: totalQty(row.details, "qty"),
+  deliveredQty: totalQty(row.details, "qtyDelivered"),
+  ...await resolveDeliveryReadiness(prisma, row.scheduleNumber),
+});
 const scheduleWhere = (statuses) => (req) => {
   const where = { isDeleted: false, ...(statuses ? { status: { in: statuses } } : {}) };
   const requestedStatus = text(req.query.status); if (requestedStatus) where.status = requestedStatus;

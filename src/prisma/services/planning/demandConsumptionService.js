@@ -9,13 +9,13 @@ function planningPolicy(partOrPolicy) {
   return String(value || "MTO").trim().toUpperCase() === "MTS" ? "MTS" : "MTO";
 }
 
-// MTS keeps the larger of forecast and actual SO. MTO uses forecast only as a
-// provisional signal; once an SO exists the firm order replaces the forecast.
+// Forecast consumption is quantity based for both policies. A partial SO may
+// replace only the matched Forecast quantity; it must never erase the remaining
+// provisional demand. Policy still remains available for reporting/governance.
 function effectiveDemandQty({ forecastQty, salesOrderQty, part, policy }) {
   const forecast = Math.max(number(forecastQty), 0);
   const salesOrder = Math.max(number(salesOrderQty), 0);
   const resolvedPolicy = planningPolicy(policy || part);
-  if (resolvedPolicy === "MTO" && salesOrder > 0) return salesOrder;
   return Math.max(forecast, salesOrder);
 }
 
@@ -80,11 +80,9 @@ function consumeDeliveryTargets({ forecastTargets = [], salesOrderTargets = [], 
       result.push({ ...sale, qty: sale.remaining, sourceType: "SALES_ORDER" });
     }
   }
-  if (resolvedPolicy !== "MTO" || !salesOrderTargets.some((row) => number(row.qty) > 0.000001)) {
-    for (const target of forecast) {
-      if (target.remaining > 0.000001) {
-        result.push({ ...target, qty: target.remaining, sourceType: "FORECAST" });
-      }
+  for (const target of forecast) {
+    if (target.remaining > 0.000001) {
+      result.push({ ...target, qty: target.remaining, sourceType: "FORECAST", demandPolicy: resolvedPolicy });
     }
   }
   return result.sort((left, right) => new Date(left.targetDate) - new Date(right.targetDate));

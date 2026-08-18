@@ -246,6 +246,62 @@ function sourcePartCode(row) {
   return String(row?.notes || "").match(/;\s*source\s+(.+?)(?:;|$)/i)?.[1]?.trim() || null;
 }
 
+function sourceMpsDetailId(row) {
+  return String(row?.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1] || null;
+}
+
+function mrpTargetKeyFromDetail(row) {
+  return String(row?.notes || "").match(/\[MRP-TARGET:([^\]]+)\]/)?.[1] || null;
+}
+
+function mrpOrderMonthFromDetail(row) {
+  return String(row?.notes || "").match(/\[MRP-ORDER-MONTH:(\d{4}-\d{2})\]/)?.[1] || null;
+}
+
+function planningMonthForMpsDetail(row, mpsDetailById = new Map()) {
+  const executionMonth = mrpOrderMonthFromDetail(row);
+  if (executionMonth) return executionMonth;
+  const parentSource = mpsDetailById.get(sourceMpsDetailId(row));
+  // Legacy/non-split rows stay with the parent FG. Current MRP process rows
+  // carry their authoritative execution month in the marker above.
+  return monthKey(parentSource?.startDate || row.startDate);
+}
+
+function stableMpsPlanDetailMatch(existingDetail, mpsRow, sourceLineMarker) {
+  if (!existingDetail || !mpsRow) return false;
+  if (String(existingDetail.partCode || "") !== String(mpsRow.partCode || "")) return false;
+
+  const existingIsProcess = isGeneratedProcess(existingDetail);
+  const rowIsProcess = isGeneratedProcess(mpsRow);
+  if (existingIsProcess !== rowIsProcess) return false;
+  const existingTarget = mrpTargetKeyFromDetail(existingDetail);
+  const rowTarget = mrpTargetKeyFromDetail(mpsRow);
+  const existingMonth = mrpOrderMonthFromDetail(existingDetail);
+  const rowMonth = mrpOrderMonthFromDetail(mpsRow);
+  if (existingDetail.mpsDetailId === mpsRow.id && !rowIsProcess) {
+    if (existingTarget || rowTarget || existingMonth || rowMonth) {
+      return existingTarget === rowTarget && existingMonth === rowMonth;
+    }
+    return true;
+  }
+
+  // Generated MPS ids and line numbers are recreated on every MRP revision.
+  // Parent MPS id + part + pegged target/month is the stable execution identity.
+  if (rowIsProcess) {
+    const existingSourceId = sourceMpsDetailId(existingDetail);
+    const rowSourceId = sourceMpsDetailId(mpsRow);
+    if (existingSourceId && rowSourceId && existingSourceId === rowSourceId) {
+      if (existingTarget || rowTarget || existingMonth || rowMonth) {
+        return existingTarget === rowTarget && existingMonth === rowMonth;
+      }
+      return true;
+    }
+    if (existingTarget || rowTarget || existingMonth || rowMonth) return false;
+  }
+
+  return Boolean(sourceLineMarker && String(existingDetail.notes || "").includes(sourceLineMarker));
+}
+
 // Production Plan is an execution proposal: PPIC may reduce/increase the
 // forecast portion here without changing the approved MPS.  Actual SO remains
 // a hard floor, and child/SFG quantities follow their parent FG proportionally.
@@ -290,6 +346,279 @@ function derivePlanDetails(mpsDetails, productionPercent, netProductionByMpsDeta
         ? number(row.qtyPlanned) * ratio
         : Math.max(adjustedReceiptQty.get(source.id) * childFactor, number(source.actualSalesOrderQty) * childFactor), row.part?.productionUomCode || row.part?.baseUomCode || row.part?.stockUomCode || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : row.uomCode)),
     };
+  });
+}
+async function currentCompletedMrpForMps(mps) {
+  const anchorMonth = mps.planningAnchorMonth || mps.periodStart;
+  const anchorMonthEnd = new Date(anchorMonth);
+  anchorMonthEnd.setUTCMonth(anchorMonthEnd.getUTCMonth() + 1, 1);
+  anchorMonthEnd.setUTCHours(0, 0, 0, 0);
+  const candidates = await prisma.mRPRun.findMany({
+    where: {
+      isDeleted: false,
+      isCurrentPlan: true,
+      status: "Completed",
+      OR: [
+        { mpsNumber: mps.mpsNumber },
+        { planningMonth: { gte: monthStart(anchorMonth), lt: anchorMonthEnd } },
+      ],
+    },
+    orderBy: { createdAt: "desc" },
+    select: { runNumber: true, mpsNumber: true, scenarioAssumptions: true },
+  });
+  return candidates.find((run) => {
+    const sourceMpsNumbers = Array.isArray(run.scenarioAssumptions?.sourceMpsNumbers)
+      ? run.scenarioAssumptions.sourceMpsNumbers
+      : [run.mpsNumber];
+    return run.mpsNumber === mps.mpsNumber || sourceMpsNumbers.includes(mps.mpsNumber);
+  }) || null;
+}
+
+async function netProductionByMpsDetailForRun(runNumber) {
+  const rootRequirements = await prisma.mRPRequirement.findMany({
+    where: {
+      runNumber,
+      isDeleted: false,
+      orderType: "Production",
+      requirementType: "Independent",
+      levelMBOM: 0,
+      mpsDetailId: { not: null },
+    },
+    select: { mpsDetailId: true, plannedOrderQty: true, adjustedOrderQty: true, netRequirement: true },
+  });
+  const result = new Map();
+  for (const row of rootRequirements) {
+    const qty = number(row.adjustedOrderQty || row.plannedOrderQty || row.netRequirement);
+    result.set(row.mpsDetailId, number(result.get(row.mpsDetailId)) + qty);
+  }
+  return result;
+}
+
+function requirementTargetKey(row) {
+  const deliveryTargetId = text(row?.deliveryTargetId);
+  if (deliveryTargetId) return deliveryTargetId;
+  const targetDate = row?.targetDeliveryDate || row?.requiredDate || row?.productionRequiredDate;
+  const date = targetDate ? new Date(targetDate).toISOString().slice(0, 10) : "UNSCHEDULED";
+  return String(row?.rootDemandSourceType || "TARGET").toUpperCase() + ":" + date;
+}
+
+async function splitPlanDetailsByMrpExecutionMonth(runNumber, planDetails) {
+  const detailSourceId = (detail) => isGeneratedProcess(detail) ? sourceMpsDetailId(detail) : detail.id;
+  const sourceIds = [...new Set(planDetails.map(detailSourceId).filter(Boolean))];
+  const partCodes = [...new Set(planDetails.map((row) => row.partCode).filter(Boolean))];
+  if (!sourceIds.length || !partCodes.length) return planDetails;
+
+  const requirements = await prisma.mRPRequirement.findMany({
+    where: {
+      runNumber,
+      isDeleted: false,
+      orderType: "Production",
+      requirementType: { in: ["Independent", "Dependent"] },
+      levelMBOM: { gte: 0 },
+      netRequirement: { gt: 0.000001 },
+      mpsDetailId: { in: sourceIds },
+      partCode: { in: partCodes },
+    },
+    select: {
+      mpsDetailId: true,
+      partCode: true,
+      deliveryTargetId: true,
+      targetDeliveryDate: true,
+      rootDemandSourceType: true,
+      orderDate: true,
+      materialRequiredDate: true,
+      productionRequiredDate: true,
+      requiredDate: true,
+      grossRequirement: true,
+      forecastQty: true,
+      soConsumedQty: true,
+      effectiveDemandQty: true,
+      bufferBaseQty: true,
+      bufferPercent: true,
+      bufferQty: true,
+      netRequirement: true,
+      priorityScore: true,
+      priorityClass: true,
+      customerCode: true,
+    },
+  });
+  const groupsByProcess = new Map();
+  for (const requirement of requirements) {
+    const executionDate = requirement.orderDate || requirement.materialRequiredDate || requirement.productionRequiredDate || requirement.requiredDate;
+    if (!executionDate) continue;
+    const executionMonth = monthKey(executionDate);
+    const targetKey = requirementTargetKey(requirement);
+    const processKey = requirement.mpsDetailId + "|" + requirement.partCode;
+    if (!groupsByProcess.has(processKey)) groupsByProcess.set(processKey, new Map());
+    const campaignKey = targetKey + "|" + executionMonth;
+    const processGroups = groupsByProcess.get(processKey);
+    const current = processGroups.get(campaignKey) || {
+      targetKey,
+      executionMonth,
+      qty: 0,
+      startDate: executionDate,
+      finishDate: requirement.productionRequiredDate || requirement.requiredDate || requirement.targetDeliveryDate || executionDate,
+      targetDeliveryDate: requirement.targetDeliveryDate || requirement.requiredDate || null,
+      priorityScore: requirement.priorityScore,
+      priorityClass: requirement.priorityClass,
+      customerCode: requirement.customerCode,
+      grossRequirement: 0,
+      forecastQty: 0,
+      soConsumedQty: 0,
+      effectiveDemandQty: 0,
+      bufferBaseQty: 0,
+      bufferPercent: requirement.bufferPercent,
+      bufferQty: 0,
+    };
+    current.qty += number(requirement.netRequirement);
+    current.grossRequirement += number(requirement.grossRequirement);
+    current.forecastQty += number(requirement.forecastQty);
+    current.soConsumedQty += number(requirement.soConsumedQty);
+    current.effectiveDemandQty += number(requirement.effectiveDemandQty);
+    current.bufferBaseQty += number(requirement.bufferBaseQty);
+    current.bufferQty += number(requirement.bufferQty);
+    if (new Date(executionDate) < new Date(current.startDate)) current.startDate = executionDate;
+    const finishDate = requirement.productionRequiredDate || requirement.requiredDate || requirement.targetDeliveryDate || executionDate;
+    if (new Date(finishDate) > new Date(current.finishDate)) current.finishDate = finishDate;
+    processGroups.set(campaignKey, current);
+  }
+
+  return planDetails.flatMap((detail) => {
+    const generatedProcess = isGeneratedProcess(detail);
+    const processGroups = groupsByProcess.get(detailSourceId(detail) + "|" + detail.partCode);
+    const groups = processGroups ? [...processGroups.values()] : [];
+    groups.sort((left, right) => new Date(left.startDate) - new Date(right.startDate)
+      || new Date(left.targetDeliveryDate || left.finishDate) - new Date(right.targetDeliveryDate || right.finishDate)
+      || left.targetKey.localeCompare(right.targetKey));
+    if (!groups.length) return [detail];
+    const totalRequirement = groups.reduce((sum, group) => sum + number(group.qty), 0);
+    const plannedTotal = Math.max(number(detail.qtyPlanned), 0);
+    const ratio = totalRequirement > 0 ? plannedTotal / totalRequirement : 0;
+    let assigned = 0;
+    return groups.map((group, index) => {
+      const qtyPlanned = index === groups.length - 1
+        ? normalizeQuantity(Math.max(plannedTotal - assigned, 0), detail.uomCode)
+        : normalizeQuantity(number(group.qty) * ratio, detail.uomCode);
+      assigned += qtyPlanned;
+      return {
+        ...detail,
+        qtyPlanned,
+        startDate: group.startDate,
+        endDate: generatedProcess ? group.finishDate : group.targetDeliveryDate || group.finishDate,
+        customerTargetDate: group.targetDeliveryDate || detail.customerTargetDate,
+        fgRequiredDate: group.targetDeliveryDate || detail.fgRequiredDate,
+        priorityScore: group.priorityScore ?? detail.priorityScore,
+        priorityClass: group.priorityClass || detail.priorityClass,
+        customerCode: group.customerCode || detail.customerCode,
+        ...(!generatedProcess ? {
+          forecastQty: group.forecastQty,
+          actualSalesOrderQty: group.soConsumedQty,
+          bufferBaseQty: group.bufferBaseQty,
+          bufferPercent: number(group.bufferPercent),
+          bufferQty: group.bufferQty,
+          effectiveDemandQty: group.grossRequirement || group.effectiveDemandQty,
+        } : {}),
+        notes: ((detail.notes || "")
+          + " [MRP-RUN:" + runNumber + "]"
+          + " [MRP-TARGET:" + group.targetKey + "]"
+          + " [MRP-ORDER-MONTH:" + group.executionMonth + "]").trim(),
+      };
+    }).filter((row) => number(row.qtyPlanned) > 0.000001);
+  });
+}
+
+async function syncDraftPlanWithCurrentMps(planNumber, actor = "system") {
+  const plan = await prisma.monthlyProductionPlan.findFirst({
+    where: { planNumber, isDeleted: false },
+    include,
+  });
+  if (!plan) throw Object.assign(new Error("Monthly Production Plan tidak ditemukan."), { statusCode: 404 });
+  if (plan.status !== "Draft") return { synced: false, reason: "PLAN_NOT_DRAFT", planStatus: plan.status };
+
+  const mpsNumber = String(plan.sourceType || "").startsWith("MPS:")
+    ? String(plan.sourceType).slice(4)
+    : null;
+  if (!mpsNumber) return { synced: false, reason: "PLAN_NOT_MPS_SOURCED" };
+  const mps = await prisma.mPS.findFirst({
+    where: { mpsNumber, isDeleted: false },
+    include: {
+      details: {
+        where: { isDeleted: false, status: { not: "Cancelled" } },
+        include: { part: true, mbom: true },
+        orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }],
+      },
+    },
+  });
+  if (!mps) throw Object.assign(new Error("MPS sumber " + mpsNumber + " tidak ditemukan."), { statusCode: 409, code: "MPS_SOURCE_NOT_FOUND" });
+  if (mps.status !== "Confirmed") throw Object.assign(new Error("MPS sumber " + mpsNumber + " harus Confirmed sebelum auto recommendation."), { statusCode: 409, code: "MPS_SOURCE_NOT_CONFIRMED" });
+  const completedMrp = await currentCompletedMrpForMps(mps);
+  if (!completedMrp) throw Object.assign(new Error("MRP current yang Completed untuk " + mpsNumber + " tidak ditemukan."), { statusCode: 409, code: "CURRENT_MRP_REQUIRED" });
+
+  const netProductionByMpsDetail = await netProductionByMpsDetailForRun(completedMrp.runNumber);
+  const receiptProductionPercents = plan.details
+    .filter((row) => !isGeneratedProcess(row))
+    .map((row) => number(row.productionPercent))
+    .filter((value) => value >= 0 && value <= 100);
+  const productionPercent = receiptProductionPercents[0] ?? 100;
+  const mpsDetailById = new Map(mps.details.map((row) => [row.id, row]));
+  const executionDetails = await splitPlanDetailsByMrpExecutionMonth(
+    completedMrp.runNumber,
+    derivePlanDetails(mps.details, productionPercent, netProductionByMpsDetail),
+  );
+  const currentMonthDetails = executionDetails
+    .filter((row) => planningMonthForMpsDetail(row, mpsDetailById) === monthKey(plan.planMonth));
+  if (!currentMonthDetails.length) throw Object.assign(new Error("MPS " + mpsNumber + " tidak memiliki detail aktif untuk bulan " + monthKey(plan.planMonth) + "."), { statusCode: 409, code: "MPS_MONTH_DETAIL_NOT_FOUND" });
+
+  return prisma.$transaction(async (tx) => {
+    const current = await tx.monthlyProductionPlan.findUnique({ where: { id: plan.id }, include });
+    let nextLineNumber = Math.max(0, ...current.details.map((row) => number(row.lineNumber))) + 1;
+    const matchedIds = new Set();
+    const createdPartCodes = [];
+    const updatedPartCodes = [];
+    for (const row of currentMonthDetails) {
+      const sourceLineMarker = "[MPS-LINE:" + row.lineNumber + "]";
+      const matched = current.details.find((detail) =>
+        !matchedIds.has(detail.id)
+        && stableMpsPlanDetailMatch(detail, row, sourceLineMarker));
+      const data = detailFromMps(row, matched?.lineNumber || nextLineNumber++);
+      if (matched) {
+        matchedIds.add(matched.id);
+        await tx.monthlyProductionPlanDetail.update({ where: { id: matched.id }, data });
+        updatedPartCodes.push(row.partCode);
+      } else {
+        await tx.monthlyProductionPlanDetail.create({ data: { ...data, planId: current.id } });
+        createdPartCodes.push(row.partCode);
+      }
+    }
+    const stale = current.details.filter((detail) => !matchedIds.has(detail.id));
+    const protectedStale = stale.filter((detail) => number(detail.qtyReleased) > 0.000001);
+    if (protectedStale.length) throw Object.assign(new Error("MPP memiliki " + protectedStale.length + " detail released yang sudah tidak ada di " + mpsNumber + "; batalkan/review eksekusi sebelum replan."), { statusCode: 409, code: "RELEASED_MPP_DETAIL_SOURCE_MISMATCH" });
+    if (stale.length) await tx.monthlyProductionPlanDetail.updateMany({
+      where: { id: { in: stale.map((detail) => detail.id) } },
+      data: { isDeleted: true, status: "Cancelled", notes: "Synchronized from " + mpsNumber + ": MPS line no longer active" },
+    });
+    const audit = {
+      synced: true,
+      syncedAt: new Date().toISOString(),
+      syncedBy: actor,
+      sourceMpsNumber: mpsNumber,
+      sourceMrpRunNumber: completedMrp.runNumber,
+      productionPercent,
+      activeDetailCount: currentMonthDetails.length,
+      createdCount: createdPartCodes.length,
+      updatedCount: updatedPartCodes.length,
+      retiredCount: stale.length,
+      createdPartCodes,
+      retiredPartCodes: stale.map((detail) => detail.partCode),
+    };
+    const currentSummary = current.recommendationSummary && typeof current.recommendationSummary === "object" && !Array.isArray(current.recommendationSummary)
+      ? current.recommendationSummary
+      : {};
+    await tx.monthlyProductionPlan.update({
+      where: { id: current.id },
+      data: { recommendationSummary: { ...currentSummary, sourcePlanSync: audit } },
+    });
+    return audit;
   });
 }
 
@@ -337,12 +666,9 @@ async function withMpsSnapshot(plan) {
       synced.planningMonth = parentSource.startDate || plan.planMonth;
       synced.parentFgPartCode = parentSource.partCode || source.partCode || detail.partCode;
       synced.parentFgPartName = parentSource.part?.partName || parentSource.part?.partNumber || null;
-      if (plan.status === "Draft" && !isGeneratedProcess(detail)) {
-        synced.qtyPlanned = Math.max(
-          number(source.effectiveDemandQty) * number(detail.productionPercent || 100) / 100,
-          number(source.actualSalesOrderQty),
-        );
-      }
+      // Keep the persisted MPP execution quantity. createFromMps already
+      // derives it from the current MRP net production; replacing it during a
+      // read would incorrectly restore gross MPS demand and ignore FG stock.
       return synced;
     }),
   };
@@ -801,7 +1127,33 @@ exports.createFromMps = async (req, res, next) => {
     });
     if (!mps) return res.status(404).json({ message: "MPS tidak ditemukan." });
     if (mps.status !== "Confirmed") return res.status(409).json({ message: "MPS harus Confirmed sebelum dibuat menjadi Production Plan." });
-    const completedMrp = await prisma.mRPRun.findFirst({ where: { mpsNumber, isDeleted: false, isCurrentPlan: true, status: "Completed" }, orderBy: { createdAt: "desc" }, select: { runNumber: true } });
+    // A rolling MRP has one monthly header (the anchor MPS), while its
+    // scenarioAssumptions.sourceMpsNumbers records every delivery month in the
+    // cycle. Looking up only mRPRun.mpsNumber incorrectly blocks MPP creation
+    // for month 2/3 even though the authoritative completed run covered it.
+    const anchorMonth = mps.planningAnchorMonth || mps.periodStart;
+    const anchorMonthEnd = new Date(anchorMonth);
+    anchorMonthEnd.setUTCMonth(anchorMonthEnd.getUTCMonth() + 1, 1);
+    anchorMonthEnd.setUTCHours(0, 0, 0, 0);
+    const completedMrpCandidates = await prisma.mRPRun.findMany({
+      where: {
+        isDeleted: false,
+        isCurrentPlan: true,
+        status: "Completed",
+        OR: [
+          { mpsNumber },
+          { planningMonth: { gte: monthStart(anchorMonth), lt: anchorMonthEnd } },
+        ],
+      },
+      orderBy: { createdAt: "desc" },
+      select: { runNumber: true, mpsNumber: true, scenarioAssumptions: true },
+    });
+    const completedMrp = completedMrpCandidates.find((run) => {
+      const sourceMpsNumbers = Array.isArray(run.scenarioAssumptions?.sourceMpsNumbers)
+        ? run.scenarioAssumptions.sourceMpsNumbers
+        : [run.mpsNumber];
+      return run.mpsNumber === mpsNumber || sourceMpsNumbers.includes(mpsNumber);
+    });
     if (!completedMrp) return res.status(409).json({ message: "Jalankan MRP sampai Completed sebelum membuat Production Plan agar material sudah diperiksa." });
     const rootRequirements = await prisma.mRPRequirement.findMany({
       where: {
@@ -819,12 +1171,16 @@ exports.createFromMps = async (req, res, next) => {
       const qty = number(row.adjustedOrderQty || row.plannedOrderQty || row.netRequirement);
       netProductionByMpsDetail.set(row.mpsDetailId, number(netProductionByMpsDetail.get(row.mpsDetailId)) + qty);
     }
-    const validDetails = derivePlanDetails(mps.details, productionPercent, netProductionByMpsDetail);
+    const validDetails = await splitPlanDetailsByMrpExecutionMonth(
+      completedMrp.runNumber,
+      derivePlanDetails(mps.details, productionPercent, netProductionByMpsDetail),
+    );
     if (!validDetails.length) return res.status(400).json({ message: "MPS belum mempunyai FG receipt atau child/SFG process." });
 
+    const mpsDetailById = new Map(mps.details.map((row) => [row.id, row]));
     const grouped = new Map();
     for (const row of validDetails) {
-      const key = monthKey(row.startDate);
+      const key = planningMonthForMpsDetail(row, mpsDetailById);
       if (!grouped.has(key)) grouped.set(key, []);
       grouped.get(key).push(row);
     }
@@ -840,7 +1196,9 @@ exports.createFromMps = async (req, res, next) => {
             const matchedIds = new Set();
             for (const row of details) {
               const sourceLineMarker = `[MPS-LINE:${row.lineNumber}]`;
-              const matched = existing.details.find((detail) => detail.mpsDetailId === row.id || String(detail.notes || "").includes(sourceLineMarker));
+              const matched = existing.details.find((detail) =>
+                !matchedIds.has(detail.id)
+                && stableMpsPlanDetailMatch(detail, row, sourceLineMarker));
               const data = detailFromMps(row, matched?.lineNumber || nextLineNumber++);
               if (matched) { matchedIds.add(matched.id); await tx.monthlyProductionPlanDetail.update({ where: { id: matched.id }, data }); }
               else await tx.monthlyProductionPlanDetail.create({ data: { ...data, planId: existing.id } });
@@ -913,7 +1271,21 @@ exports.createFromMps = async (req, res, next) => {
       }
       items.push({ ...item, capacityRecommendation });
     }
-    res.status(201).json({ items, total: items.length, sourceMpsNumber: mps.mpsNumber, mrpRunNumber: completedMrp.runNumber, productionPercent });
+    const sourceMonth = monthKey(mps.periodStart);
+    const primaryPlan = items.find((item) =>
+      monthKey(item.planMonth || item.periodStart) === sourceMonth
+      && number(item.receiptLineCount) > 0)
+      || items.find((item) => number(item.receiptLineCount) > 0)
+      || items[0]
+      || null;
+    res.status(201).json({
+      items,
+      total: items.length,
+      primaryPlanNumber: primaryPlan?.planNumber || null,
+      sourceMpsNumber: mps.mpsNumber,
+      mrpRunNumber: completedMrp.runNumber,
+      productionPercent,
+    });
   } catch (error) { next(error); }
 };
 
@@ -969,6 +1341,8 @@ exports.recommendCapacity = async (req, res, next) => {
     const presetId = String(req.body?.presetId || scenarioKey || "").trim().toLowerCase() || null;
     if (planningMode === "SIMULATION" && !scenarioKey) return res.status(400).json({ message: "Pilih preset simulasi bulanan terlebih dahulu." });
     if (presetId && !(await findPreset(prisma, presetId))) return res.status(404).json({ message: "Preset capacity tidak ditemukan." });
+    const actor = req.user?.username || req.user?.email || "system";
+    const sourcePlanSync = await syncDraftPlanWithCurrentMps(req.params.planNumber, actor);
     const planningGranularity = String(req.body?.planningGranularity || "DAY").toUpperCase() === "WEEK" ? "WEEK" : "DAY";
     const rollingLookbackWeeks = Math.min(Math.max(Math.trunc(number(req.body?.rollingLookbackWeeks)), 0), 12);
     const freezeFenceDays = Math.min(Math.max(Math.trunc(number(req.body?.freezeFenceDays)), 0), 31);
@@ -982,13 +1356,14 @@ exports.recommendCapacity = async (req, res, next) => {
     const flowRule = normalizeCapacityFlowRule(rawFlowRule || {});
     assertCapacityFlowRule(flowRule);
     const recommendation = await recommendMonthlyCapacity(prisma, req.params.planNumber, {
-      actor: req.user?.username || req.user?.email || "system",
+      actor,
       planningMode,
       scenarioKey,
       presetId,
       flowRule,
       transferBatchQty: flowRule.flowMethod === "SPLIT_BATCH" ? flowRule.flow.transferBatchQuantity : 0,
     });
+    recommendation.sourcePlanSync = sourcePlanSync;
     // Slot-search success is not sufficient: validate the persisted allocation graph with
     // the same authoritative readiness rules used by the Capacity Planning workspace.
     const allocationReady = recommendation.ready;

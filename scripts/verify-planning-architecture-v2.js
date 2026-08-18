@@ -238,8 +238,8 @@ test("FG finish splits propagate through MPS, MRP, and capacity", () => {
   assert(capacity.includes("phase.fgRequiredDate || receipt.fgRequiredDate"));
 });
 
-test("MTO replaces provisional forecast", () => {
-  assert.equal(effectiveDemandQty({ forecastQty: 10000, salesOrderQty: 6000, policy: "MTO" }), 6000);
+test("MTO partial SO consumes only the matched provisional forecast quantity", () => {
+  assert.equal(effectiveDemandQty({ forecastQty: 10000, salesOrderQty: 6000, policy: "MTO" }), 10000);
 });
 
 test("MPS keeps ending buffer after MTO replaces provisional Forecast with SO", () => {

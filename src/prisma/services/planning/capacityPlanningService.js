@@ -19,6 +19,10 @@ const capacityQtyText = (value, uomCode) => String(capacityQty(value, uomCode));
 const bool = (value, fallback = false) => value === undefined || value === null || value === "" ? fallback : ![false, 0, "0", "false", "no", "off"].includes(typeof value === "string" ? value.trim().toLowerCase() : value);
 const COVERAGE_EPSILON = 0.00001;
 
+function mrpTargetKey(detail) {
+  return String(detail?.notes || "").match(/\[MRP-TARGET:([^\]]+)\]/)?.[1] || null;
+}
+
 function predecessorQuantityStatus(predecessorOutput, predecessorPlanQty, successorQty, successorPlanQty, predecessorUomCode, successorUomCode) {
   const output = number(predecessorOutput);
   const required = number(successorQty);
@@ -271,6 +275,14 @@ function allocationFinishMoment(allocation = {}) {
   return String(allocation.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
     ? allocationMoment(allocation.vendorReturnDate || allocation.scheduleDate, allocation.plannedEndTime, true)
     : allocationMoment(allocation.scheduleDate, allocation.plannedEndTime, true);
+}
+
+function crossPlanPredecessorStatus(predecessor, successor) {
+  if (!predecessor?.plan || !successor?.plan || predecessor.plan.planNumber === successor.plan.planNumber) return null;
+  if (!predecessor.plan.sourceType || predecessor.plan.sourceType !== successor.plan.sourceType) return "SOURCE_MISMATCH";
+  return allocationFinishMoment(predecessor) <= allocationStartMoment(successor)
+    ? "READY"
+    : "LATE";
 }
 
 function resolveVendorReturnDeadline(allocation = {}, allocations = []) {
@@ -758,7 +770,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         earliestFeasibleCompletion: true,
         transferBatchNumber: true,
         predecessorAllocationIds: true,
-        plan: { select: { planNumber: true, status: true } },
+        plan: { select: { planNumber: true, status: true, sourceType: true } },
         mbomProcess: {
           select: {
             id: true,
@@ -774,6 +786,26 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       orderBy: [{ scheduleDate: "asc" }, { lineNumber: "asc" }, { createdAt: "asc" }],
     })
     : [];
+  const currentAllocationIds = new Set(productionPlanAllocations.map((row) => row.id));
+  const referencedExternalIds = [...new Set(productionPlanAllocations.flatMap((row) =>
+    Array.isArray(row.predecessorAllocationIds) ? row.predecessorAllocationIds.map(String) : []))]
+    .filter((id) => !currentAllocationIds.has(id));
+  const externalPredecessorAllocations = referencedExternalIds.length
+    ? await prisma.productionPlanAllocation.findMany({
+      where: {
+        id: { in: referencedExternalIds },
+        isDeleted: false,
+        status: { in: ["Draft", "Published"] },
+        planningMode: "PRODUCTION",
+        plan: { isDeleted: false },
+      },
+      select: {
+        id: true, scheduleDate: true, plannedStartTime: true, plannedEndTime: true,
+        routingMode: true, vendorSendDate: true, vendorReturnDate: true,
+        plan: { select: { planNumber: true, status: true, sourceType: true } },
+      },
+    })
+    : [];
   const planManufacturingOrders = planNumbers.length ? await prisma.manufacturingOrder.findMany({
     where: {
       monthlyProductionPlanNumber: { in: planNumbers },
@@ -786,7 +818,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const planMoByNumber = new Map(planManufacturingOrders.map((mo) => [mo.moNumber, mo]));
   const scheduledQtyByPlanProcess = new Map();
 
-  const allocationById = new Map(productionPlanAllocations.map((row) => [row.id, row]));
+  const allocationById = new Map([...productionPlanAllocations, ...externalPredecessorAllocations].map((row) => [row.id, row]));
   const predecessorWipState = new Map();
   const draftAllocationsInConsumptionOrder = productionPlanAllocations
     .filter((row) => row.status === "Draft")
@@ -863,10 +895,24 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     const linkedPredecessors = [];
     for (const predecessorId of predecessorIds) {
       const predecessor = allocationById.get(predecessorId);
-      if (!predecessor || predecessor.plan.planNumber !== allocation.plan.planNumber) {
-        pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_MISSING", message: `Predecessor allocation ${predecessorId} tidak ditemukan pada MPP yang sama.`, resolution: "Jalankan ulang recommendation atau perbaiki dependency allocation." }, issueKeys);
+      if (!predecessor) {
+        pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_MISSING", message: `Predecessor allocation ${predecessorId} tidak ditemukan.`, resolution: "Jalankan ulang recommendation atau perbaiki dependency allocation." }, issueKeys);
         continue;
       }
+      const crossPlanStatus = crossPlanPredecessorStatus(predecessor, allocation);
+      if (crossPlanStatus === "SOURCE_MISMATCH") {
+        pushIssue(issues, { ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_SOURCE_MISMATCH", message: `Predecessor ${predecessor.plan.planNumber} bukan bagian dari source MPS yang sama.`, resolution: "Pilih predecessor dari rolling Monthly Plan dengan source MPS yang sama." }, issueKeys);
+        continue;
+      }
+      if (crossPlanStatus === "LATE") {
+        pushIssue(issues, {
+          ...common, relatedAllocationId: predecessorId, severity: "blocking", category: "SEQUENCE", code: "PLAN_PREDECESSOR_LATE",
+          message: `Predecessor ${predecessor.plan.planNumber} selesai ${allocationFinishMoment(predecessor).toISOString()} setelah proses ini mulai.`,
+          resolution: "Majukan predecessor bulan sebelumnya atau mundurkan proses successor.",
+        }, issueKeys);
+        continue;
+      }
+      if (crossPlanStatus === "READY") continue;
       linkedPredecessors.push(predecessor);
     }
 
@@ -1721,7 +1767,9 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   for (const detail of planDetails.filter((row) => row.mpsDetailId && !String(row.notes || "").includes("[MRP-PRODUCTION]"))) {
     const mpsNumber = String(detail.plan.sourceType || "").startsWith("MPS:") ? String(detail.plan.sourceType).slice(4) : null;
     if (!mpsNumber) continue;
-    const configured = deliveryPhases.filter((phase) => phase.mpsNumber === mpsNumber && phase.mpsDetailId === detail.mpsDetailId);
+    const detailTargetKey = mrpTargetKey(detail);
+    const configured = deliveryPhases.filter((phase) => phase.mpsNumber === mpsNumber && phase.mpsDetailId === detail.mpsDetailId
+      && (!detailTargetKey || detailTargetKey === String(phase.sourceDeliveryTargetId || "")));
     const configuredQty = configured.reduce((sum, phase) => sum + number(phase.qtyPlanned), 0);
     // Delivery phases cover gross customer demand only. Buffer stock remains a
     // valid internal production target and must not be reported as an
@@ -1751,7 +1799,20 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       shortageQty: capacityQty(shortageQty, detail.uomCode), uomCode: detail.uomCode, status: configured.length ? "INCOMPLETE" : "MISSING",
     });
   }
-  const detailByMpsDetailId = new Map(planDetails.filter((detail) => detail.mpsDetailId).map((detail) => [`${detail.plan.sourceType}|${detail.mpsDetailId}`, detail]));
+  const directReceiptByTarget = new Map();
+  const directReceiptFallback = new Map();
+  const targetScopedReceiptSources = new Set();
+  for (const detail of planDetails.filter((row) =>
+    row.mpsDetailId && !String(row.notes || "").includes("[MRP-PRODUCTION]"))) {
+    const sourceKey = detail.plan.sourceType + "|" + detail.mpsDetailId;
+    const targetKey = mrpTargetKey(detail);
+    if (targetKey) {
+      directReceiptByTarget.set(sourceKey + "|" + targetKey, detail);
+      targetScopedReceiptSources.add(sourceKey);
+    } else {
+      directReceiptFallback.set(sourceKey, detail);
+    }
+  }
   const auditedStockCoverageByPhaseId = new Map();
   const auditedStockHistoryByPhaseId = new Map();
   for (const allocation of productionPlanAllocations) {
@@ -1773,8 +1834,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     .sort((left, right) => parseDateOnly(left.requiredDate) - parseDateOnly(right.requiredDate));
   for (const detail of directReceiptDetails) {
     const mpsNumber = String(detail.plan.sourceType || "").startsWith("MPS:") ? String(detail.plan.sourceType).slice(4) : null;
+    const detailTargetKey = mrpTargetKey(detail);
     const deliveryDemandQty = deliveryPhases
-      .filter((phase) => phase.mpsNumber === mpsNumber && phase.mpsDetailId === detail.mpsDetailId)
+      .filter((phase) => phase.mpsNumber === mpsNumber && phase.mpsDetailId === detail.mpsDetailId
+        && (!detailTargetKey || detailTargetKey === String(phase.sourceDeliveryTargetId || "")))
       .reduce((sum, phase) => sum + number(phase.qtyPlanned), 0);
     const stockKey = `${detail.partCode}|${String(detail.uomCode || "").toLowerCase()}`;
     const availableQty = number(remainingFinishedGoodStock.get(stockKey));
@@ -1790,13 +1853,18 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   }
   const cumulativeRequiredByDetail = new Map();
   for (const phase of deliveryPhases) {
-    const directDetail = detailByMpsDetailId.get(`MPS:${phase.mpsNumber}|${phase.mpsDetailId}`);
+    const sourceKey = "MPS:" + phase.mpsNumber + "|" + phase.mpsDetailId;
+    const phaseTargetKey = String(phase.sourceDeliveryTargetId || "");
+    const directDetail = directReceiptByTarget.get(sourceKey + "|" + phaseTargetKey)
+      || (!targetScopedReceiptSources.has(sourceKey) ? directReceiptFallback.get(sourceKey) : null);
     if (!directDetail) continue;
+    const directTargetKey = mrpTargetKey(directDetail);
     const relatedDetails = [
       directDetail,
       ...planDetails.filter((candidate) =>
-        candidate.plan.sourceType === `MPS:${phase.mpsNumber}`
-        && String(candidate.notes || "").includes(`[MPS-SOURCE:${phase.mpsDetailId}]`)),
+        candidate.plan.sourceType === "MPS:" + phase.mpsNumber
+        && String(candidate.notes || "").includes("[MPS-SOURCE:" + phase.mpsDetailId + "]")
+        && (!directTargetKey || mrpTargetKey(candidate) === directTargetKey)),
     ].filter((candidate, index, rows) => rows.findIndex((row) => row.id === candidate.id) === index);
     const routeTasksForCoverage = relatedDetails.flatMap((detail) =>
       canonicalizeRoutingOperations(routesForPlanDetail(detail)).map((route) => ({ detail, route })))
@@ -1804,8 +1872,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     const finalTask = routeTasksForCoverage.at(-1);
     const detail = finalTask?.detail || directDetail;
     const finalRoute = finalTask?.route || null;
-    const groupKey = `${directDetail.plan.planNumber}|${phase.mpsDetailId}`;
-    const cumulativeRequiredQty = number(cumulativeRequiredByDetail.get(groupKey)) + number(phase.qtyPlanned);
+    const groupKey = directDetail.plan.planNumber + "|" + phase.mpsDetailId + "|" + (directTargetKey || "ROLLING");
+    const cumulativeRequiredQty = directTargetKey
+      ? number(phase.qtyPlanned)
+      : number(cumulativeRequiredByDetail.get(groupKey)) + number(phase.qtyPlanned);
     cumulativeRequiredByDetail.set(groupKey, cumulativeRequiredQty);
     const firmQtyByDueDate = finalRoute?.processId
       ? schedules.reduce((sum, schedule) => {
@@ -1817,10 +1887,12 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         return sum + number(schedule.plannedQty);
       }, 0)
       : 0;
-    const coveredAutoPhaseIds = new Set(deliveryPhases.filter((candidate) =>
-      candidate.mpsNumber === phase.mpsNumber
-      && candidate.mpsDetailId === phase.mpsDetailId
-      && parseDateOnly(candidate.plannedDate) <= parseDateOnly(phase.plannedDate)).map((candidate) => candidate.id));
+    const coveredAutoPhaseIds = directTargetKey
+      ? new Set([phase.id])
+      : new Set(deliveryPhases.filter((candidate) =>
+        candidate.mpsNumber === phase.mpsNumber
+        && candidate.mpsDetailId === phase.mpsDetailId
+        && parseDateOnly(candidate.plannedDate) <= parseDateOnly(phase.plannedDate)).map((candidate) => candidate.id));
     const autoPhaseAllocations = productionPlanAllocations.filter((allocation) =>
       ["Draft", "Published"].includes(allocation.status)
       && allocation.allocationSource === "AUTO_RECOMMENDATION"
@@ -1868,13 +1940,17 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     const hasAuditedStockCoverage = coveredPhaseRows.some((candidate) => auditedStockCoverageByPhaseId.has(candidate.id));
     const initialStockQty = hasAuditedStockCoverage
       ? coveredPhaseRows.reduce((sum, candidate) => sum + number(auditedStockCoverageByPhaseId.get(candidate.id)), 0)
-      : number(initialStockQtyByDetailId.get(directDetail.id));
+      : directTargetKey
+        ? Math.max(number(phase.qtyPlanned) - number(directDetail.qtyPlanned), 0)
+        : number(initialStockQtyByDetailId.get(directDetail.id));
     const initialStockHistory = hasAuditedStockCoverage
       ? coveredPhaseRows.flatMap((candidate) => auditedStockHistoryByPhaseId.get(candidate.id) || [])
       : [];
     // Published recommendation rows and DPP firm schedules can describe the
     // same production output. Use the larger coverage, never their sum.
-    const plannedQtyByDueDate = initialStockQty + Math.max(firmQtyByDueDate, autoTerminalQtyByDueDate) + legacyDraftQtyByDueDate;
+    const plannedQtyByDueDate = directTargetKey
+      ? initialStockQty + number(directDetail.qtyPlanned)
+      : initialStockQty + Math.max(firmQtyByDueDate, autoTerminalQtyByDueDate) + legacyDraftQtyByDueDate;
     const shortageQty = Math.max(cumulativeRequiredQty - plannedQtyByDueDate, 0);
     deliveryCoverage.push({
       phaseId: phase.id,
@@ -2076,5 +2152,6 @@ module.exports = {
   predecessorGroupReadiness,
   compareAllocationConsumptionOrder,
   allocationFinishMoment,
+  crossPlanPredecessorStatus,
   resolveVendorReturnDeadline,
 };

@@ -86,12 +86,14 @@ const monthlyProductionPlansRouter = require("./planning/monthly-production-plan
 const reportingRouter = require("./reporting");
 const capacityPlanningRouter = require("./planning/capacity-planning");
 const demandPlanningRouter = require("./planning/demand-planning");
+const planningExecutionCockpitRouter = require("./planning/execution-cockpit");
 
 const manufacturingOrdersRouter = require("./production/manufacturing-orders");
 const workOrdersRouter = require("./production/work-orders");
 const productionLogsRouter = require("./production/production-logs");
 const downtimeLogsRouter = require("./production/downtime-logs");
 const qualityInspectionsRouter = require("./production/quality-inspections");
+const ngDispositionsRouter = require("./production/ng-dispositions");
 const materialIssuesRouter = require("./production/material-issues");
 const productionReportsRouter = require("./production/production-reports");
 const wipRouter = require("./production/wip");
@@ -219,6 +221,7 @@ function registerRoutes(app) {
   api.use("/reports", auth, reportingRouter);
   api.use("/planning/capacity-planning", auth, capacityPlanningRouter);
   api.use("/planning/demand-planning", auth, demandPlanningRouter);
+  api.use("/planning/execution-cockpit", auth, planningExecutionCockpitRouter);
 
   // Purchasing routes
   api.use("/purchasing/purchase-order", auth, purchaseOrderRouter);
@@ -244,6 +247,7 @@ function registerRoutes(app) {
   api.use("/production/production-logs", auth, productionLogsRouter);
   api.use("/production/downtime-logs", auth, downtimeLogsRouter);
   api.use("/production/quality-inspections", auth, qualityInspectionsRouter);
+  api.use("/production/ng-dispositions", auth, ngDispositionsRouter);
   api.use("/production/material-issues", auth, materialIssuesRouter);
   api.use("/production/production-reports", auth, productionReportsRouter);
   api.use("/production/wip", auth, wipRouter);
