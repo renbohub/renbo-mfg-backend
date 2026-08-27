@@ -2,7 +2,7 @@ const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { assertQuantity } = require("../../utils/uomQuantity");
-const { predecessorQuantityStatus } = require("../../services/planning/capacityPlanningService");
+const { predecessorQuantityStatus, capacityOperationCode } = require("../../services/planning/capacityPlanningService");
 const { resolveDiesAssignment } = require("../../services/planning/diesCapacityService");
 const {
   buildAvailability,
@@ -244,6 +244,7 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo, options = {})
     requirementUomMode: "BY_ITEM_TYPE",
     ignoreMaterialIssues: true,
     ignoreReservations: true,
+    includePartAllocations: true,
     // Daily Production consumes every direct BOM child of the scheduled
     // production item. This includes raw/purchase material, WIP, child FG,
     // and FG COMP. Deeper descendants remain owned by their own Daily Plan.
@@ -263,6 +264,7 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo, options = {})
       requirementUomMode: "BY_ITEM_TYPE",
       ignoreMaterialIssues: true,
       ignoreReservations: true,
+      includePartAllocations: true,
       includeDirectProductionInputs: true,
     });
   }
@@ -270,10 +272,19 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo, options = {})
   // Scope strictly to one level below the scheduled production item. The
   // parentDetailId relation is the source of truth; item type/category is not
   // used to silently drop WIP/FG/COMP inputs.
+  const scopedItems = (availability.items || []).filter((item) => item.parentDetailId === target.id);
+  const scopedShortage = scopedItems.filter((item) => !item.isSufficient);
   return {
     ...availability,
-    items: (availability.items || []).filter((item) => item.parentDetailId === target.id),
+    items: scopedItems,
     mbomHeader: target.mbomHeader,
+    summary: {
+      ...(availability.summary || {}),
+      total: scopedItems.length,
+      sufficient: scopedItems.length - scopedShortage.length,
+      shortage: scopedShortage.length,
+    },
+    isAvailable: scopedShortage.length === 0,
   };
 }
 
@@ -428,10 +439,11 @@ async function attachScheduleMachines(client, schedules = []) {
   const items = Array.isArray(schedules) ? schedules : [schedules];
   const machineIds = [...new Set(items.map((row) => row?.machineId).filter(Boolean))];
   const processIds = [...new Set(items.map((row) => row?.processId).filter(Boolean))];
+  const mbomProcessIds = [...new Set(items.map((row) => row?.mbomProcessId).filter(Boolean))];
   const diesIds = [...new Set(items.map((row) => row?.diesId).filter(Boolean))];
   const partIds = [...new Set(items.map((row) => row?.partId).filter(Boolean))];
   const partCodes = [...new Set(items.map((row) => row?.partCode).filter(Boolean))];
-  const [machines, processes, dies, parts] = await Promise.all([
+  const [machines, processes, routes, dies, parts] = await Promise.all([
     machineIds.length
       ? client.machine.findMany({ where: { id: { in: machineIds } }, select: machineSelect })
       : [],
@@ -439,6 +451,12 @@ async function attachScheduleMachines(client, schedules = []) {
       ? client.process.findMany({
           where: { id: { in: processIds }, isDeleted: false },
           select: { id: true, processCode: true, processName: true },
+        })
+      : [],
+    mbomProcessIds.length
+      ? client.mBOMProcess.findMany({
+          where: { id: { in: mbomProcessIds }, isDeleted: false },
+          select: { id: true, occurrenceCode: true, process: { select: { processCode: true, processName: true } } },
         })
       : [],
     diesIds.length
@@ -459,6 +477,7 @@ async function attachScheduleMachines(client, schedules = []) {
   ]);
   const machineById = new Map(machines.map((row) => [row.id, row]));
   const processById = new Map(processes.map((row) => [row.id, row]));
+  const routeById = new Map(routes.map((row) => [row.id, row]));
   const diesById = new Map(dies.map((row) => [row.id, row]));
   const partById = new Map(parts.map((row) => [row.id, row]));
   const partByCode = new Map(parts.map((row) => [row.partCode, row]));
@@ -466,6 +485,7 @@ async function attachScheduleMachines(client, schedules = []) {
     ...row,
     machine: machineById.get(row.machineId) || null,
     process: processById.get(row.processId) || null,
+    mbomProcess: routeById.get(row.mbomProcessId) || null,
     dies: diesById.get(row.diesId) || null,
     part: partByCode.get(row.partCode) || partById.get(row.partId) || null,
   } : row);
@@ -485,7 +505,8 @@ function mapScheduleDoc(schedule) {
     machineCapacityUnit: doc.machine?.capacityUnit || null,
     lineCode: doc.machine?.lineCode || null,
     machineLocation: doc.machine?.location || null,
-    processCode: doc.process?.processCode || null,
+    processCode: capacityOperationCode(doc.mbomProcess) || doc.process?.processCode || null,
+    baseProcessCode: doc.process?.processCode || doc.mbomProcess?.process?.processCode || null,
     processName: doc.process?.processName || null,
     partCode: doc.part?.partCode || doc.partCode || null,
     partNumber: doc.part?.partNumber || null,

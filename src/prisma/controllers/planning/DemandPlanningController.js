@@ -47,6 +47,27 @@ function mergeRecoveryChecklist(recommendation, submitted = []) {
   });
 }
 
+function acceptLateDecision(checklist = [], body = {}, requestedDeliveryDate = null) {
+  const action = (Array.isArray(checklist) ? checklist : []).find((item) => item.id === "ACCEPT_LATE" && item.selected);
+  if (!action) return { decisionType: "RECOVERY", originalDeliveryDate: requestedDeliveryDate, acceptedDeliveryDate: null, acceptLateReason: null };
+  const acceptedDeliveryDate = text(body.acceptedDeliveryDate) || text(action.targetDate);
+  return {
+    decisionType: "ACCEPT_LATE",
+    originalDeliveryDate: requestedDeliveryDate,
+    acceptedDeliveryDate: acceptedDeliveryDate ? new Date(acceptedDeliveryDate) : null,
+    acceptLateReason: text(body.acceptLateReason) || text(action.notes),
+  };
+}
+
+function validateAcceptLate(plan) {
+  if (plan.decisionType !== "ACCEPT_LATE") return [];
+  const errors = [];
+  if (!plan.acceptedDeliveryDate || Number.isNaN(new Date(plan.acceptedDeliveryDate).getTime())) errors.push("Accept Late: tanggal komitmen baru wajib diisi.");
+  if (plan.acceptedDeliveryDate && new Date(plan.acceptedDeliveryDate) <= new Date(plan.requestedDeliveryDate)) errors.push("Accept Late: tanggal komitmen baru harus setelah tanggal delivery asli.");
+  if (!text(plan.acceptLateReason) || text(plan.acceptLateReason).length < 10) errors.push("Accept Late: alasan minimal 10 karakter.");
+  return errors;
+}
+
 async function displacementSimulation(deliveryTargetId, proposedCompletion = null) {
   const target = await prisma.demandDeliveryTarget.findFirst({ where: { id: deliveryTargetId, isDeleted: false } });
   if (!target) throw Object.assign(new Error("Delivery target tidak ditemukan."), { statusCode: 404 });
@@ -103,6 +124,7 @@ exports.saveRecoveryPlan = async (req, res, next) => {
   try {
     const context = await targetFeasibility(req.params.deliveryTargetId, text(req.body.planNumber));
     const checklist = mergeRecoveryChecklist(context.recommendation, req.body.checklist);
+    const acceptLate = acceptLateDecision(checklist, req.body, new Date(context.recommendation.requestedDeliveryDate));
     const current = await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId: context.target.id, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } });
     if (current?.status === "PENDING_APPROVAL") return res.status(409).json({ message: "Recovery Plan sedang menunggu approval PPIC dan tidak dapat diedit." });
     const data = {
@@ -118,6 +140,7 @@ exports.saveRecoveryPlan = async (req, res, next) => {
       status: "DRAFT",
       updatedBy: actor(req),
       submittedBy: null, submittedAt: null, approvedBy: null, approvedAt: null, approvalReason: null, rejectedBy: null, rejectedAt: null, rejectionReason: null,
+      ...acceptLate,
     };
     const plan = await prisma.$transaction(async (tx) => {
       if (current && ["DRAFT", "REJECTED", "REPLAN_REQUIRED"].includes(current.status)) return tx.dueDateRecoveryPlan.update({ where: { id: current.id }, data });
@@ -133,7 +156,7 @@ exports.submitRecoveryPlan = async (req, res, next) => {
     const plan = await prisma.dueDateRecoveryPlan.findFirst({ where: { id: req.params.planId, isCurrentPlan: true, isDeleted: false } });
     if (!plan) return res.status(404).json({ message: "Recovery Plan tidak ditemukan." });
     if (!['DRAFT','REJECTED','REPLAN_REQUIRED'].includes(plan.status)) return res.status(409).json({ message: `Recovery Plan berstatus ${plan.status} tidak dapat diajukan.` });
-    const errors = validateRecoveryChecklist(plan.checklist, plan.requestedDeliveryDate);
+    const errors = [...validateRecoveryChecklist(plan.checklist, plan.requestedDeliveryDate), ...validateAcceptLate(plan)];
     if (errors.length) return res.status(400).json({ message: "Checklist belum siap diajukan.", errors });
     res.json(await prisma.dueDateRecoveryPlan.update({ where: { id: plan.id }, data: { status: "PENDING_APPROVAL", submittedBy: actor(req), submittedAt: new Date(), updatedBy: actor(req) } }));
   } catch (error) { next(error); }
@@ -149,7 +172,7 @@ exports.approveRecoveryPlan = async (req, res, next) => {
     if (plan.status !== "PENDING_APPROVAL") return res.status(409).json({ message: `Recovery Plan berstatus ${plan.status} tidak dapat di-approve.` });
     const target = await prisma.demandDeliveryTarget.findFirst({ where: { id: plan.deliveryTargetId, isDeleted: false, status: "ACTIVE" } });
     if (!target || target.updatedAt > plan.updatedAt || target.targetDate.getTime() !== plan.requestedDeliveryDate.getTime()) return res.status(409).json({ code: "RECOVERY_RECHECK_REQUIRED", message: "Delivery target berubah setelah checklist dibuat. Simpan ulang Recovery Plan sebelum approval." });
-    const errors = validateRecoveryChecklist(plan.checklist, plan.requestedDeliveryDate);
+    const errors = [...validateRecoveryChecklist(plan.checklist, plan.requestedDeliveryDate), ...validateAcceptLate(plan)];
     if (errors.length) return res.status(400).json({ message: "Checklist tidak valid untuk approval.", errors });
     res.json(await prisma.dueDateRecoveryPlan.update({ where: { id: plan.id }, data: { status: "APPROVED", approvedBy: actor(req), approvedAt: new Date(), approvalReason: reason, updatedBy: actor(req) } }));
   } catch (error) { next(error); }

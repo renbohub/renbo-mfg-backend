@@ -9,4 +9,8 @@ router.post("/planning-flow/reset", requireSuperAdmin, logger("planningFlow", "d
 router.get("/demand-flow/status", requireSuperAdmin, ctrl.getDemandResetStatus);
 router.post("/demand-flow/reset", requireSuperAdmin, logger("demandFlow", "delete"), ctrl.resetDemandFlow);
 
+router.get("/source-planning-reset/sources", requireSuperAdmin, ctrl.listSourcePlanningResetSources);
+router.post("/source-planning-reset/preview", requireSuperAdmin, ctrl.previewSourcePlanningReset);
+router.post("/source-planning-reset/reset", requireSuperAdmin, logger("sourcePlanningReset", "delete"), ctrl.resetSourcePlanning);
+
 module.exports = router;

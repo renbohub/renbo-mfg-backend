@@ -8,7 +8,7 @@ const { deleteQuotationFile } = require("../../middleware/uploads");
 const { generatePONumber, calcTotal } = require("./utils/purchasingHelpers");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { resolveItemIdentityInput, hasItemIdentity, buildIdentityWhere, normalizeText } = require("../inventory/utils/itemIdentity");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const { autoAllocateMaterialReceipt } = require("../inventory/utils/autoPartAllocation");
 const {
   convertPODetailNumericFields,
@@ -1956,6 +1956,12 @@ async function receiveRemainingPoToStock(tx, po, warehouseCode, rackCode, perfor
       await assertStockBalanceNotFrozen(tx, existing.id);
       postedBalance = await tx.stockBalance.update({ where: { id: existing.id }, data: balanceData });
     } else {
+      await assertStockIdentityNotFrozen(tx, {
+        warehouseCode,
+        rackCode: rackCode || null,
+        lotNumber: null,
+        stockType,
+      });
       postedBalance = await tx.stockBalance.create({ data: { warehouseCode, rackCode: rackCode || null, lotNumber: null, partCode: identity.partCode || null, ...balanceData } });
     }
     await autoAllocateMaterialReceipt(tx, {

@@ -1,0 +1,10 @@
+const router = require("express").Router();
+const controller = require("../../controllers/master-data/ShiftController");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+router.get("/", authorize("machines", "read"), controller.list);
+router.get("/:id", authorize("machines", "read"), controller.get);
+router.post("/", authorize("machines", "create"), logger("shiftMaster", "create"), controller.create);
+router.patch("/:id", authorize("machines", "update"), logger("shiftMaster", "update"), controller.update);
+router.patch("/:id/remove", authorize("machines", "delete"), logger("shiftMaster", "delete"), controller.remove);
+module.exports = router;

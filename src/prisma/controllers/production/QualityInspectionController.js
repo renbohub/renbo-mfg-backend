@@ -6,7 +6,7 @@ const { generateMovementNumber } = require("../../utils/movementNumberGenerator"
 const { parseFilter } = require("../../utils/parseFilter");
 const { incrementDiesShotCounter } = require("../../utils/diesShotCounter");
 const { createWIPEntry } = require("./WIPController");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const {
   syncManufacturingOrderQtyFromWorkOrders,
 } = require("./services/productionWorkflowService");
@@ -654,6 +654,12 @@ async function upsertDispositionTargetBalance(tx, sourceMovement, target, qty, s
     return { ...balance, qtyBefore, qtyAfter: qtyOnHand };
   }
 
+  await assertStockIdentityNotFrozen(tx, {
+    warehouseCode: target.warehouseCode,
+    rackCode: target.rackCode || null,
+    lotNumber: target.lotNumber || targetMovement.lotNumber || null,
+    stockType,
+  });
   const balance = await tx.stockBalance.create({
     data: {
       warehouseCode: target.warehouseCode,
@@ -1492,13 +1498,13 @@ async function buildNonComponentFgTrackingRows(tx, options = {}) {
         blockerCode = "FG_NONCOMP_QC_PENDING";
         blockerMessage = "Output WIP terakhir sudah diproduksi tetapi belum memiliki QC Completed dan Accepted.";
         references.push({ type: "LOG", label: latestLog.logNumber, href: `/modules/production/production-logs/${encodeURIComponent(latestLog.logNumber)}` });
-        references.push({ type: "QC", label: "Buat / selesaikan QC", href: `/modules/production/quality-inspections/new?productionLogNumber=${encodeURIComponent(latestLog.logNumber)}` });
+        references.push({ type: "QC", label: "Buat / selesaikan QC", href: `/modules/qc/quality-inspections/new?productionLogNumber=${encodeURIComponent(latestLog.logNumber)}` });
       } else {
         receiptState = "WAITING_RECEIPT_RECONCILIATION";
         blockerCode = "FG_NONCOMP_RECEIPT_QTY_GAP";
         blockerMessage = "QC Accepted sudah ada, tetapi seluruh outstanding belum menjadi baris receipt siap posting. Periksa qty QC dan source WIP release.";
         const latestQc = completedAcceptedQcs[0];
-        references.push({ type: "QC", label: latestQc.inspectionNumber, href: `/modules/production/quality-inspections/${encodeURIComponent(latestQc.inspectionNumber)}` });
+        references.push({ type: "QC", label: latestQc.inspectionNumber, href: `/modules/qc/quality-inspections/${encodeURIComponent(latestQc.inspectionNumber)}` });
       }
     }
 
@@ -3927,6 +3933,12 @@ exports.rollbackFgReceipt = async (req, res, next) => {
           select: { id: true, qtyOnHand: true, qtyReserved: true, qtyQC: true },
         });
       } else {
+        await assertStockIdentityNotFrozen(tx, {
+          warehouseCode: sourceOutMovement.warehouseCode,
+          rackCode: sourceOutMovement.rackCode || null,
+          lotNumber: sourceOutMovement.lotNumber || null,
+          stockType: sourceOutMovement.stockType || "WIP",
+        });
         sourceBalance = await tx.stockBalance.create({
           data: {
             warehouseCode: sourceOutMovement.warehouseCode,

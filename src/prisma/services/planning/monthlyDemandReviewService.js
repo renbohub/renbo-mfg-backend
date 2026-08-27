@@ -61,6 +61,26 @@ function compactTarget(row, headerStatus) {
   };
 }
 
+function dailyDemandMetrics(sourceTrace = {}, periodValue) {
+  const period = typeof periodValue === "string" ? parsePeriod(periodValue) : periodValue;
+  const trace = sourceTrace && typeof sourceTrace === "object" ? sourceTrace : {};
+  const daily = {};
+  for (let cursor = new Date(period.start); cursor < period.endExclusive; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    daily[cursor.toISOString().slice(0, 10)] = { fcc: 0, po: 0, eff: 0 };
+  }
+  const add = (rows, dateField, metric) => {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const key = iso(row?.[dateField])?.slice(0, 10);
+      if (!key || !daily[key]) continue;
+      daily[key][metric] = roundQty(daily[key][metric] + number(row.qty));
+    }
+  };
+  add(trace.fccTargets, "targetDate", "fcc");
+  add(trace.poTargets, "targetDate", "po");
+  add(trace.effectiveDeliveryPhases, "targetDeliveryDate", "eff");
+  return daily;
+}
+
 function readinessFor(item, part, selectedForecasts, phasePlanning) {
   const issues = [];
   if (!part) issues.push({ code: "PART_MASTER_MISSING", severity: "BLOCKER", message: "Part belum terhubung ke Part Master." });
@@ -105,7 +125,7 @@ async function buildLiveMonthlyDemand(prisma, periodValue) {
     }),
   ]);
   const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && row.forecastDetail.forecast && !row.forecastDetail.forecast.isDeleted && row.forecastDetail.forecast.isCurrentVersion && row.forecastDetail.forecast.status !== "Obsolete");
-  const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled"].includes(row.soDetail.soHeader.status));
+  const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
   const partCodes = unique([...forecasts, ...sales].map((row) => row.partCode));
   const parts = partCodes.length ? await prisma.part.findMany({
     where: { partCode: { in: partCodes }, isDeleted: false },
@@ -407,7 +427,8 @@ async function getMonthlyReview(prisma, options = {}) {
     return {
       ...(basis || {}),
       customerCodes: Array.isArray(basis?.customerCodes) ? basis.customerCodes : [],
-      currentSource,
+      daily: dailyDemandMetrics(basis?.sourceTrace, live.period),
+      currentSource: currentSource ? { ...currentSource, daily: dailyDemandMetrics(currentSource.sourceTrace, live.period) } : null,
       phasePlanning,
       effectivePhaseCount,
       sourceDeltaEffQty,
@@ -453,6 +474,7 @@ async function getMonthlyReview(prisma, options = {}) {
 
 module.exports = {
   parsePeriod,
+  dailyDemandMetrics,
   buildLiveMonthlyDemand,
   getMonthlyReview,
   createSnapshot,

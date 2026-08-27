@@ -16,7 +16,7 @@ const DOCUMENT_STATUS_LIFECYCLES = {
   "purchasing/purchase-invoices": ["Draft", "Submitted", "Matched", "Need Review", "Approved", "Posted", "Paid", "Cancelled"],
   "sales/forecasts": ["Draft", "Submitted", "Confirmed", "Rejected", "Partial Product", "Consumed", "Closed", "Obsolete"],
   "production/production-logs": ["Open", "Submitted", "Approved", "Rejected"],
-  "inventory/stock-opname": ["DRAFT", "COUNTING", "WAITING_APPROVAL", "APPROVED", "ADJUSTED", "CLOSED", "CANCELLED", "REJECTED"],
+  "inventory/stock-opname": ["DRAFT", "COUNTING", "WAITING_CHECK", "WAITING_APPROVAL", "APPROVED", "ADJUSTED", "CLOSED", "CANCELLED", "REJECTED"],
 };
 
 function actor(req) {

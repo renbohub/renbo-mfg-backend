@@ -13,6 +13,20 @@ function numberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function canResumeCompletedApproval({ document, request, decision = "Approved", documentStatuses = [] } = {}) {
+  if (!document || !request || !Array.isArray(documentStatuses) || !documentStatuses.length) return false;
+  const expectedDecision = ["rejected", "reject"].includes(normalize(decision)) ? "Rejected" : "Approved";
+  if (normalize(request.status) !== normalize(expectedDecision)) return false;
+  if (!documentStatuses.map(normalize).includes(normalize(document.status))) return false;
+
+  const completedAt = new Date(request.completedAt || 0).getTime();
+  if (!Number.isFinite(completedAt) || completedAt <= 0) return false;
+  const documentUpdatedAt = new Date(document.updatedAt || 0).getTime();
+  // A document edited after the approval is a new version and must be
+  // submitted again. Only resume the exact version whose posting failed.
+  return !Number.isFinite(documentUpdatedAt) || documentUpdatedAt <= 0 || completedAt >= documentUpdatedAt;
+}
+
 function getPath(object, path) {
   return String(path || "").split(".").reduce((value, key) => value == null ? undefined : value[key], object);
 }
@@ -352,6 +366,29 @@ function approvalGate(config) {
         include: REQUEST_INCLUDE,
       });
       if (!request) {
+        if (config.allowCompletedRequestRetry) {
+          const completedStatus = ["rejected", "reject"].includes(normalize(config.decision)) ? "Rejected" : "Approved";
+          const completedRequest = await prisma.approvalRequest.findFirst({
+            where: { ...requestKey, isDeleted: false, status: completedStatus },
+            include: REQUEST_INCLUDE,
+            orderBy: { completedAt: "desc" },
+          });
+          if (canResumeCompletedApproval({
+            document,
+            request: completedRequest,
+            decision: completedStatus,
+            documentStatuses: config.completedRetryDocumentStatuses,
+          })) {
+            req.approval = {
+              request: completedRequest,
+              final: true,
+              decision: completedStatus,
+              shouldContinue: true,
+              resumedCompletedRequest: true,
+            };
+            return next();
+          }
+        }
         if (config.requireExistingRequest) {
           return res.status(409).json({ message: "Dokumen belum disubmit ke alur approval atau approval request aktif tidak ditemukan." });
         }
@@ -411,5 +448,6 @@ module.exports = {
   processApprovalAction,
   hasPageAction,
   approvalGate,
+  canResumeCompletedApproval,
   matchesConditions,
 };

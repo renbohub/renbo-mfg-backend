@@ -1,6 +1,8 @@
 "use strict";
 
 const { consumeDeliveryTargets, planningPolicy } = require("./demandConsumptionService");
+const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
+const { loadAdditionalDemandCoverage } = require("./additionalDemandCoverageService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const roundQty = (value) => Math.round((number(value) + Number.EPSILON) * 1000000) / 1000000;
@@ -148,6 +150,52 @@ function aggregateYearlyDemand({ year, forecastTargets = [], salesOrderTargets =
   });
 }
 
+function mergeAdditionalCoverageIntoYearlyItems(items, coverageByPartMonth) {
+  for (const row of items || []) {
+    for (const [month, metric] of Object.entries(row.months || {})) {
+      const coverage = coverageByPartMonth?.get(`${month}|${row.partCode}`);
+      if (!coverage) {
+        metric.lock = { locked: false };
+        metric.additional = {
+          qty: 0,
+          coveredFgStockQty: 0,
+          coveredFirmReceiptQty: 0,
+          generatedDeltaQty: 0,
+          pendingDeltaQty: 0,
+          uncoveredQty: 0,
+          reductionQty: 0,
+          sourceSalesOrders: [],
+        };
+        metric.currentQty = metric.po;
+        continue;
+      }
+      metric.lock = {
+        locked: true,
+        lockedEfd: coverage.lockedEfdQty,
+        forecastQtyLocked: coverage.forecastQtyLocked,
+        poQtyLocked: coverage.poQtyLocked,
+        baselineMpsNumbers: coverage.baselineMpsNumbers,
+        baselineMrpNumbers: coverage.baselineMrpNumbers,
+        lockedAt: coverage.locks.map((lock) => lock?.lockedAt).filter(Boolean).sort()[0] || null,
+        lockedBy: unique(coverage.locks.map((lock) => lock?.lockedBy)).join(", ") || null,
+        customerCodes: coverage.customerCodes,
+      };
+      metric.additional = {
+        qty: coverage.additionalQty,
+        coveredFgStockQty: coverage.coveredFgStockQty,
+        coveredFirmReceiptQty: coverage.coveredFirmReceiptQty,
+        generatedDeltaQty: coverage.generatedDeltaQty,
+        pendingDeltaQty: coverage.pendingDeltaQty,
+        uncoveredQty: coverage.uncoveredQty,
+        reductionQty: coverage.reductionQty,
+        sourceSalesOrders: coverage.sourceSalesOrders,
+      };
+      metric.currentQty = coverage.currentSoQty;
+    }
+  }
+  return items;
+}
+
 async function buildYearlyDemand(prisma, options = {}) {
   const year = validYear(options.year);
   const start = new Date(Date.UTC(year, 0, 1));
@@ -166,7 +214,7 @@ async function buildYearlyDemand(prisma, options = {}) {
     }),
   ]);
   const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && row.forecastDetail.forecast && !row.forecastDetail.forecast.isDeleted && row.forecastDetail.forecast.isCurrentVersion && row.forecastDetail.forecast.status !== "Obsolete");
-  const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled"].includes(row.soDetail.soHeader.status));
+  const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
   const customerOptions = unique([...forecasts, ...sales].map((row) => row.customerCode)).sort();
   const customerCode = String(options.customerCode || "").trim();
   const filteredForecasts = customerCode ? forecasts.filter((row) => row.customerCode === customerCode) : forecasts;
@@ -177,14 +225,36 @@ async function buildYearlyDemand(prisma, options = {}) {
     select: { partCode: true, partNumber: true, partName: true, planningPolicy: true, baseUomCode: true, salesUomCode: true },
   }) : [];
   let items = aggregateYearlyDemand({ year, forecastTargets: filteredForecasts, salesOrderTargets: filteredSales, parts });
+  const efdConfiguration = await loadEfdConfiguration(prisma);
+  for (const row of items) {
+    for (const [month, metric] of Object.entries(row.months)) {
+      const resolved = resolveEfd({ forecastQty: metric.fcc, poQty: metric.po, calculatedQty: metric.eff, partCode: row.partCode, month }, efdConfiguration);
+      metric.effCalculated = metric.eff;
+      metric.efd = resolved.value;
+      metric.eff = resolved.value;
+      metric.efdSource = resolved.source;
+      metric.efdOverride = resolved.override;
+      metric.efdRuleMode = resolved.ruleMode;
+    }
+    row.totals.effCalculated = roundQty(Object.values(row.months).reduce((sum, metric) => sum + number(metric.effCalculated), 0));
+    row.totals.efd = roundQty(Object.values(row.months).reduce((sum, metric) => sum + number(metric.efd), 0));
+    row.totals.eff = row.totals.efd;
+  }
   const query = String(options.q || "").trim().toLowerCase();
   if (query) items = items.filter((row) => [row.partCode, row.partNumber, row.partName, ...row.customerCodes].some((value) => String(value || "").toLowerCase().includes(query)));
   items.sort((left, right) => String(left.partNumber || left.partCode).localeCompare(String(right.partNumber || right.partCode)));
 
+  const additionalCoverage = await loadAdditionalDemandCoverage(prisma, {
+    year,
+    customerCode,
+    partCodes: items.map((row) => row.partCode),
+  });
+  mergeAdditionalCoverageIntoYearlyItems(items, additionalCoverage.byPartMonth);
+
   const totals = { fcc: 0, po: 0, consumedFcc: 0, poEffective: 0, unplannedPo: 0, poPullIn: 0, poPullOut: 0, eff: 0 };
   for (const row of items) for (const key of Object.keys(totals)) totals[key] += number(row.totals[key]);
   for (const key of Object.keys(totals)) totals[key] = roundQty(totals[key]);
-  const pageSize = Math.min(Math.max(Number.parseInt(options.pageSize, 10) || 25, 10), 200);
+  const pageSize = options.unpaginated === true ? Math.max(items.length, 1) : Math.min(Math.max(Number.parseInt(options.pageSize, 10) || 25, 10), 200);
   const total = items.length;
   const totalPages = Math.max(Math.ceil(total / pageSize), 1);
   const page = Math.min(Math.max(Number.parseInt(options.page, 10) || 1, 1), totalPages);
@@ -198,21 +268,25 @@ async function buildYearlyDemand(prisma, options = {}) {
       partCount: total,
       customerCount: unique(items.flatMap((row) => row.customerCodes)).length,
       forecastCoveragePercent: totals.eff > 0 ? roundQty((totals.consumedFcc / totals.eff) * 100) : 0,
+      lockedScopeCount: additionalCoverage.items.length,
+      additionalQty: roundQty(additionalCoverage.items.reduce((sum, row) => sum + number(row.additionalQty), 0)),
+      pendingDeltaQty: roundQty(additionalCoverage.items.reduce((sum, row) => sum + number(row.pendingDeltaQty), 0)),
     },
     pagination: { page, pageSize, total, totalPages },
     filters: { customerCode: customerCode || null, customerOptions },
+    efdRule: efdConfiguration.rule,
     formula: {
-      code: "EFF",
-      expression: "FCC tersisa + PO firm pada tanggal efektif",
-      monthlyExpression: "EFF = (FCC - FCC consumed) + (PO + pull-in - pull-out)",
+      code: "EFD",
+      expression: efdConfiguration.rule.label,
+      monthlyExpression: "EFD ditentukan oleh general rule, lalu dapat dioverride per part dan bulan",
       rules: [
-        "Forecast Draft, Submitted, dan Confirmed yang masih current version tetap tampil sebagai FCC.",
-        "Hanya Sales Order selain Draft/Cancelled yang dihitung sebagai PO firm.",
-        "PO mengonsumsi FCC secara explicit pegging lebih dulu, lalu FIFO pada customer dan part yang sama.",
-        "Tanggal EFF mengikuti tanggal paling awal antara target FCC dan target PO yang mengonsumsinya.",
+        "Rule umum berlaku untuk seluruh part dan bulan yang tidak memiliki override.",
+        "Override per sel dapat memilih Actual PO, Forecast, atau nilai manual.",
+        "Saat sumber Actual PO dipilih tetapi PO = 0, sistem otomatis memakai Forecast.",
+        "Perubahan EFD menandai MPS bulan terkait dan MPS bulan sebelumnya untuk dihitung ulang.",
       ],
     },
   };
 }
 
-module.exports = { aggregateYearlyDemand, buildYearlyDemand, validYear };
+module.exports = { aggregateYearlyDemand, buildYearlyDemand, mergeAdditionalCoverageIntoYearlyItems, validYear };

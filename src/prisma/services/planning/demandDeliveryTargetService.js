@@ -150,6 +150,25 @@ async function replaceDeliveryTargets(tx, options) {
   }
 }
 
+async function retireDeliveryTargets(tx, options) {
+  const {
+    sourceType,
+    sourceNumber,
+    status = "SUPERSEDED",
+    user = null,
+    markDeleted = false,
+  } = options;
+  if (!sourceType || !sourceNumber) return { count: 0 };
+  return tx.demandDeliveryTarget.updateMany({
+    where: { sourceType, sourceNumber, isDeleted: false, status: "ACTIVE" },
+    data: {
+      status,
+      isDeleted: markDeleted,
+      updatedBy: user,
+    },
+  });
+}
+
 async function assertCompleteDeliveryTargets(tx, sourceType, sourceNumber, lines) {
   const targets = await tx.demandDeliveryTarget.findMany({
     where: { sourceType, sourceNumber, isDeleted: false, status: "ACTIVE" },
@@ -164,4 +183,4 @@ async function assertCompleteDeliveryTargets(tx, sourceType, sourceNumber, lines
   return targets;
 }
 
-module.exports = { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange };
+module.exports = { replaceDeliveryTargets, retireDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange };

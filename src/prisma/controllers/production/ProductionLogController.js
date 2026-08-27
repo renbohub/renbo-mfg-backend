@@ -6,7 +6,7 @@ const { parseFilter } = require("../../utils/parseFilter");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { incrementDiesShotCounter } = require("../../utils/diesShotCounter");
 const { createWIPEntry } = require("./WIPController");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const {
   buildExcludeSpecialRackCondition,
   resolveReservationBalanceWhere,
@@ -41,6 +41,7 @@ const {
 } = require("../../services/planning/productionShortfallCarryoverService");
 
 const QUANTITY_TOLERANCE = 0.000001;
+const PRODUCTION_APPROVAL_TRANSACTION_OPTIONS = { maxWait: 10000, timeout: 30000 };
 
 function formatRelationList(items) {
   return items.filter(Boolean).join(", ");
@@ -2065,6 +2066,12 @@ async function receiveProductionLogOutputToQc(tx, log, stockTarget, performedBy 
       },
     });
   } else {
+    await assertStockIdentityNotFrozen(tx, {
+      warehouseCode,
+      rackCode,
+      lotNumber,
+      stockType,
+    });
     outputBalance = await tx.stockBalance.create({
       data: {
         warehouseCode,
@@ -2342,6 +2349,12 @@ async function createProductionRejectDisposition(tx, log, stockTarget, performed
         },
       });
     } else {
+      await assertStockIdentityNotFrozen(tx, {
+        warehouseCode: row.warehouseCode,
+        rackCode: row.rackCode,
+        lotNumber: row.lotNumber,
+        stockType,
+      });
       await tx.stockBalance.create({
         data: {
           warehouseCode: row.warehouseCode,
@@ -2433,6 +2446,161 @@ async function createProductionReworkWorkOrder(tx, log, performedBy = "system") 
 
   return created;
 }
+
+async function finalizeProductionLogNgDisposition(
+  tx,
+  productionLogId,
+  stockTarget = {},
+  performedBy = "system",
+) {
+  const judgments = await tx.productionLogNgReason.findMany({
+    where: { productionLogId, isDeleted: false },
+    select: { status: true, qtyNg: true, qtyRework: true, qtyReject: true },
+  });
+  const pendingCount = judgments.filter((row) => row.status === "PENDING_QC").length;
+  const qtyRework = judgments.reduce((sum, row) => sum + toNumber(row.qtyRework), 0);
+  const qtyReject = judgments.reduce((sum, row) => sum + toNumber(row.qtyReject), 0);
+
+  await tx.productionLog.update({
+    where: { id: productionLogId },
+    data: { qtyRework },
+  });
+
+  const log = await tx.productionLog.findUnique({
+    where: { id: productionLogId },
+    include: {
+      coilPhases: {
+        where: { isDeleted: false },
+        orderBy: [{ phaseNumber: "asc" }, { createdAt: "asc" }],
+        select: { productionLotNumber: true },
+      },
+      manufacturingOrder: {
+        select: {
+          id: true,
+          partId: true,
+          uomCode: true,
+          part: {
+            select: {
+              id: true,
+              partCode: true,
+              partNumber: true,
+              partName: true,
+              material: { select: { spec: true } },
+              partBases: {
+                orderBy: { createdAt: "asc" },
+                select: { baseOn: true, thickness: true, width: true, CSP: true },
+              },
+            },
+          },
+        },
+      },
+      workOrder: {
+        select: {
+          id: true,
+          moId: true,
+          mbomDetailId: true,
+          machineId: true,
+          processId: true,
+          sequence: true,
+          cycleTime: true,
+          machineCostingRate: true,
+          machineRateType: true,
+          machineCurrency: true,
+          uomCode: true,
+          outputPartId: true,
+          outputPartCode: true,
+          outputPartNumber: true,
+          outputPartName: true,
+          mbomDetail: {
+            select: {
+              part: {
+                select: {
+                  id: true,
+                  partCode: true,
+                  partNumber: true,
+                  partName: true,
+                  material: { select: { spec: true } },
+                  partBases: {
+                    orderBy: { createdAt: "asc" },
+                    select: { baseOn: true, thickness: true, width: true, CSP: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  if (!log) throw Object.assign(new Error("Production Log untuk judgment NG tidak ditemukan."), { statusCode: 404 });
+
+  if (pendingCount > 0 || log.status !== "Approved") {
+    return { pendingCount, qtyRework, qtyReject, finalized: false };
+  }
+
+  const existingReject = await tx.stockMovement.aggregate({
+    where: {
+      referenceType: "PRODUCTION_LOG",
+      referenceNumber: log.logNumber,
+      transactionType: "QC_HOLD",
+      movementType: "IN",
+      qualityBucket: "NG",
+      isDeleted: false,
+    },
+    _sum: { qty: true },
+  });
+  const postedRejectQty = toNumber(existingReject._sum.qty);
+  if (postedRejectQty > qtyReject + QUANTITY_TOLERANCE) {
+    throw Object.assign(
+      new Error(`Disposition reject ${log.logNumber} sudah terposting melebihi hasil judgment QC.`),
+      { statusCode: 409 },
+    );
+  }
+
+  let rejectMovement = null;
+  const remainingRejectQty = Math.max(0, qtyReject - postedRejectQty);
+  if (remainingRejectQty > QUANTITY_TOLERANCE) {
+    const productionLotNumber = log.coilPhases[0]?.productionLotNumber || null;
+    const destination = Array.isArray(stockTarget)
+      ? stockTarget
+      : {
+          warehouseCode: normalizeOptionalText(stockTarget?.warehouseCode) || "WH-001",
+          rackCode: normalizeOptionalText(stockTarget?.rackCode) || "RACK-REJECT",
+          lotNumber: normalizeOptionalText(stockTarget?.lotNumber) || productionLotNumber,
+        };
+    rejectMovement = await createProductionRejectDisposition(
+      tx,
+      log,
+      destination,
+      performedBy,
+      remainingRejectQty,
+    );
+  }
+
+  let reworkWorkOrder = await tx.workOrder.findFirst({
+    where: {
+      isDeleted: false,
+      isReworkOrder: true,
+      reworkReferenceType: "PRODUCTION_LOG",
+      reworkReferenceNumber: log.logNumber,
+    },
+    select: { id: true, woNumber: true, status: true, plannedQty: true },
+  });
+  if (!reworkWorkOrder && qtyRework > QUANTITY_TOLERANCE) {
+    reworkWorkOrder = await createProductionReworkWorkOrder(tx, log, performedBy);
+  }
+
+  return {
+    pendingCount: 0,
+    qtyRework,
+    qtyReject,
+    finalized: true,
+    rejectMovement,
+    reworkWorkOrder,
+  };
+}
+
+exports.finalizeProductionLogNgDisposition = finalizeProductionLogNgDisposition;
 
 exports.list = async (req, res, next) => {
   try {
@@ -3488,21 +3656,13 @@ exports.approve = async (req, res, next) => {
         where: { productionLogId: existing.id, isDeleted: false },
         select: { status: true, qtyNg: true, qtyRework: true, qtyReject: true },
       });
-      const pendingNgJudgments = ngJudgments.filter((row) => row.status === "PENDING_QC");
       const recordedNgQty = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyNg), 0);
       if (toNumber(currentLog.qtyReject) > QUANTITY_TOLERANCE) {
         if (!ngJudgments.length || Math.abs(recordedNgQty - toNumber(currentLog.qtyReject)) > QUANTITY_TOLERANCE) {
           throw Object.assign(new Error("Detail reason NG belum lengkap. Lengkapi reason per phase sebelum approval."), { statusCode: 409 });
         }
-        if (pendingNgJudgments.length) {
-          throw Object.assign(
-            new Error(`${pendingNgJudgments.length} reason NG masih menunggu judgment QC. Selesaikan di QC Rework Judgment terlebih dahulu.`),
-            { statusCode: 409 },
-          );
-        }
       }
       const judgmentQtyRework = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyRework), 0);
-      const judgmentQtyReject = ngJudgments.reduce((sum, row) => sum + toNumber(row.qtyReject), 0);
       currentLog.qtyRework = judgmentQtyRework;
       const approvalPayload = ngJudgments.length
         ? { ...(req.body || {}), qtyReject: currentLog.qtyReject }
@@ -3613,18 +3773,14 @@ exports.approve = async (req, res, next) => {
         outputMovement,
         req.user?.username || "system",
       );
-      const rejectMovement = await createProductionRejectDisposition(
+      const ngDisposition = await finalizeProductionLogNgDisposition(
         tx,
-        updated,
+        updated.id,
         rejectStockTarget,
         req.user?.username || "system",
-        judgmentQtyReject,
       );
-      const reworkWorkOrder = await createProductionReworkWorkOrder(
-        tx,
-        updated,
-        req.user?.username || "system",
-      );
+      const rejectMovement = ngDisposition.rejectMovement || null;
+      const reworkWorkOrder = ngDisposition.reworkWorkOrder || null;
 
       // Auto sync akumulasi qty ke WorkOrder (jika log terkait WO)
       if (existing.woId) {
@@ -3657,7 +3813,7 @@ exports.approve = async (req, res, next) => {
         }
 
         // WO completion is gated by completed QC, not by log approval.
-        automation = { outputMovement, qualityInspection, rejectMovement, reworkWorkOrder, subAssemblyMovementNumbers };
+        automation = { outputMovement, qualityInspection, rejectMovement, reworkWorkOrder, ngDisposition, subAssemblyMovementNumbers };
       }
 
       const syncedMo = existing.woId
@@ -3694,7 +3850,7 @@ exports.approve = async (req, res, next) => {
       }
 
       return { updated, carryover, automation, outputMovement, subAssemblyMovementNumbers, syncedMo };
-    });
+    }, PRODUCTION_APPROVAL_TRANSACTION_OPTIONS);
 
     if (doc.syncedMo) {
       emitManufacturingOrderUpdate(doc.syncedMo, "sync", req.user?.username || "system");
@@ -3786,7 +3942,7 @@ exports.ensureQcRelease = async (req, res, next) => {
         ? "Self-check selesai dan stok hasil OK sudah direlease."
         : "Antrean QC Release Stock berhasil dibuat.",
       inspection: mapDoc(result),
-      href: `/modules/production/quality-inspections/${encodeURIComponent(result.inspectionNumber)}`,
+      href: `/modules/qc/quality-inspections/${encodeURIComponent(result.inspectionNumber)}`,
     });
   } catch (e) {
     if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });

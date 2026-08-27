@@ -5,13 +5,15 @@ const { generateDocNumber } = require("../purchasing/utils/purchasingHelpers");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { assertStockBalanceNotFrozen } = require("./utils/stockOpnameFreezeGuard");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
+const { STO_STOCK_TYPES, stockIdentityMatchesScope } = require("../../services/inventory/stockOpnameDomain");
+const { startStockOpnameCounting, saveStockOpnameCountAttempt } = require("../../services/inventory/stockOpnameCountingService");
+const { submitStockOpnameRound, checkStockOpnameRound, startStockOpnameRecount } = require("../../services/inventory/stockOpnameWorkflowService");
+const { previewStockOpnameAdjustment, postStockOpnameAdjustment } = require("../../services/inventory/stockOpnameAdjustmentService");
+const { resolveItemIdentityInput, hasItemIdentity, buildIdentityWhere } = require("./utils/itemIdentity");
+const { resolveStockOpnameScope } = require("../../services/inventory/stockOpnameScopeService");
 
-const FROZEN_STATUSES = ["COUNTING", "WAITING_APPROVAL", "APPROVED"];
-const STO_STOCK_TYPES = {
-  MATERIAL: ["Material", "Purchase Part"],
-  WIP: ["WIP", "WP", "Semi-Finished"],
-  FG: ["Finished Goods", "FG"],
-};
+const FROZEN_STATUSES = ["COUNTING", "WAITING_CHECK", "WAITING_APPROVAL", "APPROVED"];
+
 const fail = (message, statusCode = 400) => { const error = new Error(message); error.statusCode = statusCode; throw error; };
 const actor = (req) => req.user?.username || req.user?.email || "system";
 const counterName = (req, fallback = true) => {
@@ -72,6 +74,38 @@ function mapStockOpname(item) {
       : 0,
     countSummary: summary,
   });
+  const rounds = Array.isArray(item.countRounds) ? item.countRounds : [];
+  const currentRound = rounds.find((round) => round.roundNo === Number(item.currentRoundNo || 1)) || rounds[0] || null;
+  mapped.currentRound = currentRound ? {
+    id: currentRound.id,
+    roundNo: currentRound.roundNo,
+    status: currentRound.status,
+    startedBy: currentRound.startedBy,
+    startedAt: currentRound.startedAt,
+    submittedBy: currentRound.submittedBy,
+    submittedAt: currentRound.submittedAt,
+    progress: {
+      totalLines: summary.totalLines,
+      countedLines: summary.countedLines,
+      uncountedLines: summary.uncountedLines,
+    },
+  } : null;
+  mapped.countRounds = rounds.map((round) => ({
+    id: round.id,
+    roundNo: round.roundNo,
+    status: round.status,
+    requestReason: round.requestReason,
+    requestedBy: round.requestedBy,
+    startedBy: round.startedBy,
+    startedAt: round.startedAt,
+    submittedBy: round.submittedBy,
+    submittedAt: round.submittedAt,
+    attemptCount: Array.isArray(round.attempts) ? round.attempts.length : 0,
+    counters: [...new Set((round.attempts || []).map((attempt) => attempt.countedBy).filter(Boolean))],
+    ...(!["DRAFT", "COUNTING"].includes(String(item.status || "").toUpperCase())
+      ? { attempts: round.attempts || [] }
+      : {}),
+  }));
   if (["DRAFT", "COUNTING"].includes(String(item.status || "").toUpperCase())) {
     mapped.details = (mapped.details || []).map((detail) => {
       const { systemQty, varianceQty, varianceAmount, varianceStatus, ...blindDetail } = detail;
@@ -100,6 +134,17 @@ async function findItem(stoNo, db = prisma) {
           { partCode: "asc" },
           { lotNumber: "asc" },
         ],
+      },
+      countRounds: {
+        orderBy: { roundNo: "desc" },
+        include: {
+          attempts: {
+            orderBy: [
+              { stoDetailId: "asc" },
+              { sequenceNo: "asc" },
+            ],
+          },
+        },
       },
     },
   });
@@ -149,76 +194,57 @@ exports.get = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.previewScope = async (req, res, next) => {
+  try {
+    const preview = await resolveStockOpnameScope(prisma, req.body || {}, { includeBalances: false });
+    res.json(preview);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+
 exports.create = async (req, res, next) => {
   try {
     const body = req.body || {};
-    const warehouseCode = String(body.warehouseCode || "").trim();
-    const stoType = String(body.stoType || "MATERIAL").trim().toUpperCase();
-    if (!warehouseCode) return res.status(400).json({ message: "warehouseCode wajib diisi." });
-    if (!STO_STOCK_TYPES[stoType]) return res.status(400).json({ message: "stoType harus MATERIAL, WIP, atau FG." });
-    const warehouse = await prisma.warehouse.findFirst({
-      where: { warehouseCode, isDeleted: false, isActive: true },
-      select: { warehouseCode: true },
-    });
-    if (!warehouse) return res.status(400).json({ message: "Warehouse tidak ditemukan atau tidak aktif." });
-    const requestedStockType = String(body.stockType || "").trim();
-    if (requestedStockType && !STO_STOCK_TYPES[stoType].includes(requestedStockType)) {
-      return res.status(400).json({ message: `Stock type ${requestedStockType} tidak sesuai dengan STO ${stoType}.` });
-    }
-    const purchasePartCodes = stoType === "MATERIAL"
-      ? (await prisma.part.findMany({
-          where: { isDeleted: false, itemType: "RAW", rawType: "PURCHASE_PART" },
-          select: { partCode: true },
-        })).map((part) => part.partCode)
-      : [];
-    const canonicalStockTypeWhere = requestedStockType
-      ? requestedStockType === "Purchase Part"
-        ? { OR: [
-            { stockType: "Purchase Part" },
-            { stockType: "Part", partCode: { in: purchasePartCodes } },
-          ] }
-        : { stockType: requestedStockType }
-      : stoType === "MATERIAL"
-        ? { OR: [
-            { stockType: { in: STO_STOCK_TYPES.MATERIAL } },
-            { stockType: "Part", partCode: { in: purchasePartCodes } },
-          ] }
-        : { stockType: { in: STO_STOCK_TYPES[stoType] } };
-    const balances = await prisma.stockBalance.findMany({
-      where: {
-        warehouseCode,
-        isDeleted: false,
-        ...canonicalStockTypeWhere,
-        ...(body.rackCode ? { rackCode: String(body.rackCode) } : {}),
-        ...(body.lotNumber ? { lotNumber: String(body.lotNumber) } : {}),
-      },
-      orderBy: [{ rackCode: "asc" }, { partCode: "asc" }, { lotNumber: "asc" }],
-    });
-    if (!balances.length) {
+    const resolved = await resolveStockOpnameScope(prisma, body, { includeBalances: true });
+    if (!resolved.summary.lineCount) {
       return res.status(409).json({ message: "Tidak ada stock balance pada scope opname yang dipilih." });
     }
+    const toleranceQty = Number(body.toleranceQty || 0);
+    const tolerancePercent = Number(body.tolerancePercent || 0);
+    if (!Number.isFinite(toleranceQty) || toleranceQty < 0) {
+      return res.status(400).json({ message: "toleranceQty harus berupa angka >= 0." });
+    }
+    if (!Number.isFinite(tolerancePercent) || tolerancePercent < 0) {
+      return res.status(400).json({ message: "tolerancePercent harus berupa angka >= 0." });
+    }
+
     const stoNo = await generateDocNumber("stockOpnameHeader", "STO", "stoNo");
     const scopeNote = [
-      body.rackCode ? `Scope rack: ${body.rackCode}` : null,
-      body.lotNumber ? `Scope lot: ${body.lotNumber}` : null,
+      resolved.scope.rackCodes.length ? "Scope rack: " + resolved.scope.rackCodes.join(", ") : null,
+      resolved.scope.lotNumbers.length ? "Scope lot: " + resolved.scope.lotNumbers.join(", ") : null,
       body.notes || null,
     ].filter(Boolean).join(" | ");
     const header = await prisma.stockOpnameHeader.create({
       data: {
         stoNo,
-        stoType,
-        warehouseCode,
+        stoType: resolved.scope.stoType,
+        countMode: resolved.scope.countMode,
+        scopeJson: resolved.scope,
+        warehouseCode: resolved.scope.warehouseCode,
         stoDate: body.stoDate ? new Date(body.stoDate) : new Date(),
         status: "DRAFT",
         notes: scopeNote || null,
+        toleranceQty,
+        tolerancePercent,
         createdBy: actor(req),
         details: {
-          create: balances.map((balance) => ({
+          create: resolved.balances.map((balance) => ({
             stockBalanceId: balance.id,
             partCode: balance.partCode,
             partNumber: balance.partNumber,
             partName: balance.partName || balance.materialName,
-            // Preserve material identity in the frozen scope for dependent counting dropdowns.
             materialId: balance.materialId,
             materialCode: balance.materialCode,
             materialName: balance.materialName,
@@ -240,76 +266,49 @@ exports.create = async (req, res, next) => {
       },
       include: { details: true },
     });
-    res.status(201).json(mapStockOpname(header));
-  } catch (error) { next(error); }
+    res.status(201).json({
+      ...mapStockOpname(header),
+      scopeWarnings: resolved.warnings,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
-
 exports.startCounting = async (req, res, next) => {
   try {
     const item = await findItem(req.params.stoNo);
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
-    statusGuard(item.status, "DRAFT");
-    const balanceIds = item.details.map((detail) => detail.stockBalanceId).filter(Boolean);
-    const updated = await prisma.$transaction(async (tx) => {
-      const conflict = await tx.stockOpnameDetail.findFirst({
-        where: {
-          stockBalanceId: { in: balanceIds },
-          isDeleted: false,
-          header: {
-            isDeleted: false,
-            inventoryFrozen: true,
-            status: { in: FROZEN_STATUSES },
-            stoNo: { not: item.stoNo },
-          },
-        },
-        select: { header: { select: { stoNo: true } } },
-      });
-      if (conflict) fail(`Scope stock sudah dibekukan oleh ${conflict.header.stoNo}.`, 409);
-      const balances = await tx.stockBalance.findMany({
-        where: { id: { in: balanceIds }, isDeleted: false },
-        select: { id: true, qtyOnHand: true },
-      });
-      const qtyById = new Map(balances.map((balance) => [balance.id, Number(balance.qtyOnHand || 0)]));
-      if (qtyById.size !== balanceIds.length) fail("Sebagian stock balance sudah tidak tersedia. Buat ulang dokumen opname.", 409);
-      await Promise.all(item.details.map((detail) =>
-        tx.stockOpnameDetail.update({
-          where: { id: detail.id },
-          data: {
-            systemQty: qtyById.get(detail.stockBalanceId) || 0,
-            actualQty: null,
-            varianceQty: 0,
-            varianceStatus: "MATCH",
-            reason: null,
-            countedBy: null,
-            countedAt: null,
-          },
-        }),
-      ));
-      return tx.stockOpnameHeader.update({
-        where: { id: item.id },
-        data: { status: "COUNTING", inventoryFrozen: true },
-        include: { details: { where: { isDeleted: false } } },
-      });
-    });
-    res.json(mapStockOpname(updated));
-  } catch (error) { next(error); }
+    await prisma.$transaction((tx) => startStockOpnameCounting(tx, item, actor(req)));
+    res.json(mapStockOpname(await findItem(item.stoNo)));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.countDetail = async (req, res, next) => {
   try {
-    const detail = await prisma.stockOpnameDetail.findUnique({ where: { id: req.params.detailId }, include: { header: true } });
-    if (!detail || detail.isDeleted) return res.status(404).json({ message: "Detail stock opname tidak ditemukan." });
-    if (detail.header.stoNo !== req.params.stoNo) return res.status(409).json({ message: "Detail bukan bagian dari dokumen Stock Opname ini." });
-    statusGuard(detail.header.status, "COUNTING");
-    const actualQty = Number(req.body?.actualQty);
-    const countedBy = counterName(req, false);
-    if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "actualQty harus berupa angka >= 0." });
-    if (!countedBy) return res.status(400).json({ message: "Nama petugas hitung wajib diisi." });
-    const result = variance(detail.systemQty, actualQty);
-    const updated = await prisma.stockOpnameDetail.update({ where: { id: detail.id }, data: { actualQty, varianceQty: result.value, varianceStatus: result.status, reason: req.body?.reason || null, countedBy, countedAt: new Date() } });
-    const { systemQty, varianceQty, varianceAmount, varianceStatus, ...blindDetail } = mapDoc(updated);
-    res.json(blindDetail);
-  } catch (error) { next(error); }
+    const item = await findItem(req.params.stoNo);
+    if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
+    statusGuard(item.status, "COUNTING");
+    const detail = item.details.find((row) => row.id === req.params.detailId);
+    if (!detail) return res.status(404).json({ message: "Detail stock opname tidak ditemukan." });
+    const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo && row.status === "ACTIVE");
+    if (!round) return res.status(409).json({ message: "Count round aktif tidak ditemukan." });
+    await prisma.$transaction((tx) => saveStockOpnameCountAttempt(tx, {
+      header: item,
+      round,
+      detail,
+      actualQty: req.body?.actualQty,
+      countedBy: counterName(req, false),
+      reason: req.body?.reason,
+    }));
+    res.json(mapStockOpname(await findItem(item.stoNo)));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.blindCount = async (req, res, next) => {
@@ -324,14 +323,14 @@ exports.blindCount = async (req, res, next) => {
     const materialIdentity = normalizeIdentity(req.body?.materialIdentity || req.body?.materialCode || req.body?.materialName);
     const partIdentity = normalizeIdentity(req.body?.partIdentity || req.body?.partCode || req.body?.partNumber);
     const partName = normalizeIdentity(req.body?.partName);
-    const actualQty = Number(req.body?.actualQty);
-    const countedBy = counterName(req, false);
     if (!stockType) return res.status(400).json({ message: "Jenis stock wajib dipilih." });
     const isMaterial = stockType === "MATERIAL";
-    if (isMaterial && (!materialType || !materialIdentity)) return res.status(400).json({ message: "Jenis material dan nama/kode material wajib dipilih." });
-    if (!isMaterial && (!partIdentity || !partName)) return res.status(400).json({ message: "Part No/Part Code dan Part Name wajib dipilih." });
-    if (!Number.isFinite(actualQty) || actualQty < 0) return res.status(400).json({ message: "Qty hasil hitung harus berupa angka >= 0." });
-    if (!countedBy) return res.status(400).json({ message: "Nama petugas hitung wajib diisi." });
+    if (isMaterial && (!materialType || !materialIdentity)) {
+      return res.status(400).json({ message: "Jenis material dan nama/kode material wajib dipilih." });
+    }
+    if (!isMaterial && (!partIdentity || !partName)) {
+      return res.status(400).json({ message: "Part No/Part Code dan Part Name wajib dipilih." });
+    }
     const matches = item.details.filter((detail) =>
       normalizeIdentity(detail.rackCode) === rackCode
       && normalizeIdentity(detail.lotNumber) === lotNumber
@@ -347,20 +346,128 @@ exports.blindCount = async (req, res, next) => {
     if (matches.length > 1) {
       return res.status(409).json({ message: "Kombinasi rack, lot, dan part tidak unik. Gunakan identitas part yang lebih spesifik." });
     }
-    const detail = matches[0];
-    const result = variance(detail.systemQty, actualQty);
-    await prisma.stockOpnameDetail.update({
-      where: { id: detail.id },
-      data: {
-        actualQty,
-        varianceQty: result.value,
-        varianceStatus: result.status,
-        countedBy,
-        countedAt: new Date(),
-      },
-    });
+    const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo && row.status === "ACTIVE");
+    if (!round) return res.status(409).json({ message: "Count round aktif tidak ditemukan." });
+    await prisma.$transaction((tx) => saveStockOpnameCountAttempt(tx, {
+      header: item,
+      round,
+      detail: matches[0],
+      actualQty: req.body?.actualQty,
+      countedBy: counterName(req, false),
+      reason: req.body?.reason,
+    }));
     res.json(mapStockOpname(await findItem(item.stoNo)));
-  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+
+exports.foundStock = async (req, res, next) => {
+  try {
+    const item = await findItem(req.params.stoNo);
+    if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
+    statusGuard(item.status, "COUNTING");
+    const body = req.body || {};
+    const stockType = String(body.stockType || "").trim();
+    if (!STO_STOCK_TYPES[item.stoType]?.includes(stockType)) {
+      return res.status(400).json({ message: "Stock type found stock tidak sesuai dengan STO." });
+    }
+    const countedBy = counterName(req, false);
+    const reason = String(body.reason || "").trim();
+    const uomCode = String(body.uomCode || "").trim() || null;
+    if (!countedBy) return res.status(400).json({ message: "Nama petugas hitung wajib diisi." });
+    if (!reason) return res.status(400).json({ message: "Alasan found stock wajib diisi." });
+    if (!uomCode) return res.status(400).json({ message: "UOM found stock wajib diisi." });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const identity = await resolveItemIdentityInput(tx, body, { enrichPartSnapshot: true });
+      if (!hasItemIdentity(identity)) fail("Identitas item found stock wajib diisi.");
+      const rackCode = String(body.rackCode || "").trim() || null;
+      const lotNumber = String(body.lotNumber || "").trim() || null;
+      if (rackCode) {
+        const rack = await tx.rack.findFirst({
+          where: { rackCode, warehouseCode: item.warehouseCode, isDeleted: false },
+          select: { rackCode: true },
+        });
+        if (!rack) fail("Rack found stock tidak ditemukan pada warehouse STO.");
+      }
+      const scope = item.scopeJson || {
+        version: 1,
+        countMode: "FULL",
+        stoType: item.stoType,
+        warehouseCode: item.warehouseCode,
+        stockTypes: STO_STOCK_TYPES[item.stoType],
+        rackCodes: [],
+        lotNumbers: [],
+        stockBalanceIds: [],
+        includeZeroBalance: true,
+      };
+      if (!stockIdentityMatchesScope({
+        warehouseCode: item.warehouseCode,
+        stockType,
+        rackCode,
+        lotNumber,
+      }, scope)) {
+        fail("Found stock berada di luar scope Stock Opname.", 409);
+      }
+      const existing = await tx.stockBalance.findFirst({
+        where: {
+          warehouseCode: item.warehouseCode,
+          rackCode,
+          lotNumber,
+          stockType,
+          uomCode,
+          ...buildIdentityWhere(identity),
+          isDeleted: false,
+        },
+        select: { id: true },
+      });
+      if (existing) fail("Kombinasi found stock sudah ada pada expected scope. Hitung detail existing.", 409);
+
+      const detail = await tx.stockOpnameDetail.create({
+        data: {
+          stoHeaderId: item.id,
+          stockBalanceId: null,
+          warehouseCode: item.warehouseCode,
+          rackCode,
+          lotNumber,
+          stockType,
+          uomCode,
+          partCode: identity.partCode || null,
+          partNumber: identity.partNumber || null,
+          partName: identity.partName || null,
+          materialId: identity.materialId || null,
+          materialCode: identity.materialCode || null,
+          materialName: identity.materialName || null,
+          materialType: identity.materialType || null,
+          productId: identity.productId || null,
+          description: identity.description || null,
+          spec: identity.spec || null,
+          thickness: identity.thickness ?? null,
+          width: identity.width ?? null,
+          CSP: identity.CSP || null,
+          systemQty: 0,
+          isUnexpected: true,
+          resolutionStatus: "FOUND",
+        },
+      });
+      const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo && row.status === "ACTIVE");
+      if (!round) fail("Count round aktif tidak ditemukan.", 409);
+      return saveStockOpnameCountAttempt(tx, {
+        header: item,
+        round,
+        detail,
+        actualQty: body.actualQty,
+        countedBy,
+        reason,
+      });
+    });
+    res.json({ foundStock: result.detail, ...mapStockOpname(await findItem(item.stoNo)) });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.bulkCount = async (req, res, next) => {
@@ -372,40 +479,65 @@ exports.bulkCount = async (req, res, next) => {
     const defaultCountedBy = counterName(req, false);
     if (!counts.length) return res.status(400).json({ message: "counts wajib berisi minimal satu baris." });
     const detailById = new Map(item.details.map((detail) => [detail.id, detail]));
-    const normalized = counts.map((count) => {
-      const detail = detailById.get(count.detailId);
-      if (!detail) fail(`Detail ${count.detailId || "-"} bukan bagian dari ${item.stoNo}.`, 400);
-      const actualQty = Number(count.actualQty);
-      if (!Number.isFinite(actualQty) || actualQty < 0) fail("Semua actualQty harus berupa angka >= 0.");
-      const result = variance(detail.systemQty, actualQty);
-      const countedBy = String(count.countedBy || defaultCountedBy || "").trim();
-      if (!countedBy) fail("Nama petugas hitung wajib diisi untuk semua baris.");
-      return { detail, actualQty, result, reason: String(count.reason || "").trim() || null, countedBy };
+    const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo && row.status === "ACTIVE");
+    if (!round) return res.status(409).json({ message: "Count round aktif tidak ditemukan." });
+    await prisma.$transaction(async (tx) => {
+      for (const count of counts) {
+        const detail = detailById.get(count.detailId);
+        if (!detail) fail("Detail " + (count.detailId || "-") + " bukan bagian dari " + item.stoNo + ".");
+        await saveStockOpnameCountAttempt(tx, {
+          header: item,
+          round,
+          detail,
+          actualQty: count.actualQty,
+          countedBy: String(count.countedBy || defaultCountedBy || "").trim(),
+          reason: count.reason,
+        });
+      }
     });
-    await prisma.$transaction(normalized.map(({ detail, actualQty, result, reason, countedBy }) =>
-      prisma.stockOpnameDetail.update({
-        where: { id: detail.id },
-        data: {
-          actualQty,
-          varianceQty: result.value,
-          varianceStatus: result.status,
-          reason,
-          countedBy,
-          countedAt: new Date(),
-        },
-      }),
-    ));
     res.json(mapStockOpname(await findItem(item.stoNo)));
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
-
 exports.submit = async (req, res, next) => {
   try {
-    const item = await prisma.stockOpnameHeader.findUnique({ where: { stoNo: req.params.stoNo }, include: { details: true } });
+    const item = await findItem(req.params.stoNo);
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
-    statusGuard(item.status, "COUNTING");
-    if (item.details.some((detail) => detail.actualQty == null && !detail.isDeleted)) return res.status(409).json({ message: "Semua detail harus dihitung sebelum diajukan." });
+    const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo && row.status === "ACTIVE");
+    const result = await prisma.$transaction((tx) => submitStockOpnameRound(tx, {
+      header: item,
+      round,
+      details: item.details,
+      submittedBy: actor(req),
+    }));
+    res.json({ ...mapStockOpname(await findItem(item.stoNo)), recountRequiredCount: result.recountRequiredDetails.length });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+
+exports.check = async (req, res, next) => {
+  try {
+    const item = await findItem(req.params.stoNo);
+    if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
+    const round = item.countRounds.find((row) =>
+      row.roundNo === item.currentRoundNo && row.status === "SUBMITTED");
+    const currentCounters = [...new Set((round?.attempts || [])
+      .filter((attempt) => attempt.isCurrent)
+      .map((attempt) => attempt.countedBy)
+      .filter(Boolean))];
     const result = await prisma.$transaction(async (tx) => {
+      const checked = await checkStockOpnameRound(tx, {
+        header: item,
+        round,
+        details: item.details,
+        currentCounters,
+        checkedBy: actor(req),
+        acceptanceReason: req.body?.acceptanceReason || req.body?.reason,
+      });
       const approvalRequest = await submitDocumentForApproval({
         moduleCode: "inventory",
         pageCode: "stock-opname",
@@ -413,87 +545,105 @@ exports.submit = async (req, res, next) => {
         documentType: "StockOpnameHeader",
         documentId: item.id,
         documentNumber: item.stoNo,
-        context: item,
+        context: checked.header,
         requestedByUserId: req.user?.id,
         requestedBy: actor(req),
         tx,
       });
-      const updated = await tx.stockOpnameHeader.update({ where: { id: item.id }, data: { status: "WAITING_APPROVAL", checkerBy: actor(req), checkerApprovedAt: new Date() } });
-      return { updated, approvalRequest };
+      return { ...checked, approvalRequest };
     });
-    res.json({ ...mapDoc(result.updated), approvalRequest: result.approvalRequest });
-  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
+    res.json({
+      ...mapStockOpname(await findItem(item.stoNo)),
+      approvalRequest: result.approvalRequest,
+      recountRequiredCount: result.recountRequiredDetails.length,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.approve = async (req, res, next) => {
   try {
-    const item = await prisma.stockOpnameHeader.findUnique({ where: { stoNo: req.params.stoNo } });
+    const item = await findItem(req.params.stoNo);
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
     statusGuard(item.status, "WAITING_APPROVAL");
     const approver = actor(req);
-    if (approver !== "system" && [item.createdBy, item.checkerBy].filter(Boolean).includes(approver)) {
-      return res.status(409).json({ message: "Maker/checker tidak boleh menjadi approver Stock Opname yang sama." });
+    const currentRound = item.countRounds.find((row) => row.roundNo === item.currentRoundNo);
+    const counters = (currentRound?.attempts || []).filter((attempt) => attempt.isCurrent).map((attempt) => attempt.countedBy);
+    const forbidden = [item.createdBy, item.submittedBy, item.checkerBy, ...counters]
+      .filter(Boolean)
+      .map((value) => String(value).trim().toLowerCase());
+    if (approver !== "system" && forbidden.includes(String(approver).trim().toLowerCase())) {
+      return res.status(409).json({ message: "Maker, checker, submitter, atau penghitung ronde aktif tidak boleh menjadi approver Stock Opname yang sama." });
     }
-    const updated = await prisma.stockOpnameHeader.update({ where: { id: item.id }, data: { status: "APPROVED", approvedBy: approver, approvedAt: new Date() } });
+    const updated = await prisma.stockOpnameHeader.update({
+      where: { id: item.id },
+      data: { status: "APPROVED", approvedBy: approver, approvedAt: new Date() },
+    });
     res.json(mapDoc(updated));
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.requestRecount = async (req, res, next) => {
   try {
     const item = await findItem(req.params.stoNo);
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
-    statusGuard(item.status, ["WAITING_APPROVAL", "APPROVED"]);
-    const reason = String(req.body?.reason || "").trim();
-    if (!reason) return res.status(400).json({ message: "Alasan recount wajib diisi." });
-    const note = [item.notes, `RECOUNT ${new Date().toISOString()} oleh ${actor(req)}: ${reason}`].filter(Boolean).join("\n");
-    const updated = await prisma.stockOpnameHeader.update({
-      where: { id: item.id },
-      data: {
-        status: "COUNTING",
-        notes: note,
-        checkerBy: null,
-        checkerApprovedAt: null,
-        approvedBy: null,
-        approvedAt: null,
-      },
-      include: { details: { where: { isDeleted: false } } },
+    const round = item.countRounds.find((row) => row.roundNo === item.currentRoundNo);
+    await prisma.$transaction((tx) => startStockOpnameRecount(tx, {
+      header: item,
+      round,
+      requestedBy: actor(req),
+      reason: req.body?.reason,
+    }));
+    res.json(mapStockOpname(await findItem(item.stoNo)));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
+};
+exports.previewAdjustment = async (req, res, next) => {
+  try {
+    const item = await findItem(req.params.stoNo);
+    if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
+    const preview = await previewStockOpnameAdjustment(prisma, { header: item, details: item.details });
+    res.json({
+      stoNo: item.stoNo,
+      canPost: preview.conflicts.length === 0,
+      adjustmentLineCount: preview.lines.length,
+      conflicts: preview.conflicts,
     });
-    res.json(mapStockOpname(updated));
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, conflicts: error.conflicts || [] });
+    next(error);
+  }
 };
 
 exports.adjust = async (req, res, next) => {
   try {
-    const item = await prisma.stockOpnameHeader.findUnique({ where: { stoNo: req.params.stoNo }, include: { details: true } });
+    const item = await findItem(req.params.stoNo);
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
-    statusGuard(item.status, "APPROVED");
-    const changed = await prisma.$transaction(async (tx) => {
-      const movements = [];
-      for (const detail of item.details.filter((row) => !row.isDeleted && Number(row.varianceQty || 0) !== 0)) {
-        if (!detail.stockBalanceId) fail(`Detail ${detail.id} tidak memiliki referensi stock balance. Minta recount sebelum posting.`, 409);
-        const balance = await tx.stockBalance.findUnique({ where: { id: detail.stockBalanceId } });
-        if (!balance || balance.isDeleted) fail(`Stock balance untuk detail ${detail.id} tidak ditemukan.`, 409);
-        await assertStockBalanceNotFrozen(tx, balance.id, { allowStoNo: item.stoNo });
-        const before = Number(balance.qtyOnHand || 0);
-        if (Math.abs(before - Number(detail.systemQty || 0)) > 1e-9) {
-          fail(`Saldo ${detail.partCode || detail.description || detail.id} berubah setelah freeze. Minta recount sebelum posting.`, 409);
-        }
-        const after = Number(detail.actualQty);
-        const reserved = Number(balance.qtyReserved || 0);
-        const qc = Number(balance.qtyQC || 0);
-        await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: after, qtyAvailable: Math.max(0, after - reserved - qc), lastMovement: new Date() } });
-        const movementNumber = await generateMovementNumber("ADJUSTMENT", tx);
-        movements.push(await tx.stockMovement.create({ data: { movementNumber, movementDate: new Date(), movementType: "ADJUSTMENT", direction: Number(detail.varianceQty) < 0 ? "OUT" : "IN", transactionType: "STOCK_OPNAME", warehouseCode: detail.warehouseCode, rackCode: detail.rackCode, lotNumber: detail.lotNumber, partCode: detail.partCode, partNumber: detail.partNumber, partName: detail.partName, productId: detail.productId, description: detail.description, spec: detail.spec, thickness: detail.thickness, width: detail.width, CSP: detail.CSP, stockType: detail.stockType, qty: Math.abs(Number(detail.varianceQty)), deltaQty: Number(detail.varianceQty), qtyBefore: before, qtyAfter: after, adjustmentType: Number(detail.varianceQty) < 0 ? "DECREASE" : "INCREASE", uomCode: detail.uomCode, referenceType: "STOCK_OPNAME", referenceNumber: item.stoNo, notes: detail.reason || item.notes || null, performedBy: actor(req) } }));
-        await tx.stockOpnameDetail.update({ where: { id: detail.id }, data: { adjustmentNumber: movementNumber } });
-      }
-      const updated = await tx.stockOpnameHeader.update({ where: { id: item.id }, data: { status: "ADJUSTED", inventoryFrozen: false, adjustedBy: actor(req), adjustedAt: new Date() }, include: { details: true } });
-      return { updated, movements };
+    const changed = await prisma.$transaction((tx) => postStockOpnameAdjustment(tx, {
+      header: item,
+      details: item.details,
+      performedBy: actor(req),
+    }));
+    res.json({
+      ...mapStockOpname(await findItem(item.stoNo)),
+      movements: changed.movements.map(mapDoc),
+      conflicts: [],
     });
-    res.json({ ...mapDoc(changed.updated), movements: changed.movements.map(mapDoc) });
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({
+      message: error.message,
+      conflicts: error.conflicts || [],
+    });
+    next(error);
+  }
 };
-
 exports.close = async (req, res, next) => {
   try {
     const item = await prisma.stockOpnameHeader.findUnique({ where: { stoNo: req.params.stoNo } });
@@ -514,7 +664,7 @@ exports.cancel = async (req, res, next) => {
   try {
     const item = await prisma.stockOpnameHeader.findFirst({ where: { stoNo: req.params.stoNo, isDeleted: false } });
     if (!item) return res.status(404).json({ message: "Stock opname tidak ditemukan." });
-    statusGuard(item.status, ["DRAFT", "COUNTING", "WAITING_APPROVAL"]);
+    statusGuard(item.status, ["DRAFT", "COUNTING", "WAITING_CHECK", "WAITING_APPROVAL"]);
     const reason = String(req.body?.reason || "").trim();
     if (!reason) return res.status(400).json({ message: "Alasan pembatalan wajib diisi." });
     const note = [item.notes, `CANCELLED ${new Date().toISOString()} oleh ${actor(req)}: ${reason}`].filter(Boolean).join("\n");

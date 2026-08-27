@@ -17,6 +17,11 @@ const {
   selectedRevisionId,
 } = require("./mbomRevisionService");
 const { netMpsBucket, buildMpsCalculationTrace } = require("./mpsNettingService");
+const { invalidateRccp } = require("./rccpService");
+const { refreshMpsDeliveryFeasibility, invalidateMpsDeliveryGate } = require("./mpsDeliveryFeasibilityService");
+const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
+const { buildDeliveryPerformance } = require("./deliveryPerformanceService");
+const { buildYearlyDemand } = require("./yearlyDemandService");
 
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const MONTHLY_SOURCE_PREFIX = "MONTH:";
@@ -25,6 +30,11 @@ const OPEN_SO_STATUSES = ["Confirmed", "In Progress", "In Production", "Ready to
 const OPEN_SO_LINE_STATUSES = ["Pending", "In Planning", "In Production"];
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+const previousPlanningMonthKey = (month) => {
+  const [year, value] = String(month || "").split("-").map(Number);
+  const previous = new Date(Date.UTC(year, value - 2, 1));
+  return `${previous.getUTCFullYear()}-${String(previous.getUTCMonth() + 1).padStart(2, "0")}`;
+};
 const uniq = (values) => [...new Set(values.filter(Boolean))];
 const sourceKeyForMonth = (month) => `${MONTHLY_SOURCE_PREFIX}${month}`;
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith("[MRP-PRODUCTION]");
@@ -493,7 +503,7 @@ function resolveActiveCanonicalMpsLifecycle(status, demandChanged, simulationOnl
   if (status === "Released") return "RELEASED";
   if (status === "Completed") return "COMPLETED";
   if (status === "Confirmed") return demandChanged ? "DRAFT" : "REVIEWED";
-  return "DRAFT";
+  return "CALCULATED";
 }
 
 async function previewMonthlyMbomSelections(tx, options = {}) {
@@ -538,12 +548,41 @@ async function syncMonthlyMps(tx, options = {}) {
   const completeDemand = await collectMonthlyDemand(tx, null, anchorMonth);
   const { buckets, forecasts } = selectedDemand;
   const forecastLookahead = completeDemand.forecastLookahead;
+  const efdConfiguration = await loadEfdConfiguration(tx);
+  const efdByPartMonth = new Map();
+  for (const bucket of completeDemand.buckets.values()) {
+    const effectiveTargets = effectiveDeliveryTargets(bucket);
+    const calculatedQty = effectiveTargets.reduce((sum, target) => sum + number(target.qty), 0);
+    const resolved = resolveEfd({
+      forecastQty: bucket.forecastQty,
+      poQty: bucket.actualSalesOrderQty,
+      calculatedQty,
+      partCode: bucket.partCode,
+      month: bucket.month,
+    }, efdConfiguration);
+    efdByPartMonth.set(`${bucket.month}|${bucket.partCode}`, resolved);
+  }
   const deliveryTargetIds = uniq([...buckets.values()].flatMap((bucket) => [...bucket.forecastTargets, ...bucket.soTargets].map((target) => target.id)));
   const decisions = deliveryTargetIds.length ? await tx.demandPlanningDecision.findMany({ where: { deliveryTargetId: { in: deliveryTargetIds }, isDeleted: false } }) : [];
   const decisionByTarget = new Map(decisions.map((row) => [row.deliveryTargetId, row]));
   const monthKeys = uniq([...buckets.values()].map((row) => row.month)).sort();
   const formulas = await getFormulaSet(tx, "planning");
   const partCodes = uniq([...buckets.values()].map((row) => row.partCode));
+  const historyMonths = uniq(monthKeys.flatMap((month) => [previousPlanningMonthKey(month), month]));
+  const historyYears = uniq(historyMonths.map((month) => Number(month.slice(0, 4))));
+  const [historyPayloads, deliveryPerformances] = await Promise.all([
+    Promise.all(historyYears.map((year) => buildYearlyDemand(tx, { year, unpaginated: true }))),
+    Promise.all(monthKeys.map((month) => buildDeliveryPerformance(tx, { month, partCodes }))),
+  ]);
+  const historicalEfdByPartMonth = new Map();
+  for (const payload of historyPayloads) {
+    for (const row of payload.items || []) {
+      for (const month of historyMonths) {
+        if (row.months?.[month]) historicalEfdByPartMonth.set(`${month}|${row.partCode}`, number(row.months[month].efd ?? row.months[month].eff));
+      }
+    }
+  }
+  const deliveryPerformanceByMonth = new Map(deliveryPerformances.map((performance) => [performance.month, performance]));
   const stockRows = partCodes.length
     ? await tx.stockBalance.groupBy({
       by: ["partCode"],
@@ -680,7 +719,8 @@ async function syncMonthlyMps(tx, options = {}) {
       // deliberately not part of `buckets` when PPIC processes one month at a
       // time, but it must still drive the current month's safety buffer.
       const nextForecastKey = `${nextPlanningMonthKey(month)}|${bucket.partCode}`;
-      const bufferBaseQty = number(forecastLookahead.get(nextForecastKey));
+      const nextEfd = efdByPartMonth.get(nextForecastKey);
+      const bufferBaseQty = number(nextEfd?.value ?? forecastLookahead.get(nextForecastKey));
       const bufferPercent = existing?.bufferOverridden
         ? number(existing.bufferPercent)
         : Math.max(number(bucket.part?.bufferStock), 0);
@@ -700,14 +740,26 @@ async function syncMonthlyMps(tx, options = {}) {
         bufferPercent,
         stockAvailableQty: stockByPart.get(bucket.partCode) || 0,
       }), uomCode);
-      // Effective targets contain firm SO plus only the unconsumed Forecast
-      // remainder. This is the authoritative gross customer demand.
-      const policyDemandQty = consumedDemandQty || normalizeQuantity(resolvePolicyDemandQty({ forecastQty, salesOrderQty: actualSalesOrderQty, part: bucket.part }), uomCode);
+      const currentEfd = efdByPartMonth.get(`${month}|${bucket.partCode}`) || resolveEfd({
+        forecastQty,
+        poQty: actualSalesOrderQty,
+        calculatedQty: consumedDemandQty || resolvePolicyDemandQty({ forecastQty, salesOrderQty: actualSalesOrderQty, part: bucket.part }),
+        partCode: bucket.partCode,
+        month,
+      }, efdConfiguration);
+      // EFD M is the current bucket. Undelivered EFD M-1 is carried into the
+      // official gross demand, while EFD M+1 remains the buffer reference.
+      const policyDemandQty = normalizeQuantity(currentEfd.value, uomCode);
+      const previousMonth = previousPlanningMonthKey(month);
+      const previousEfdQty = normalizeQuantity(historicalEfdByPartMonth.get(`${previousMonth}|${bucket.partCode}`) || efdByPartMonth.get(`${previousMonth}|${bucket.partCode}`)?.value || 0, uomCode);
+      const deliveredPreviousQty = normalizeQuantity(deliveryPerformanceByMonth.get(month)?.byPart.get(bucket.partCode)?.deliveredPreviousQty || 0, uomCode);
+      const carryoverShortageQty = normalizeQuantity(Math.max(previousEfdQty - deliveredPreviousQty, 0), uomCode);
+      const grossDemandWithCarryoverQty = normalizeQuantity(policyDemandQty + carryoverShortageQty, uomCode);
       const formulaEffectiveDemandQty = normalizeQuantity(evaluateFromSet(formulas, "MPS_EFFECTIVE_DEMAND", {
-        forecastQty: policyDemandQty,
+        forecastQty: grossDemandWithCarryoverQty,
         bufferQty,
       }), uomCode);
-      const effectiveDemandQty = Math.max(formulaEffectiveDemandQty, normalizeQuantity(policyDemandQty + bufferQty, uomCode));
+      const effectiveDemandQty = Math.max(formulaEffectiveDemandQty, normalizeQuantity(grossDemandWithCarryoverQty + bufferQty, uomCode));
       const openingFreeQty = normalizeQuantity(projectedFgByPart.get(bucket.partCode) || 0, uomCode);
       let reservationDemandRemaining = actualSalesOrderQty;
       let peggedReservationQty = 0;
@@ -734,7 +786,7 @@ async function syncMonthlyMps(tx, options = {}) {
       peggedReservationQty = normalizeQuantity(peggedReservationQty, uomCode);
       const openingAvailableQty = normalizeQuantity(openingFreeQty + peggedReservationQty, uomCode);
       const firmScheduledReceiptQty = normalizeQuantity(firmReceiptByPartMonth.get(`${month}|${bucket.partCode}`) || 0, uomCode);
-      const netting = netMpsBucket({ openingAvailableQty, firmScheduledReceiptQty, grossDemandQty: policyDemandQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty });
+      const netting = netMpsBucket({ openingAvailableQty, firmScheduledReceiptQty, grossDemandQty: grossDemandWithCarryoverQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty });
       const qtyPlanned = normalizeQuantity(netting.plannedProductionQty, uomCode);
       projectedFgByPart.set(bucket.partCode, normalizeQuantity(netting.projectedEndingStockQty, uomCode));
       const customerCodes = uniq(bucket.customerCodes);
@@ -774,11 +826,19 @@ async function syncMonthlyMps(tx, options = {}) {
         firmScheduledReceiptQty: netting.firmScheduledReceiptQty,
         targetEndingStockQty: netting.targetEndingStockQty,
         projectedEndingStockQty: netting.projectedEndingStockQty,
-        calculationTrace: buildMpsCalculationTrace({
+        calculationTrace: {
+          ...buildMpsCalculationTrace({
           month, partCode: bucket.partCode, policy: String(bucket.part?.planningPolicy || "MTO").toUpperCase(),
           forecastQty, actualSalesOrderQty, bufferBaseQty, bufferPercent, openingFreeQty, peggedReservationQty,
           reservationRows: appliedReservationRows, netting, sourceRows: bucket.sourceRows,
-        }),
+          }),
+          efd: { month, qty: policyDemandQty, source: currentEfd.source, ruleMode: currentEfd.ruleMode, override: currentEfd.override || null },
+          previousEfd: { month: previousMonth, qty: previousEfdQty, deliveredQty: deliveredPreviousQty, shortageQty: carryoverShortageQty },
+          bufferEfd: { month: nextPlanningMonthKey(month), qty: bufferBaseQty, source: nextEfd?.source || "FORECAST_FALLBACK", ruleMode: nextEfd?.ruleMode || currentEfd.ruleMode },
+          bufferAllocationMode: existing?.calculationTrace?.bufferAllocationMode === "DISTRIBUTE_TO_PHASES"
+            ? "DISTRIBUTE_TO_PHASES"
+            : "SEPARATE_END_MONTH",
+        },
         qtyPlanned,
         startDate: utcMonthStart(month),
         endDate: utcMonthEnd(month),
@@ -903,6 +963,10 @@ async function syncMonthlyMps(tx, options = {}) {
         lastReplannedAt: syncedAt,
       },
     });
+    if (demandChanged && !wasCreated && !protectReleasedBaseline) {
+      await invalidateRccp(tx, doc.id, "MPS Qty/periode berubah saat monthly sync; RCCP sebelumnya tidak lagi valid.");
+    }
+    await refreshMpsDeliveryFeasibility(tx, doc.mpsNumber);
     if (demandChanged && !protectReleasedBaseline) changedMpsNumbers.push(doc.mpsNumber);
     docs.push(await tx.mPS.findUnique({
       where: { id: doc.id },
@@ -941,6 +1005,7 @@ async function syncMonthlyMps(tx, options = {}) {
           replanRequired: false,
         },
       });
+      if (protectedHistory) await invalidateMpsDeliveryGate(tx, stale.mpsNumber, `Tidak ada Target Delivery aktif pada ${month}; feasibility historical MPS harus direview ulang.`);
       changedMpsNumbers.push(stale.mpsNumber);
     }
   }

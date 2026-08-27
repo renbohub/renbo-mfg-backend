@@ -22,6 +22,7 @@ const partPriceListsRouter = require("./master-data/part-price-lists");
 const partAttachmentsRouter = require("./master-data/partAttachments");
 const materialsRouter = require("./master-data/materials");
 const materialPriceListsRouter = require("./master-data/material-price-lists");
+const scrapPriceMastersRouter = require("./master-data/scrap-price-masters");
 const materialSubstancesRouter = require("./master-data/material-substances");
 const materialDensitiesRouter = require("./master-data/material-densities");
 const materialGradesRouter = require("./master-data/material-grades");
@@ -36,6 +37,8 @@ const diesMaintenanceRouter = require("./master-data/dies-maintenance");
 const diesUsageRouter = require("./master-data/dies-usage");
 const machinesRouter = require("./master-data/machines");
 const machineCostRatesRouter = require("./master-data/machine-cost-rates");
+const shiftsRouter = require("./master-data/shifts");
+const workingHourProfilesRouter = require("./master-data/working-hour-profiles");
 const subProcessesRouter = require("./master-data/sub-processes");
 const departmentsRouter = require("./master-data/departments");
 const divisionsRouter = require("./master-data/divisions");
@@ -83,6 +86,7 @@ const forecastsRouter = require("./planning/forecasts");
 const mpsRouter = require("./planning/mps");
 const mrpRouter = require("./planning/mrp");
 const monthlyProductionPlansRouter = require("./planning/monthly-production-plans");
+const dailyPlanRevisionsRouter = require("./planning/daily-plan-revisions");
 const reportingRouter = require("./reporting");
 const capacityPlanningRouter = require("./planning/capacity-planning");
 const demandPlanningRouter = require("./planning/demand-planning");
@@ -96,8 +100,10 @@ const qualityInspectionsRouter = require("./production/quality-inspections");
 const ngDispositionsRouter = require("./production/ng-dispositions");
 const materialIssuesRouter = require("./production/material-issues");
 const productionReportsRouter = require("./production/production-reports");
+const qualityReportsRouter = require("./production/quality-reports");
 const wipRouter = require("./production/wip");
 const dailyProductionSchedulesRouter = require("./production/daily-production-schedules");
+const machineAvailabilityEventsRouter = require("./production/machine-availability-events");
 const vendorProcessOrdersRouter = require("./production/vendor-process-orders");
 
 const notificationsRouter = require("./notifications");
@@ -110,6 +116,7 @@ const excelImportsRouter = require("./system/excel-imports");
 const approvalsRouter = require("./system/approvals");
 const maintenanceRouter = require("./system/maintenance");
 const tableDocumentsRouter = require("./system/table-documents");
+const { createDefaultAiRouter } = require("./ai");
 
 const BASE_PATH = "/api";
 
@@ -145,6 +152,7 @@ function registerRoutes(app) {
   api.use("/users", auth, userRouter);
   api.use("/logs", auth, logsRouter);
   api.use("/page-context", auth, pageContextRouter);
+  api.use("/ai", auth, createDefaultAiRouter());
   api.use("/system/roles", auth, rolesRouter);
   api.use("/system/approval-rules", auth, approvalRulesRouter);
   api.use("/system/master-formulas", auth, masterFormulasRouter);
@@ -167,6 +175,7 @@ function registerRoutes(app) {
   api.use("/master-data/part-attachments", auth, partAttachmentsRouter);
   api.use("/master-data/materials", auth, materialsRouter);
   api.use("/master-data/material-price-lists", auth, materialPriceListsRouter);
+  api.use("/master-data/scrap-price-masters", auth, scrapPriceMastersRouter);
   api.use("/master-data/material-substances", auth, materialSubstancesRouter);
   api.use("/master-data/material-densities", auth, materialDensitiesRouter);
   api.use("/master-data/material-grades", auth, materialGradesRouter);
@@ -181,6 +190,8 @@ function registerRoutes(app) {
   api.use("/master-data/dies-usage", auth, diesUsageRouter);
   api.use("/master-data/machines", auth, machinesRouter);
   api.use("/master-data/machine-cost-rates", auth, machineCostRatesRouter);
+  api.use("/master-data/shifts", auth, shiftsRouter);
+  api.use("/master-data/working-hour-profiles", auth, workingHourProfilesRouter);
   api.use("/master-data/sub-processes", auth, subProcessesRouter);
   api.use("/master-data/departments", auth, departmentsRouter);
   api.use("/master-data/divisions", auth, divisionsRouter);
@@ -218,6 +229,7 @@ function registerRoutes(app) {
   api.use("/planning/mps", auth, mpsRouter);
   api.use("/planning/mrp", auth, mrpRouter);
   api.use("/planning/monthly-production-plans", auth, monthlyProductionPlansRouter);
+  api.use("/planning/daily-plan-revisions", auth, dailyPlanRevisionsRouter);
   api.use("/reports", auth, reportingRouter);
   api.use("/planning/capacity-planning", auth, capacityPlanningRouter);
   api.use("/planning/demand-planning", auth, demandPlanningRouter);
@@ -248,10 +260,16 @@ function registerRoutes(app) {
   api.use("/production/downtime-logs", auth, downtimeLogsRouter);
   api.use("/production/quality-inspections", auth, qualityInspectionsRouter);
   api.use("/production/ng-dispositions", auth, ngDispositionsRouter);
+  // URL baru mengikuti kepemilikan modul QC. URL /production di atas tetap
+  // tersedia untuk integrasi lama dan bookmark yang belum dipindahkan.
+  api.use("/quality/quality-inspections", auth, qualityInspectionsRouter);
+  api.use("/quality/ng-dispositions", auth, ngDispositionsRouter);
+  api.use("/quality/reports", auth, qualityReportsRouter);
   api.use("/production/material-issues", auth, materialIssuesRouter);
   api.use("/production/production-reports", auth, productionReportsRouter);
   api.use("/production/wip", auth, wipRouter);
   api.use("/production/daily-production-schedules", auth, dailyProductionSchedulesRouter);
+  api.use("/production/machine-availability-events", auth, machineAvailabilityEventsRouter);
   api.use("/production/vendor-process-orders", auth, vendorProcessOrdersRouter);
 
   // Notification routes

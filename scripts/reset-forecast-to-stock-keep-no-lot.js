@@ -1,16 +1,19 @@
 /* eslint-disable no-console */
 // Destructive simulation reset requested by the operator.
-// Removes transactional data from Forecast through Inventory while keeping
-// StockBalance and StockMovement rows whose lot number is empty/null.
+// Removes transactional data from Forecast through Inventory. By default it
+// keeps StockBalance and StockMovement rows whose lot number is empty/null;
+// --purge-all-stock removes those rows too and leaves inventory at zero.
 
 const fs = require("fs");
 const path = require("path");
 const { prisma } = require("../src/prisma");
 
 const execute = process.argv.includes("--execute");
+const purgeAllStock = process.argv.includes("--purge-all-stock");
 
 const DELETE_ALL_DELEGATES = [
   "productionLogCarryover",
+  "productionLogNgReason",
   "productionLogCoilPhase",
   "incomingInspectionDetail",
   "incomingInspection",
@@ -38,7 +41,10 @@ const DELETE_ALL_DELEGATES = [
   "materialIssueDetail",
   "materialIssue",
   "productionLog",
+  "dailyPlanningException",
   "dailyProductionSchedule",
+  "dailyPlanRevision",
+  "machineAvailabilityEvent",
   "wIPEntry",
   "vendorProcessOrder",
   "manufacturingOrderSourceWip",
@@ -46,18 +52,34 @@ const DELETE_ALL_DELEGATES = [
   "manufacturingOrder",
   "diesUsage",
   "stockReservation",
+  "capacityEditChange",
+  "capacityQueueItem",
+  "capacityEditSession",
+  "monthlyPlanRecommendationItem",
+  "monthlyPlanRecommendationScenario",
   "productionPlanAllocation",
   "capacityMachineOverride",
   "capacityDayOverride",
   "monthlyProductionPlanDetail",
   "monthlyProductionPlan",
   "planningChangeImpact",
+  "planningAdjustmentLine",
+  "planningAdjustment",
+  "additionalDemandCoverage",
+  "planningBaselineLock",
+  "rccpRecommendation",
+  "rccpOverride",
+  "rccpOffsetDetail",
+  "rccpTimeBucket",
+  "rccpLoad",
+  "rccpRun",
   "mRPPegging",
   "mRPDirtyItem",
   "mRPPartialSnapshot",
   "plannedOrder",
   "mRPRequirement",
   "mRPRun",
+  "mPSDeliveryFeasibilitySnapshot",
   "mPSDemandSource",
   "mPSDeliveryPlan",
   "mPSDetail",
@@ -65,6 +87,11 @@ const DELETE_ALL_DELEGATES = [
   "dueDateRecoveryPlan",
   "dPPDisplacementProposal",
   "demandPlanningDecision",
+  "monthlyDemandSnapshotAction",
+  "monthlyDemandSnapshotDetail",
+  "monthlyDemandSnapshot",
+  "demandExceptionAction",
+  "demandException",
   "demandDeliveryTarget",
   "deliveryScheduleDetail",
   "deliverySchedule",
@@ -73,6 +100,8 @@ const DELETE_ALL_DELEGATES = [
   "salesOrderHeader",
   "forecastDetail",
   "forecast",
+  "stockOpnameCountAttempt",
+  "stockOpnameCountRound",
   "stockOpnameDetail",
   "stockOpnameHeader",
 ];
@@ -151,10 +180,10 @@ async function loadScope(db) {
   const stockMovements = await db.stockMovement.findMany();
   return {
     rows,
-    deleteStockBalances: stockBalances.filter((row) => !hasNoLot(row)),
-    preserveStockBalances: stockBalances.filter(hasNoLot),
-    deleteStockMovements: stockMovements.filter((row) => !hasNoLot(row)),
-    preserveStockMovements: stockMovements.filter(hasNoLot),
+    deleteStockBalances: purgeAllStock ? stockBalances : stockBalances.filter((row) => !hasNoLot(row)),
+    preserveStockBalances: purgeAllStock ? [] : stockBalances.filter(hasNoLot),
+    deleteStockMovements: purgeAllStock ? stockMovements : stockMovements.filter((row) => !hasNoLot(row)),
+    preserveStockMovements: purgeAllStock ? [] : stockMovements.filter(hasNoLot),
   };
 }
 
@@ -197,10 +226,13 @@ async function main() {
   const before = await loadScope(prisma);
   console.log(JSON.stringify({
     mode: execute ? "EXECUTE" : "DRY_RUN",
+    purgeAllStock,
     before: summarize(before),
     preservedMasterData: true,
     preservedCapacityCalendarPreset: true,
-    note: "Stock balance dan stock movement tanpa lot dipertahankan.",
+    note: purgeAllStock
+      ? "Seluruh stock balance, stock movement, dan lot dihapus; inventory menjadi nol."
+      : "Stock balance dan stock movement tanpa lot dipertahankan.",
   }, null, 2));
 
   if (!execute) {
@@ -213,7 +245,7 @@ async function main() {
   const backupPath = path.join(backupDir, `forecast-to-stock-reset-${stamp()}.json`);
   fs.writeFileSync(backupPath, JSON.stringify({
     createdAt: new Date().toISOString(),
-    scope: "Forecast through Stock; no-lot stock preserved",
+    scope: purgeAllStock ? "Forecast through Stock; all stock purged" : "Forecast through Stock; no-lot stock preserved",
     deleted: {
       ...before.rows,
       stockBalances: before.deleteStockBalances,
@@ -259,13 +291,13 @@ async function main() {
     const currentMovements = await tx.stockMovement.findMany({ select: { id: true, lotNumber: true } });
     result.stockMovementWithLot = await deleteIds(
       tx.stockMovement,
-      ids(currentMovements.filter((row) => !hasNoLot(row))),
+      ids(purgeAllStock ? currentMovements : currentMovements.filter((row) => !hasNoLot(row))),
     );
 
     const currentBalances = await tx.stockBalance.findMany({
       select: { id: true, lotNumber: true, qtyOnHand: true, qtyQC: true },
     });
-    const balanceIdsWithLot = ids(currentBalances.filter((row) => !hasNoLot(row)));
+    const balanceIdsWithLot = ids(purgeAllStock ? currentBalances : currentBalances.filter((row) => !hasNoLot(row)));
     result.stockBalanceWithLot = await deleteIds(tx.stockBalance, balanceIdsWithLot);
     result.lotMaster = (await tx.lotMaster.deleteMany({})).count;
 

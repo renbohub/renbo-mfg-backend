@@ -17,7 +17,7 @@ const machine = {
 const workOrder = { id: "WO-1", machineId: machine.id, cycleTime: 60 };
 
 function fakeTransaction(plannedQty) {
-  const state = { updates: [], creates: [], carryover: null };
+  const state = { updates: [], creates: [], carryover: null, advisoryLockCount: 0 };
   const nextDayDpp = {
     ...sourceSchedule,
     id: "DPS-NEXT-ID",
@@ -31,7 +31,7 @@ function fakeTransaction(plannedQty) {
     createdAt: targetDate,
   };
   const tx = {
-    $queryRaw: async () => [],
+    $executeRaw: async () => { state.advisoryLockCount += 1; return 1; },
     productionLogCarryover: {
       findUnique: async () => null,
       create: async ({ data }) => { state.carryover = { id: "CARRY-1", ...data }; return state.carryover; },
@@ -70,6 +70,7 @@ function fakeTransaction(plannedQty) {
   assert.equal(full.state.creates[0].schedulePriority, 1);
   assert.match(full.state.creates[0].notes, /CAPACITY-OVERFLOW/);
   assert.equal(fullResult.status, "OVER_CAPACITY");
+  assert.equal(full.state.advisoryLockCount, 1, "new DPS number must use an execute-only advisory lock");
 
   console.log("Production shortfall carry-over checks passed: spare-capacity increase and full-capacity extra DPP");
 })().catch((error) => { console.error(error); process.exit(1); });

@@ -12,6 +12,11 @@ const { syncMonthlyMps, previewMonthlyMbomSelections, normalizeMpsRunSelection }
 const { planningAnchorMonth } = require("../../services/planning/demandPlanningService");
 const { resolveMbomRevision, selectedRevisionId } = require("../../services/planning/mbomRevisionService");
 const { getMpsWorkbench } = require("../../services/planning/mpsWorkbenchService");
+const { assertMpsApprovalAllowed, invalidateRccp } = require("../../services/planning/rccpService");
+const { assertMpsDeliveryApprovalAllowed, invalidateMpsDeliveryGate, reviewMpsDeliveryFeasibility } = require("../../services/planning/mpsDeliveryFeasibilityService");
+const { previewBaselineLocks, lockBaselineForMps } = require("../../services/planning/planningBaselineLockService");
+const { previewDeltaMps, generateDeltaMps } = require("../../services/planning/planningDeltaMpsService");
+const { previewProductionCut, createProductionCut, approveProductionCut } = require("../../services/planning/productionCutService");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim() || null;
@@ -937,12 +942,142 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
 exports.createFromForecast = (req, res, next) => syncMonthlyDemand(req, res, next, true);
 exports.syncMonthly = (req, res, next) => syncMonthlyDemand(req, res, next, false);
 
+exports.previewBaseline = async (req, res, next) => {
+  try {
+    const mpsNumbers = [...new Set([
+      ...(Array.isArray(req.body?.mpsNumbers) ? req.body.mpsNumbers : []),
+      req.body?.mpsNumber,
+    ].map((value) => String(value || "").trim()).filter(Boolean))];
+    const preview = await previewBaselineLocks(prisma, { mpsNumbers });
+    return res.json({ ...preview, preview: true, persisted: false });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    return next(error);
+  }
+};
+
+exports.generateBaseline = async (req, res, next) => {
+  try {
+    const actor = req.user?.username || req.user?.email || "system";
+    const result = await prisma.$transaction(async (tx) => {
+      let mpsNumbers = [...new Set([
+        ...(Array.isArray(req.body?.mpsNumbers) ? req.body.mpsNumbers : []),
+        req.body?.mpsNumber,
+      ].map((value) => String(value || "").trim()).filter(Boolean))];
+      if (!mpsNumbers.length) {
+        const selection = normalizeMpsRunSelection({
+          months: req.body?.months,
+          selectedDeliveryTargetIds: req.body?.selectedDeliveryTargetIds,
+          selectionRequired: Array.isArray(req.body?.selectedDeliveryTargetIds),
+        });
+        const synced = await syncMonthlyMps(tx, {
+          months: selection.months.length ? selection.months : undefined,
+          planningAnchorMonth: text(req.body?.planningAnchorMonth) || selection.months[0] || planningAnchorMonth(new Date()),
+          simulationOnly: false,
+          selectedDeliveryTargetIds: selection.selectedDeliveryTargetIds,
+          mbomSelections: req.body?.mbomSelections && typeof req.body.mbomSelections === "object" ? req.body.mbomSelections : undefined,
+          runBy: actor,
+        });
+        mpsNumbers = synced.docs.map((document) => document.mpsNumber);
+      }
+      return lockBaselineForMps(tx, {
+        mpsNumbers,
+        actor,
+        expectedFingerprint: text(req.body?.expectedFingerprint),
+      });
+    }, { maxWait: 10000, timeout: 120000 });
+    return res.status(result.createdCount ? 201 : 200).json({
+      ...result,
+      preview: false,
+      persisted: true,
+      message: result.idempotent ? "Baseline sudah terkunci dengan snapshot yang sama." : `${result.createdCount} scope EFD berhasil dikunci.`,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    return next(error);
+  }
+};
+
+exports.previewDelta = async (req, res, next) => {
+  try {
+    const result = await previewDeltaMps(prisma, { lockIds: Array.isArray(req.body?.lockIds) ? req.body.lockIds : [] });
+    return res.json({ ...result, preview: true, persisted: false });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    return next(error);
+  }
+};
+
+exports.generateDelta = async (req, res, next) => {
+  try {
+    const result = await prisma.$transaction((tx) => generateDeltaMps(tx, {
+      lockIds: Array.isArray(req.body?.lockIds) ? req.body.lockIds : [],
+      expectedFingerprint: text(req.body?.expectedFingerprint),
+      idempotencyKey: text(req.body?.idempotencyKey),
+      actor: req.user?.username || req.user?.email || "system",
+    }), { maxWait: 10000, timeout: 120000 });
+    return res.status(result.idempotent ? 200 : 201).json({
+      ...result,
+      preview: false,
+      persisted: true,
+      message: result.status === "COVERED_WITHOUT_PRODUCTION"
+        ? "PO tambahan seluruhnya tercover FG stock dan firm receipt; Delta MPS tidak diperlukan."
+        : `${result.createdDocuments.length} Delta MPS berhasil dibuat tanpa mengubah baseline.`,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    return next(error);
+  }
+};
+
+exports.previewProductionCut = async (req, res, next) => {
+  try {
+    const result = await previewProductionCut(prisma, { baselineLockId: req.body?.baselineLockId, requestedQty: req.body?.requestedQty });
+    res.json(mapDoc(result));
+  } catch (error) { next(error); }
+};
+
+exports.createProductionCut = async (req, res, next) => {
+  try {
+    const result = await prisma.$transaction((tx) => createProductionCut(tx, { baselineLockId: req.body?.baselineLockId, requestedQty: req.body?.requestedQty, expectedFingerprint: req.body?.expectedFingerprint, reason: req.body?.reason, actor: req.user?.username || req.user?.email || "system" }));
+    res.status(201).json(mapDoc(result));
+  } catch (error) { next(error); }
+};
+
+exports.approveProductionCut = async (req, res, next) => {
+  try {
+    const result = await prisma.$transaction((tx) => approveProductionCut(tx, { adjustmentNumber: req.params.adjustmentNumber, actor: req.user?.username || req.user?.email || "system" }));
+    res.json(mapDoc(result));
+  } catch (error) { next(error); }
+};
+
+exports.reviewDeliveryFeasibility = async (req, res, next) => {
+  try {
+    const deliveryTargetIds = Array.isArray(req.body?.deliveryTargetIds)
+      ? req.body.deliveryTargetIds
+      : [];
+    const result = await prisma.$transaction((tx) => reviewMpsDeliveryFeasibility(tx, req.params.mpsNumber, {
+      deliveryTargetIds,
+      actor: req.user?.username || req.user?.email || "system",
+    }), { maxWait: 10000, timeout: 120000 });
+    return res.status(200).json({
+      ...result,
+      message: `${result.reviewedCount} delivery phase selesai diperiksa.`,
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 exports.updateAdjustments = async (req, res, next) => {
   try {
     const detailIds = [...new Set(Array.isArray(req.body.detailIds) ? req.body.detailIds.filter(Boolean) : [])];
     const bufferPercent = Number(req.body.bufferPercent);
     const productionPercent = Number(req.body.productionPercent);
     const scope = req.body.scope === "parent" ? "PARENT_FG" : "LINE";
+    const bufferAllocationMode = req.body.bufferAllocationMode === "DISTRIBUTE_TO_PHASES"
+      ? "DISTRIBUTE_TO_PHASES"
+      : "SEPARATE_END_MONTH";
     if (!detailIds.length) return res.status(400).json({ message: "Detail MPS wajib dipilih" });
     if (!Number.isFinite(bufferPercent) || bufferPercent < 0 || bufferPercent > 100) return res.status(400).json({ message: "Buffer % harus antara 0 sampai 100" });
     if (!Number.isFinite(productionPercent) || productionPercent < 0 || productionPercent > 100) return res.status(400).json({ message: "Produksi % harus antara 0 sampai 100" });
@@ -951,9 +1086,17 @@ exports.updateAdjustments = async (req, res, next) => {
       include: { details: { where: { id: { in: detailIds }, isDeleted: false }, include: { part: true } } },
     });
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
-    if (doc.status !== "Draft") return res.status(409).json({ message: `MPS status ${doc.status} tidak dapat disesuaikan. Buat/recalculate revisi Draft agar approval lama tidak berubah.` });
+    if (!["Draft", "Confirmed"].includes(doc.status)) return res.status(409).json({ message: `MPS status ${doc.status} tidak dapat disesuaikan. Buffer hanya dapat diedit pada Draft atau Confirmed yang akan dibuka kembali menjadi Draft.` });
     if (doc.details.length !== detailIds.length) return res.status(404).json({ message: "Sebagian detail MPS tidak ditemukan" });
     if (doc.details.some((row) => isGeneratedProcess(row))) return res.status(400).json({ message: "Buffer dan persentase produksi hanya dapat diatur pada FG receipt" });
+    await invalidateRccp(prisma, doc.id, "Buffer/production quantity MPS diubah; RCCP sebelumnya tidak lagi valid.");
+    await invalidateMpsDeliveryGate(prisma, doc.mpsNumber, "Buffer/production quantity MPS berubah; hitung ulang feasibility delivery bersama Draft MPS.");
+    if (doc.status === "Confirmed") {
+      await prisma.mPS.update({
+        where: { id: doc.id },
+        data: { status: "Draft", lifecycleStatus: "DRAFT", approvedBy: null, approvedDate: null },
+      });
+    }
     let targetDetails = doc.details;
     if (scope === "PARENT_FG") {
       const parentPartCodes = [...new Set(doc.details.map((row) => row.partCode).filter(Boolean))];
@@ -979,7 +1122,12 @@ exports.updateAdjustments = async (req, res, next) => {
       const qtyPlanned = normalizeQuantity(evaluateFromSet(formulas, "MPS_TARGET_QTY", { effectiveDemandQty, productionPercent, actualSalesOrderQty }), row.uomCode || row.part?.uomCode || "pcs");
       return prisma.mPSDetail.update({
         where: { id: row.id },
-        data: { bufferPercent, bufferQty, bufferOverridden: true, bufferReferenceScope: scope, effectiveDemandQty, productionPercent, productionOverridden: true, actualSalesOrderQty, soNumber: [...new Set(actual.soNumbers)].join(",") || row.soNumber || null, qtyPlanned },
+        data: {
+          bufferPercent, bufferQty, bufferOverridden: true, bufferReferenceScope: scope,
+          effectiveDemandQty, productionPercent, productionOverridden: true,
+          actualSalesOrderQty, soNumber: [...new Set(actual.soNumbers)].join(",") || row.soNumber || null, qtyPlanned,
+          calculationTrace: { ...(row.calculationTrace && typeof row.calculationTrace === "object" ? row.calculationTrace : {}), bufferAllocationMode },
+        },
       });
     }));
     // Rebuild the complete rolling horizon after persisting the override.
@@ -991,6 +1139,10 @@ exports.updateAdjustments = async (req, res, next) => {
       months: horizonMonths, planningAnchorMonth: planningAnchor,
       runBy: req.user?.username || req.user?.email || "system",
     }));
+    await prisma.mRPRun.updateMany({
+      where: { mpsNumber: doc.mpsNumber, isCurrentPlan: true, isDeleted: false },
+      data: { isCurrentPlan: false },
+    });
     const updated = await prisma.mPS.findFirst({ where: { mpsNumber: doc.mpsNumber }, include });
     res.json(updated);
   } catch (error) { next(error); }
@@ -1002,14 +1154,19 @@ exports.confirm = async (req, res, next) => {
     if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan" });
     if (!doc.details.length) return res.status(400).json({ message: "MPS tanpa detail tidak dapat dikonfirmasi" });
     if (doc.replanRequired) return res.status(409).json({ message: doc.replanReason || "Target delivery berubah. Hitung ulang MPS bulanan sebelum konfirmasi.", code: "DELIVERY_REPLAN_REQUIRED" });
-    if (doc.status !== "Draft") return res.status(409).json({ message: `MPS tidak dapat dikonfirmasi dari status ${doc.status}` });
+    if (!["Draft", "Confirmed"].includes(doc.status)) return res.status(409).json({ message: `MPS tidak dapat di-approve dari status ${doc.status}` });
+    const rccp = await assertMpsApprovalAllowed(prisma, doc);
+    const deliveryGate = await assertMpsDeliveryApprovalAllowed(prisma, doc);
     const readiness = await buildMpsReadiness(prisma, doc);
     if (!readiness.ok) return res.status(409).json({
       message: `MPS belum siap dikonfirmasi: ${readiness.blockingCount} blocker routing/UOM harus diperbaiki.`,
       code: "MPS_READINESS_BLOCKED",
       readiness,
     });
-    const updated = await prisma.mPS.update({ where: { mpsNumber: doc.mpsNumber }, data: { status: "Confirmed", lifecycleStatus: "REVIEWED", simulationOnly: false, approvedBy: req.user?.username || req.user?.email || null, approvedDate: new Date() }, include });
-    res.json(updated);
-  } catch (error) { next(error); }
+    const updated = await prisma.mPS.update({ where: { mpsNumber: doc.mpsNumber }, data: { status: "Confirmed", lifecycleStatus: "APPROVED", simulationOnly: false, approvedBy: req.user?.username || req.user?.email || null, approvedDate: new Date(), capacityStatus: rccp.status === "OVERRIDDEN" ? "OVERRIDDEN" : rccp.overallLoadStatus, officialGateStatus: deliveryGate.officialGateStatus === "APPROVED_WITH_EXCEPTION" ? "APPROVED_WITH_EXCEPTION" : "OFFICIAL" }, include });
+    res.json({ ...updated, rccp, deliveryGate, message: deliveryGate.officialGateStatus === "APPROVED_WITH_EXCEPTION" ? `${doc.mpsNumber} approved dengan exception Accept Late.` : `${doc.mpsNumber} approved setelah RCCP ${rccp.status} dan seluruh delivery feasible.` });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code || null, exceptions: error.exceptions || [], rccp: error.rccp || null, deliveryGate: error.deliveryGate || null });
+    return next(error);
+  }
 };

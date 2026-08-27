@@ -167,6 +167,71 @@ function buildDueDateRecoveryChecklist(feasibility = {}, options = {}) {
     }));
   }
 
+  // Optional PPIC recovery levers. These remain explicit audit decisions: no
+  // lead-time master or production date is silently rewritten by a recovery
+  // plan. The selected option, owner, target date, evidence and approval are
+  // stored on the versioned DueDateRecoveryPlan.
+  actions.push(action({
+    id: "REDUCE_SUPPLIER_LEAD_TIME",
+    category: "SUPPLIER",
+    title: "Kurangi lead time supplier untuk recovery",
+    reason: "Gunakan committed lead time hasil negosiasi supplier khusus delivery phase ini.",
+    ownerRole: "Purchasing",
+    targetDate: feasibility.materialRequiredDate || today,
+    required: false,
+    verification: "Konfirmasi supplier dan committed arrival date wajib dilampirkan; master lead time tidak berubah otomatis.",
+  }));
+  actions.push(action({
+    id: "RUN_TRIAL_RECOVERY",
+    category: "TRIAL",
+    title: "Jalankan trial recovery",
+    reason: "Validasi percepatan material atau proses dalam mode trial sebelum dijadikan komitmen resmi.",
+    ownerRole: "PPIC / Production / Purchasing",
+    targetDate: today,
+    required: false,
+    verification: "Hasil trial, asumsi, dan dampak delivery phase dicatat sebelum approval.",
+  }));
+  actions.push(action({
+    id: "SHIFT_PRODUCTION_START",
+    category: "PRODUCTION",
+    title: "Geser start production",
+    reason: "Start production diubah sebagai recovery dan tidak boleh mengubah customer due date tanpa approval.",
+    ownerRole: "PPIC / Production",
+    targetDate: feasibility.productionLatestStartDate || today,
+    required: false,
+    verification: "Tanggal start baru, resource terdampak, dan alasan pergeseran tercatat pada Production Plan.",
+  }));
+  actions.push(action({
+    id: "REDUCE_VENDOR_LEAD_TIME",
+    category: "VENDOR",
+    title: "Kurangi lead time vendor process",
+    reason: "Gunakan committed vendor turnaround khusus recovery tanpa mengubah master lead time permanen.",
+    ownerRole: "PPIC / Purchasing",
+    targetDate: feasibility.vendorReturnDate || feasibility.productionLatestStartDate || today,
+    required: false,
+    verification: "Vendor send/return baru dikonfirmasi dan tidak melewati successor process start.",
+  }));
+  actions.push(action({
+    id: "FORCE_WITH_REASON",
+    category: "GOVERNANCE",
+    title: "Force dengan alasan khusus",
+    reason: "Override hanya untuk keputusan berotorisasi ketika recovery standar tidak mencukupi.",
+    ownerRole: "PPIC Approver",
+    targetDate: today,
+    required: false,
+    verification: "Alasan khusus, risiko, pemilik risiko, dan bukti approval wajib lengkap.",
+  }));
+  actions.push(action({
+    id: "ACCEPT_LATE",
+    category: "GOVERNANCE",
+    title: "Accept Late",
+    reason: "Keterlambatan diterima dengan tanggal komitmen baru dan persetujuan formal.",
+    ownerRole: "PPIC Approver",
+    targetDate: earliestDeliveryDate || requestedDeliveryDate,
+    required: false,
+    verification: "Alasan, tanggal baru, dampak delivery phase, dan approval wajib tersimpan.",
+  }));
+
   actions.push(action({
     id: "DAILY_CONTROL",
     category: "CONTROL",
@@ -202,7 +267,7 @@ function validateRecoveryChecklist(checklist = [], requestedDeliveryDate = null)
     if (!item.selected) continue;
     if (!String(item.owner || "").trim()) errors.push(`${item.title}: PIC wajib diisi.`);
     if (!dateKey(item.targetDate)) errors.push(`${item.title}: target selesai wajib diisi.`);
-    if (customerDue && customerDue >= today && dateKey(item.targetDate) > customerDue) errors.push(`${item.title}: target tindakan tidak boleh melewati due date customer.`);
+    if (item.id !== "ACCEPT_LATE" && customerDue && customerDue >= today && dateKey(item.targetDate) > customerDue) errors.push(`${item.title}: target tindakan tidak boleh melewati due date customer.`);
   }
   return errors;
 }

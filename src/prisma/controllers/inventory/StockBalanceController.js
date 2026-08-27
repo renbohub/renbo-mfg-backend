@@ -29,7 +29,7 @@ const {
 } = require("./utils/itemIdentity");
 const {
   assertStockBalanceNotFrozen,
-  assertWarehouseNotFrozen,
+  assertStockIdentityNotFrozen,
 } = require("./utils/stockOpnameFreezeGuard");
 const { assertQuantity } = require("../../utils/uomQuantity");
 
@@ -139,7 +139,12 @@ async function upsertDispositionTargetBalance(tx, stockBalance, target, qty) {
     return { ...balance, qtyBefore, qtyAfter: qtyOnHand };
   }
 
-  await assertWarehouseNotFrozen(tx, target.warehouseCode);
+  await assertStockIdentityNotFrozen(tx, {
+    warehouseCode: target.warehouseCode,
+    rackCode: normalizeText(target.rackCode),
+    lotNumber: normalizeLotValue(target.lotNumber) || normalizeLotValue(stockBalance.lotNumber),
+    stockType: stockBalance.stockType || null,
+  });
   const balance = await tx.stockBalance.create({
     data: {
       warehouseCode: target.warehouseCode,
@@ -1567,7 +1572,12 @@ exports.upsert = async (req, res, next) => {
         },
       });
     } else {
-      await assertWarehouseNotFrozen(prisma, warehouseCode);
+      await assertStockIdentityNotFrozen(prisma, {
+        warehouseCode,
+        rackCode: normalizedRackCode,
+        lotNumber: normalizedLotNumber,
+        stockType: data.stockType || null,
+      });
       stockBalance = await prisma.stockBalance.create({
         data: {
           warehouseCode,
@@ -1698,7 +1708,12 @@ exports.adjust = async (req, res, next) => {
         },
       });
     } else {
-      await assertWarehouseNotFrozen(prisma, warehouseCode);
+      await assertStockIdentityNotFrozen(prisma, {
+        warehouseCode,
+        rackCode: normalizedRackCode,
+        lotNumber: normalizedLotNumber,
+        stockType: data.stockType || null,
+      });
       stockBalance = await prisma.stockBalance.create({
         data: {
           warehouseCode,

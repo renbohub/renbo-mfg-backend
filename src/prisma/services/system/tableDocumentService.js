@@ -260,6 +260,25 @@ function buildPdf(payload) {
           });
           return height;
         };
+        const sectionDrawGroupHeaders = (y) => {
+          const groups = (Array.isArray(source.groupHeaders) ? source.groupHeaders : []).filter((group) => {
+            const start = Number(group.start); const span = Math.max(1, Number(group.span) || 1);
+            return start >= sectionChunk.start && start + span <= sectionChunk.end;
+          });
+          if (!groups.length) return y;
+          const height = 18;
+          let x = doc.page.margins.left;
+          sectionWidths.forEach((width) => { doc.rect(x, y, width, height).fillAndStroke("#F8FAFC", "#D7DDE7"); x += width; });
+          groups.forEach((group) => {
+            const localStart = Number(group.start) - sectionChunk.start;
+            const span = Math.max(1, Number(group.span) || 1);
+            const groupX = doc.page.margins.left + sectionWidths.slice(0, localStart).reduce((sum, value) => sum + value, 0);
+            const groupWidth = sectionWidths.slice(localStart, localStart + span).reduce((sum, value) => sum + value, 0);
+            doc.rect(groupX, y, groupWidth, height).fillAndStroke("#DDE5FF", "#AEBBEF");
+            doc.fillColor("#2438A3").font("Helvetica-Bold").fontSize(7.3).text(cleanText(group.label), groupX + 4, y + 5, { width: groupWidth - 8, align: "center", lineBreak: false });
+          });
+          return y + height;
+        };
         const sectionHeader = () => {
           doc.x = doc.page.margins.left;
           doc.y = doc.page.margins.top;
@@ -268,7 +287,7 @@ function buildPdf(payload) {
           doc.fillColor("#111827").font("Helvetica-Bold").fontSize(15).text(section.title, { width: usableWidth });
           const panel = sectionChunks.length > 1 ? ` | Panel kolom ${panelIndex + 1}/${sectionChunks.length}` : "";
           doc.fillColor("#667085").font("Helvetica").fontSize(7.5).text(`${section.subtitle || `Lampiran ${sectionIndex + 1}`}${panel}`, { width: usableWidth });
-          const y = doc.y + 8;
+          const y = sectionDrawGroupHeaders(doc.y + 8);
           return y + sectionDrawRow(sectionHeaders, y, true);
         };
         let sectionY = sectionHeader();

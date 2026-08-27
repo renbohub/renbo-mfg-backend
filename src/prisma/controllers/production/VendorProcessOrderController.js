@@ -3,7 +3,8 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { parseFilter } = require("../../utils/parseFilter");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { generateConfiguredNumber } = require("../../services/numberingService");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const {
   buildExcludeSpecialRackCondition,
 } = require("../inventory/utils/stockReservationHelpers");
@@ -772,13 +773,19 @@ async function findPreviousWipBalances(tx, order, body = {}) {
   }
 
   const sourceWarehouseCode = normalizeText(body.sourceWarehouseCode || body.warehouseCode);
+  const sourceRackCode = normalizeText(body.sourceRackCode || body.rackCode);
+  const selectedBalanceIds = Array.isArray(body.sourceStockBalanceIds)
+    ? [...new Set(body.sourceStockBalanceIds.map(normalizeText).filter(Boolean))]
+    : [];
 
   return tx.stockBalance.findMany({
     where: {
       AND: [
         {
+          ...(selectedBalanceIds.length ? { id: { in: selectedBalanceIds } } : {}),
           partCode: sourcePartCode,
           ...(sourceWarehouseCode ? { warehouseCode: sourceWarehouseCode } : {}),
+          ...(sourceRackCode ? { rackCode: sourceRackCode } : {}),
           uomCode: order.uomCode || null,
           stockType: WIP_STOCK_TYPE,
           isDeleted: false,
@@ -789,6 +796,25 @@ async function findPreviousWipBalances(tx, order, body = {}) {
     },
     orderBy: [{ qtyAvailable: "asc" }, { lastMovement: "asc" }],
   });
+}
+
+function parseVendorSchedulePhase(notes) {
+  const text = String(notes || "");
+  const markerIndex = text.indexOf("phase ");
+  if (markerIndex < 0) return {};
+  const jsonStart = text.indexOf("{", markerIndex);
+  if (jsonStart < 0) return {};
+
+  try {
+    return JSON.parse(text.slice(jsonStart));
+  } catch (_error) {
+    return {};
+  }
+}
+
+function vendorScheduleDate(order) {
+  const phase = parseVendorSchedulePhase(order?.notes);
+  return phase.sendDate || order?.orderDate || order?.dueDate || null;
 }
 
 async function consumeSourceBalancesForVendorSend(tx, order, balances, qty, now, performedBy, sourceContext = {}) {
@@ -897,6 +923,12 @@ async function restoreStockBalanceFromMovement(tx, movement, now = new Date()) {
     });
   }
 
+  await assertStockIdentityNotFrozen(tx, {
+    warehouseCode: movement.warehouseCode,
+    rackCode: movement.rackCode || null,
+    lotNumber: movement.lotNumber || null,
+    stockType: movement.stockType || WIP_STOCK_TYPE,
+  });
   return tx.stockBalance.create({
     data: {
       warehouseCode: movement.warehouseCode,
@@ -1271,7 +1303,10 @@ async function receiveVendorOutputToQc(tx, order, body, performedBy) {
     },
   });
 
-  const now = new Date();
+  const now = body.receivedAt ? new Date(body.receivedAt) : new Date();
+  if (Number.isNaN(now.getTime())) {
+    throw Object.assign(new Error("Tanggal penerimaan tidak valid."), { statusCode: 400 });
+  }
   const qtyBefore = toNumber(existingBalance?.qtyOnHand);
   const qtyAfter = roundQuantity(qtyBefore + qty);
   const qtyQC = roundQuantity(toNumber(existingBalance?.qtyQC) + qty);
@@ -1300,7 +1335,11 @@ async function receiveVendorOutputToQc(tx, order, body, performedBy) {
       uomCode: order.uomCode || null,
       referenceType: "VENDOR_PROCESS_ORDER",
       referenceNumber: order.orderNumber,
-      notes: `${order.stockType === FINAL_STOCK_TYPE ? "FG" : "WIP"} vendor output ${order.orderNumber} masuk QC Hold`,
+      notes: [
+        `${order.stockType === FINAL_STOCK_TYPE ? "FG" : "WIP"} vendor output ${order.orderNumber} masuk QC Hold`,
+        normalizeText(body.deliveryNoteNumber) ? `Surat jalan vendor: ${normalizeText(body.deliveryNoteNumber)}` : null,
+        normalizeText(body.notes),
+      ].filter(Boolean).join(" · "),
       performedBy,
     },
   });
@@ -1317,6 +1356,12 @@ async function receiveVendorOutputToQc(tx, order, body, performedBy) {
       },
     });
   } else {
+    await assertStockIdentityNotFrozen(tx, {
+      warehouseCode,
+      rackCode,
+      lotNumber,
+      stockType: order.stockType || WIP_STOCK_TYPE,
+    });
     await tx.stockBalance.create({
       data: {
         warehouseCode,
@@ -1337,7 +1382,55 @@ async function receiveVendorOutputToQc(tx, order, body, performedBy) {
     });
   }
 
-  return { movementNumber, qty };
+  return { movementNumber, qty, receivedAt: now };
+}
+
+async function createVendorReceiptQualityInspection(tx, order, receipt, body, performedBy) {
+  if (!order.moId) {
+    throw Object.assign(new Error("MO sumber Vendor Process belum tersedia; QC Inspection tidak dapat dibuat."), {
+      statusCode: 409,
+    });
+  }
+
+  const inspectionNumber = await generateConfiguredNumber("QUALITY_INSPECTION", {
+    db: tx,
+    context: { prefix: "QC" },
+  });
+  const receiptMarker = `[VPO-RECEIPT:${receipt.movementNumber}]`;
+  const notes = [
+    receiptMarker,
+    `Penerimaan vendor ${order.orderNumber}; stock ditahan di QC Hold sampai inspeksi selesai. Dibuat oleh ${performedBy}.`,
+    normalizeText(body.deliveryNoteNumber) ? `Surat jalan vendor: ${normalizeText(body.deliveryNoteNumber)}` : null,
+    normalizeText(body.notes),
+  ].filter(Boolean).join(" ");
+
+  return tx.qualityInspection.create({
+    data: {
+      inspectionNumber,
+      inspectionDate: receipt.receivedAt,
+      moId: order.moId,
+      vendorProcessOrderId: order.id,
+      partId: order.outputPartId || null,
+      batchNumber: normalizeText(body.lotNumber || body.receiveLotNumber) || null,
+      sampleSize: 1,
+      qtyInspected: receipt.qty,
+      qtyPassed: 0,
+      qtyFailed: 0,
+      qtyRework: 0,
+      decision: "Pending",
+      inspectedBy: "Unassigned",
+      status: "Draft",
+      notes,
+    },
+    select: {
+      id: true,
+      inspectionNumber: true,
+      inspectionDate: true,
+      qtyInspected: true,
+      status: true,
+      decision: true,
+    },
+  });
 }
 
 async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
@@ -1752,10 +1845,167 @@ exports.get = async (req, res, next) => {
       loadMbomProcessMap(prisma, [item.mbomProcessId]),
       loadPartIdentityMaps(prisma, [item]),
     ]);
-    const readiness = await resolveVendorSendReadiness(prisma, item);
+    const [readiness, receiptMovements, qualityInspections] = await Promise.all([
+      resolveVendorSendReadiness(prisma, item),
+      prisma.stockMovement.findMany({
+        where: {
+          referenceType: "VENDOR_PROCESS_ORDER",
+          referenceNumber: item.orderNumber,
+          transactionType: "QC_HOLD",
+          movementType: "IN",
+          isDeleted: false,
+        },
+        orderBy: [{ movementDate: "desc" }, { createdAt: "desc" }],
+        select: {
+          movementNumber: true,
+          movementDate: true,
+          qty: true,
+          uomCode: true,
+          warehouseCode: true,
+          rackCode: true,
+          lotNumber: true,
+          notes: true,
+          performedBy: true,
+        },
+      }),
+      prisma.qualityInspection.findMany({
+        where: { vendorProcessOrderId: item.id, isDeleted: false },
+        orderBy: [{ inspectionDate: "desc" }, { createdAt: "desc" }],
+        select: {
+          inspectionNumber: true,
+          inspectionDate: true,
+          qtyInspected: true,
+          qtyPassed: true,
+          qtyFailed: true,
+          decision: true,
+          status: true,
+          notes: true,
+        },
+      }),
+    ]);
+    const inspectionsByMovement = new Map();
+    qualityInspections.forEach((inspection) => {
+      const marker = String(inspection.notes || "").match(/\[VPO-RECEIPT:([^\]]+)\]/)?.[1];
+      if (marker) inspectionsByMovement.set(marker, inspection);
+    });
+    const receiptHistory = receiptMovements.map((movement) => ({
+      ...movement,
+      qualityInspection: inspectionsByMovement.get(movement.movementNumber) || null,
+    }));
+    const qcInspectedQty = qualityInspections.reduce(
+      (sum, inspection) => sum + toNumber(inspection.qtyInspected),
+      0,
+    );
     res.json({
       ...mapDoc(enrichVendorProcessOrder(item, mbomDetailMaps, mbomProcessesById, partIdentityMaps)),
       ...readiness,
+      qcInspectedQty,
+      qcRemainingQty: Math.max(0, toNumber(item.qtyReceived) - qcInspectedQty),
+      receiptHistory: mapDoc(receiptHistory),
+      qualityInspections: mapDoc(qualityInspections),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getSendOptions = async (req, res, next) => {
+  try {
+    const order = await prisma.vendorProcessOrder.findFirst({
+      where: { orderNumber: req.params.orderNumber, isDeleted: false },
+    });
+    if (!order) return res.status(404).json({ message: "Vendor Process Order tidak ditemukan." });
+
+    const currentReadiness = await resolveVendorSendReadiness(prisma, order);
+    const balances = await findPreviousWipBalances(prisma, order);
+    const warehouseCodes = [...new Set(balances.map((row) => row.warehouseCode).filter(Boolean))];
+    const rackCodes = [...new Set(balances.map((row) => row.rackCode).filter(Boolean))];
+    const [warehouses, racks] = await Promise.all([
+      warehouseCodes.length
+        ? prisma.warehouse.findMany({
+          where: { warehouseCode: { in: warehouseCodes }, isDeleted: false, isActive: true },
+          select: { warehouseCode: true, warehouseName: true },
+        })
+        : [],
+      rackCodes.length
+        ? prisma.rack.findMany({
+          where: { rackCode: { in: rackCodes }, isDeleted: false, isActive: true },
+          select: { rackCode: true, rackName: true, warehouseCode: true },
+        })
+        : [],
+    ]);
+    const warehouseNames = new Map(warehouses.map((row) => [row.warehouseCode, row.warehouseName]));
+    const rackNames = new Map(racks.map((row) => [row.rackCode, row.rackName]));
+
+    const sameProcess = order.processId
+      ? { processId: order.processId }
+      : { processCode: order.processCode || null };
+    const candidateOrders = await prisma.vendorProcessOrder.findMany({
+      where: {
+        id: { not: order.id },
+        isDeleted: false,
+        vendorCode: order.vendorCode || null,
+        inputPartCode: order.inputPartCode || null,
+        uomCode: order.uomCode || null,
+        ...sameProcess,
+        status: { notIn: ["Sent", "Partial Received", "QC Hold", "Completed", "Closed", "Cancelled"] },
+      },
+      orderBy: [{ dueDate: "asc" }, { orderDate: "asc" }, { orderNumber: "asc" }],
+    });
+    const currentScheduleTime = new Date(vendorScheduleDate(order) || 0).getTime();
+    const candidateReadiness = await Promise.all(candidateOrders.map(async (candidate) => ({
+      candidate,
+      readiness: await resolveVendorSendReadiness(prisma, candidate),
+    })));
+
+    const scheduleRow = (item, readiness, locked = false) => {
+      const phase = parseVendorSchedulePhase(item.notes);
+      return {
+        orderNumber: item.orderNumber,
+        moNumber: item.moNumber,
+        processCode: item.processCode,
+        processName: item.processName,
+        vendorCode: item.vendorCode,
+        vendorName: item.vendorName,
+        inputPartCode: item.inputPartCode,
+        inputPartNumber: item.inputPartNumber,
+        inputPartName: item.inputPartName,
+        uomCode: item.uomCode,
+        qtyPlanned: roundQuantity(toNumber(item.qtyPlanned)),
+        qtySent: roundQuantity(toNumber(item.qtySent)),
+        qtyToSend: roundQuantity(Math.max(0, toNumber(item.qtyPlanned) - toNumber(item.qtySent))),
+        sendDate: phase.sendDate || item.orderDate,
+        dueDate: phase.returnDate || item.dueDate,
+        status: readiness.status,
+        materialReady: readiness.materialReady,
+        locked,
+      };
+    };
+
+    res.json({
+      item: {
+        order: scheduleRow(order, currentReadiness, true),
+        stockOptions: balances.map((balance) => ({
+          stockBalanceId: balance.id,
+          warehouseCode: balance.warehouseCode,
+          warehouseName: warehouseNames.get(balance.warehouseCode) || balance.warehouseCode,
+          rackCode: balance.rackCode || null,
+          rackName: balance.rackCode ? (rackNames.get(balance.rackCode) || balance.rackCode) : "Tanpa rack",
+          lotNumber: balance.lotNumber || null,
+          partCode: balance.partCode,
+          partNumber: balance.partNumber,
+          partName: balance.partName,
+          uomCode: balance.uomCode,
+          qtyAvailable: roundQuantity(toNumber(balance.qtyAvailable)),
+        })),
+        nextSchedules: candidateReadiness
+          .filter(({ candidate, readiness }) => {
+            const candidateTime = new Date(vendorScheduleDate(candidate) || 0).getTime();
+            return readiness.materialReady
+              && (!Number.isFinite(currentScheduleTime) || !Number.isFinite(candidateTime) || candidateTime >= currentScheduleTime);
+          })
+          .map(({ candidate, readiness }) => scheduleRow(candidate, readiness)),
+      },
     });
   } catch (err) {
     next(err);
@@ -1854,8 +2104,192 @@ exports.update = async (req, res, next) => {
   }
 };
 
+function sameVendorSendGroup(order, primary) {
+  const sameProcess = primary.processId
+    ? order.processId === primary.processId
+    : normalizeText(order.processCode) === normalizeText(primary.processCode);
+  return sameProcess
+    && normalizeText(order.vendorCode) === normalizeText(primary.vendorCode)
+    && normalizeText(order.inputPartCode) === normalizeText(primary.inputPartCode)
+    && normalizeText(order.uomCode) === normalizeText(primary.uomCode);
+}
+
+async function sendScheduledPreviousWip(tx, order, body, actor) {
+  if (["Closed", "Cancelled"].includes(order.status)) {
+    throw Object.assign(new Error(`${order.orderNumber} sudah closed/cancelled.`), { statusCode: 400 });
+  }
+
+  const readiness = await resolveVendorSendReadiness(tx, order);
+  if (!readiness.materialReady) {
+    throw Object.assign(new Error(`${order.orderNumber}: ${readiness.materialReadinessMessage}`), { statusCode: 409 });
+  }
+
+  const remaining = roundQuantity(toNumber(order.qtyPlanned) - toNumber(order.qtySent));
+  const requestedQty = roundQuantity(toNumber(body.qtySent || body.qty));
+  if (requestedQty <= 0 || Math.abs(requestedQty - remaining) > QUANTITY_TOLERANCE) {
+    throw Object.assign(
+      new Error(`${order.orderNumber}: qty kirim harus sama dengan sisa qty jadwal (${remaining} ${order.uomCode || ""}).`.trim()),
+      { statusCode: 400 },
+    );
+  }
+
+  const now = new Date();
+  const balances = await findPreviousWipBalances(tx, order, body);
+  const sourceMovements = await consumeSourceBalancesForVendorSend(
+    tx,
+    order,
+    balances,
+    requestedQty,
+    now,
+    actor,
+  );
+  if (!sourceMovements.length) {
+    throw Object.assign(new Error(`${order.orderNumber}: source WIP untuk kirim vendor tidak ditemukan.`), {
+      statusCode: 400,
+    });
+  }
+
+  const vendorTarget = {
+    warehouseCode: normalizeText(body.vendorWarehouseCode),
+    rackCode: normalizeText(body.vendorRackCode),
+    lotNumber: normalizeText(body.vendorLotNumber || body.lotNumber),
+  };
+  const destinationRackCode = await resolveInternalRackCode(tx, vendorTarget.rackCode);
+  const movementNumbers = [];
+  for (const sourceMovementData of sourceMovements) {
+    const movementNumber = await generateMovementNumber("OUT", tx);
+    await tx.stockMovement.create({
+      data: {
+        movementNumber,
+        movementDate: now,
+        movementType: "OUT",
+        direction: "OUT",
+        transactionType: "VENDOR_SEND",
+        warehouseCode: sourceMovementData.warehouseCode,
+        rackCode: sourceMovementData.rackCode || null,
+        destinationWarehouseCode: vendorTarget.warehouseCode || null,
+        destinationRackCode,
+        lotNumber: sourceMovementData.lotNumber || null,
+        partCode: sourceMovementData.partCode,
+        partNumber: sourceMovementData.partNumber,
+        partName: sourceMovementData.partName,
+        productId: sourceMovementData.productId,
+        description: sourceMovementData.description,
+        spec: sourceMovementData.spec,
+        thickness: sourceMovementData.thickness,
+        width: sourceMovementData.width,
+        CSP: sourceMovementData.CSP,
+        stockType: sourceMovementData.stockType,
+        qty: sourceMovementData.qty || requestedQty,
+        deltaQty: -(sourceMovementData.qty || requestedQty),
+        qtyBefore: sourceMovementData.qtyBefore,
+        qtyAfter: sourceMovementData.qtyAfter,
+        uomCode: order.uomCode || null,
+        referenceType: "VENDOR_PROCESS_ORDER",
+        referenceNumber: order.orderNumber,
+        notes: sourceMovementData.notes,
+        performedBy: sourceMovementData.performedBy || actor,
+      },
+    });
+    movementNumbers.push(movementNumber);
+  }
+
+  const primarySource = sourceMovements[0];
+  const updated = await tx.vendorProcessOrder.update({
+    where: { id: order.id },
+    data: {
+      qtySent: roundQuantity(toNumber(order.qtySent) + requestedQty),
+      sourceWarehouseCode: primarySource.warehouseCode,
+      sourceRackCode: primarySource.rackCode || null,
+      sourceLotNumber: primarySource.lotNumber || null,
+      vendorWarehouseCode: vendorTarget.warehouseCode || order.vendorWarehouseCode,
+      vendorRackCode: vendorTarget.rackCode || order.vendorRackCode,
+      vendorLotNumber: vendorTarget.lotNumber || order.vendorLotNumber,
+      sentAt: order.sentAt || now,
+      status: "Sent",
+    },
+  });
+
+  const capacityAllocationId = String(order.notes || "").match(/\[CAPACITY-VENDOR:([^\]]+)\]/)?.[1] || null;
+  if (capacityAllocationId) {
+    await tx.dailyProductionSchedule.updateMany({
+      where: {
+        moId: order.moId,
+        productionPlanAllocationId: capacityAllocationId,
+        isDeleted: false,
+        status: { in: ["Draft", "Released", "In Progress"] },
+      },
+      data: { status: "In Progress" },
+    });
+  }
+
+  return { updated, movementNumber: movementNumbers[0], movementNumbers };
+}
+
 exports.send = async (req, res, next) => {
   try {
+    if (Array.isArray(req.body?.shipments)) {
+      const shipments = req.body.shipments.map((row) => ({
+        orderNumber: normalizeText(row?.orderNumber),
+        qtySent: roundQuantity(toNumber(row?.qtySent || row?.qty)),
+      }));
+      const uniqueOrderNumbers = new Set(shipments.map((row) => row.orderNumber).filter(Boolean));
+      if (!shipments.length || shipments.length > 20 || uniqueOrderNumbers.size !== shipments.length) {
+        throw Object.assign(new Error("Daftar jadwal kirim kosong, duplikat, atau melebihi 20 jadwal."), { statusCode: 400 });
+      }
+      if (!uniqueOrderNumbers.has(req.params.orderNumber)) {
+        throw Object.assign(new Error("Jadwal utama wajib ikut dalam pengiriman."), { statusCode: 400 });
+      }
+      const selectedBalanceIds = Array.isArray(req.body.sourceStockBalanceIds)
+        ? [...new Set(req.body.sourceStockBalanceIds.map(normalizeText).filter(Boolean))]
+        : [];
+      if (!normalizeText(req.body.sourceWarehouseCode) || !selectedBalanceIds.length || selectedBalanceIds.length > 100) {
+        throw Object.assign(new Error("Pilih warehouse dan minimal satu stock WIP sumber."), { statusCode: 400 });
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const orders = await tx.vendorProcessOrder.findMany({
+          where: { orderNumber: { in: [...uniqueOrderNumbers] }, isDeleted: false },
+        });
+        if (orders.length !== shipments.length) {
+          throw Object.assign(new Error("Satu atau lebih jadwal vendor tidak ditemukan."), { statusCode: 404 });
+        }
+        const orderByNumber = new Map(orders.map((order) => [order.orderNumber, order]));
+        const primary = orderByNumber.get(req.params.orderNumber);
+        if (orders.some((order) => !sameVendorSendGroup(order, primary))) {
+          throw Object.assign(
+            new Error("Jadwal gabungan harus menggunakan vendor, proses, part input, dan UOM yang sama."),
+            { statusCode: 400 },
+          );
+        }
+
+        const actor = req.user?.username || req.user?.email || "system";
+        const orderedShipments = [
+          shipments.find((row) => row.orderNumber === req.params.orderNumber),
+          ...shipments.filter((row) => row.orderNumber !== req.params.orderNumber),
+        ];
+        const sent = [];
+        for (const shipment of orderedShipments) {
+          sent.push(await sendScheduledPreviousWip(tx, orderByNumber.get(shipment.orderNumber), {
+            ...req.body,
+            sourceType: SOURCE_PREVIOUS_WIP,
+            qtySent: shipment.qtySent,
+            sourceStockBalanceIds: selectedBalanceIds,
+          }, actor));
+        }
+        return sent;
+      });
+
+      const movementNumbers = result.flatMap((row) => row.movementNumbers);
+      return res.json({
+        message: `${result.length} jadwal berhasil dikirim ke vendor dalam satu transaksi.`,
+        movementNumber: movementNumbers[0] || null,
+        movementNumbers,
+        items: result.map((row) => mapDoc(row.updated)),
+        item: mapDoc(result[0].updated),
+      });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       const order = await tx.vendorProcessOrder.findFirst({
         where: {
@@ -2257,6 +2691,13 @@ exports.receive = async (req, res, next) => {
         req.body || {},
         req.user?.username || req.user?.email || "system",
       );
+      const qualityInspection = await createVendorReceiptQualityInspection(
+        tx,
+        order,
+        receipt,
+        req.body || {},
+        req.user?.username || req.user?.email || "system",
+      );
       const vendorRate = toNumber(order.vendorRate);
       const qtyReceived = roundQuantity(toNumber(order.qtyReceived) + receipt.qty);
       const effectiveSentQty = Math.max(toNumber(order.qtySent || 0), qtyReceived);
@@ -2271,17 +2712,18 @@ exports.receive = async (req, res, next) => {
           receiveWarehouseCode: normalizeText(req.body?.warehouseCode || req.body?.receiveWarehouseCode),
           receiveRackCode: normalizeText(req.body?.rackCode || req.body?.receiveRackCode),
           receiveLotNumber: normalizeText(req.body?.lotNumber || req.body?.receiveLotNumber),
-          receivedAt: order.receivedAt || new Date(),
+          receivedAt: order.receivedAt || receipt.receivedAt,
           status,
         },
       });
 
-      return { updated, movementNumber: receipt.movementNumber };
+      return { updated, movementNumber: receipt.movementNumber, qualityInspection };
     });
 
     res.json({
       message: "Vendor output received to QC Hold.",
       movementNumber: result.movementNumber,
+      qualityInspection: mapDoc(result.qualityInspection),
       item: mapDoc(result.updated),
     });
   } catch (err) {

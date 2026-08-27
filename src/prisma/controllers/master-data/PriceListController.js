@@ -2,6 +2,13 @@ const { prisma } = require("../../index");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertNumericFields } = require("../../utils/numericConverter");
+const { assertReference } = require("../../utils/referenceValidation");
+
+const validateReferences = async (data, current = {}) => {
+  await assertReference({ delegate: prisma.part, field: "partCode", value: data.partCode, currentValue: current.partCode, key: "partCode", label: "Part", activeWhere: { status: "Active" } });
+  await assertReference({ delegate: prisma.material, field: "materialCode", value: data.materialCode, currentValue: current.materialCode, key: "materialCode", label: "Material" });
+  await assertReference({ delegate: prisma.supplier, field: "supplierCode", value: data.supplierCode, currentValue: current.supplierCode, key: "supplierCode", label: "Supplier", activeWhere: { status: "Active" } });
+};
 
 exports.list = async (req, res, next) => {
   try {
@@ -102,6 +109,8 @@ exports.create = async (req, res, next) => {
       convertedData.priceListCode = `${datePrefix}-${String(sequence).padStart(3, '0')}`;
     }
 
+    await validateReferences(convertedData);
+
     const doc = await prisma.priceList.create({
       data: convertedData,
     });
@@ -118,6 +127,9 @@ exports.update = async (req, res, next) => {
       "partDiameter",
       "materialThickness",
     ]);
+    const current = await prisma.priceList.findUnique({ where: { id: req.params.id } });
+    if (!current) return res.status(404).json({ message: "Price list not found" });
+    await validateReferences(convertedData, current);
     
     const doc = await prisma.priceList.update({
       where: { id: req.params.id },

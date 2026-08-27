@@ -2,6 +2,7 @@ const router = require("express").Router();
 const ctrl = require("../../controllers/outgoing/OutgoingTransactionController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
+router.get("/delivery-board", authorize("salesOrder", "read"), ctrl.deliveryBoard);
 router.post("/delivery-schedules", authorize("salesOrder", "create"), logger("delivery-schedule", "create"), ctrl.createSchedule);
 router.post("/delivery-schedules/:scheduleNumber/pick", authorize("salesOrder", "update"), logger("delivery-schedule", "pick"), ctrl.pick);
 router.post("/delivery-schedules/:scheduleNumber/pack", authorize("salesOrder", "update"), logger("delivery-schedule", "pack"), ctrl.pack);

@@ -3,7 +3,7 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { parseFilter } = require("../../utils/parseFilter");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 
 function formatQtyWithUom(qty, uomCode) {
   return [qty, uomCode].filter((value) => value !== null && value !== undefined && value !== "").join(" ");
@@ -892,6 +892,12 @@ exports.wipTransfer = async (req, res, next) => {
         });
       } else if (movementDirection === "IN") {
         // Hanya buat baru kalau arah IN
+        await assertStockIdentityNotFrozen(tx, {
+          warehouseCode,
+          rackCode: rackCode || null,
+          lotNumber: lotNumber || null,
+          stockType: stockTypeValue,
+        });
         await tx.stockBalance.create({
           data: {
             warehouseCode,

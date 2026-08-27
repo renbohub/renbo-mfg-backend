@@ -15,7 +15,7 @@ const {
   buildExcludeSpecialRackCondition,
   isSpecialRackCode,
 } = require("../inventory/utils/stockReservationHelpers");
-const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const { assertQuantity } = require("../../utils/uomQuantity");
 
 // Generate nomor Material Issue otomatis: MI-YYYYMMDD-001
@@ -405,6 +405,93 @@ const mapMaterialIssueDetailInput = async (tx, detail = {}, index = 0, issueId) 
   };
 };
 
+function buildProductionReservationScopes(moNumber, reservationPartCode) {
+  return [
+    moNumber ? {
+      referenceType: "MANUFACTURING_ORDER",
+      OR: [
+        { referenceNumber: moNumber },
+        { referenceNumber: { startsWith: `${moNumber}#` } },
+      ],
+    } : null,
+    reservationPartCode ? {
+      referenceType: "PART_ALLOCATION",
+      targetPartCode: reservationPartCode,
+    } : null,
+  ].filter(Boolean);
+}
+
+async function findActiveProductionReservations(tx, {
+  stockBalanceId,
+  moNumber,
+  reservationPartCode,
+} = {}) {
+  const scopes = buildProductionReservationScopes(moNumber, reservationPartCode);
+  if (!stockBalanceId || scopes.length === 0) return [];
+
+  const reservations = await tx.stockReservation.findMany({
+    where: {
+      stockBalanceId,
+      status: "Active",
+      isDeleted: false,
+      OR: scopes,
+    },
+    orderBy: { createdAt: "asc" },
+    select: {
+      id: true,
+      referenceType: true,
+      qtyReserved: true,
+      qtyReleased: true,
+    },
+  });
+
+  // MO-specific locks are consumed first. A target-part allocation is the
+  // fallback stock pool for the same raw part and must never be used by a
+  // different part sharing the material master.
+  return reservations.sort((left, right) => {
+    const leftPriority = left.referenceType === "MANUFACTURING_ORDER" ? 0 : 1;
+    const rightPriority = right.referenceType === "MANUFACTURING_ORDER" ? 0 : 1;
+    return leftPriority - rightPriority;
+  });
+}
+
+function openProductionReservationQty(reservations = []) {
+  return reservations.reduce(
+    (sum, reservation) => sum + Math.max(
+      0,
+      Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0),
+    ),
+    0,
+  );
+}
+
+async function releaseProductionReservations(tx, activeReservations, qtyToRelease) {
+  let remaining = Math.max(0, Number(qtyToRelease || 0));
+  let released = 0;
+
+  for (const reservation of activeReservations) {
+    if (!hasEnoughMaterialIssueQty(remaining, 0.001)) break;
+    const openQty = Math.max(
+      0,
+      Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0),
+    );
+    const releaseQty = Math.min(openQty, remaining);
+    if (!hasEnoughMaterialIssueQty(releaseQty, 0.001)) continue;
+    const nextReleasedQty = Number(reservation.qtyReleased || 0) + releaseQty;
+    await tx.stockReservation.update({
+      where: { id: reservation.id },
+      data: {
+        qtyReleased: nextReleasedQty,
+        status: nextReleasedQty >= Number(reservation.qtyReserved || 0) ? "Released" : "Active",
+      },
+    });
+    released += releaseQty;
+    remaining -= releaseQty;
+  }
+
+  return released;
+}
+
 async function prepareDppMaterialIssueSources(tx, issue) {
   if (!String(issue.notes || "").includes("[DPS-CONSUME:")) return issue.details || [];
 
@@ -417,6 +504,7 @@ async function prepareDppMaterialIssueSources(tx, issue) {
     const identity = await resolveMaterialIssueIdentity(tx, detail);
     const noteTokens = materialIssueNoteTokens(detail.notes);
     const materialCode = String(noteTokens.material || "").trim() || null;
+    const reservationPartCode = String(detail.partCode || identity.partCode || "").trim() || null;
     const sourceIdentityFilters = [
       detail.stockBalanceId ? { id: detail.stockBalanceId } : null,
       materialCode ? { materialCode: { equals: materialCode, mode: "insensitive" } } : null,
@@ -446,17 +534,17 @@ async function prepareDppMaterialIssueSources(tx, issue) {
         qtyAvailable: true,
       },
     });
-    const reservations = issue.manufacturingOrder?.moNumber && balances.length
+    const reservationScopes = buildProductionReservationScopes(
+      issue.manufacturingOrder?.moNumber || null,
+      reservationPartCode,
+    );
+    const reservations = balances.length && reservationScopes.length
       ? await tx.stockReservation.findMany({
           where: {
             stockBalanceId: { in: balances.map((balance) => balance.id) },
-            referenceType: "MANUFACTURING_ORDER",
-            OR: [
-              { referenceNumber: issue.manufacturingOrder.moNumber },
-              { referenceNumber: { startsWith: `${issue.manufacturingOrder.moNumber}#` } },
-            ],
             status: "Active",
             isDeleted: false,
+            OR: reservationScopes,
           },
           select: { stockBalanceId: true, qtyReserved: true, qtyReleased: true },
         })
@@ -1058,21 +1146,14 @@ exports.issue = async (req, res, next) => {
         });
 
         const moNumber = existing.manufacturingOrder?.moNumber || null;
-        let activeReservation = null;
-
-        if (moNumber && stockBalance) {
-          activeReservation = await tx.stockReservation.findFirst({
-            where: {
+        const reservationPartCode = String(identity.partCode || detail.partCode || "").trim() || null;
+        let activeReservations = stockBalance
+          ? await findActiveProductionReservations(tx, {
               stockBalanceId: stockBalance.id,
-              referenceType: "MANUFACTURING_ORDER",
-              OR: [{ referenceNumber: moNumber }, { referenceNumber: { startsWith: `${moNumber}#` } }],
-              status: "Active",
-              isDeleted: false,
-            },
-            orderBy: { createdAt: "asc" },
-            select: { id: true, qtyReserved: true, qtyReleased: true },
-          });
-        }
+              moNumber,
+              reservationPartCode,
+            })
+          : [];
 
         if (!stockBalance && moNumber) {
           const reservationWhere = {
@@ -1082,7 +1163,6 @@ exports.issue = async (req, res, next) => {
             status: "Active",
             isDeleted: false,
           };
-          const reservationPartCode = identity.partCode || detail.partCode;
           if (reservationPartCode) reservationWhere.partCode = reservationPartCode;
           if (identity.productId) reservationWhere.productId = identity.productId;
           if (identity.description) reservationWhere.description = identity.description;
@@ -1176,11 +1256,11 @@ exports.issue = async (req, res, next) => {
           if (reservation?.stockBalance && !reservation.stockBalance.isDeleted) {
             const { isDeleted: _isDeleted, ...reservationStockBalance } = reservation.stockBalance;
             stockBalance = reservationStockBalance;
-            activeReservation = {
-              id: reservation.id,
-              qtyReserved: reservation.qtyReserved,
-              qtyReleased: reservation.qtyReleased,
-            };
+            activeReservations = await findActiveProductionReservations(tx, {
+              stockBalanceId: stockBalance.id,
+              moNumber,
+              reservationPartCode,
+            });
           }
         }
 
@@ -1196,10 +1276,7 @@ exports.issue = async (req, res, next) => {
             `Stok ${detail.partCode || detail.description || "item"} berada di special rack ${stockBalance.rackCode} dan tidak boleh dipakai untuk Material Issue produksi`
           );
         }
-        let qtyStillReserved = Math.max(
-          0,
-          Number(activeReservation?.qtyReserved || 0) - Number(activeReservation?.qtyReleased || 0)
-        );
+        let qtyStillReserved = openProductionReservationQty(activeReservations);
         let reservationReleaseQty = Math.min(qtyToIssue, qtyStillReserved);
         let nextReservedQty = Math.max(0, Number(stockBalance.qtyReserved) - reservationReleaseQty);
         let issuableQty = Number(stockBalance.qtyAvailable || 0) + qtyStillReserved;
@@ -1235,23 +1312,17 @@ exports.issue = async (req, res, next) => {
           }) : [];
 
           for (const candidate of alternateBalances) {
-            const candidateReservation = moNumber ? await tx.stockReservation.findFirst({
-              where: {
-                stockBalanceId: candidate.id,
-                referenceType: "MANUFACTURING_ORDER",
-                OR: [{ referenceNumber: moNumber }, { referenceNumber: { startsWith: `${moNumber}#` } }],
-                status: "Active",
-                isDeleted: false,
-              },
-              orderBy: { createdAt: "asc" },
-              select: { id: true, qtyReserved: true, qtyReleased: true },
-            }) : null;
-            const candidateReserved = Math.max(0, Number(candidateReservation?.qtyReserved || 0) - Number(candidateReservation?.qtyReleased || 0));
+            const candidateReservations = await findActiveProductionReservations(tx, {
+              stockBalanceId: candidate.id,
+              moNumber,
+              reservationPartCode,
+            });
+            const candidateReserved = openProductionReservationQty(candidateReservations);
             const candidateIssuable = Number(candidate.qtyAvailable || 0) + candidateReserved;
             if (!hasEnoughMaterialIssueQty(candidateIssuable, qtyToIssue)) continue;
 
             stockBalance = candidate;
-            activeReservation = candidateReservation;
+            activeReservations = candidateReservations;
             qtyStillReserved = candidateReserved;
             reservationReleaseQty = Math.min(qtyToIssue, qtyStillReserved);
             nextReservedQty = Math.max(0, Number(stockBalance.qtyReserved) - reservationReleaseQty);
@@ -1315,15 +1386,8 @@ exports.issue = async (req, res, next) => {
           },
         });
 
-        if (activeReservation && reservationReleaseQty > 0) {
-          const nextReleasedQty = Number(activeReservation.qtyReleased || 0) + reservationReleaseQty;
-          await tx.stockReservation.update({
-            where: { id: activeReservation.id },
-            data: {
-              qtyReleased: nextReleasedQty,
-              status: nextReleasedQty >= Number(activeReservation.qtyReserved || 0) ? "Released" : "Active",
-            },
-          });
+        if (activeReservations.length > 0 && reservationReleaseQty > 0) {
+          await releaseProductionReservations(tx, activeReservations, reservationReleaseQty);
         }
 
         // Update stock balance. Reservation ikut dilepas karena barang sudah keluar dari gudang.
@@ -1502,6 +1566,13 @@ exports.close = async (req, res, next) => {
           });
         } else {
           // Balance tidak ada → buat baru
+          const returnedStockType = detail.stockType || (identity.materialId || identity.materialCode ? "Material" : "Purchase Part");
+          await assertStockIdentityNotFrozen(tx, {
+            warehouseCode: existing.warehouseCode,
+            rackCode: detail.rackCode || null,
+            lotNumber: detail.lotNumber || null,
+            stockType: returnedStockType,
+          });
           await tx.stockBalance.create({
             data: {
               warehouseCode: existing.warehouseCode,
@@ -1517,6 +1588,7 @@ exports.close = async (req, res, next) => {
               description: identity.description || null,
               lotNumber: detail.lotNumber || null,
               uomCode: detail.uomCode || null,
+              stockType: returnedStockType,
               qtyOnHand: qtyToReturn,
               qtyReserved: 0,
               qtyAvailable: qtyToReturn,

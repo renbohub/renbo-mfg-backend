@@ -6,7 +6,7 @@ const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const {
   assertStockBalanceNotFrozen,
-  assertWarehouseNotFrozen,
+  assertStockIdentityNotFrozen,
 } = require("./utils/stockOpnameFreezeGuard");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const { assertQuantity } = require("../../utils/uomQuantity");
@@ -89,7 +89,12 @@ async function findOrCreateBalance(tx, input, warehouseCode, rackCode, qty, dire
     qtyReserved: 0,
     qtyQC: 0,
   });
-  await assertWarehouseNotFrozen(tx, warehouseCode);
+  await assertStockIdentityNotFrozen(tx, {
+    warehouseCode,
+    rackCode: where.rackCode || null,
+    lotNumber: where.lotNumber || null,
+    stockType: text(input.stockType),
+  });
   const balance = await tx.stockBalance.create({
     data: {
       ...where,

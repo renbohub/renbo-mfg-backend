@@ -718,7 +718,82 @@ async function buildProductionMaterialGate(prisma, planOrNumber) {
 
 function materialGateForJob(gate, job = {}) {
   const targetId = job.sourceDeliveryTargetId || job.deliveryTargetId || job.id || null;
-  return (targetId && gate?.phaseGates?.[targetId]) || gate || null;
+  if (!gate) return null;
+  if (targetId && gate.phaseGates?.[targetId]) {
+    return { ...gate.phaseGates[targetId], matchStatus: "PHASE_MATCHED" };
+  }
+
+  const scopeTargetIds = [...new Set((job.materialScopeDeliveryTargetIds || []).filter(Boolean))];
+  if (!targetId && scopeTargetIds.length) {
+    const scopeSet = new Set(scopeTargetIds.map(String));
+    const scopedItems = (gate.items || []).filter((item) =>
+      (item.deliveryTargetIds || []).some((itemTargetId) => scopeSet.has(String(itemTargetId))));
+    const identity = {
+      planNumber: gate.planNumber || null,
+      mpsNumber: gate.mpsNumber || null,
+      mrpRunNumber: gate.mrpRunNumber || null,
+      suggestionNumber: gate.suggestionNumber || null,
+      suggestionStatus: gate.suggestionStatus || null,
+      deliveryTargetIds: scopeTargetIds,
+    };
+    if (scopedItems.length) {
+      return {
+        ...summarizeMaterialGates(scopedItems, identity),
+        matchStatus: "FG_TARGETS_MATCHED",
+      };
+    }
+    return {
+      ...identity,
+      readyDate: null,
+      source: "NO_FG_PURCHASE_REQUIREMENT",
+      confirmed: true,
+      itemCount: 0,
+      confirmedItemCount: 0,
+      fallbackItemCount: 0,
+      criticalItems: [],
+      matchStatus: "FG_TARGETS_NOT_IN_PURCHASE_REQUIREMENT",
+    };
+  }
+
+  // A purchase suggestion only carries delivery targets that actually create
+  // a net purchase requirement. Earlier phases may be fully covered by stock,
+  // so their IDs are intentionally absent from phaseGates. Falling back to the
+  // overall gate would make those phases inherit an unrelated later shortage
+  // (for example a different FG's material due at month end).
+  if (targetId && Object.keys(gate.phaseGates || {}).length > 0) {
+    return {
+      planNumber: gate.planNumber || null,
+      mpsNumber: gate.mpsNumber || null,
+      mrpRunNumber: gate.mrpRunNumber || null,
+      suggestionNumber: gate.suggestionNumber || null,
+      suggestionStatus: gate.suggestionStatus || null,
+      deliveryTargetId: targetId,
+      readyDate: null,
+      source: "NO_PHASE_PURCHASE_REQUIREMENT",
+      confirmed: true,
+      itemCount: 0,
+      confirmedItemCount: 0,
+      fallbackItemCount: 0,
+      criticalItems: [],
+      matchStatus: "PHASE_NOT_IN_PURCHASE_REQUIREMENT",
+    };
+  }
+
+  return { ...gate, matchStatus: targetId ? "OVERALL_NO_PHASE_GATE" : "OVERALL_FALLBACK" };
+}
+
+function planningMaterialDisposition(materialReadiness = {}) {
+  if (materialReadiness.ready !== false) return { allowed: true, warnings: [] };
+  return {
+    allowed: true,
+    warnings: [{
+      code: "MATERIAL_NOT_READY",
+      severity: "WARNING",
+      blocking: false,
+      message: "Material belum siap sesuai tanggal planning. MPP dan Daily Plan tetap dapat direlease; validasi stok aktual dijalankan sebelum material issue/produksi.",
+      materialReadiness,
+    }],
+  };
 }
 
 module.exports = {
@@ -727,4 +802,5 @@ module.exports = {
   materialGateForJob,
   resolveSuggestionMaterialGate,
   suggestionSystemMaterialDate,
+  planningMaterialDisposition,
 };

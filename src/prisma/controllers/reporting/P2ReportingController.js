@@ -316,7 +316,7 @@ exports.inventory = async (req, res, next) => {
       }),
       prisma.stockBalance.findMany({ where, select }),
       prisma.stockBalance.count({ where }),
-      buildFgCompStockTraceability(prisma, { q, warehouseCode: req.query.warehouseCode }),
+      buildFgCompStockTraceability(prisma, { q, warehouseCode: req.query.warehouseCode, includeValuation: true }),
     ]);
     const mapRow = (row) => {
       const agingDays = daysOld(row.lastMovement);

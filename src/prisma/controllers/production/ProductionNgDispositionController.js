@@ -1,6 +1,7 @@
 const { prisma } = require("../../index");
 const { mapDoc } = require("../../utils/mapDoc");
 const { parseFilter } = require("../../utils/parseFilter");
+const { finalizeProductionLogNgDisposition } = require("./ProductionLogController");
 
 const TOLERANCE = 0.000001;
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
@@ -121,17 +122,21 @@ exports.judge = async (req, res, next) => {
         },
         include,
       });
-      const aggregate = await tx.productionLogNgReason.aggregate({
-        where: { productionLogId: current.productionLogId, isDeleted: false },
-        _sum: { qtyRework: true },
-      });
-      await tx.productionLog.update({
-        where: { id: current.productionLogId },
-        data: { qtyRework: number(aggregate._sum.qtyRework) },
-      });
-      return updated;
+      const disposition = await finalizeProductionLogNgDisposition(
+        tx,
+        current.productionLogId,
+        {},
+        req.user?.username || req.user?.email || "system",
+      );
+      return { updated, disposition };
     });
-    res.json({ message: "QC judgment NG tersimpan.", item: present(result) });
+    res.json({
+      message: result.disposition.finalized
+        ? "QC judgment NG tersimpan dan disposition sudah diproses."
+        : "QC judgment NG tersimpan.",
+      item: present(result.updated),
+      disposition: result.disposition,
+    });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     next(error);

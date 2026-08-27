@@ -16,7 +16,7 @@ const incomingController = read("backend/src/prisma/controllers/incoming/Incomin
 const purchaseOrderController = read("backend/src/prisma/controllers/purchasing/PurchaseOrderController.js");
 
 const checks = [
-  [inventory.includes('root.fgOnHand += Math.round(uomStock(fg.fgStock, "pcs", "qtyOnHand"))'), "FG matrix must use physical on-hand, not available"],
+  [inventory.includes('const rootFgOnHand = Math.round(uomStock(fg.fgStock, "pcs", "qtyOnHand"))') && inventory.includes("root.fgOnHand += rootFgOnHand"), "FG matrix must use physical on-hand, not available"],
   [inventory.includes('matrixQty(row.materialAvailable'), "Material Free must use authoritative qtyAvailable"],
   [!inventory.includes("row.materialAvailable - row.materialAllocated"), "Historical GR pegging must not reduce current free stock"],
   [inventory.includes('"TOTAL PHYSICAL"'), "Inventory matrix must expose Material/WIP/FG totals"],

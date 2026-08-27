@@ -2,8 +2,14 @@
 
 const { planningMonthKey, utcMonthStart, utcMonthEnd, nextPlanningMonthKey } = require("../../utils/planningMonth");
 const { buildFgCompStockTraceability } = require("../inventory/fgCompStockTraceabilityService");
+const { buildYearlyDemand } = require("./yearlyDemandService");
+const { buildDeliveryPerformance, phaseDeliveryStatus } = require("./deliveryPerformanceService");
+const { getMpsDeliveryGate } = require("./mpsDeliveryFeasibilityService");
+const { loadAdditionalDemandCoverage } = require("./additionalDemandCoverageService");
 
 const EPSILON = 0.000001;
+const WORKING_HOURS_PER_DAY = 14;
+const MINIMUM_WIP_LEAD_TIME_HOURS = 2;
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 6) => {
   const factor = 10 ** digits;
@@ -14,6 +20,254 @@ const isSalesReservation = (row) => ["SO", "SALES_ORDER", "SALES ORDER"].include
 const remainingReservation = (row) => Math.max(number(row?.qtyReserved) - number(row?.qtyReleased), 0);
 const remainingMo = (row) => Math.max(number(row?.qtyPlanned) - Math.max(number(row?.qtyGood), number(row?.qtyProduced)) - number(row?.qtyReject), 0);
 const dateValue = (value, fallback) => value ? new Date(value) : new Date(fallback);
+const leadTimeInDays = (value, unit) => {
+  const duration = number(value);
+  switch (text(unit).toUpperCase()) {
+    case "HOUR": return duration / 24;
+    case "WEEK": return duration * 7;
+    case "MONTH": return duration * 30;
+    default: return duration;
+  }
+};
+const planningProcess = (row, category, fallbackVendorLeadTimeDays = 0) => {
+  const routingMode = text(row?.routingMode || "INHOUSE").toUpperCase();
+  const isVendor = routingMode === "VENDOR"
+    || text(category).toUpperCase() === "VENDOR"
+    || row?.routingOperation?.isSubcontract === true;
+  return {
+    id: row.id, sequence: number(row.sequence), processCode: row.process?.processCode || null,
+    processName: row.process?.processName || row.process?.processCode || "Process",
+    occurrenceCode: row.occurrenceCode || null, routingNumber: row.routingNumber || null,
+    routingMode: isVendor ? "VENDOR" : routingMode,
+    isVendor,
+    cycleTimeSeconds: number(row.routingOperation?.cycleSeconds) || number(row.cycleTime),
+    vendorCode: row.vendor?.vendorCode || null,
+    vendorName: row.vendor?.vendorName || null,
+    vendorLeadTimeDays: isVendor ? (number(row.vendor?.leadTimeDays) || number(fallbackVendorLeadTimeDays)) : 0,
+  };
+};
+const operationalRequirementQty = (value, uomCode) => {
+  const qty = Math.max(number(value), 0);
+  return ["PCS", "PC", "UNIT", "EA"].includes(text(uomCode).toUpperCase())
+    ? Math.ceil(qty - EPSILON)
+    : round(qty, 3);
+};
+const componentRequirementMatchesPhase = (requirement, phase) => {
+  if (phase.deliveryTargetId) return requirement.deliveryTargetId === phase.deliveryTargetId;
+  const phaseReference = text(phase.sourceNumber);
+  return Boolean(phaseReference && [requirement.rootDemandSourceNumber, requirement.sourceNumber].some((value) => text(value) === phaseReference));
+};
+const bufferAllocationMode = (value) => String(value || "").toUpperCase() === "DISTRIBUTE_TO_PHASES"
+  ? "DISTRIBUTE_TO_PHASES"
+  : "SEPARATE_END_MONTH";
+const buildComponentPhaseNetting = ({ component, phases, receipts, officialRequirements = [] }) => {
+  let stockPool = number(component.availableStockQty);
+  let receiptPool = 0;
+  let receiptIndex = 0;
+  const receiptEvents = receipts
+    .map((row) => ({ date: row.plannedEndDate, qty: remainingMo(row), reference: row.moNumber }))
+    .filter((row) => row.qty > EPSILON)
+    .sort((left, right) => dateValue(left.date, new Date(0)) - dateValue(right.date, new Date(0)));
+  return phases.map((phase, phaseIndex) => {
+    const phaseDate = dateValue(phase.fgRequiredDate || phase.targetDeliveryDate, new Date(8640000000000000));
+    while (receiptIndex < receiptEvents.length && dateValue(receiptEvents[receiptIndex].date, phaseDate) <= phaseDate) {
+      receiptPool += receiptEvents[receiptIndex].qty;
+      receiptIndex += 1;
+    }
+    const openingStockQty = round(stockPool);
+    const openingFirmReceiptQty = round(receiptPool);
+    const previewGrossQty = operationalRequirementQty(number(component.qtyPerFg) * number(phase.plannedProductionQty || phase.qty), component.uomCode);
+    const stockUsedQty = Math.min(stockPool, previewGrossQty);
+    stockPool -= stockUsedQty;
+    const afterStockQty = Math.max(previewGrossQty - stockUsedQty, 0);
+    const firmReceiptUsedQty = Math.min(receiptPool, afterStockQty);
+    receiptPool -= firmReceiptUsedQty;
+    const previewNetQty = round(Math.max(afterStockQty - firmReceiptUsedQty, 0));
+    const official = officialRequirements.filter((row) => componentRequirementMatchesPhase(row, phase)
+      && [row.grossRequirement, row.netRequirement, row.plannedOrderQty].some((value) => number(value) > EPSILON));
+    if (official.length) {
+      const grossRequirementQty = round(official.reduce((sum, row) => sum + number(row.grossRequirement), 0));
+      const netRequirementQty = round(official.reduce((sum, row) => sum + number(row.netRequirement), 0));
+      const officialPlannedQty = round(official.reduce((sum, row) => sum + number(row.plannedOrderQty), 0));
+      return {
+        phaseId: phase.id || String(phaseIndex), phaseIndex, source: "OFFICIAL_MRP",
+        grossRequirementQty: previewGrossQty, stockUsedQty: round(stockUsedQty), firmReceiptUsedQty: round(firmReceiptUsedQty),
+        netRequirementQty: previewNetQty, plannedOrderQty: previewNetQty, projectedAvailableQty: round(stockPool + receiptPool),
+        openingStockQty, openingFirmReceiptQty, endingStockQty: round(stockPool), endingFirmReceiptQty: round(receiptPool),
+        officialGrossRequirementQty: grossRequirementQty, officialNetRequirementQty: netRequirementQty,
+        officialPlannedOrderQty: officialPlannedQty > EPSILON ? officialPlannedQty : netRequirementQty,
+      };
+    }
+    return {
+      phaseId: phase.id || String(phaseIndex), phaseIndex, source: "WORKBENCH_PREVIEW",
+      grossRequirementQty: previewGrossQty, stockUsedQty: round(stockUsedQty), firmReceiptUsedQty: round(firmReceiptUsedQty),
+      netRequirementQty: previewNetQty, plannedOrderQty: previewNetQty, projectedAvailableQty: round(stockPool + receiptPool),
+      openingStockQty, openingFirmReceiptQty, endingStockQty: round(stockPool), endingFirmReceiptQty: round(receiptPool),
+    };
+  });
+};
+const buildCascadingComponentNetting = ({ components, rootPartCode, phases, receipts }) => {
+  const ordered = [...components].sort((left, right) => number(left.level) - number(right.level) || text(left.partCode).localeCompare(text(right.partCode), "id", { numeric: true }));
+  const states = new Map();
+  const phaseNettingByPart = new Map(ordered.map((component) => [component.partCode, []]));
+  for (const component of ordered) {
+    const receiptEvents = receipts.filter((row) => row.part?.partCode === component.partCode)
+      .map((row) => ({ date: row.plannedEndDate, qty: remainingMo(row), reference: row.moNumber }))
+      .filter((row) => row.qty > EPSILON)
+      .sort((left, right) => dateValue(left.date, new Date(0)) - dateValue(right.date, new Date(0)));
+    states.set(component.partCode, { stockPool: number(component.availableStockQty), receiptPool: 0, receiptIndex: 0, receiptEvents });
+  }
+  for (const [phaseIndex, phase] of phases.entries()) {
+    const plannedByPart = new Map([[rootPartCode, number(phase.plannedProductionQty || phase.qty)]]);
+    const phaseDate = dateValue(phase.fgRequiredDate || phase.targetDeliveryDate, new Date(8640000000000000));
+    for (const component of ordered) {
+      const state = states.get(component.partCode);
+      while (state.receiptIndex < state.receiptEvents.length && dateValue(state.receiptEvents[state.receiptIndex].date, phaseDate) <= phaseDate) {
+        state.receiptPool += state.receiptEvents[state.receiptIndex].qty;
+        state.receiptIndex += 1;
+      }
+      const openingStockQty = round(state.stockPool);
+      const openingFirmReceiptQty = round(state.receiptPool);
+      const dependencies = Array.isArray(component.dependencies) && component.dependencies.length
+        ? component.dependencies
+        : [{ parentPartCode: rootPartCode, qtyPerParent: component.qtyPerFg }];
+      const grossRequirementQty = operationalRequirementQty(dependencies.reduce((sum, dependency) => (
+        sum + number(dependency.qtyPerParent) * number(plannedByPart.get(dependency.parentPartCode))
+      ), 0), component.uomCode);
+      const stockUsedQty = Math.min(state.stockPool, grossRequirementQty);
+      state.stockPool -= stockUsedQty;
+      const afterStockQty = Math.max(grossRequirementQty - stockUsedQty, 0);
+      const firmReceiptUsedQty = Math.min(state.receiptPool, afterStockQty);
+      state.receiptPool -= firmReceiptUsedQty;
+      const plannedOrderQty = operationalRequirementQty(Math.max(afterStockQty - firmReceiptUsedQty, 0), component.uomCode);
+      plannedByPart.set(component.partCode, plannedOrderQty);
+      phaseNettingByPart.get(component.partCode).push({
+        phaseId: phase.id || String(phaseIndex), phaseIndex, source: "CASCADE_NETTING",
+        grossRequirementQty, stockUsedQty: round(stockUsedQty), firmReceiptUsedQty: round(firmReceiptUsedQty),
+        netRequirementQty: plannedOrderQty, plannedOrderQty,
+        openingStockQty, openingFirmReceiptQty, endingStockQty: round(state.stockPool), endingFirmReceiptQty: round(state.receiptPool),
+        projectedAvailableQty: round(state.stockPool + state.receiptPool),
+        dependencies: dependencies.map((dependency) => ({
+          parentPartCode: dependency.parentPartCode,
+          qtyPerParent: dependency.qtyPerParent,
+          parentPlannedQty: number(plannedByPart.get(dependency.parentPartCode)),
+        })),
+      });
+    }
+  }
+  return phaseNettingByPart;
+};
+const processLeadTimeForQty = (component, qty) => {
+  const plannedQty = Math.max(number(qty), 0);
+  const steps = (component.processes || []).map((process) => {
+    if (process.isVendor) {
+      const vendorLeadTimeDays = plannedQty > EPSILON ? Math.max(number(process.vendorLeadTimeDays), 0) : 0;
+      return {
+        partCode: component.partCode, processCode: process.processCode, processName: process.processName,
+        routingMode: "VENDOR", qty: plannedQty, cycleTimeSeconds: 0, cycleLoadHours: 0,
+        vendorCode: process.vendorCode || null, vendorLeadTimeDays,
+        elapsedHours: round(vendorLeadTimeDays * WORKING_HOURS_PER_DAY),
+      };
+    }
+    const cycleTimeSeconds = Math.max(number(process.cycleTimeSeconds), 0);
+    const cycleLoadHours = cycleTimeSeconds * plannedQty / 3600;
+    return {
+      partCode: component.partCode, processCode: process.processCode, processName: process.processName,
+      routingMode: "INHOUSE", qty: plannedQty, cycleTimeSeconds,
+      cycleLoadHours: round(cycleLoadHours), vendorLeadTimeDays: 0, elapsedHours: round(cycleLoadHours),
+    };
+  });
+  return {
+    cycleTimeSeconds: round(steps.reduce((sum, step) => sum + number(step.cycleTimeSeconds), 0)),
+    cycleLoadHours: round(steps.reduce((sum, step) => sum + number(step.cycleLoadHours), 0)),
+    vendorLeadTimeDays: round(steps.reduce((sum, step) => sum + number(step.vendorLeadTimeDays), 0)),
+    elapsedHours: round(steps.reduce((sum, step) => sum + number(step.elapsedHours), 0)),
+    steps,
+  };
+};
+const buildCumulativeComponentLeadTimes = ({ components, rootPartCode, phases }) => {
+  const byPart = new Map(components.map((component) => [component.partCode, component]));
+  const result = new Map(components.map((component) => [component.partCode, []]));
+  for (const [phaseIndex, phase] of phases.entries()) {
+    const plannedByPart = new Map([[rootPartCode, number(phase.plannedProductionQty || phase.qty)]]);
+    for (const component of components) {
+      const netting = component.phaseNetting?.find((row) => number(row.phaseIndex) === phaseIndex);
+      plannedByPart.set(component.partCode, number(netting?.plannedOrderQty));
+    }
+    const memo = new Map();
+    const calculate = (partCode, visiting = new Set()) => {
+      if (partCode === rootPartCode || !byPart.has(partCode) || visiting.has(partCode)) {
+        return { totalHours: 0, totalDays: 0, ownHours: 0, parentHours: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0, steps: [] };
+      }
+      if (memo.has(partCode)) return memo.get(partCode);
+      const component = byPart.get(partCode);
+      const plannedQty = number(plannedByPart.get(partCode));
+      if (plannedQty <= EPSILON) {
+        const zero = {
+          phaseId: phase.id || String(phaseIndex), phaseIndex, plannedQty: 0,
+          ownHours: 0, parentHours: 0, totalHours: 0, totalDays: 0,
+          cycleTimeSeconds: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0,
+          ownCycleLoadHours: 0, ownVendorLeadTimeDays: 0, minimumLeadTimeAdjustmentHours: 0,
+          steps: [], calculationMethod: "ZERO_WHEN_MPS_ZERO",
+        };
+        memo.set(partCode, zero);
+        return zero;
+      }
+      const own = processLeadTimeForQty(component, plannedQty);
+      const nextVisiting = new Set(visiting).add(partCode);
+      const parents = (component.dependencies || []).map((dependency) => calculate(dependency.parentPartCode, nextVisiting));
+      const criticalParent = parents.sort((left, right) => number(right.totalHours) - number(left.totalHours))[0]
+        || { totalHours: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0, steps: [] };
+      const rawTotalHours = round(own.elapsedHours + criticalParent.totalHours);
+      const totalHours = round(Math.max(rawTotalHours, MINIMUM_WIP_LEAD_TIME_HOURS));
+      const minimumLeadTimeAdjustmentHours = round(totalHours - rawTotalHours);
+      const value = {
+        phaseId: phase.id || String(phaseIndex), phaseIndex, plannedQty: round(plannedQty),
+        ownHours: round(own.elapsedHours), parentHours: round(criticalParent.totalHours), totalHours,
+        totalDays: round(totalHours / WORKING_HOURS_PER_DAY, 3),
+        cycleTimeSeconds: own.cycleTimeSeconds,
+        cycleLoadHours: round(own.cycleLoadHours + criticalParent.cycleLoadHours),
+        vendorLeadTimeDays: round(own.vendorLeadTimeDays + criticalParent.vendorLeadTimeDays),
+        ownCycleLoadHours: own.cycleLoadHours, ownVendorLeadTimeDays: own.vendorLeadTimeDays,
+        minimumLeadTimeAdjustmentHours,
+        steps: [
+          ...own.steps,
+          ...criticalParent.steps,
+          ...(minimumLeadTimeAdjustmentHours > EPSILON ? [{
+            partCode, processCode: "MIN-LEAD-TIME", processName: "Minimum WIP lead time",
+            routingMode: "POLICY", qty: plannedQty, elapsedHours: minimumLeadTimeAdjustmentHours,
+          }] : []),
+        ],
+        calculationMethod: "CUMULATIVE_QTY_X_CYCLE_PLUS_VENDOR_MIN_2H_14H_DAY",
+      };
+      memo.set(partCode, value);
+      return value;
+    };
+    for (const component of components) result.get(component.partCode).push(calculate(component.partCode));
+  }
+  return result;
+};
+const shiftMonth = (month, offset) => {
+  const [year, value] = String(month || "").split("-").map(Number);
+  const shifted = new Date(Date.UTC(year, value - 1 + offset, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}`;
+};
+
+async function efdWindow(tx, month) {
+  const months = [shiftMonth(month, -1), month, shiftMonth(month, 1)];
+  const years = [...new Set(months.map((key) => Number(key.slice(0, 4))))];
+  const payloads = await Promise.all(years.map((year) => buildYearlyDemand(tx, { year, unpaginated: true })));
+  const byPart = new Map();
+  for (const payload of payloads) {
+    for (const row of payload.items) {
+      const values = byPart.get(row.partCode) || {};
+      months.forEach((key) => { if (row.months[key]) values[key] = number(row.months[key].efd ?? row.months[key].eff); });
+      byPart.set(row.partCode, values);
+    }
+  }
+  const totals = Object.fromEntries(months.map((key) => [key, round([...byPart.values()].reduce((sum, values) => sum + number(values[key]), 0))]));
+  return { months, byPart, totals, total: round(Object.values(totals).reduce((sum, value) => sum + number(value), 0)), rule: payloads[0]?.efdRule || null };
+}
 
 async function blockedForecastSources(tx, month) {
   const rows = await tx.forecast.findMany({
@@ -31,6 +285,21 @@ async function blockedForecastSources(tx, month) {
 
 function demandPhases(detail) {
   const phases = [];
+  const previousEfd = detail.calculationTrace?.previousEfd;
+  const carryoverQty = Math.max(number(previousEfd?.shortageQty), 0);
+  if (carryoverQty > EPSILON) {
+    phases.push({
+      id: `${detail.id}:CARRYOVER:${previousEfd?.month || "M-1"}`,
+      sourceType: "CARRYOVER",
+      sourceNumber: `EFD ${previousEfd?.month || "M-1"}`,
+      customerCode: detail.customerCode || null,
+      qty: carryoverQty,
+      phaseNumber: 1,
+      targetDeliveryDate: detail.startDate,
+      fgRequiredDate: detail.startDate,
+      carryoverFromMonth: previousEfd?.month || null,
+    });
+  }
   for (const source of detail.demandSources || []) {
     const peggingRows = Array.isArray(source.sourcePegging) ? source.sourcePegging : [];
     if (!peggingRows.length) {
@@ -140,9 +409,9 @@ function buildPhasePurchaseSimulation({ detail, phases = [], requirements = [], 
     const identity = requirementIdentity(requirement);
     if (!identity) continue;
     initialBalance.set(identity, Math.max(number(initialBalance.get(identity)), number(requirement.onHandQty)));
-    const processes = (requirement.mbomDetail?.parentDetail?.mbomProcesses?.length
-      ? requirement.mbomDetail.parentDetail.mbomProcesses
-      : requirement.mbomDetail?.mbomProcesses || [])
+    const processes = (requirement.mbomDetail?.mbomProcesses?.length
+      ? requirement.mbomDetail.mbomProcesses
+      : requirement.mbomDetail?.parentDetail?.mbomProcesses || [])
       .map((row) => row.process?.processCode || row.occurrenceCode)
       .filter(Boolean);
     const parent = requirement.mbomDetail?.parentDetail?.part || requirement.mbomDetail?.mbomHeader?.part || null;
@@ -223,9 +492,9 @@ function buildPhasePurchaseSimulation({ detail, phases = [], requirements = [], 
       if (!contributions.length) continue;
       const factor = contributions.reduce((sum, row) => sum + row.factor, 0);
       const identity = text(requirement.partCode).toUpperCase();
-      const processes = (requirement.mbomDetail?.parentDetail?.mbomProcesses?.length
-        ? requirement.mbomDetail.parentDetail.mbomProcesses
-        : requirement.mbomDetail?.mbomProcesses || [])
+      const processes = (requirement.mbomDetail?.mbomProcesses?.length
+        ? requirement.mbomDetail.mbomProcesses
+        : requirement.mbomDetail?.parentDetail?.mbomProcesses || [])
         .map((row) => row.process?.processCode || row.occurrenceCode).filter(Boolean);
       const current = productionMap.get(identity) || {
         identity,
@@ -422,6 +691,7 @@ function buildLedger({ detail, stockLines, reservations, receipts, comparePhysic
 
 async function getMpsWorkbench(tx, options = {}) {
   const month = planningMonthKey(options.month || new Date());
+  const demandWindow = await efdWindow(tx, month);
   const page = Math.max(Math.trunc(number(options.page)) || 1, 1);
   const pageSize = Math.min(Math.max(Math.trunc(number(options.pageSize)) || 25, 10), 100);
   const includeSimulation = ["1", "true", "yes"].includes(text(options.includeSimulation).toLowerCase());
@@ -429,25 +699,111 @@ async function getMpsWorkbench(tx, options = {}) {
   const doc = await tx.mPS.findFirst({
     where: { sourceKey: `MONTH:${month}`, isDeleted: false, status: { not: "Superseded" } },
     orderBy: { updatedAt: "desc" },
-    include: { details: { where: { isDeleted: false, NOT: { notes: { startsWith: "[MRP-PRODUCTION]" } } }, orderBy: { lineNumber: "asc" }, include: { part: true, demandSources: { orderBy: [{ effectiveRequiredDate: "asc" }, { sourceNumber: "asc" }] } } } },
+    include: {
+      details: {
+        where: { isDeleted: false, NOT: { notes: { startsWith: "[MRP-PRODUCTION]" } } },
+        orderBy: { lineNumber: "asc" },
+        include: {
+          part: true,
+          demandSources: { orderBy: [{ effectiveRequiredDate: "asc" }, { sourceNumber: "asc" }] },
+          mbom: {
+            include: {
+              details: {
+                where: { isDeleted: false },
+                orderBy: [{ levelComponent: "asc" }, { createdAt: "asc" }],
+                include: {
+                  part: true,
+                  mbomProcesses: {
+                    where: { isDeleted: false },
+                    orderBy: { sequence: "asc" },
+                    select: {
+                      id: true, sequence: true, occurrenceCode: true, routingNumber: true, routingMode: true, cycleTime: true,
+                      process: { select: { processCode: true, processName: true } },
+                      vendor: { select: { vendorCode: true, vendorName: true, leadTimeDays: true } },
+                      routingOperation: { select: { cycleSeconds: true, isSubcontract: true } },
+                    },
+                  },
+                  parentDetail: {
+                    select: {
+                      category: true, leadTime: true, leadTimeUnit: true,
+                      mbomProcesses: {
+                        where: { isDeleted: false },
+                        orderBy: { sequence: "asc" },
+                        select: {
+                          id: true, sequence: true, occurrenceCode: true, routingNumber: true, routingMode: true, cycleTime: true,
+                          process: { select: { processCode: true, processName: true } },
+                          vendor: { select: { vendorCode: true, vendorName: true, leadTimeDays: true } },
+                          routingOperation: { select: { cycleSeconds: true, isSubcontract: true } },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
   });
-  if (!doc) return { period: month, mps: null, mrp: null, items: [], blockedForecasts: await blockedForecastSources(tx, month), summary: { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0 }, pagination: { page: 1, pageSize, filtered: 0, pages: 1 }, statuses: [] };
+  if (!doc) return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, mps: null, rccp: null, mrp: null, items: [], blockedForecasts: await blockedForecastSources(tx, month), summary: { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0 }, pagination: { page: 1, pageSize, filtered: 0, pages: 1 }, statuses: [] };
+  const additionalCoverage = await loadAdditionalDemandCoverage(tx, {
+    year: Number(month.slice(0, 4)),
+    partCodes: doc.details.map((row) => row.partCode),
+  });
+  const coverageByPart = new Map([...additionalCoverage.byPartMonth.entries()]
+    .filter(([key]) => key.startsWith(`${month}|`))
+    .map(([key, value]) => [key.slice(month.length + 1), value]));
+  const lockIds = additionalCoverage.items.filter((row) => row.month === month).map((row) => row.baselineLockId);
+  const [deltaDocuments, cutDocuments] = await Promise.all([
+    tx.mPS.findMany({
+      where: { planKind: "DELTA", baselineMpsNumber: doc.mpsNumber, isDeleted: false, status: { notIn: ["Cancelled", "Superseded"] } },
+      include: { details: { where: { isDeleted: false }, select: { partCode: true, qtyPlanned: true } } },
+      orderBy: { createdAt: "asc" },
+    }),
+    lockIds.length ? tx.planningAdjustment.findMany({
+      where: { baselineLockId: { in: lockIds }, adjustmentType: "PRODUCTION_CUT", status: { in: ["APPROVED", "APPLIED"] } },
+      include: { lines: true },
+      orderBy: { createdAt: "asc" },
+    }) : [],
+  ]);
+  const deltaQtyByPart = new Map();
+  const deltaDocumentsByPart = new Map();
+  for (const delta of deltaDocuments) for (const detail of delta.details || []) {
+    deltaQtyByPart.set(detail.partCode, round((deltaQtyByPart.get(detail.partCode) || 0) + number(detail.qtyPlanned)));
+    if (!deltaDocumentsByPart.has(detail.partCode)) deltaDocumentsByPart.set(detail.partCode, []);
+    deltaDocumentsByPart.get(detail.partCode).push(delta.mpsNumber);
+  }
+  const cutQtyByPart = new Map();
+  const cutDocumentsByPart = new Map();
+  for (const adjustment of cutDocuments) for (const line of adjustment.lines || []) {
+    const cutQty = number(line.appliedCutQty) || number(line.approvedCutQty);
+    cutQtyByPart.set(line.partCode, round((cutQtyByPart.get(line.partCode) || 0) + cutQty));
+    if (!cutDocumentsByPart.has(line.partCode)) cutDocumentsByPart.set(line.partCode, []);
+    cutDocumentsByPart.get(line.partCode).push(adjustment.adjustmentNumber);
+  }
+  const deliveryGate = await getMpsDeliveryGate(tx, doc);
   const planningCycleMonth = planningMonthKey(doc.planningAnchorMonth || doc.periodStart);
   const mrp = await tx.mRPRun.findFirst({
     where: {
       isDeleted: false,
-      isCurrentPlan: true,
+      planKind: { not: "DELTA" },
       OR: [
         { mpsNumber: doc.mpsNumber },
         { planningMonth: utcMonthStart(planningCycleMonth) },
       ],
     },
     select: {
-      runNumber: true, planNumber: true, planRevision: true, status: true,
+      runNumber: true, planNumber: true, planRevision: true, status: true, scenarioStatus: true, planKind: true, isCurrentPlan: true,
       totalRequirements: true, totalPlannedOrders: true, runDate: true,
       createdAt: true, updatedAt: true, errorMessage: true,
     },
-    orderBy: [{ planRevision: "desc" }, { createdAt: "desc" }],
+    orderBy: [{ isCurrentPlan: "desc" }, { planRevision: "desc" }, { createdAt: "desc" }],
+  });
+  const rccp = await tx.rccpRun.findFirst({
+    where: { mpsId: doc.id, invalidatedAt: null },
+    include: { loads: { orderBy: { loadPercentage: "desc" } }, overrides: { orderBy: { approvedAt: "desc" } } },
+    orderBy: { createdAt: "desc" },
   });
   const selectedDetail = detailId ? doc.details.find((row) => row.id === detailId) : null;
   const traceSearch = selectedDetail?.partCode || text(options.q);
@@ -492,18 +848,72 @@ async function getMpsWorkbench(tx, options = {}) {
     }),
     buildFgCompStockTraceability(tx, { q: traceSearch }),
   ]) : [[], null];
+  const childMrpRequirements = mrp?.runNumber ? await tx.mRPRequirement.findMany({
+    where: { runNumber: mrp.runNumber, isDeleted: false, orderType: { in: ["Purchase", "Production"] } },
+    orderBy: [{ requiredDate: "asc" }, { treePath: "asc" }],
+    select: {
+      mpsDetailId: true, partCode: true, requiredDate: true, orderType: true, levelMBOM: true, treePath: true,
+      grossRequirement: true, onHandQty: true, firmSupplyQty: true, netRequirement: true,
+      plannedOrderQty: true, projectedAvailableQty: true, targetDeliveryDate: true,
+      deliveryTargetId: true, rootDemandSourceNumber: true, sourceNumber: true,
+      part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, canManufacture: true, productionUomCode: true, baseUomCode: true } },
+      mbomDetail: {
+        select: {
+          category: true, qty: true, uomCode: true, leadTime: true, leadTimeUnit: true,
+          mbomProcesses: {
+            where: { isDeleted: false }, orderBy: { sequence: "asc" },
+            select: {
+              id: true, sequence: true, occurrenceCode: true, routingNumber: true, routingMode: true, cycleTime: true,
+              process: { select: { processCode: true, processName: true } },
+              vendor: { select: { vendorCode: true, vendorName: true, leadTimeDays: true } },
+              routingOperation: { select: { cycleSeconds: true, isSubcontract: true } },
+            },
+          },
+          parentDetail: {
+            select: {
+              category: true, leadTime: true, leadTimeUnit: true,
+              mbomProcesses: {
+                where: { isDeleted: false }, orderBy: { sequence: "asc" },
+                select: {
+                  id: true, sequence: true, occurrenceCode: true, routingNumber: true, routingMode: true, cycleTime: true,
+                  process: { select: { processCode: true, processName: true } },
+                  vendor: { select: { vendorCode: true, vendorName: true, leadTimeDays: true } },
+                  routingOperation: { select: { cycleSeconds: true, isSubcontract: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }) : [];
   const partCodes = [...new Set(doc.details.map((row) => row.partCode).filter(Boolean))];
-  const [stockLines, reservations, receipts] = await Promise.all([
-    partCodes.length ? tx.stockBalance.findMany({ where: { partCode: { in: partCodes }, isDeleted: false, warehouse: { isDeleted: false, availableForProduction: true } }, select: { id: true, partCode: true, warehouseCode: true, rackCode: true, lotNumber: true, stockType: true, uomCode: true, qtyOnHand: true, qtyAvailable: true, qtyReserved: true, qtyQC: true }, orderBy: [{ partCode: "asc" }, { warehouseCode: "asc" }, { lotNumber: "asc" }] }) : [],
+  const componentPartCodes = [...new Set(doc.details.flatMap((row) => (row.mbom?.details || []).map((component) => component.part?.partCode)).filter(Boolean))];
+  const explodedPartCodes = [...new Set(childMrpRequirements.map((row) => row.partCode).filter(Boolean))];
+  const stockPartCodes = [...new Set([...partCodes, ...componentPartCodes, ...explodedPartCodes])];
+  const [stockLines, reservations, receipts, deliveryPerformance] = await Promise.all([
+    stockPartCodes.length ? tx.stockBalance.findMany({ where: { partCode: { in: stockPartCodes }, isDeleted: false, warehouse: { isDeleted: false, availableForProduction: true } }, select: { id: true, partCode: true, warehouseCode: true, rackCode: true, lotNumber: true, stockType: true, uomCode: true, qtyOnHand: true, qtyAvailable: true, qtyReserved: true, qtyQC: true }, orderBy: [{ partCode: "asc" }, { warehouseCode: "asc" }, { lotNumber: "asc" }] }) : [],
     partCodes.length ? tx.stockReservation.findMany({ where: { partCode: { in: partCodes }, isDeleted: false, status: { equals: "Active", mode: "insensitive" }, warehouse: { isDeleted: false, availableForProduction: true } }, select: { id: true, reservationNumber: true, reservationDate: true, stockBalanceId: true, partCode: true, warehouseCode: true, rackCode: true, lotNumber: true, qtyReserved: true, qtyReleased: true, referenceType: true, referenceNumber: true, status: true, expiryDate: true }, orderBy: [{ partCode: "asc" }, { reservationDate: "asc" }] }) : [],
-    partCodes.length ? tx.manufacturingOrder.findMany({ where: { isDeleted: false, part: { partCode: { in: partCodes } }, OR: [{ status: { in: ["Released", "In Progress", "Completed"] } }, { status: "Draft", referenceType: { in: ["MRPPlannedOrder", "MonthlyProductionPlan"] } }] }, select: { id: true, moNumber: true, status: true, referenceType: true, plannedOrderNumber: true, monthlyProductionPlanNumber: true, qtyPlanned: true, qtyProduced: true, qtyGood: true, qtyReject: true, plannedStartDate: true, plannedEndDate: true, uomCode: true, part: { select: { partCode: true } } }, orderBy: [{ plannedEndDate: "asc" }, { moNumber: "asc" }] }) : [],
+    stockPartCodes.length ? tx.manufacturingOrder.findMany({ where: { isDeleted: false, part: { partCode: { in: stockPartCodes } }, OR: [{ status: { in: ["Released", "In Progress", "Completed"] } }, { status: "Draft", referenceType: { in: ["MRPPlannedOrder", "MonthlyProductionPlan"] } }] }, select: { id: true, moNumber: true, status: true, referenceType: true, plannedOrderNumber: true, monthlyProductionPlanNumber: true, qtyPlanned: true, qtyProduced: true, qtyGood: true, qtyReject: true, plannedStartDate: true, plannedEndDate: true, uomCode: true, part: { select: { partCode: true } } }, orderBy: [{ plannedEndDate: "asc" }, { moNumber: "asc" }] }) : [],
+    buildDeliveryPerformance(tx, { month, partCodes }),
   ]);
+  const stockTotalsByPart = new Map();
+  for (const line of stockLines) {
+    const current = stockTotalsByPart.get(line.partCode) || { onHandQty: 0, availableQty: 0, reservedQty: 0, qcQty: 0 };
+    current.onHandQty += number(line.qtyOnHand);
+    current.availableQty += number(line.qtyAvailable);
+    current.reservedQty += number(line.qtyReserved);
+    current.qcQty += number(line.qtyQC);
+    stockTotalsByPart.set(line.partCode, current);
+  }
   const rows = doc.details.map((detail) => {
     const netting = buildLedger({ detail, stockLines: stockLines.filter((row) => row.partCode === detail.partCode), reservations: reservations.filter((row) => row.partCode === detail.partCode), receipts: receipts.filter((row) => row.part?.partCode === detail.partCode), comparePhysicalOpening: planningMonthKey(doc.planningAnchorMonth || doc.periodStart) === month });
     const demandEvents = netting.ledger.filter((row) => row.eventType === "GROSS_DEMAND");
-    const phasesWithProduction = netting.phases.map((phase, index) => ({ ...phase, plannedProductionQty: number(demandEvents[index]?.plannedProductionQty) }));
+    const performance = deliveryPerformance.byPart.get(detail.partCode) || null;
+    const phasesWithProduction = netting.phases.map((phase, index) => ({ ...phase, plannedProductionQty: number(demandEvents[index]?.plannedProductionQty), deliveryStatus: phaseDeliveryStatus(performance, phase) }));
     const bufferEvent = netting.ledger.find((row) => row.eventType === "BUFFER_TARGET");
-    const bufferPhase = number(detail.bufferQty) > EPSILON ? {
+    const allocationMode = bufferAllocationMode(detail.calculationTrace?.bufferAllocationMode);
+    const rawBufferPhase = number(detail.bufferQty) > EPSILON ? {
       id: `${detail.id}:BUFFER`,
       sourceType: "BUFFER",
       sourceNumber: doc.mpsNumber,
@@ -517,20 +927,232 @@ async function getMpsWorkbench(tx, options = {}) {
       bufferBaseQty: number(detail.bufferBaseQty),
       bufferPercent: number(detail.bufferPercent),
       nextForecastMonth: nextPlanningMonthKey(month),
+      deliveryStatus: phaseDeliveryStatus(performance, { sourceType: "BUFFER" }),
     } : null;
-    const planningPhases = bufferPhase ? [...phasesWithProduction, bufferPhase] : phasesWithProduction;
+    const distributeBuffer = allocationMode === "DISTRIBUTE_TO_PHASES" && phasesWithProduction.length > 0 && number(rawBufferPhase?.plannedProductionQty) > EPSILON;
+    let distributedBufferQty = 0;
+    const weightedProductionQty = phasesWithProduction.reduce((sum, phase) => sum + Math.max(number(phase.plannedProductionQty), number(phase.qty)), 0);
+    const allocatedPhases = distributeBuffer ? phasesWithProduction.map((phase, index) => {
+      const customerProductionQty = number(phase.plannedProductionQty);
+      const weight = weightedProductionQty > EPSILON
+        ? Math.max(number(phase.plannedProductionQty), number(phase.qty)) / weightedProductionQty
+        : 1 / phasesWithProduction.length;
+      const allocation = index === phasesWithProduction.length - 1
+        ? round(number(rawBufferPhase.plannedProductionQty) - distributedBufferQty)
+        : round(number(rawBufferPhase.plannedProductionQty) * weight);
+      distributedBufferQty = round(distributedBufferQty + allocation);
+      return {
+        ...phase,
+        customerProductionQty: round(customerProductionQty),
+        bufferAllocatedQty: allocation,
+        plannedProductionQty: round(customerProductionQty + allocation),
+        bufferAllocationMode: allocationMode,
+      };
+    }) : phasesWithProduction.map((phase) => ({ ...phase, customerProductionQty: number(phase.plannedProductionQty), bufferAllocatedQty: 0, bufferAllocationMode: allocationMode }));
+    const bufferPhase = distributeBuffer ? null : rawBufferPhase;
+    const planningPhases = bufferPhase ? [...allocatedPhases, bufferPhase] : allocatedPhases;
     const inventoryTrace = traceability?.items?.find((row) => row.fgPartCode === detail.partCode) || null;
-    const phasePurchaseSimulation = includeSimulation && (!detailId || detailId === detail.id) ? buildPhasePurchaseSimulation({ detail, phases: planningPhases, requirements: mrpRequirements, mrp, inventoryTrace }) : null;
-    return { id: detail.id, mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode: detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "MASTER_PART", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, ...netting, phasePurchaseSimulation };
+    const phasePurchaseSimulation = includeSimulation && (!detailId || detailId === detail.id) ? buildPhasePurchaseSimulation({
+      detail,
+      phases: planningPhases,
+      requirements: mrp?.isCurrentPlan ? mrpRequirements : [],
+      mrp: mrp?.isCurrentPlan ? mrp : null,
+      inventoryTrace,
+    }) : null;
+    const window = demandWindow.byPart.get(detail.partCode) || {};
+    const componentMap = new Map();
+    const mbomDetails = detail.mbom?.details || [];
+    const mbomById = new Map(mbomDetails.map((row) => [row.id, row]));
+    const cumulativeQtyPerFg = (component) => {
+      let qty = number(component.qty);
+      let parentId = component.parentDetailId;
+      const visited = new Set([component.id]);
+      while (parentId && mbomById.has(parentId) && !visited.has(parentId)) {
+        visited.add(parentId);
+        const parent = mbomById.get(parentId);
+        qty *= number(parent.qty) || 1;
+        parentId = parent.parentDetailId;
+      }
+      return round(qty);
+    };
+    for (const component of mbomDetails) {
+      const componentCode = component.part?.partCode || component.id;
+      if (!componentCode || componentCode === detail.partCode) continue;
+      const parentPartCode = component.parentDetailId
+        ? mbomById.get(component.parentDetailId)?.part?.partCode
+        : detail.partCode;
+      const dependency = {
+        structureKey: `ROOT:${component.id}`,
+        parentPartCode: parentPartCode || detail.partCode,
+        qtyPerParent: number(component.qty) || 1,
+      };
+      const componentStock = stockTotalsByPart.get(componentCode) || {};
+      const routeOwner = component.mbomProcesses?.length ? component : component.parentDetail;
+      const route = routeOwner?.mbomProcesses || [];
+      const routeVendorLeadTimeDays = leadTimeInDays(routeOwner?.leadTime, routeOwner?.leadTimeUnit);
+      const processes = route.map((row) => planningProcess(row, routeOwner?.category, routeVendorLeadTimeDays));
+      const existing = componentMap.get(componentCode);
+      if (existing) {
+        existing.qtyPerFg = round(existing.qtyPerFg + cumulativeQtyPerFg(component));
+        existing.level = Math.min(existing.level, component.levelComponent);
+        if (!existing.dependencies.some((row) => row.structureKey === dependency.structureKey)) existing.dependencies.push(dependency);
+        for (const process of processes) if (!existing.processes.some((row) => row.id === process.id)) existing.processes.push(process);
+        if (existing.type !== "INHOUSE" && String(component.category || "").toUpperCase() === "INHOUSE") existing.type = "INHOUSE";
+        if (!existing.itemType && component.part?.itemType) existing.itemType = String(component.part.itemType).toUpperCase();
+        if (component.part?.canManufacture === true) existing.canManufacture = true;
+        continue;
+      }
+      componentMap.set(componentCode, {
+        id: component.id, level: component.levelComponent, partCode: component.part?.partCode || null,
+        partNumber: component.part?.partNumber || component.part?.partCode || null, partName: component.part?.partName || "-",
+        type: String(component.category || "").toUpperCase(), qtyPerFg: cumulativeQtyPerFg(component),
+        itemType: String(component.part?.itemType || "").toUpperCase() || null,
+        canManufacture: component.part?.canManufacture === true,
+        currentStockQty: round(componentStock.onHandQty), availableStockQty: round(componentStock.availableQty),
+        leadTime: number(component.leadTime), leadTimeUnit: component.leadTimeUnit || null,
+        uomCode: component.uomCode || component.part?.productionUomCode || component.part?.baseUomCode || null,
+        processes, dependencies: [dependency],
+      });
+    }
+    const explodedByPart = new Map();
+    const detailMrpRequirements = childMrpRequirements.filter((row) => row.mpsDetailId === detail.id);
+    const requirementByTreePath = new Map(detailMrpRequirements.filter((row) => row.treePath).map((row) => [row.treePath, row]));
+    const structuralQtyForPath = (treePath) => {
+      const segments = text(treePath).split(".").filter(Boolean);
+      if (segments.length < 2) return 0;
+      let qtyPerFg = 1;
+      for (let index = 1; index < segments.length; index += 1) {
+        const ancestor = requirementByTreePath.get(segments.slice(0, index + 1).join("."));
+        qtyPerFg *= number(ancestor?.mbomDetail?.qty) || 1;
+      }
+      return round(qtyPerFg);
+    };
+    for (const requirement of detailMrpRequirements.filter((row) => row.partCode && row.partCode !== detail.partCode)) {
+      const group = explodedByPart.get(requirement.partCode) || [];
+      group.push(requirement);
+      explodedByPart.set(requirement.partCode, group);
+    }
+    for (const [componentCode, requirements] of explodedByPart) {
+      const first = requirements.find((row) => row.part) || requirements[0];
+      const itemType = String(first.part?.itemType || "").toUpperCase();
+      const isProductionChild = requirements.some((row) => String(row.orderType || "").toUpperCase() === "PRODUCTION");
+      const componentLevels = requirements.map((row) => number(row.levelMBOM)).filter((value) => value > 0);
+      const explodedLevel = componentLevels.length ? Math.min(...componentLevels) : 1;
+      const meaningful = requirements.filter((row) => number(row.grossRequirement) > EPSILON);
+      const grossQty = meaningful.reduce((sum, row) => sum + number(row.grossRequirement), 0);
+      const targetIds = [...new Set(meaningful.map((row) => row.deliveryTargetId).filter(Boolean))];
+      const rootQty = targetIds.reduce((sum, targetId) => {
+        const phase = planningPhases.find((row) => row.deliveryTargetId === targetId);
+        return sum + number(phase?.plannedProductionQty || phase?.qty);
+      }, 0);
+      const officialQtyPerFg = rootQty > EPSILON ? round(grossQty / rootQty) : 0;
+      const structuralPaths = new Map();
+      for (const requirement of requirements) {
+        const path = text(requirement.treePath);
+        const structureKey = path.split(".").slice(1).join(".");
+        if (!structureKey || structuralPaths.has(structureKey)) continue;
+        structuralPaths.set(structureKey, structuralQtyForPath(path));
+      }
+      const structuralQtyPerFg = round([...structuralPaths.values()].reduce((sum, value) => sum + number(value), 0));
+      const dependencyMap = new Map();
+      for (const requirement of requirements) {
+        const segments = text(requirement.treePath).split(".").filter(Boolean);
+        const structureKey = segments.slice(1).join(".");
+        if (!structureKey || dependencyMap.has(structureKey)) continue;
+        const parentPath = segments.slice(0, -1).join(".");
+        const parentRequirement = requirementByTreePath.get(parentPath);
+        dependencyMap.set(structureKey, {
+          structureKey: `MRP:${structureKey}`,
+          parentPartCode: parentRequirement?.partCode || detail.partCode,
+          qtyPerParent: number(requirement.mbomDetail?.qty) || 1,
+        });
+      }
+      const requirementDependencies = [...dependencyMap.values()];
+      const processes = [];
+      for (const requirement of requirements) {
+        const routeOwner = requirement.mbomDetail?.mbomProcesses?.length
+          ? requirement.mbomDetail
+          : requirement.mbomDetail?.parentDetail;
+        const route = routeOwner?.mbomProcesses || [];
+        const routeVendorLeadTimeDays = leadTimeInDays(routeOwner?.leadTime, routeOwner?.leadTimeUnit);
+        for (const row of route) {
+          if (processes.some((process) => process.id === row.id)) continue;
+          processes.push(planningProcess(row, routeOwner?.category, routeVendorLeadTimeDays));
+        }
+      }
+      const existing = componentMap.get(componentCode);
+      if (existing) {
+        existing.level = Math.min(number(existing.level) || explodedLevel, explodedLevel);
+        for (const process of processes) if (!existing.processes.some((row) => row.id === process.id)) existing.processes.push(process);
+        existing.itemType = itemType || existing.itemType;
+        existing.canManufacture = first.part?.canManufacture === true || existing.canManufacture;
+        existing.isProductionChild = isProductionChild || existing.isProductionChild;
+        existing.explosionSource = "MRP";
+        continue;
+      }
+      const componentStock = stockTotalsByPart.get(componentCode) || {};
+      const mbomDetail = first.mbomDetail || {};
+      componentMap.set(componentCode, {
+        id: `MRP:${detail.id}:${componentCode}`, level: explodedLevel,
+        partCode: componentCode, partNumber: first.part?.partNumber || componentCode, partName: first.part?.partName || componentCode,
+        type: String(mbomDetail.category || (first.orderType === "Production" ? "INHOUSE" : "PURCHASE")).toUpperCase(),
+        itemType: itemType || null, canManufacture: first.part?.canManufacture === true, isProductionChild,
+        qtyPerFg: structuralQtyPerFg > EPSILON ? structuralQtyPerFg : (number(first.mbomDetail?.qty) || officialQtyPerFg), currentStockQty: round(componentStock.onHandQty), availableStockQty: round(componentStock.availableQty),
+        leadTime: number(mbomDetail.leadTime), leadTimeUnit: mbomDetail.leadTimeUnit || null,
+        uomCode: mbomDetail.uomCode || first.part?.productionUomCode || first.part?.baseUomCode || null,
+        processes, dependencies: requirementDependencies, explosionSource: "MRP",
+      });
+    }
+    const componentRows = [...componentMap.values()]
+      .filter((component) => ["WIP", "FG"].includes(String(component.itemType || "").toUpperCase())
+        && (component.isProductionChild === true || component.canManufacture === true))
+      .sort((left, right) => number(left.level) - number(right.level) || text(left.partCode).localeCompare(text(right.partCode), "id", { numeric: true }));
+    const phaseNettingByPart = buildCascadingComponentNetting({
+      components: componentRows,
+      rootPartCode: detail.partCode,
+      phases: planningPhases,
+      receipts,
+    });
+    const nettedComponents = componentRows.map((component) => ({
+      ...component,
+      phaseNetting: phaseNettingByPart.get(component.partCode) || [],
+    }));
+    const cumulativeLeadTimeByPart = buildCumulativeComponentLeadTimes({
+      components: nettedComponents,
+      rootPartCode: detail.partCode,
+      phases: planningPhases,
+    });
+    const components = nettedComponents.map((component) => ({
+      ...component,
+      phaseNetting: component.phaseNetting.map((netting, index) => ({
+        ...netting,
+        leadTime: cumulativeLeadTimeByPart.get(component.partCode)?.[index] || null,
+      })),
+    }));
+    const stock = stockTotalsByPart.get(detail.partCode) || {};
+    const efdM1 = number(window[demandWindow.months[0]]);
+    const delivery = performance ? { deliveredPreviousQty: round(performance.deliveredPreviousQty), scheduledPreviousQty: round(performance.scheduledPreviousQty), previousOutstandingQty: round(performance.previousOutstandingQty), currentPlannedQty: round(performance.currentPlannedQty), currentDeliveredQty: round(performance.currentDeliveredQty), scheduleCount: performance.scheduleCount, status: performance.status, statusLabel: performance.statusLabel, statusTone: performance.statusTone, lastScheduleNumber: performance.lastScheduleNumber } : { deliveredPreviousQty: 0, scheduledPreviousQty: 0, previousOutstandingQty: 0, currentPlannedQty: 0, currentDeliveredQty: 0, scheduleCount: 0, status: "NOT_SCHEDULED", statusLabel: "Not Scheduled", statusTone: "muted", lastScheduleNumber: null };
+    const leadTimeDays = components.reduce((max, component) => Math.max(
+      max,
+      ...(component.phaseNetting || []).map((row) => number(row.leadTime?.totalDays)),
+    ), 0);
+    const capacitySummary = (Array.isArray(rccp?.partSummaries) ? rccp.partSummaries : []).find((row) => row.partCode === detail.partCode);
+    const coverage = coverageByPart.get(detail.partCode) || null;
+    const baselineMpsQty = number(netting.metrics?.plannedProductionQty);
+    const deltaMpsQty = number(deltaQtyByPart.get(detail.partCode));
+    const approvedCutQty = number(cutQtyByPart.get(detail.partCode));
+    return { id: detail.id, mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode: detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, efdM1, deliveredM1: delivery.deliveredPreviousQty, shortageM1: round(Math.max(efdM1 - delivery.deliveredPreviousQty, 0)), efdM: number(window[demandWindow.months[1]]), efdMPlus1: number(window[demandWindow.months[2]]), bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferAllocationMode: allocationMode, currentStockQty: round(stock.onHandQty), availableStockQty: round(stock.availableQty), stockReservedQty: round(stock.reservedQty), stockQcQty: round(stock.qcQty), leadTimeDays: round(leadTimeDays), delivery, capacity: { status: rccp?.status === "OVERRIDDEN" && capacitySummary?.capacityStatus === "OVERLOAD" ? "OVERRIDDEN" : capacitySummary?.capacityStatus || doc.capacityStatus || "NOT_CHECKED", maxLoadPercentage: number(capacitySummary?.maxLoadPercentage), rccpRunId: rccp?.id || null }, bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "GENERAL_RULE", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase, components, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, planningLock: coverage ? { locked: true, lockIds: coverage.locks.map((row) => row.id), lockedAt: coverage.locks.map((row) => row.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(coverage.locks.map((row) => row.lockedBy).filter(Boolean))].join(", ") || null } : { locked: false, lockIds: [] }, planMetrics: { baselineMpsQty: round(baselineMpsQty), deltaMpsQty: round(deltaMpsQty), approvedCutQty: round(approvedCutQty), totalPlanQty: round(Math.max(baselineMpsQty + deltaMpsQty - approvedCutQty, 0)), additionalQty: number(coverage?.additionalQty), pendingDeltaQty: number(coverage?.pendingDeltaQty) }, planningDocuments: { baselineMpsNumbers: [doc.mpsNumber], deltaMpsNumbers: [...new Set(deltaDocumentsByPart.get(detail.partCode) || [])], cutNumbers: [...new Set(cutDocumentsByPart.get(detail.partCode) || [])] }, ...netting, phases: allocatedPhases, phasePurchaseSimulation };
   });
   const query = text(options.q).toLowerCase();
   const statusFilter = text(options.status).toUpperCase();
-  const filtered = rows.filter((row) => (!detailId || row.id === detailId) && (!query || [row.partCode, row.partNumber, row.partName, row.customerCode, row.mpsNumber].some((value) => text(value).toLowerCase().includes(query))) && (!statusFilter || row.status === statusFilter));
+  const filtered = rows.filter((row) => (!detailId || row.id === detailId) && (!query || [row.partCode, row.partNumber, row.partName, row.customerCode, row.mpsNumber, row.delivery?.statusLabel, row.delivery?.lastScheduleNumber].some((value) => text(value).toLowerCase().includes(query))) && (!statusFilter || row.status === statusFilter || row.delivery?.status === statusFilter));
   const summary = rows.reduce((acc, row) => { acc.partCount += 1; ["grossDemandQty", "freeOpeningQty", "peggedReservationQty", "firmReceiptQty", "plannedProductionQty", "uncoveredQty"].forEach((key) => { acc[key] += number(row.metrics[key]); }); acc.bufferBaseQty += number(row.bufferBaseQty); acc.bufferQty += number(row.bufferQty); if (row.status === "REVIEW_VARIANCE") acc.varianceCount += 1; if (row.status === "SHORTAGE") acc.shortageCount += 1; return acc; }, { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0 });
   Object.keys(summary).forEach((key) => { if (key !== "partCount" && key !== "varianceCount" && key !== "shortageCount") summary[key] = round(summary[key]); });
   const pages = Math.max(Math.ceil(filtered.length / pageSize), 1);
   const safePage = Math.min(page, pages);
-  return { period: month, mps: { mpsNumber: doc.mpsNumber, status: doc.status, lifecycleStatus: doc.lifecycleStatus, planningAnchorMonth: doc.planningAnchorMonth, updatedAt: doc.updatedAt, replanRequired: doc.replanRequired, replanReason: doc.replanReason }, mrp, items: filtered.slice((safePage - 1) * pageSize, safePage * pageSize), summary, pagination: { page: safePage, pageSize, filtered: filtered.length, pages }, statuses: [...new Set(rows.map((row) => row.status))].sort(), generatedAt: new Date().toISOString(), periodStart: utcMonthStart(month), periodEnd: utcMonthEnd(month) };
+  const rccpApprovalAllowed = rccp?.status === "FEASIBLE" || (rccp?.status === "WARNING" && Boolean(rccp.acknowledgedAt)) || (rccp?.status === "OVERRIDDEN" && (rccp.overrides || []).length > 0);
+  const planningLock = { locked: additionalCoverage.items.some((row) => row.month === month), lockIds, lockedAt: additionalCoverage.items.map((row) => row.lock?.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(additionalCoverage.items.map((row) => row.lock?.lockedBy).filter(Boolean))].join(", ") || null, fingerprint: [...new Set(additionalCoverage.items.map((row) => row.lock?.sourceFingerprint).filter(Boolean))].join(",") || null };
+  return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, planningLock, mps: { mpsNumber: doc.mpsNumber, status: doc.status, lifecycleStatus: doc.lifecycleStatus, revision: doc.revision, planKind: doc.planKind, lockedAt: doc.lockedAt, lockedBy: doc.lockedBy, capacityStatus: doc.capacityStatus, capacityCheckedAt: doc.capacityCheckedAt, planningAnchorMonth: doc.planningAnchorMonth, periodStart: doc.periodStart, periodEnd: doc.periodEnd, updatedAt: doc.updatedAt, replanRequired: doc.replanRequired, replanReason: doc.replanReason, deliveryFeasibilityStatus: doc.deliveryFeasibilityStatus, deliveryDispositionStatus: doc.deliveryDispositionStatus, officialGateStatus: doc.officialGateStatus, deliveryFeasibilityCheckedAt: doc.deliveryFeasibilityCheckedAt, deliveryFeasibilityReason: doc.deliveryFeasibilityReason }, deliveryGate, rccp: rccp ? { id: rccp.id, status: rccp.status, overallLoadStatus: rccp.overallLoadStatus, mpsRevision: rccp.mpsRevision, mpsQtySnapshot: rccp.mpsQtySnapshot, warningThreshold: rccp.warningThreshold, overloadThreshold: rccp.overloadThreshold, partSummaries: rccp.partSummaries, exceptions: rccp.exceptions, acknowledgedAt: rccp.acknowledgedAt, acknowledgedBy: rccp.acknowledgedBy, approvalAllowed: rccpApprovalAllowed, maxLoadPercentage: Math.max(0, ...(rccp.loads || []).map((row) => number(row.loadPercentage))) } : null, mrp, items: filtered.slice((safePage - 1) * pageSize, safePage * pageSize), summary, pagination: { page: safePage, pageSize, filtered: filtered.length, pages }, statuses: [...new Set(rows.map((row) => row.delivery?.status).filter(Boolean))].sort(), nettingStatuses: [...new Set(rows.map((row) => row.status))].sort(), generatedAt: new Date().toISOString(), periodStart: utcMonthStart(month), periodEnd: utcMonthEnd(month) };
 }
 
 module.exports = { getMpsWorkbench, buildLedger, demandPhases, blockedForecastSources, buildPhasePurchaseSimulation, phaseSimulationKey, requirementPhaseContributions };

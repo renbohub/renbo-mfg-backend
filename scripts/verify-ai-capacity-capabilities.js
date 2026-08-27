@@ -1,0 +1,11 @@
+"use strict";
+const assert = require("assert");
+const { buildCapacityRisks, createCapacityCapabilityDefinitions } = require("../src/prisma/services/ai/capabilities/capacityCapabilities");
+const snapshot = { machines: [{ id: "m1", machineCode: "M-01", workCenterId: "wc1", cells: { "2026-09-01": { availableMinutes: 420, loadMinutes: 500, items: [{ allocationId: "a1", mbomProcessId: "p1", processCode: "WELD", partCode: "WIP-A", fgRequiredDate: "2026-09-02", deliveryPhaseId: "d1" }] } } }], unscheduled: [{ riskCode: "MISSING_CYCLE_TIME", partCode: "WIP-B", processCode: "PRG", fgRequiredDate: "2026-09-03", deliveryPhaseId: "d2" }] };
+const risks = buildCapacityRisks(snapshot);
+assert.strictEqual(risks[0].overloadMinutes, 80);
+assert.strictEqual(risks[0].deliveryPhaseId, "d1");
+assert.ok(risks.some((risk) => risk.riskCode === "MISSING_CYCLE_TIME"));
+const defs = createCapacityCapabilityDefinitions({ buildSnapshot: async () => snapshot });
+assert.deepStrictEqual(defs.map((row) => row.code), ["ppic.get_capacity_risk", "ppic.compare_capacity_presets", "ppic.explain_capacity_blocker", "ppic.create_capacity_simulation_draft"]);
+console.log("AI capacity capabilities: OK");

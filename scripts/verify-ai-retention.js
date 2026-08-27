@@ -1,0 +1,6 @@
+"use strict";
+const assert = require("assert");
+const { cleanupExpiredAiData } = require("../src/prisma/services/ai/aiRetentionService");
+const calls = [];
+const prisma = { aiDraft: { updateMany: async (args) => { calls.push(["draft", args]); return { count: 1 }; } }, aiConversation: { findMany: async () => [{ id: "plain", _count: { capabilityCalls: 0, drafts: 0 } }, { id: "audit", _count: { capabilityCalls: 1, drafts: 0 } }], delete: (args) => ({ type: "delete-conversation", args }), update: (args) => ({ type: "conversation", args }) }, aiMessage: { deleteMany: (args) => ({ type: "delete-messages", args }), updateMany: (args) => ({ type: "messages", args }) }, aiRequest: { deleteMany: (args) => ({ type: "delete-requests", args }), updateMany: (args) => ({ type: "requests", args }) }, $transaction: async (ops) => calls.push(["transaction", ops]) };
+(async () => { const result = await cleanupExpiredAiData(prisma, new Date("2026-08-25")); assert.deepStrictEqual(result, { expiredDrafts: 1, deleted: 1, archived: 1, redactedMessages: 1 }); assert.ok(JSON.stringify(calls).includes("[REDACTED_BY_RETENTION]")); console.log("AI retention contracts: OK"); })().catch((error) => { console.error(error); process.exitCode = 1; });

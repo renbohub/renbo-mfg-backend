@@ -14,7 +14,9 @@ router.get("/net-change/snapshots/latest", authorize("mrp", "read"), ctrl.getLat
 router.get("/net-change/snapshots", authorize("mrp", "read"), ctrl.listNetChangeSnapshots);
 router.post("/net-change/run", authorize("mrp", "release"), logger("mrp", "run-net-change"), ctrl.runNetChange);
 router.get("/", authorize("mrp", "read"), ctrl.list);
+router.post("/delta/run", authorize("mrp", "create"), guardMps, logger("mrp", "run-delta"), ctrl.runDeltaMRP);
 router.post("/run", authorize("mrp", "create"), guardMps, logger("mrp", "run"), ctrl.runMRP);
+router.patch("/:runNumber/approve", authorize("mrp", "release"), guardMrp, logger("mrp", "approve"), ctrl.approve);
 router.get("/:runNumber/audit", authorize("mrp", "read"), ctrl.getAudit);
 router.get("/:runNumber/requirements", authorize("mrp", "read"), ctrl.getRequirements);
 router.get("/:runNumber/procurement-view", authorize("mrp", "read"), ctrl.procurementView);

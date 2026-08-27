@@ -14,6 +14,8 @@ const {
   priorityNetBatchQuantity,
   phaseJobs,
   combineSingleDeliveryBufferCampaigns,
+  splitCampaignTransferBatches,
+  campaignDetailForBatch,
   fitFirstBatchStrategies,
   scorePlacementCandidate,
   SCORING_MODEL,
@@ -192,6 +194,50 @@ const continuousCampaign = combineSingleDeliveryBufferCampaigns(bufferJobs);
 assert.strictEqual(continuousCampaign.length, 1, "Satu delivery customer dan buffer dengan FG due yang sama harus menjadi satu production campaign");
 assert.strictEqual(continuousCampaign[0].qty, 430, "Campaign harus memproduksi total 280 customer + 150 buffer tanpa memecah eksekusi route");
 assert.deepStrictEqual(continuousCampaign[0].campaignSegments.map((segment) => [segment.targetType, segment.productionQty, segment.stockCoverageQty]), [["CUSTOMER", 280, 20], ["INTERNAL_STOCK", 150, 0]], "Pegging customer dan buffer harus tetap terpisah walaupun eksekusi mesin dikonsolidasikan");
+
+const phaseScopedCampaigns = combineSingleDeliveryBufferCampaigns([
+  {
+    id: "phase-early", phaseNumber: 1, due: new Date("2026-09-15T00:00:00.000Z"), qty: 5000,
+    grossDemandQty: 5000, targetType: "CUSTOMER",
+    group: { receipt: { id: "receipt-phase-early", mpsDetailId: "mps-fg-1" } },
+  },
+  {
+    id: "phase-month-end", phaseNumber: 2, due: new Date("2026-09-30T00:00:00.000Z"), qty: 5000,
+    grossDemandQty: 5000, targetType: "CUSTOMER",
+    group: { receipt: { id: "receipt-phase-month-end", mpsDetailId: "mps-fg-1" } },
+  },
+  {
+    id: null, phaseNumber: null, due: new Date("2026-09-30T00:00:00.000Z"), qty: 6000,
+    grossDemandQty: 6000, targetType: "INTERNAL_STOCK", isBufferStock: true,
+    materialScopeDeliveryTargetIds: ["target-phase-1", "target-phase-2"],
+    group: { receipt: { id: "receipt-buffer", mpsDetailId: "mps-fg-1" } },
+  },
+]);
+assert.strictEqual(phaseScopedCampaigns.length, 2, "Receipt phase-scoped dari FG yang sama harus memakai lineage MPS, bukan receipt id");
+assert.strictEqual(phaseScopedCampaigns[0].qty, 5000, "Delivery lebih awal harus tetap menjadi campaign sendiri");
+assert.strictEqual(phaseScopedCampaigns[1].qty, 11000, "Delivery dan buffer dengan target FG 30 September harus dihitung sebagai satu campaign 11.000");
+assert.strictEqual(phaseScopedCampaigns[1].group.productionTargetQty, 11000, "Basis receipt campaign harus menjumlahkan target delivery dan buffer");
+assert.deepStrictEqual(phaseScopedCampaigns[1].capacityTargetKeys, ["BUFFER:2026-09-30"], "Campaign harus membawa scope target buffer saat source delivery target belum tersedia pada fixture");
+assert.deepStrictEqual(
+  phaseScopedCampaigns[1].campaignSegments.map((segment) => [segment.phaseNumber, segment.targetType, segment.productionQty]),
+  [[2, "CUSTOMER", 5000], [null, "INTERNAL_STOCK", 6000]],
+  "Pegging phase 2 dan buffer harus tetap transparan setelah campaign digabung",
+);
+assert.deepStrictEqual(
+  splitCampaignTransferBatches(phaseScopedCampaigns[1], 1100),
+  Array(11).fill(1000),
+  "Transfer batch harus berhenti tepat di batas 5.000 customer lalu dilanjutkan 6.000 buffer",
+);
+const campaignTask = {
+  detail: { id: "detail-customer", notes: "[MRP-TARGET:target-phase-2]" },
+  sourceDetails: [
+    { id: "detail-buffer", notes: "[MRP-TARGET:BUFFER:2026-09-30]" },
+    { id: "detail-customer", notes: "[MRP-TARGET:target-phase-2]" },
+  ],
+};
+phaseScopedCampaigns[1].campaignSegments[0].sourceDeliveryTargetId = "target-phase-2";
+assert.strictEqual(campaignDetailForBatch(campaignTask, phaseScopedCampaigns[1], 4000, 0).id, "detail-customer", "Batch sebelum qty customer terpenuhi harus memakai line delivery");
+assert.strictEqual(campaignDetailForBatch(campaignTask, phaseScopedCampaigns[1], 5000, 0).id, "detail-buffer", "Batch setelah qty customer terpenuhi harus memakai line buffer");
 
 const priorityRoutePhase1 = priorityNetBatchQuantity(280, 0, 341, 430, "pcs");
 const priorityRouteBuffer = priorityNetBatchQuantity(150, 280, 341, 430, "pcs");

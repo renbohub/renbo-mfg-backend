@@ -5,6 +5,62 @@ const { syncOperationalSalesOrderStatus } = require("../../services/production/s
 const { resolveDeliveryReadiness } = require("../../services/outgoing/deliveryReadinessService");
 const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
 const scheduleNumber = () => `DS-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+const numberValue = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+
+exports.deliveryBoard = async (req, res, next) => {
+  try {
+    const today = new Date();
+    const defaultFrom = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
+    const defaultTo = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+    const from = req.query.from ? new Date(`${req.query.from}T00:00:00.000Z`) : defaultFrom;
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999Z`) : defaultTo;
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return res.status(400).json({ message: "Periode delivery board tidak valid" });
+
+    const schedules = await prisma.deliverySchedule.findMany({
+      where: {
+        isDeleted: false,
+        status: { notIn: ["Cancelled", "Failed"] },
+        plannedDate: { gte: from, lte: to },
+      },
+      include: {
+        soHeader: { select: { customerCode: true, customerName: true } },
+        details: {
+          where: { isDeleted: false },
+          include: { soDetail: true },
+          orderBy: { lineNumber: "asc" },
+        },
+      },
+      orderBy: [{ plannedDate: "asc" }, { scheduleNumber: "asc" }],
+      take: 1500,
+    });
+
+    const rows = schedules.flatMap((schedule) => schedule.details.map((detail) => ({
+      itemType: "FINISHED_GOOD",
+      scheduleNumber: schedule.scheduleNumber,
+      soNumber: schedule.soNumber,
+      customerCode: schedule.soHeader?.customerCode,
+      customerName: schedule.soHeader?.customerName || schedule.soHeader?.customerCode || "Customer belum ditentukan",
+      partCode: detail.soDetail?.partCode || detail.soDetail?.partNumber || "-",
+      partNumber: detail.soDetail?.partNumber,
+      partName: detail.soDetail?.partName,
+      plannedAt: schedule.plannedDate,
+      actualAt: schedule.actualDate || schedule.deliveredAt,
+      plannedQty: numberValue(detail.qty),
+      deliveredQty: numberValue(detail.qtyDelivered),
+      outstandingQty: Math.max(numberValue(detail.qty) - numberValue(detail.qtyDelivered), 0),
+      uomCode: detail.soDetail?.uomCode,
+      status: schedule.status,
+      shippingMethod: schedule.shippingMethod,
+      vehicle: schedule.vehicle,
+    })));
+
+    res.json({
+      period: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+      generatedAt: new Date(),
+      rows,
+    });
+  } catch (error) { next(error); }
+};
 
 async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy) {
   let remaining = Number(qty || 0);

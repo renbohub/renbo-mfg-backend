@@ -1,5 +1,10 @@
 const { prisma } = require("../../index");
 const { countPlanningFlowRows, resetPlanningFlow, countDemandResetRows, resetDemandFlow } = require("../../services/system/planningFlowResetService");
+const {
+  listResetSources,
+  previewSourcePlanningReset,
+  resetSourcePlanning,
+} = require("../../services/system/sourcePlanningResetService");
 
 exports.getPlanningFlowResetStatus = async (_req, res, next) => {
   try {
@@ -41,5 +46,29 @@ exports.resetDemandFlow = async (req, res, next) => {
       });
     }
     return res.json(await resetDemandFlow(prisma));
+  } catch (error) { return next(error); }
+};
+
+exports.listSourcePlanningResetSources = async (req, res, next) => {
+  try {
+    const rows = await listResetSources(prisma, {
+      sourceType: req.query.sourceType,
+      query: req.query.query,
+      limit: req.query.limit,
+    });
+    return res.json({ rows });
+  } catch (error) { return next(error); }
+};
+
+exports.previewSourcePlanningReset = async (req, res, next) => {
+  try {
+    return res.json(await previewSourcePlanningReset(prisma, req.body || {}));
+  } catch (error) { return next(error); }
+};
+
+exports.resetSourcePlanning = async (req, res, next) => {
+  try {
+    const actor = req.user?.username || req.user?.email || req.user?.id || null;
+    return res.json(await resetSourcePlanning(prisma, req.body || {}, actor));
   } catch (error) { return next(error); }
 };

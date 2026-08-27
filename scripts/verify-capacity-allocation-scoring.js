@@ -8,6 +8,7 @@ const {
   candidateMachinesForLane,
   comparePlacementCandidates,
   cycleCapableMachines,
+  effectiveCycleMinutes,
   findFeasibleSlotStarts,
   findPlacement,
   machineLaneKey,
@@ -16,6 +17,10 @@ const {
   scorePlacementCandidate,
   shouldPinMachineLane,
   summarizeAllocationScoring,
+  criticalRouteDurationMinutes,
+  deliveryJitExecutionFloor,
+  shouldScheduleLateVisibility,
+  buildNextCampaignStartByPhase,
 } = require("../src/prisma/services/planning/capacityRecommendationService");
 
 assert.strictEqual(
@@ -23,7 +28,29 @@ assert.strictEqual(
   100,
   "Weighted allocation score must remain normalized to 100",
 );
-assert.match(VERSION, /V6-WEIGHTED-SCORING/, "Algorithm version must identify the advanced scoring generation");
+const nextCampaignGate = buildNextCampaignStartByPhase(new Date("2026-08-01T00:00:00.000Z"), [
+  { id: "later", deliveryPhaseId: "phase-7", scheduleDate: new Date("2026-09-02T00:00:00.000Z"), plannedStartTime: "08:00", plan: { planNumber: "MPP-202609-001", planMonth: new Date("2026-09-01T00:00:00.000Z") } },
+  { id: "earlier", deliveryPhaseId: "phase-7", scheduleDate: new Date("2026-08-25T00:00:00.000Z"), plannedStartTime: "08:00", plan: { planNumber: "MPP-202608-002", planMonth: new Date("2026-08-01T00:00:00.000Z") } },
+], new Date("2026-08-01T00:00:00.000Z"));
+assert.strictEqual(nextCampaignGate.get("PHASE:phase-7").planNumber, "MPP-202609-001", "A later MPP must cap the JIT deadline of its predecessor campaign");
+assert.match(VERSION, /V11-FG-REQUIRED-LATE-VISIBILITY/, "Algorithm version must identify visible late FG Required scheduling");
+assert.strictEqual(shouldScheduleLateVisibility("VENDOR_LEAD_TIME_LATE"), true, "Vendor late harus tetap menghasilkan allocation untuk recovery PPIC");
+assert.strictEqual(shouldScheduleLateVisibility("CAPACITY_BEFORE_DUE_UNAVAILABLE"), true, "Capacity late harus tetap terlihat sebagai allocation");
+assert.strictEqual(shouldScheduleLateVisibility("MATERIAL_READY_AFTER_FG_DUE"), true, "Material late harus tetap terlihat sebagai allocation");
+assert.strictEqual(shouldScheduleLateVisibility("ROUTING_MISSING"), false, "Routing missing tidak dapat dibuat menjadi allocation semu");
+assert.strictEqual(effectiveCycleMinutes({ cycleTime: 121 }, {}, 100), 2.42, "Monthly runtime harus memakai CT x 1,2 walaupun efficiency master 100%");
+assert.strictEqual(Number((effectiveCycleMinutes({ cycleTime: 121 }, {}, 100) * 192).toFixed(2)), 464.64, "Campaign WELD-1 192 PCS harus mempunyai load CT x qty x 1,2");
+
+const jitGraph = {
+  ordered: [{ route: { id: "paint" } }, { route: { id: "inspect" } }],
+  predecessors: new Map([["paint", new Set()], ["inspect", new Set(["paint"])]]),
+};
+assert.strictEqual(criticalRouteDurationMinutes(jitGraph, (task) => task.route.id === "paint" ? 5 * 1440 : 120), 7320);
+assert.strictEqual(
+  deliveryJitExecutionFloor({ due: 20 * 1440, executionFloor: 0, criticalDurationMinutes: 5 * 1440, safetyDays: 2 }),
+  13 * 1440,
+  "Vendor and downstream production must be pulled backward from delivery with an explicit safety buffer",
+);
 
 const baseCandidate = scorePlacementCandidate({
   candidate: { start: 400, end: 500, shift: "1", overtime: false },

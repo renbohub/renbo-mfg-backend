@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const { Prisma } = require("@prisma/client");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
+const { assertReference } = require("../../utils/referenceValidation");
 const { resetDiesShotCounter } = require("../../utils/diesShotCounter");
 
 const MAINTENANCE_NUMBER_CONFLICT = "Nomor maintenance sudah digunakan.";
@@ -208,6 +209,7 @@ exports.create = async (req, res, next) => {
 
     // Start transaction
     const result = await prisma.$transaction(async (tx) => {
+      await assertReference({ delegate: tx.vendor, field: "vendorCode", value: maintenanceData.vendorCode, key: "vendorCode", label: "Vendor", activeWhere: { status: "Active" } });
       // Get current dies info
       const dies = await tx.dies.findUnique({
         where: { id: diesId },
@@ -290,6 +292,9 @@ exports.create = async (req, res, next) => {
 // Update maintenance record
 exports.update = async (req, res, next) => {
   try {
+    const current = await prisma.diesMaintenance.findUnique({ where: { maintenanceNumber: req.params.maintenanceNumber } });
+    if (!current || current.isDeleted) return res.status(404).json({ message: "Maintenance record not found" });
+    await assertReference({ delegate: prisma.vendor, field: "vendorCode", value: req.body.vendorCode, currentValue: current.vendorCode, key: "vendorCode", label: "Vendor", activeWhere: { status: "Active" } });
     const doc = await prisma.diesMaintenance.update({
       where: { maintenanceNumber: req.params.maintenanceNumber },
       data: {
@@ -315,8 +320,6 @@ exports.update = async (req, res, next) => {
       },
     });
 
-    if (!doc)
-      return res.status(404).json({ message: "Maintenance record not found" });
     res.json(mapDoc(doc));
   } catch (e) {
     next(e);

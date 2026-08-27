@@ -1,6 +1,8 @@
 const { prisma } = require("../../index");
 const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
 const { normalizePreset, loadPresetStore, savePresetStore, activePresetId } = require("../../services/planning/capacitySimulationPresetService");
+const { createAiDraftService } = require("../../services/ai/aiDraftService");
+const aiDraftService = createAiDraftService({ prisma });
 
 const SCENARIO_KEYS = {
   "simulation-1": "CAPACITY_SCENARIO_SIMULATION_1",
@@ -125,6 +127,7 @@ exports.getPresets = async (req, res, next) => {
 
 exports.createPreset = async (req, res, next) => {
   try {
+    if (req.body?.aiDraftId) await aiDraftService.validateDraftForOfficial({ draftId: req.body.aiDraftId, actor: req.user, draftType: "CAPACITY_SIMULATION", moduleCode: "planning-ppic", pageCode: "capacity-planning" });
     const actor = req.user?.username || req.user?.email || "system";
     const presets = await loadPresetStore(prisma);
     const preset = normalizePreset(req.body, null, actor);
@@ -133,6 +136,7 @@ exports.createPreset = async (req, res, next) => {
       return res.status(409).json({ message: `Preset ${preset.name} sudah ada pada ${preset.month}. Gunakan nama lain atau update preset tersebut.` });
     }
     presets.push(preset); await savePresetStore(prisma, presets, actor);
+    if (req.body?.aiDraftId) await aiDraftService.markAiDraftConfirmed({ draftId: req.body.aiDraftId, userId: req.user?.id, officialEntityType: "CAPACITY_PRESET", officialEntityId: preset.id });
     res.status(201).json({ preset, message: `${preset.name} tersimpan untuk ${preset.month}.` });
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };

@@ -11,8 +11,15 @@ const DEFAULT_CANDIDATE_BUDGET = 50000;
 const MAX_CANDIDATE_BUDGET = 500000;
 const RETAINED_PLACEMENT_CANDIDATES = 4;
 const AUTO_CAPACITY_OVERRIDE_PREFIX = "[AUTO-CAPACITY-RECOMMENDATION]";
-const VERSION = "FINITE-CAPACITY-PIPELINE-V6-WEIGHTED-SCORING";
+const VERSION = "FINITE-CAPACITY-PIPELINE-V11-FG-REQUIRED-LATE-VISIBILITY";
 const SCORING_MODEL = "CAPACITY_ALLOCATION_SCORE_V2";
+const EARLY_START_TOLERANCE_DAYS = 2;
+const MINIMUM_RUNTIME_ALLOWANCE_FACTOR = 1.2;
+const LATE_VISIBILITY_BLOCKERS = new Set([
+  "VENDOR_LEAD_TIME_LATE",
+  "CAPACITY_BEFORE_DUE_UNAVAILABLE",
+  "MATERIAL_READY_AFTER_FG_DUE",
+]);
 // Keep this model normalized to 100 so a recommendation score remains easy to
 // explain to planners. `breakdown` intentionally stays a numeric map because it
 // is consumed by the current UI; richer evidence is stored alongside it in the
@@ -32,6 +39,7 @@ if (SCORING_WEIGHT_TOTAL !== 100) throw new Error(`Capacity allocation scoring w
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const round = (value, digits = 3) => Number(number(value).toFixed(digits));
 const clamp01 = (value) => Math.min(Math.max(number(value), 0), 1);
+const shouldScheduleLateVisibility = (code) => LATE_VISIBILITY_BLOCKERS.has(String(code || "").toUpperCase());
 
 function generatedBatchQuantity(batchReceiptQty, receiptQtyBeforeBatch, factor, uomCode) {
   const batchQty = Math.max(number(batchReceiptQty), 0);
@@ -93,11 +101,26 @@ function allocateStockCoverage(stockRows, requestedQty) {
 }
 
 function dateOnly(value) {
+  if (value == null || String(value).trim() === "") return null;
   const parsed = value instanceof Date ? new Date(value) : new Date(`${String(value).slice(0, 10)}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
   return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate()));
 }
 
-function dateKey(value) { return dateOnly(value).toISOString().slice(0, 10); }
+function dateKey(value) {
+  const parsed = dateOnly(value);
+  return parsed ? parsed.toISOString().slice(0, 10) : null;
+}
+
+function isReplaceableAutoAllocation(row, today, firmAllocationIds = new Set()) {
+  if (row?.allocationSource !== "AUTO_RECOMMENDATION" || firmAllocationIds.has(row?.id)) return false;
+  const scheduleDate = dateOnly(row?.scheduleDate);
+  // A Draft recommendation is still a proposal, including when its proposed
+  // date has just passed. It must not be treated as execution history and
+  // silently consume a different delivery phase after MRP/MPP is replanned.
+  if (row?.status === "Draft") return true;
+  return !scheduleDate || scheduleDate >= today;
+}
 function jakartaClock(value = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Jakarta",
@@ -139,9 +162,11 @@ function capacityJobTargetKey(job) {
   if (job?.isBufferStock) return "BUFFER:" + dateKey(job.due);
   return null;
 }
+
 function capacityDetailAppliesToJob(detail, job) {
   const targetKey = mrpTargetKey(detail);
-  return !targetKey || targetKey === capacityJobTargetKey(job);
+  const scopedKeys = Array.isArray(job?.capacityTargetKeys) ? job.capacityTargetKeys.map(String) : [];
+  return !targetKey || (scopedKeys.length ? scopedKeys.includes(String(targetKey)) : targetKey === capacityJobTargetKey(job));
 }
 function capacityTaskBatchQuantity(task, batchReceiptQty, receiptQtyBeforeBatch, receiptProductionQty, receiptQtyBeforeJob = 0) {
   if (task.phasePlannedQty != null) {
@@ -152,6 +177,34 @@ function capacityTaskBatchQuantity(task, batchReceiptQty, receiptQtyBeforeBatch,
   return priorityNetBatchQuantity(
     batchReceiptQty, receiptQtyBeforeBatch, number(task.detail.qtyPlanned), receiptProductionQty, task.detail.uomCode,
   );
+}
+
+function aggregateCapacityRouteTasks(tasks = []) {
+  const grouped = new Map();
+  for (const task of tasks) {
+    const routeId = task?.route?.id;
+    if (!routeId) continue;
+    const current = grouped.get(routeId);
+    if (!current) {
+      grouped.set(routeId, {
+        ...task,
+        detail: { ...task.detail },
+        sourceDetails: [task.detail].filter(Boolean),
+        sourceDetailIds: [task.detail?.id].filter(Boolean),
+      });
+      continue;
+    }
+    current.sourceDetails.push(...[task.detail].filter(Boolean));
+    current.sourceDetailIds.push(...[task.detail?.id].filter(Boolean));
+    current.detail.qtyPlanned = number(current.detail.qtyPlanned) + number(task.detail?.qtyPlanned);
+    if (current.phasePlannedQty != null || task.phasePlannedQty != null) {
+      current.phasePlannedQty = number(current.phasePlannedQty) + number(task.phasePlannedQty);
+      // Both rows refer to the same delivery receipt. Summing this denominator
+      // would halve the route factor; keep the authoritative phase receipt qty.
+      current.phaseReceiptQty = Math.max(number(current.phaseReceiptQty), number(task.phaseReceiptQty), EPSILON);
+    }
+  }
+  return [...grouped.values()];
 }
 function priorCampaignGateKey(value) {
   if (value?.deliveryPhaseId || value?.id) return "PHASE:" + (value.deliveryPhaseId || value.id);
@@ -177,6 +230,30 @@ function buildPriorCampaignCompletionByPhase(periodStart, allocations = []) {
     if (!current || completionMinute > current.minute + EPSILON) {
       result.set(key, { minute: completionMinute, allocationIds: [allocation.id], completionDate });
     } else if (Math.abs(completionMinute - current.minute) <= EPSILON) {
+      current.allocationIds.push(allocation.id);
+    }
+  }
+  return result;
+}
+function buildNextCampaignStartByPhase(periodStart, allocations = [], currentPlanMonth = null) {
+  const result = new Map();
+  const currentMonth = dateOnly(currentPlanMonth);
+  for (const allocation of allocations) {
+    const allocationMonth = dateOnly(allocation.plan?.planMonth);
+    if (currentMonth && (!allocationMonth || allocationMonth <= currentMonth)) continue;
+    const key = priorCampaignGateKey(allocation);
+    if (!key || !allocation.scheduleDate) continue;
+    const startMinute = absoluteMinute(periodStart, allocation.vendorSendDate || allocation.scheduleDate,
+      minuteOfDay(allocation.plannedStartTime, 0));
+    const current = result.get(key);
+    if (!current || startMinute < current.minute - EPSILON) {
+      result.set(key, {
+        minute: startMinute,
+        allocationIds: [allocation.id],
+        startDate: allocation.vendorSendDate || allocation.scheduleDate,
+        planNumber: allocation.plan?.planNumber || null,
+      });
+    } else if (Math.abs(startMinute - current.minute) <= EPSILON) {
       current.allocationIds.push(allocation.id);
     }
   }
@@ -263,7 +340,36 @@ function buildRouteGraph(tasks, headers, bomDetails) {
   // Invalid legacy trees must remain visible as blockers elsewhere, but do
   // not silently drop their routes from this recommendation.
   for (const task of tasks) if (!ordered.some((item) => item.route.id === task.route.id)) ordered.push(task);
-  return { ordered, predecessors };
+  return { ordered, predecessors, successors };
+}
+
+function criticalRouteDurationMinutes(graph, durationForTask) {
+  const completionByRoute = new Map();
+  let campaignDuration = 0;
+  for (const task of graph?.ordered || []) {
+    const routeId = task.route.id;
+    const predecessorDuration = Math.max(0, ...[...(graph.predecessors.get(routeId) || [])]
+      .map((id) => number(completionByRoute.get(id))));
+    const completion = predecessorDuration + Math.max(number(durationForTask(task)), 0);
+    completionByRoute.set(routeId, completion);
+    campaignDuration = Math.max(campaignDuration, completion);
+  }
+  return campaignDuration;
+}
+
+function deliveryJitExecutionFloor({ due, executionFloor, criticalDurationMinutes, safetyDays = 2 }) {
+  const protectedDuration = Math.max(number(criticalDurationMinutes), 0)
+    + Math.max(number(safetyDays), 0) * DAY_MINUTES;
+  return Math.max(number(executionFloor), number(due) - protectedDuration, 0);
+}
+
+function planSchedulingHorizonEnd(plan) {
+  const candidates = [plan?.periodEnd, ...(plan?.details || []).map((detail) => detail.requiredDate)]
+    .map(dateOnly)
+    .filter(Boolean);
+  return candidates.length
+    ? new Date(Math.max(...candidates.map((value) => value.getTime())))
+    : dateOnly(plan?.periodEnd);
 }
 
 function splitTransferBatches(quantity, configuredBatchQty = 0) {
@@ -278,6 +384,37 @@ function splitTransferBatches(quantity, configuredBatchQty = 0) {
   return Array.from({ length: count }, (_, index) => index === count - 1
     ? round(qty - round(base, 6) * (count - 1), 6)
     : round(base, 6));
+}
+
+function splitCampaignTransferBatches(job, configuredBatchQty = 0) {
+  const segments = Array.isArray(job?.campaignSegments)
+    ? job.campaignSegments.filter((segment) => number(segment.productionQty) > EPSILON)
+    : [];
+  if (segments.length <= 1) return splitTransferBatches(job?.qty, configuredBatchQty);
+  // Preserve customer/buffer pegging boundaries. One transfer batch may not
+  // straddle two MPP lines because the persisted allocation must reconcile
+  // against each line independently.
+  return segments.flatMap((segment) => splitTransferBatches(segment.productionQty, configuredBatchQty));
+}
+
+function campaignDetailForBatch(task, job, receiptQtyBeforeBatch, receiptQtyBeforeJob = 0) {
+  const sourceDetails = Array.isArray(task?.sourceDetails) && task.sourceDetails.length
+    ? task.sourceDetails
+    : [task?.detail].filter(Boolean);
+  const segments = Array.isArray(job?.campaignSegments) ? job.campaignSegments : [];
+  if (segments.length <= 1 || sourceDetails.length <= 1) return task?.detail || sourceDetails[0] || null;
+  const withinCampaign = Math.max(number(receiptQtyBeforeBatch) - number(receiptQtyBeforeJob), 0);
+  let cumulative = 0;
+  const segment = segments.find((candidate, index) => {
+    cumulative += number(candidate.productionQty);
+    return withinCampaign < cumulative - EPSILON || index === segments.length - 1;
+  });
+  const targetKey = segment?.sourceDeliveryTargetId
+    ? String(segment.sourceDeliveryTargetId)
+    : segment?.isBufferStock
+      ? `BUFFER:${dateKey(segment.fgRequiredDate || segment.due)}`
+      : null;
+  return sourceDetails.find((detail) => mrpTargetKey(detail) === targetKey) || task?.detail || sourceDetails[0] || null;
 }
 
 function splitFlowBatches(quantity, flowRule, configuredBatchQty = 0) {
@@ -983,13 +1120,14 @@ function occupyDies(usage, diesId, allocation) {
 
 function effectiveCycleMinutes(route, machine, efficiency = 85) {
   const factor = Math.min(Math.max(number(efficiency), 1), 100) / 100;
+  const runtimeAllowance = Math.max(1 / factor, MINIMUM_RUNTIME_ALLOWANCE_FACTOR);
   const seconds = number(route.cycleTime) || number(machine?.cycleTime);
-  if (seconds > 0) return seconds / 60 / factor;
+  if (seconds > 0) return seconds / 60 * runtimeAllowance;
   const rate = number(machine?.capacity);
   const unit = String(machine?.capacityUnit || "").toUpperCase();
   if (rate <= 0) return 0;
-  if (unit.includes("HOUR") || unit.includes("JAM")) return 60 / rate / factor;
-  if (unit.includes("MIN")) return 1 / rate / factor;
+  if (unit.includes("HOUR") || unit.includes("JAM")) return 60 / rate * runtimeAllowance;
+  if (unit.includes("MIN")) return 1 / rate * runtimeAllowance;
   return 0;
 }
 
@@ -1091,7 +1229,7 @@ function buildRecommendationValidationScope({ planNumber, planningMode, scenario
   };
 }
 
-function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBeforeJob, trialUsage, trialDiesUsage, trialManualByRoute, manualCompletionByRoute, machineBySpecification, diesForRoute, mode, due, executionFloor, periodStart, periodEnd, preset, planningDecision }) {
+function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBeforeJob, trialUsage, trialDiesUsage, trialManualByRoute, manualCompletionByRoute, machineBySpecification, diesForRoute, mode, due, executionFloor, periodStart, periodEnd, preset, planningDecision, preserveBatchBoundaries = false }) {
   const allocations = [];
   const completionByRoute = new Map();
   const allocationIndexesByRoute = new Map();
@@ -1128,8 +1266,17 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
       const duration = Math.max(leadMinutes(route, planningDecision), 1);
       const end = predecessorEnd + duration;
       if (end > due + EPSILON) return { failed: { code: "VENDOR_LEAD_TIME_LATE", route, qty: totalQty }, allocations, usage: trialUsage, manualByRoute: trialManualByRoute, batches };
-      allocations.push({ task, qty: totalQty, start: predecessorEnd, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: 1, receiptBatchQty: combinedReceiptBatchQty, receiptQtyBeforeBatch: receiptQtyBeforeJob, manualConsumedQty: totalManualConsumedQty });
-      allocationIndexesByRoute.set(route.id, [allocations.length - 1]);
+      if (preserveBatchBoundaries) {
+        const routeIndexes = [];
+        routeChunks.forEach((chunk, index) => {
+          allocations.push({ task, qty: chunk.qty, start: predecessorEnd, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: index + 1, receiptBatchQty: chunk.receiptBatchQty, receiptQtyBeforeBatch: chunk.receiptQtyBeforeBatch, manualConsumedQty: chunk.manualConsumedQty });
+          routeIndexes.push(allocations.length - 1);
+        });
+        allocationIndexesByRoute.set(route.id, routeIndexes);
+      } else {
+        allocations.push({ task, qty: totalQty, start: predecessorEnd, end, shift: "VENDOR", machine: null, overtime: false, predecessorDraftIndexes, batchNumber: 1, receiptBatchQty: combinedReceiptBatchQty, receiptQtyBeforeBatch: receiptQtyBeforeJob, manualConsumedQty: totalManualConsumedQty });
+        allocationIndexesByRoute.set(route.id, [allocations.length - 1]);
+      }
       completionByRoute.set(route.id, end);
       continue;
     }
@@ -1149,7 +1296,7 @@ function scheduleFitFirstPerRoute({ graph, batches, receiptQty, receiptQtyBefore
     const candidateMachines = machineResources.machines;
     const scoringContext = { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId };
     const fullPlacement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => Math.max(totalQty * cycleByMachine(machine), 1), mode, periodStart, periodEnd, preset, scoringContext });
-    if (fullPlacement) {
+    if (fullPlacement && !preserveBatchBoundaries) {
       if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, fullPlacement.machine.id);
       occupy(trialUsage, fullPlacement.machine.id, { ...fullPlacement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
       occupyDies(trialDiesUsage, fullPlacement.dies?.id, fullPlacement);
@@ -1295,10 +1442,18 @@ function phaseJobs(plan, details, deliveryPhases, options = {}) {
     const bufferProductionQty = Math.max(productionTargetQty - producedCustomerQty, 0);
     const tracedStockCoverageQty = customerJobs.reduce((sum, job) => sum + (job.stockCoverageHistory || []).reduce((lineSum, line) => lineSum + number(line.usedQty), 0), 0);
     const stockCoverageLines = customerJobs.flatMap((job) => job.stockCoverageHistory || []);
+    // Buffer rows do not have their own customer delivery target. Keep the
+    // purchase-material lookup scoped to every non-buffer target generated by
+    // the same MPS detail/FG, otherwise it falls back to the latest material
+    // date from another FG in the same MPS.
+    const materialScopeDeliveryTargetIds = [...new Set(related
+      .map((detail) => mrpTargetKey(detail))
+      .filter((targetId) => targetId && !String(targetId).startsWith("BUFFER:")))];
     const jobs = [...customerJobs];
     if (bufferProductionQty > EPSILON) jobs.push({
       id: null, phaseNumber: null, due: plan.periodEnd, qty: round(bufferProductionQty), grossDemandQty: round(bufferProductionQty),
       targetType: "INTERNAL_STOCK", targetCode: "BUFFER_STOCK", isBufferStock: true,
+      materialScopeDeliveryTargetIds,
       requestedBufferQty: round(requestedBufferQty), prioritySequence: customerJobs.length + 1,
       quantityPolicy: "BUFFER_AFTER_PRIORITY_DEMAND",
     });
@@ -1352,7 +1507,12 @@ function phaseJobs(plan, details, deliveryPhases, options = {}) {
 function combineSingleDeliveryBufferCampaigns(jobs = []) {
   const candidatesByKey = new Map();
   for (const job of jobs) {
-    const key = `${job.group?.receipt?.id || "?"}|${dateKey(job.fgRequiredDate || job.due).slice(0, 7)}`;
+    // Phase-scoped MPP rows have a different receipt row for every customer
+    // phase and buffer, but they still belong to the same FG/MPS detail. Group
+    // on that stable lineage so a buffer due on the same FG date can share one
+    // continuous campaign with its customer phase.
+    const sourceKey = job.group?.receipt?.mpsDetailId || job.group?.receipt?.id || "?";
+    const key = `${sourceKey}|${dateKey(job.fgRequiredDate || job.due).slice(0, 7)}`;
     if (!candidatesByKey.has(key)) candidatesByKey.set(key, []);
     candidatesByKey.get(key).push(job);
   }
@@ -1362,10 +1522,6 @@ function combineSingleDeliveryBufferCampaigns(jobs = []) {
     const productionRows = rows.filter((row) => number(row.qty) > EPSILON);
     const customerRows = productionRows.filter((row) => row.targetType === "CUSTOMER" && !row.isBufferStock);
     const bufferRows = productionRows.filter((row) => row.isBufferStock);
-    if (productionRows.length !== 2 || customerRows.length !== 1 || bufferRows.length !== 1) continue;
-    const customer = customerRows[0];
-    const buffer = bufferRows[0];
-    if (customer.configurationError || buffer.configurationError || dateKey(customer.due).slice(0, 7) !== dateKey(buffer.due).slice(0, 7)) continue;
     const segment = (row) => ({
       id: row.id || null,
       phaseNumber: row.phaseNumber || null,
@@ -1386,22 +1542,59 @@ function combineSingleDeliveryBufferCampaigns(jobs = []) {
       prioritySequence: row.prioritySequence || null,
       priorityClass: row.priorityClass || null,
       priorityScore: row.priorityScore == null ? null : round(row.priorityScore, 2),
+      sourceDeliveryTargetId: row.sourceDeliveryTargetId || null,
     });
-    const campaignSegments = [segment(customer), segment(buffer)];
-    replacements.set(customer, {
-      ...customer,
-      qty: round(number(customer.qty) + number(buffer.qty)),
-      grossDemandQty: round(number(customer.grossDemandQty ?? customer.qty) + number(buffer.grossDemandQty ?? buffer.qty)),
-      stockCoverageQty: round(number(customer.stockCoverageQty) + number(buffer.stockCoverageQty)),
-      stockCoverageHistory: [...(customer.stockCoverageHistory || []), ...(buffer.stockCoverageHistory || [])],
-      stockCoverageHistoryUntracedQty: round(number(customer.stockCoverageHistoryUntracedQty) + number(buffer.stockCoverageHistoryUntracedQty)),
-      requestedBufferQty: round(number(buffer.qty)),
-      isBufferStock: false,
-      hasBufferCampaign: true,
-      quantityPolicy: "SINGLE_DELIVERY_PLUS_BUFFER_CONTINUOUS_CAMPAIGN",
-      campaignSegments,
-    });
-    suppressed.add(buffer);
+    for (const buffer of bufferRows) {
+      if (buffer.configurationError || suppressed.has(buffer)) continue;
+      const bufferTargetDate = dateKey(buffer.fgRequiredDate || buffer.due);
+      const exactCustomers = customerRows.filter((customer) => !replacements.has(customer)
+        && !customer.configurationError
+        && dateKey(customer.fgRequiredDate || customer.due) === bufferTargetDate);
+      // Legacy, non-phase-scoped plans can have one customer delivery and a
+      // month-end buffer with slightly different day labels. Preserve that
+      // existing consolidation only when the pairing is unambiguous.
+      const customer = exactCustomers.length === 1
+        ? exactCustomers[0]
+        : customerRows.length === 1 && bufferRows.length === 1
+          ? customerRows[0]
+          : null;
+      if (!customer || replacements.has(customer)
+        || dateKey(customer.due).slice(0, 7) !== dateKey(buffer.due).slice(0, 7)) continue;
+      const campaignSegments = [segment(customer), segment(buffer)];
+      replacements.set(customer, {
+        ...customer,
+        group: {
+          ...customer.group,
+          related: [...new Map([
+            ...(customer.group?.related || []),
+            ...(buffer.group?.related || []),
+          ].map((detail) => [detail.id || `${detail.lineNumber}:${detail.partCode}`, detail])).values()],
+          productionTargetQty: round(
+            number(customer.group?.productionTargetQty == null ? customer.qty : customer.group.productionTargetQty)
+            + number(buffer.group?.productionTargetQty == null ? buffer.qty : buffer.group.productionTargetQty),
+          ),
+        },
+        qty: round(number(customer.qty) + number(buffer.qty)),
+        grossDemandQty: round(number(customer.grossDemandQty ?? customer.qty) + number(buffer.grossDemandQty ?? buffer.qty)),
+        stockCoverageQty: round(number(customer.stockCoverageQty) + number(buffer.stockCoverageQty)),
+        stockCoverageHistory: [...(customer.stockCoverageHistory || []), ...(buffer.stockCoverageHistory || [])],
+        stockCoverageHistoryUntracedQty: round(number(customer.stockCoverageHistoryUntracedQty) + number(buffer.stockCoverageHistoryUntracedQty)),
+        materialScopeDeliveryTargetIds: [...new Set([
+          ...(customer.materialScopeDeliveryTargetIds || []),
+          ...(buffer.materialScopeDeliveryTargetIds || []),
+        ])],
+        capacityTargetKeys: [...new Set([
+          capacityJobTargetKey(customer),
+          capacityJobTargetKey(buffer),
+        ].filter(Boolean))],
+        requestedBufferQty: round(number(buffer.qty)),
+        isBufferStock: false,
+        hasBufferCampaign: true,
+        quantityPolicy: "SAME_FG_DATE_DELIVERY_PLUS_BUFFER_CONTINUOUS_CAMPAIGN",
+        campaignSegments,
+      });
+      suppressed.add(buffer);
+    }
   }
   return jobs.flatMap((job) => suppressed.has(job) ? [] : [replacements.get(job) || job]);
 }
@@ -1423,7 +1616,8 @@ async function loadContext(prisma, planNumber, options = {}) {
   });
   if (!plan) { const error = new Error("Monthly Production Plan tidak ditemukan."); error.statusCode = 404; throw error; }
   const mpsNumber = String(plan.sourceType || "").startsWith("MPS:") ? String(plan.sourceType).slice(4) : null;
-  const horizonEndExclusive = addDays(plan.periodEnd, 1);
+  const schedulingHorizonEnd = planSchedulingHorizonEnd(plan);
+  const horizonEndExclusive = addDays(schedulingHorizonEnd, 1);
   const receiptPartCodes = [...new Set((plan.details || []).filter((detail) => !isGeneratedProcess(detail)).map((detail) => detail.partCode).filter(Boolean))];
   const [machines, headers, bomDetails, allRoutes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, calendarOverrides, planOverrides, downtimes, finishedGoodStockBalances, materialGate] = await Promise.all([
     prisma.machine.findMany({ where: { isDeleted: false, status: "Active" }, orderBy: { machineCode: "asc" } }),
@@ -1433,7 +1627,10 @@ async function loadContext(prisma, planNumber, options = {}) {
     mpsNumber ? prisma.mPSDeliveryPlan.findMany({ where: { mpsNumber, targetType: "CUSTOMER", isDeleted: false, status: { not: "Cancelled" } }, orderBy: [{ plannedDate: "asc" }, { phaseNumber: "asc" }] }) : [],
     prisma.productionPlanAllocation.findMany({
       where: { planId: plan.id, isDeleted: false, status: { in: ["Draft", "Published"] }, planningMode, ...(planningMode === "SIMULATION" ? { scenarioKey } : {}) },
-      include: { mbomProcess: { select: { diesId: true, process: { select: { processCode: true } }, mbomDetail: { select: { part: { select: { partCode: true } } } } } } },
+      include: {
+        plan: { select: { planNumber: true, planMonth: true } },
+        mbomProcess: { select: { diesId: true, process: { select: { processCode: true } }, mbomDetail: { select: { part: { select: { partCode: true } } } } } },
+      },
     }),
     planningMode === "PRODUCTION"
       ? prisma.dailyProductionSchedule.findMany({
@@ -1453,9 +1650,12 @@ async function loadContext(prisma, planNumber, options = {}) {
     prisma.productionPlanAllocation.findMany({
       where: {
         planId: { not: plan.id }, isDeleted: false, status: { in: ["Draft", "Published"] }, planningMode: "PRODUCTION",
-        scheduleDate: { gte: plan.periodStart, lte: plan.periodEnd }, routingMode: "INHOUSE", machineId: { not: null },
+        scheduleDate: { gte: plan.periodStart, lte: schedulingHorizonEnd }, routingMode: "INHOUSE", machineId: { not: null },
       },
-      include: { mbomProcess: { select: { diesId: true, process: { select: { processCode: true } }, mbomDetail: { select: { part: { select: { partCode: true } } } } } } },
+      include: {
+        plan: { select: { planNumber: true, planMonth: true } },
+        mbomProcess: { select: { diesId: true, process: { select: { processCode: true } }, mbomDetail: { select: { part: { select: { partCode: true } } } } } },
+      },
     }),
     prisma.productionPlanAllocation.findMany({
       where: {
@@ -1474,7 +1674,7 @@ async function loadContext(prisma, planNumber, options = {}) {
     prisma.dailyProductionSchedule.findMany({
       where: {
         productionPlanAllocationId: null, isDeleted: false, status: { in: ["Draft", "Released", "In Progress"] },
-        scheduleDate: { gte: plan.periodStart, lte: plan.periodEnd }, shift: { not: "VENDOR" }, machineId: { not: null },
+        scheduleDate: { gte: plan.periodStart, lte: schedulingHorizonEnd }, shift: { not: "VENDOR" }, machineId: { not: null },
       },
       select: { machineId: true, diesId: true, scheduleDate: true, shift: true, plannedStartTime: true, plannedEndTime: true },
     }),
@@ -1520,7 +1720,7 @@ async function loadContext(prisma, planNumber, options = {}) {
   return {
     plan, machines, headers: headers.filter((header) => noRegs.has(header.noReg)), bomDetails: bomDetails.filter((detail) => noRegs.has(detail.noReg)), routes: allRoutes.filter((route) => noRegs.has(route.noReg)),
     phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate,
-    planningMode, scenarioKey, presetId: configuredPreset?.id || presetId, preset, planningConstraintByTarget,
+    planningMode, scenarioKey, presetId: configuredPreset?.id || presetId, preset, planningConstraintByTarget, schedulingHorizonEnd,
     capacityConstraintAudit: {
       rulePrecedence: ["PLAN_OVERRIDE", "SIMULATION_PRESET", "GLOBAL_CALENDAR"],
       globalCalendarRuleCount: calendarOverrides.length,
@@ -1533,8 +1733,10 @@ async function loadContext(prisma, planNumber, options = {}) {
 
 async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const context = await loadContext(prisma, planNumber, options);
-  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit, planningConstraintByTarget } = context;
+  const { plan, machines, headers, bomDetails, routes, phases, existing, linkedSchedules, dies, diesParts, externalAllocations, priorCampaignAllocations, unlinkedSchedules, downtimes, finishedGoodStockBalances, materialGate, planningMode, scenarioKey, presetId, preset, capacityConstraintAudit, planningConstraintByTarget, schedulingHorizonEnd } = context;
   const fgCompletionDaysBefore = Math.max(Math.trunc(number(options.flowRule?.delivery?.fgCompletionDaysBefore)), 0);
+  const schedulePolicy = String(options.flowRule?.delivery?.schedulePolicy || "DELIVERY_JIT").toUpperCase();
+  const jitSafetyDays = Math.max(Math.trunc(number(options.flowRule?.delivery?.jitSafetyDays ?? 2)), 0);
   const allowedStatuses = ["Draft", "Confirmed", "Released", "In Progress"];
   if (!allowedStatuses.includes(plan.status)) { const error = new Error(`Rekomendasi ${planningMode.toLowerCase()} tidak dapat dibuat saat MPP berstatus ${plan.status}.`); error.statusCode = 409; throw error; }
   const machineBySpecification = new Map();
@@ -1552,7 +1754,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     routesByPart.get(key).push(route);
   }
   const usage = new Map();
-  const downtimeConstraintAudit = reserveDowntimeCapacity({ usage, machines, downtimes, preset, periodStart: plan.periodStart, periodEnd: plan.periodEnd });
+  const downtimeConstraintAudit = reserveDowntimeCapacity({ usage, machines, downtimes, preset, periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd });
   const capacityConstraints = { ...capacityConstraintAudit, downtime: downtimeConstraintAudit };
   const diesUsage = new Map();
   const diesById = new Map(dies.map((row) => [row.id, row]));
@@ -1565,7 +1767,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     if (!isPressResource(eligibleMachines[0] || route.machine, route)) return [];
     if (route.diesId) return [diesById.get(route.diesId)].filter(Boolean);
     const scheduleStart = dateOnly(plan.periodStart);
-    const scheduleEnd = dateOnly(plan.periodEnd);
+    const scheduleEnd = dateOnly(schedulingHorizonEnd);
     return (diesPartsByPartId.get(route.mbomDetail?.partId) || [])
       .filter((mapping) => mapping.effectiveDate <= scheduleEnd && (!mapping.expiryDate || mapping.expiryDate >= scheduleStart))
       .map((mapping) => diesById.get(mapping.diesId))
@@ -1588,6 +1790,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const today = currentClock.date;
   const executionFloor = Math.max(0, absoluteMinute(plan.periodStart, currentClock.date, currentClock.minuteOfDay));
   const priorCampaignCompletionByPhase = buildPriorCampaignCompletionByPhase(plan.periodStart, priorCampaignAllocations);
+  const nextCampaignStartByPhase = buildNextCampaignStartByPhase(plan.periodStart, externalAllocations, plan.planMonth);
   capacityConstraints.executionContext = {
     timezone: "Asia/Jakarta",
     asOfDate: dateKey(currentClock.date),
@@ -1601,6 +1804,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     externalAllocationCount: externalAllocations.length,
     unlinkedDailyScheduleCount: unlinkedSchedules.length,
     downtimeCount: downtimes.length,
+    schedulePolicy,
+    schedulingHorizonEnd: dateKey(schedulingHorizonEnd),
   };
   const planPartByLine = new Map((plan.details || []).map((detail) => [number(detail.lineNumber), detail.partCode]));
   // Once Production has released/started/completed a DPP, its originating
@@ -1610,7 +1815,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     .filter((row) => row.status !== "Draft")
     .map((row) => row.productionPlanAllocationId)
     .filter(Boolean));
-  const manual = existing.filter((row) => row.allocationSource !== "AUTO_RECOMMENDATION" || dateOnly(row.scheduleDate) < today || firmAllocationIds.has(row.id));
+  const manual = existing.filter((row) => !isReplaceableAutoAllocation(row, today, firmAllocationIds));
   for (const row of [...externalAllocations, ...manual]) {
     if (!row.machineId) continue;
     const day = dayIndex(plan.periodStart, row.scheduleDate);
@@ -1667,22 +1872,38 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     const groupKey = job.group.receipt.id;
     const receiptQtyBeforeJob = number(cumulativeQty.get(groupKey));
     const matchingDetails = job.group.related.filter((detail) => capacityDetailAppliesToJob(detail, job));
-    const relatedRoutes = matchingDetails.flatMap((detail) => {
+    const relatedRoutes = aggregateCapacityRouteTasks(matchingDetails.flatMap((detail) => {
       const key = detail.partId || detail.partCode;
-      const phaseScoped = Boolean(mrpTargetKey(detail));
+      // A consolidated same-date delivery+buffer campaign has more than one
+      // MRP target. Aggregate their route requirement first and net it against
+      // the combined FG receipt quantity; per-target factors would otherwise
+      // double-count or cap the buffer portion.
+      const phaseScoped = Boolean(mrpTargetKey(detail)) && !(job.capacityTargetKeys?.length > 1);
       return canonicalizeRoutingOperations(routesByPart.get(key) || []).map((route) => ({
         detail,
         route,
         phasePlannedQty: phaseScoped ? number(detail.qtyPlanned) : null,
         phaseReceiptQty: phaseScoped ? Math.max(number(job.qty), EPSILON) : null,
       }));
-    });
+    }));
     if (!relatedRoutes.length) {
       const receiptMilestone = matchingDetails.some((detail) =>
         detail.id === job.group.receipt.id && !isGeneratedProcess(detail));
-      if (!receiptMilestone) {
-        blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode, code: "ROUTING_MISSING", qty: round(job.qty) });
-        for (const segment of resultSegmentsForJob(job)) phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), targetType: segment.targetType, status: "BLOCKED", blocker: "ROUTING_MISSING" });
+      if (!receiptMilestone || number(job.qty) > EPSILON) {
+        const blockerCode = receiptMilestone ? "PROCESS_ALLOCATION_MISSING" : "ROUTING_MISSING";
+        blockers.push({
+          phaseId: job.id,
+          phaseNumber: job.phaseNumber,
+          dueDate: dateKey(job.due),
+          targetFgDate: dateKey(targetFgDue),
+          partCode: job.group.receipt.partCode,
+          code: blockerCode,
+          qty: round(job.qty),
+          message: receiptMilestone
+            ? "FG receipt mempunyai quantity produksi, tetapi tidak memiliki routing/process allocation. Receipt milestone saja tidak boleh dianggap capacity covered."
+            : "Routing produksi untuk delivery phase belum tersedia.",
+        });
+        for (const segment of resultSegmentsForJob(job)) phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), targetType: segment.targetType, status: "BLOCKED", blocker: blockerCode });
         continue;
       }
       let runningCumulativeQty = receiptQtyBeforeJob;
@@ -1701,7 +1922,14 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     }
     const graph = buildRouteGraph(relatedRoutes, headers, bomDetails);
     let attempt = null;
-    const due = absoluteMinute(plan.periodStart, targetFgDue, DAY_MINUTES);
+    const customerDue = absoluteMinute(plan.periodStart, targetFgDue, DAY_MINUTES);
+    const nextCampaignGate = nextCampaignStartByPhase.get(priorCampaignGateKey(job));
+    const due = Math.min(customerDue, number(nextCampaignGate?.minute) || customerDue);
+    job.nextCampaignGate = nextCampaignGate ? {
+      planNumber: nextCampaignGate.planNumber,
+      startDate: dateKey(nextCampaignGate.startDate),
+      allocationIds: nextCampaignGate.allocationIds,
+    } : null;
     const priorCampaignGate = priorCampaignCompletionByPhase.get(priorCampaignGateKey(job));
     job.priorCampaignGate = priorCampaignGate ? {
       completionDate: dateKey(priorCampaignGate.completionDate),
@@ -1710,9 +1938,51 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     const materialReadyMinute = jobMaterialGate?.readyDate
       ? Math.max(0, absoluteMinute(plan.periodStart, jobMaterialGate.readyDate, 0))
       : executionFloor;
-    const materialExecutionFloor = Math.max(executionFloor, materialReadyMinute, number(priorCampaignGate?.minute));
+    const recommendedStartCandidates = [
+      job.group.receipt.latestStartDate,
+      ...matchingDetails.map((detail) => detail.latestStartDate),
+    ].map(dateOnly).filter(Boolean);
+    const recommendedStartDate = recommendedStartCandidates.length
+      ? new Date(Math.min(...recommendedStartCandidates.map((value) => value.getTime())))
+      : null;
+    const preferredStartDate = recommendedStartDate
+      ? addDays(recommendedStartDate, -EARLY_START_TOLERANCE_DAYS)
+      : null;
+    const preferredStartMinute = preferredStartDate
+      ? Math.max(0, absoluteMinute(plan.periodStart, preferredStartDate, 0))
+      : executionFloor;
+    job.recommendedStartDate = recommendedStartDate;
+    job.preferredStartDate = preferredStartDate;
+    const baseMaterialExecutionFloor = Math.max(
+      executionFloor,
+      materialReadyMinute,
+      number(priorCampaignGate?.minute),
+    );
+    const ownMaterialExecutionFloor = Math.max(
+      baseMaterialExecutionFloor,
+      preferredStartMinute,
+    );
+    const estimatedCriticalDuration = criticalRouteDurationMinutes(graph, (task) => {
+      const taskQty = capacityTaskBatchQuantity(task, job.qty, receiptQtyBeforeJob, receiptQty, receiptQtyBeforeJob);
+      if (routeMode(task.route) === "VENDOR") return Math.max(leadMinutes(task.route, job.planningDecision), 1);
+      const spec = specificationCode(task.route);
+      const eligible = spec ? machineBySpecification.get(spec) || [] : [];
+      const capable = cycleCapableMachines(eligible, (machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85));
+      if (!capable.length) return 0;
+      return taskQty * Math.min(...capable.map((machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85)));
+    });
+    const dueWeekday = dateOnly(targetFgDue)?.getUTCDay();
+    const weekendSafetyDays = !preset?.includeSunday && dueWeekday === 0 ? 1 : 0;
+    const effectiveJitSafetyDays = jitSafetyDays + weekendSafetyDays;
+    const ownJitExecutionFloor = schedulePolicy === "DELIVERY_JIT"
+      ? deliveryJitExecutionFloor({ due, executionFloor: ownMaterialExecutionFloor, criticalDurationMinutes: estimatedCriticalDuration, safetyDays: effectiveJitSafetyDays })
+      : ownMaterialExecutionFloor;
+    job.schedulePolicy = schedulePolicy;
+    job.jitSafetyDays = effectiveJitSafetyDays;
+    job.campaignExecutionFloor = ownJitExecutionFloor;
+    job.estimatedCriticalDurationMinutes = estimatedCriticalDuration;
     const profile = String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase();
-    if (materialExecutionFloor >= due - EPSILON) {
+    if (ownJitExecutionFloor >= due - EPSILON) {
       attempt = {
         failed: {
           code: "MATERIAL_READY_AFTER_FG_DUE",
@@ -1728,14 +1998,15 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const configuredBatches = profile === "FULL_COMPLETION_SEQUENCE"
         ? splitTransferBatches(job.qty, 0)
         : profile === "SHIFT_CAPACITY_TRANSFER"
-          ? splitTransferBatches(job.qty, shiftCapacityTransferQuantity(job.qty, graph, receiptQty, machineBySpecification, preset))
+          ? splitCampaignTransferBatches(job, shiftCapacityTransferQuantity(job.qty, graph, receiptQty, machineBySpecification, preset))
           : splitFlowBatches(job.qty, options.flowRule, options.transferBatchQty);
       if (profile === "SHIFT_CAPACITY_TRANSFER") {
         const perRouteAttempt = scheduleFitFirstPerRoute({
           graph, batches: configuredBatches, receiptQty, receiptQtyBeforeJob,
           trialUsage: cloneUsage(usage), trialDiesUsage: cloneUsage(diesUsage), trialManualByRoute: new Map(manualByRoute), manualCompletionByRoute,
-          machineBySpecification, diesForRoute, mode, due, executionFloor: materialExecutionFloor, periodStart: plan.periodStart, periodEnd: plan.periodEnd, preset,
+          machineBySpecification, diesForRoute, mode, due, executionFloor: ownJitExecutionFloor, periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset,
           planningDecision: job.planningDecision,
+          preserveBatchBoundaries: Boolean(job.campaignSegments?.length > 1),
         });
         if (!perRouteAttempt.failed) { attempt = { mode, ...perRouteAttempt }; break attemptModes; }
         attempt = { mode, ...perRouteAttempt };
@@ -1758,7 +2029,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           for (const task of graph.ordered) {
           const route = task.route;
           const predecessorRouteIds = [...(graph.predecessors.get(route.id) || [])];
-          const predecessorEnd = Math.max(materialExecutionFloor, ...predecessorRouteIds.map((id) => number(completionByRoute.get(id))));
+          const predecessorEnd = Math.max(ownJitExecutionFloor, ...predecessorRouteIds.map((id) => number(completionByRoute.get(id))));
           const predecessorDraftIndexes = normalizeLineageIndexes(predecessorRouteIds.map((id) => allocationIndexByRoute.get(id)), allocations.length);
           const receiptQtyBeforeBatch = receiptQtyBeforeJob + batches.slice(0, batchIndex).reduce((sum, value) => sum + number(value), 0);
           const receiptBatchQty = number(batches[batchIndex]);
@@ -1799,7 +2070,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           const machineResources = buildMachineDiesOptions(route, laneMachines, diesForRoute);
           if (!machineResources.machines.length) { failed = { code: machineResources.excludedPressMachineIds.length ? "DIES_UNAVAILABLE" : "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty, specificationCode: spec }; break; }
           const candidateMachines = machineResources.machines;
-          const placement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => qty * cycleByMachine(machine), mode, periodStart: plan.periodStart, periodEnd: plan.periodEnd, preset, scoringContext: { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId } });
+          const placement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => qty * cycleByMachine(machine), mode, periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset, scoringContext: { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId } });
           if (!placement) { failed = { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty, specificationCode: spec }; break; }
           if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
           occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
@@ -1815,6 +2086,72 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         }
         attempt = { mode, usage: trialUsage, allocations, failed, batches };
       }
+    }
+    // Delivery JIT is a placement preference, not a hard release fence. If
+    // the late-start window cannot fit the complete campaign, retry against
+    // the same FG due date from the material/recommended-start floor. This is
+    // the normal backward-scheduling pull-forward required when another FG is
+    // added to the same bottleneck resources.
+    const jitFailure = attempt?.failed || null;
+    if (profile === "SHIFT_CAPACITY_TRANSFER"
+      && jitFailure
+      && shouldScheduleLateVisibility(jitFailure.code)
+      && ownJitExecutionFloor > ownMaterialExecutionFloor + EPSILON) {
+      const pullForwardBatches = splitCampaignTransferBatches(
+        job,
+        shiftCapacityTransferQuantity(job.qty, graph, receiptQty, machineBySpecification, preset),
+      );
+      for (const mode of modes) {
+        const pullForwardAttempt = scheduleFitFirstPerRoute({
+          graph, batches: pullForwardBatches, receiptQty, receiptQtyBeforeJob,
+          trialUsage: cloneUsage(usage), trialDiesUsage: cloneUsage(diesUsage), trialManualByRoute: new Map(manualByRoute), manualCompletionByRoute,
+          machineBySpecification, diesForRoute, mode, due, executionFloor: ownMaterialExecutionFloor,
+          periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset, planningDecision: job.planningDecision,
+          preserveBatchBoundaries: Boolean(job.campaignSegments?.length > 1),
+        });
+        if (pullForwardAttempt.failed) continue;
+        attempt = { mode, ...pullForwardAttempt, jitPullForward: true, jitFailure };
+        job.jitPullForward = true;
+        job.jitOriginalExecutionFloor = ownJitExecutionFloor;
+        job.campaignExecutionFloor = ownMaterialExecutionFloor;
+        break;
+      }
+    }
+    // A late delivery must remain visible to PPIC. If the on-time attempt is
+    // impossible only because the material/vendor/capacity completion crosses
+    // FG Required, build the earliest feasible route through the end of the
+    // owner month. It remains a release blocker; this fallback only prevents
+    // PAINT and every successor (for example INSP-2) from disappearing.
+    const onTimeFailure = attempt?.failed || null;
+    if (profile === "SHIFT_CAPACITY_TRANSFER" && shouldScheduleLateVisibility(onTimeFailure?.code)) {
+      const lateDue = absoluteMinute(plan.periodStart, schedulingHorizonEnd, DAY_MINUTES);
+      const lateBatches = splitCampaignTransferBatches(job, shiftCapacityTransferQuantity(job.qty, graph, receiptQty, machineBySpecification, preset));
+      for (const mode of modes) {
+        const lateAttempt = scheduleFitFirstPerRoute({
+          graph, batches: lateBatches, receiptQty, receiptQtyBeforeJob,
+          trialUsage: cloneUsage(usage), trialDiesUsage: cloneUsage(diesUsage), trialManualByRoute: new Map(manualByRoute), manualCompletionByRoute,
+          machineBySpecification, diesForRoute, mode, due: lateDue, executionFloor: ownJitExecutionFloor,
+          periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset, planningDecision: job.planningDecision,
+          preserveBatchBoundaries: Boolean(job.campaignSegments?.length > 1),
+        });
+        if (lateAttempt.failed) continue;
+        const completion = Math.max(...lateAttempt.allocations.map((allocation) => number(allocation.end)), ownJitExecutionFloor);
+        attempt = { mode, ...lateAttempt, lateVisibility: true, onTimeFailure };
+        job.capacityLate = true;
+        job.lateConstraintCode = onTimeFailure.code;
+        job.earliestFeasibleCompletion = dateFromAbsolute(plan.periodStart, completion);
+        blockers.push({
+          phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue),
+          partCode: job.group.receipt.partCode, code: onTimeFailure.code, classification: "DELIVERY_LATE",
+          earliestFeasibleCompletion: dateKey(job.earliestFeasibleCompletion),
+          processCode: onTimeFailure.route?.process?.processCode || null,
+          machineSpecificationCode: onTimeFailure.specificationCode || null,
+          qty: round(onTimeFailure.qty ?? job.qty), materialReadyDate: jobMaterialGate?.readyDate || null,
+          materialReadySource: jobMaterialGate?.source || null,
+        });
+        break;
+      }
+      if (!attempt?.lateVisibility) attempt = { ...(attempt || {}), failed: onTimeFailure };
     }
     if (attempt.failed) {
       blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, dueDate: dateKey(job.due), targetFgDate: dateKey(targetFgDue), partCode: job.group.receipt.partCode, code: attempt.failed.code, classification: attempt.failed.code === "CAPACITY_BEFORE_DUE_UNAVAILABLE" ? "CAPACITY_LATE" : attempt.failed.code, earliestFeasibleCompletion: null, processCode: attempt.failed.route?.process?.processCode || null, machineSpecificationCode: attempt.failed.specificationCode || null, qty: round(attempt.failed.qty), materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null });
@@ -1849,6 +2186,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const receiptQtyBeforeBatch = draft.receiptQtyBeforeBatch == null
         ? receiptQtyBeforeJob + (attempt.batches || []).slice(0, Math.max(number(draft.batchNumber) - 1, 0)).reduce((sum, value) => sum + number(value), 0)
         : number(draft.receiptQtyBeforeBatch);
+      const allocationDetail = campaignDetailForBatch(draft.task, job, receiptQtyBeforeBatch, receiptQtyBeforeJob) || draft.task.detail;
       const routeRequirementQty = number(draft.task.detail.qtyPlanned);
       const routeFactor = routeRequirementQty / Math.max(receiptQty, EPSILON);
       const allocationUomCode = draft.task.detail.uomCode || null;
@@ -1873,6 +2211,19 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
             prioritySequence: job.prioritySequence || null,
             priorityClass: job.priorityClass || null,
             priorityScore: job.priorityScore == null ? null : round(job.priorityScore, 2),
+            recommendedStartDate: job.recommendedStartDate ? dateKey(job.recommendedStartDate) : null,
+            preferredStartDate: job.preferredStartDate ? dateKey(job.preferredStartDate) : null,
+            earlyStartToleranceDays: EARLY_START_TOLERANCE_DAYS,
+            schedulePolicy: job.schedulePolicy,
+            jitSafetyDays: job.jitSafetyDays,
+            jitCampaignStartDate: dateKey(dateFromAbsolute(plan.periodStart, job.campaignExecutionFloor)),
+            jitPullForwardApplied: Boolean(job.jitPullForward),
+            jitOriginalCampaignStartDate: job.jitOriginalExecutionFloor == null
+              ? null
+              : dateKey(dateFromAbsolute(plan.periodStart, job.jitOriginalExecutionFloor)),
+            estimatedCriticalDurationMinutes: round(job.estimatedCriticalDurationMinutes, 1),
+            schedulingDeadlineDate: dateKey(dateFromAbsolute(plan.periodStart, due)),
+            nextCampaignGate: job.nextCampaignGate,
             campaignSegments: job.campaignSegments || [],
           },
           quantityCalculation: {
@@ -1925,12 +2276,12 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
             plannedStartTime: timeText(draft.start),
             completionDate: dateKey(dateFromAbsolute(plan.periodStart, draft.end)),
             plannedEndTime: timeText(draft.end),
-            batchingPolicy: "FULL_LOT_FIRST_SPLIT_ONLY_IF_SLOT_CAPACITY_REQUIRES",
+            batchingPolicy: "FG_REQUIRED_JIT_FULL_LOT_FIRST_SPLIT_ONLY_IF_SLOT_CAPACITY_REQUIRES",
             fullLotPreserved: number(allocationCountByRoute.get(draft.task.route.id)) === 1,
             transferBatchCount: number(allocationCountByRoute.get(draft.task.route.id)),
             batchingReason: number(allocationCountByRoute.get(draft.task.route.id)) === 1
               ? (job.hasBufferCampaign
-                ? "Demand customer dan buffer dikonsolidasikan menjadi satu production campaign karena route masih muat pada satu slot/shift."
+                ? "Demand customer dan buffer untuk FG Required yang sama dikonsolidasikan selama material tersedia dan masih muat pada slot kapasitas."
                 : "Qty demand masih muat pada satu slot/shift, sehingga batch dipertahankan utuh.")
               : "Qty utuh pada route ini tidak memiliki slot yang cukup sebelum due date; split dipakai sebagai fallback kapasitas shift.",
           },
@@ -1943,7 +2294,18 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           },
         },
       };
-      generated.push({ ...draft, recommendationScoreBreakdown, phase: job, mode: attempt.mode, capacityMode, predecessorToken, priorCampaignPredecessorIds, lineageKey, predecessorLineageKeys });
+      generated.push({
+        ...draft,
+        task: { ...draft.task, detail: allocationDetail },
+        recommendationScoreBreakdown,
+        phase: job,
+        mode: attempt.mode,
+        capacityMode,
+        predecessorToken,
+        priorCampaignPredecessorIds,
+        lineageKey,
+        predecessorLineageKeys,
+      });
     }
     for (const [key, value] of attempt.usage) usage.set(key, value);
     for (const [key, value] of attempt.diesUsage || []) diesUsage.set(key, value);
@@ -1952,7 +2314,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     let runningCumulativeQty = number(cumulativeQty.get(groupKey));
     for (const segment of resultSegmentsForJob(job)) {
       runningCumulativeQty += number(segment.productionQty ?? segment.qty);
-      phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.productionQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), stockCoverageHistory: segment.stockCoverageHistory || [], requestedBufferQty: round(segment.requestedBufferQty), isBufferStock: Boolean(segment.isBufferStock), prioritySequence: segment.prioritySequence || null, cumulativeQty: round(runningCumulativeQty), targetType: segment.targetType, status: "COVERED", capacityMode, laneCount, algorithmProfile: String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase(), scoringModel: SCORING_MODEL, averageAllocationScore: allocationScores.length ? round(allocationScores.reduce((sum, score) => sum + score, 0) / allocationScores.length, 2) : null, minimumAllocationScore: allocationScores.length ? round(Math.min(...allocationScores), 2) : null, transferBatchCount: attempt.batches.length, transferBatchQty: round(Math.max(...attempt.batches, 0)), materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null, supplierScheduleConfirmed: Boolean(jobMaterialGate?.confirmed) });
+      phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), targetFgDate: dateKey(segment.fgRequiredDate || targetFgDue), qty: round(segment.grossDemandQty ?? segment.productionQty ?? segment.qty), productionQty: round(segment.productionQty ?? segment.qty), stockCoverageQty: round(segment.stockCoverageQty), stockCoverageHistory: segment.stockCoverageHistory || [], requestedBufferQty: round(segment.requestedBufferQty), isBufferStock: Boolean(segment.isBufferStock), prioritySequence: segment.prioritySequence || null, cumulativeQty: round(runningCumulativeQty), targetType: segment.targetType, status: job.capacityLate ? "LATE" : "COVERED", blocker: job.capacityLate ? job.lateConstraintCode : null, earliestFeasibleCompletion: job.capacityLate ? dateKey(job.earliestFeasibleCompletion) : null, capacityMode, laneCount, algorithmProfile: String(options.flowRule?.algorithmProfile || "SHIFT_CAPACITY_TRANSFER").toUpperCase(), scoringModel: SCORING_MODEL, averageAllocationScore: allocationScores.length ? round(allocationScores.reduce((sum, score) => sum + score, 0) / allocationScores.length, 2) : null, minimumAllocationScore: allocationScores.length ? round(Math.min(...allocationScores), 2) : null, transferBatchCount: attempt.batches.length, transferBatchQty: round(Math.max(...attempt.batches, 0)), materialReadyDate: jobMaterialGate?.readyDate || null, materialReadySource: jobMaterialGate?.source || null, supplierScheduleConfirmed: Boolean(jobMaterialGate?.confirmed) });
     }
     cumulativeQty.set(groupKey, runningCumulativeQty);
   }
@@ -1962,7 +2324,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   if (options.persist !== false) {
     await prisma.$transaction(async (tx) => {
       const replaceableIds = existing
-        .filter((row) => row.allocationSource === "AUTO_RECOMMENDATION" && dateOnly(row.scheduleDate) >= today && !firmAllocationIds.has(row.id))
+        .filter((row) => isReplaceableAutoAllocation(row, today, firmAllocationIds))
         .map((row) => row.id);
       if (planningMode === "PRODUCTION" && replaceableIds.length) {
         await tx.dailyProductionSchedule.updateMany({
@@ -1991,6 +2353,9 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         const materialReadyText = item.phase.materialGate?.readyDate
           ? dateKey(item.phase.materialGate.readyDate)
           : "tidak dibatasi";
+        const lateReasonText = item.phase.capacityLate
+          ? `; LATE ${item.phase.lateConstraintCode}, earliest feasible ${dateKey(item.phase.earliestFeasibleCompletion)}`
+          : "";
         const quantityReason = item.phase.hasBufferCampaign
           ? `Campaign ${round(item.phase.qty)} = demand customer ${round(item.phase.campaignSegments?.[0]?.productionQty)} + buffer ${round(item.phase.campaignSegments?.[1]?.productionQty)}; stock FG ${round(item.phase.stockCoverageQty)} sudah dinetting sebelum produksi`
           : `Urutan ${item.phase.prioritySequence || "buffer"}: gross ${round(item.phase.grossDemandQty ?? item.phase.qty)} - stock FG ${round(item.phase.stockCoverageQty)} = produksi ${round(item.phase.qty)}`;
@@ -2003,7 +2368,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           vendorLeadTimeDays: routeMode(route) === "VENDOR" ? leadMinutes(route, item.phase.planningDecision) / DAY_MINUTES : null,
           expectedReturnQty: routeMode(route) === "VENDOR" ? plannedQty : null,
           plannedQty, uomCode, status: "Draft",
-          notes: `[AUTO-RECOMMENDATION:${VERSION}] ${item.phase.isBufferStock ? "Internal buffer stock" : `Delivery phase ${item.phase.phaseNumber}`}; transfer batch ${item.batchNumber}; [LINEAGE:${item.lineageKey}]`,
+          notes: `[AUTO-RECOMMENDATION:${VERSION}] ${item.phase.isBufferStock ? "Internal buffer stock" : `Delivery phase ${item.phase.phaseNumber}`}; transfer batch ${item.batchNumber};${item.phase.capacityLate ? ` [LATE:${item.phase.lateConstraintCode}]` : ""} [LINEAGE:${item.lineageKey}]`,
           allocationSource: "AUTO_RECOMMENDATION", planningMode, scenarioKey,
           recommendationScore: hasRecommendationScore ? round(item.recommendationScore, 2) : null,
           recommendationScoreBreakdown: routeMode(route) === "VENDOR"
@@ -2018,8 +2383,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
               }
             : item.recommendationScoreBreakdown || null,
           recommendationReason: hasRecommendationScore
-            ? `Score ${round(item.recommendationScore, 2)}/100; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); ${item.capacityMode}; predecessor siap ${timeText(item.start)}`
-            : `Rule-based ${routeMode(route).toLowerCase()} allocation; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); predecessor siap ${timeText(item.start)}`,
+            ? `Score ${round(item.recommendationScore, 2)}/100; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; start guard ${item.phase.preferredStartDate ? dateKey(item.phase.preferredStartDate) : "tidak dibatasi"}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); ${item.capacityMode}; predecessor siap ${timeText(item.start)}${lateReasonText}`
+            : `Rule-based ${routeMode(route).toLowerCase()} allocation; ${quantityReason}; Delivery ${dateKey(item.phase.due)}; target FG ${dateKey(item.phase.targetFgDue || item.phase.due)}; start guard ${item.phase.preferredStartDate ? dateKey(item.phase.preferredStartDate) : "tidak dibatasi"}; material siap ${materialReadyText} (${item.phase.materialGate?.source || "NO_PURCHASE_REQUIREMENT"}); predecessor siap ${timeText(item.start)}${lateReasonText}`,
           capacityMode: item.capacityMode, deliveryPhaseId: item.phase.id, deliveryPhaseNumber: item.phase.phaseNumber,
           demandSourceType: item.phase.sourceType || null, demandSourceNumber: item.phase.sourceNumber || null,
           customerCode: item.phase.customerCode || null, customerTargetDate: item.phase.due || null,
@@ -2027,6 +2392,9 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           priorityScore: item.phase.priorityScore || null, priorityClass: item.phase.priorityClass || null,
           latestFinishDate: item.phase.targetFgDue || item.phase.due || null,
           latestStartDate: dateFromAbsolute(plan.periodStart, Math.max(0, absoluteMinute(plan.periodStart, item.phase.targetFgDue || item.phase.due, DAY_MINUTES) - Math.max(item.end - item.start, 1))),
+          capacityLate: Boolean(item.phase.capacityLate),
+          lateConstraintCode: item.phase.lateConstraintCode || null,
+          earliestFeasibleCompletion: item.phase.earliestFeasibleCompletion || null,
           transferBatchNumber: item.batchNumber, predecessorAllocationIds: predecessorIds, createdBy: options.actor || "system",
         } });
         createdIds.push(created.id); persisted.push(created);
@@ -2040,7 +2408,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
             planId: plan.id,
             isDeleted: false,
             reason: { startsWith: AUTO_CAPACITY_OVERRIDE_PREFIX },
-            scheduleDate: { gte: today, lte: plan.periodEnd },
+            scheduleDate: { gte: today, lte: schedulingHorizonEnd },
           },
           data: { isDeleted: true, changedBy: options.actor || "system", changedAt: new Date() },
         });
@@ -2060,7 +2428,12 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         else await tx.capacityDayOverride.create({ data: { planId: plan.id, machineId: day.machineId, scheduleDate: day.scheduleDate, ...data } });
       }
       const previousSummary = plan.recommendationSummary && typeof plan.recommendationSummary === "object" && !Array.isArray(plan.recommendationSummary) ? plan.recommendationSummary : {};
-      const capacityFlowRule = previousSummary.capacityFlowRule || (options.flowRule ? { active: options.flowRule } : null);
+      const previousCapacityFlowRule = previousSummary.capacityFlowRule && typeof previousSummary.capacityFlowRule === "object"
+        ? previousSummary.capacityFlowRule
+        : {};
+      const capacityFlowRule = options.flowRule
+        ? { ...previousCapacityFlowRule, active: options.flowRule }
+        : (Object.keys(previousCapacityFlowRule).length ? previousCapacityFlowRule : null);
       const summary = { ...previousSummary, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS, scoringSummary, capacityConstraints, materialGate, averageAllocationScore: scoringSummary.averageScore, minimumAllocationScore: scoringSummary.minimumScore, allocationCount: persisted.length, phaseCount: phaseResults.length, coveredPhaseCount: phaseResults.filter((row) => row.status === "COVERED").length, blockerCount: blockers.length, phaseResults, blockers, ...(capacityFlowRule ? { capacityFlowRule } : {}) };
       if (planningMode === "PRODUCTION") await tx.monthlyProductionPlan.update({ where: { id: plan.id }, data: { recommendationGeneratedAt: new Date(), recommendationVersion: VERSION, recommendationSummary: summary } });
     });
@@ -2069,6 +2442,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const validationRequest = buildRecommendationValidationScope({ planNumber, planningMode, scenarioKey, presetId, persisted: options.persist !== false });
   return {
     planNumber, planningMode, scenarioKey, presetId, presetName: preset?.name || null, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS,
+    schedulePolicy, schedulingHorizonEnd: dateKey(schedulingHorizonEnd), jitSafetyDays,
     scoringSummary,
     capacityConstraints,
     materialGate,
@@ -2076,7 +2450,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     firmAllocationCount: firmAllocationIds.size,
     preservedCompletedDppCount: (linkedSchedules || []).filter((row) => row.status === "Completed").length,
     ...(options.persist === false ? { previewAllocations: generated.map((row) => ({
-      partCode: row.task.detail.partCode, processCode: row.task.route.process?.processCode || null,
+      lineNumber: row.task.detail.lineNumber, partCode: row.task.detail.partCode, processCode: row.task.route.process?.processCode || null,
       qty: round(row.qty), phaseNumber: row.phase.phaseNumber, batchNumber: row.batchNumber,
       machineCode: row.machine?.machineCode || null, shift: row.shift,
       scheduleDate: dateKey(dateFromAbsolute(plan.periodStart, row.start)),
@@ -2100,18 +2474,26 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
 
 module.exports = {
   recommendMonthlyCapacity,
+  shouldScheduleLateVisibility,
   generatedBatchQuantity,
   priorityNetBatchQuantity,
   mrpTargetKey,
   capacityJobTargetKey,
   capacityDetailAppliesToJob,
   capacityTaskBatchQuantity,
+  criticalRouteDurationMinutes,
+  deliveryJitExecutionFloor,
+  planSchedulingHorizonEnd,
+  aggregateCapacityRouteTasks,
   priorCampaignGateKey,
   buildPriorCampaignCompletionByPhase,
+  buildNextCampaignStartByPhase,
   allocateStockCoverage,
   customerDemandQuantity,
   phaseJobs,
   combineSingleDeliveryBufferCampaigns,
+  splitCampaignTransferBatches,
+  campaignDetailForBatch,
   splitFlowBatches,
   fitFirstBatchStrategies,
   shiftCapacityTransferQuantity,
@@ -2130,6 +2512,7 @@ module.exports = {
   retainRankedCandidate,
   resolveCandidateBudget,
   cycleCapableMachines,
+  effectiveCycleMinutes,
   candidateMachinesForLane,
   shouldPinMachineLane,
   machineLaneKey,
@@ -2137,10 +2520,12 @@ module.exports = {
   normalizeLineageIndexes,
   summarizeAllocationScoring,
   buildRecommendationValidationScope,
+  isReplaceableAutoAllocation,
   SCORING_MODEL,
   SCORING_WEIGHTS,
   DEFAULT_CANDIDATE_BUDGET,
   MAX_CANDIDATE_BUDGET,
+  MINIMUM_RUNTIME_ALLOWANCE_FACTOR,
   AUTO_CAPACITY_OVERRIDE_PREFIX,
   VERSION,
 };

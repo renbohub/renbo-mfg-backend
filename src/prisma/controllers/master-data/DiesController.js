@@ -4,6 +4,15 @@ const { mapDoc } = require("../../utils/mapDoc");
 const { incrementDiesShotCounter, resetDiesShotCounter } = require("../../utils/diesShotCounter");
 const { deleteDiesFile } = require("../../middleware/uploads");
 const { convertNumericFields } = require("../../utils/numericConverter");
+const { assertReference, referenceError } = require("../../utils/referenceValidation");
+
+const validateReferences = async (data, current = {}) => {
+  if (String(data.ownerType || current.ownerType || "").toLowerCase() === "customer" && !(data.customerCode || current.customerCode)) {
+    throw referenceError("customerCode", "Customer pemilik wajib dipilih untuk Dies milik customer.", "REFERENCE_REQUIRED");
+  }
+  await assertReference({ delegate: prisma.customer, field: "customerCode", value: data.customerCode, currentValue: current.customerCode, key: "customerCode", label: "Customer", activeWhere: { status: "Active" } });
+  await assertReference({ delegate: prisma.warehouse, field: "warehouseCode", value: data.warehouseCode, currentValue: current.warehouseCode, key: "warehouseCode", label: "Gudang", activeWhere: { isActive: true } });
+};
 const { parseFilter } = require("../../utils/parseFilter");
 
 // Field-field Die yang tipenya bukan string di schema Prisma
@@ -240,6 +249,7 @@ exports.create = async (req, res, next) => {
   try {
     const { diesParts, existingPhotos, existingDrawings, existingSpecs, ...rawData } = req.body;
     const diesData = sanitizeDiesData(rawData);
+    await validateReferences(diesData);
 
     // Pasang file uploads ke JSON field masing-masing
     if (req.files?.photos?.length > 0)
@@ -309,6 +319,7 @@ exports.update = async (req, res, next) => {
     if (!currentDies) {
       return res.status(404).json({ message: "Dies not found" });
     }
+    await validateReferences(diesData, currentDies);
 
     // Jika diesCode berubah, cek apakah ada dies soft deleted dengan code yang sama
     if (diesData.diesCode && diesData.diesCode !== currentDies.diesCode) {

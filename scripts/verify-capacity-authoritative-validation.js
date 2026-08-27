@@ -5,6 +5,7 @@ const {
   uniqueBlockers,
   visibleStoredRecommendationBlockers,
 } = require("../src/prisma/services/planning/capacityRecommendationValidationService");
+const { applyUnscheduledNoticePolicy } = require("../src/prisma/services/planning/capacityPlanningService");
 
 const algorithmBlocker = { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", phaseId: "phase-1", phaseNumber: 1 };
 const validationBlocker = { code: "PLAN_PREDECESSOR_QTY_SHORT", allocationId: "allocation-2", processCode: "PACK" };
@@ -72,4 +73,17 @@ assert.strictEqual(visibleStoredRecommendationBlockers(stalePlan, {
   deliveryCoverage: { ready: true },
 }).length, 1, "Stored blocker must remain visible while the live snapshot is still blocked");
 
-console.log("Capacity authoritative post-validation checks passed: 16/16 cases");
+const unscheduledIssues = [
+  { code: "PLAN_ROUTING_MISSING", severity: "blocking" },
+  { code: "PLAN_CAPACITY_SHORTAGE", severity: "overridable" },
+  { code: "PLAN_MACHINE_TIME_OVERLAP", severity: "blocking" },
+];
+const unscheduledRows = [{ reason: "Routing process belum tersedia" }];
+applyUnscheduledNoticePolicy(unscheduledIssues, unscheduledRows);
+assert.strictEqual(unscheduledIssues[0].severity, "warning", "Unscheduled routing must be a follow-up warning");
+assert.strictEqual(unscheduledIssues[1].severity, "warning", "Unscheduled capacity shortage must not block release");
+assert.strictEqual(unscheduledIssues[2].severity, "blocking", "A real machine overlap must remain blocking");
+assert.strictEqual(unscheduledRows[0].noticeCode, "UNSCHEDULED_FOLLOW_UP", "Unscheduled rows must carry an auditable notice code");
+assert.strictEqual(unscheduledRows[0].requiresFollowUp, true, "Unscheduled warning must stay visible for the next review");
+
+console.log("Capacity authoritative post-validation checks passed: 21/21 cases");

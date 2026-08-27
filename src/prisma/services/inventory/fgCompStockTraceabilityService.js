@@ -1,3 +1,6 @@
+const { calculateLiveMbomCosts } = require("../mbomLiveCostingService");
+const { legacyPriceValue, resolveEffectiveRecord } = require("../pricing/effectivePriceService");
+
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 3) => Number(number(value).toFixed(digits));
 const normalizeUomCode = (value) => String(value || "unit").trim().toLowerCase();
@@ -283,14 +286,16 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
   for (const header of headers) if (header.partId && !headerByPartId.has(header.partId)) headerByPartId.set(header.partId, header);
   const traces = roots.map((root) => ({ root, rootHeader: headerByPartId.get(root.id) || null, ...collectTraceLines(root, headerByPartId) }));
   const partCodes = new Set(roots.map((root) => root.partCode));
+  const partIds = new Set(roots.map((root) => root.id));
   const materialIds = new Set();
   for (const trace of traces) {
     for (const line of trace.lines.values()) {
       partCodes.add(line.partCode);
+      if (line.partId) partIds.add(line.partId);
       if (line.materialId) materialIds.add(line.materialId);
     }
   }
-  const [stockRows, materialPieceMovements, receiptAllocations, purchaseSuggestionAllocations] = await Promise.all([
+  const [stockRows, materialPieceMovements, receiptAllocations, purchaseSuggestionAllocations, valuationContext] = await Promise.all([
     prisma.stockBalance.findMany({
       where: {
         isDeleted: false,
@@ -365,6 +370,12 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
       },
       select: { partCode: true, materialId: true, uomCode: true, sourceRequirements: true },
     }) : [],
+    options.includeValuation ? Promise.all([
+      partIds.size ? prisma.partPriceList.findMany({ where: { isDeleted: false, partId: { in: [...partIds] } } }) : [],
+      materialIds.size ? prisma.materialPriceList.findMany({ where: { isDeleted: false, materialId: { in: [...materialIds] } } }) : [],
+      prisma.currency.findMany({ where: { isDeleted: false }, select: { currencyCode: true, exchangeRate: true } }),
+      calculateLiveMbomCosts(prisma, { costingDate: asOf }),
+    ]) : null,
   ]);
   const stockByPartCode = new Map();
   const stockByMaterialId = new Map();
@@ -373,6 +384,36 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
     if (row.materialId) stockByMaterialId.set(row.materialId, [...(stockByMaterialId.get(row.materialId) || []), row]);
   }
   const materialPieceAttribution = buildMaterialPieceAttribution(materialPieceMovements);
+  const [partPrices, materialPrices, currencies, liveBomCosts] = valuationContext || [[], [], [], new Map()];
+  const currencyRates = new Map(currencies.map((row) => [String(row.currencyCode || "IDR").toUpperCase(), number(row.exchangeRate) || 1]));
+  const toIdr = (value, currencyCode) => number(value) * (String(currencyCode || "IDR").toUpperCase() === "IDR"
+    ? 1
+    : currencyRates.get(String(currencyCode).toUpperCase()) || 1);
+  const resolveValuation = (partId, materialId, defaultUomCode = "PCS") => {
+    const priceRows = materialId
+      ? materialPrices.filter((row) => row.materialId === materialId)
+      : partPrices.filter((row) => row.partId === partId);
+    const priceRecord = resolveEffectiveRecord(priceRows, asOf);
+    const priceValue = toIdr(legacyPriceValue(priceRecord, asOf), priceRecord?.currencyCode);
+    if (priceValue > 0) {
+      return {
+        unitPriceIdr: round(priceValue, 4),
+        uomCode: String(priceRecord?.uomCode || defaultUomCode || "PCS").toUpperCase(),
+        source: materialId ? "Material Price List" : "Part Price List",
+        priced: true,
+      };
+    }
+    const bomHeader = headerByPartId.get(partId);
+    const liveCost = number(liveBomCosts.get(bomHeader?.id)?.costPerUnit);
+    if (!materialId && liveCost > 0) {
+      return { unitPriceIdr: round(liveCost, 4), uomCode: "PCS", source: "Live MBOM Costing", priced: true };
+    }
+    return { unitPriceIdr: 0, uomCode: String(defaultUomCode || "PCS").toUpperCase(), source: "Belum ada harga", priced: false };
+  };
+  const rootValuationByPartNumber = new Map(roots.filter((root) => root.partNumber).map((root) => [
+    root.partNumber,
+    resolveValuation(root.id, null, root.stockUomCode || "PCS"),
+  ]));
   const allocationSummaryForLine = (line, rootPartCode, attributionShare) => {
     const basePartCode = String(line.partCode || "").replace(/-\d{3}$/, "-000");
     const matching = receiptAllocations.filter((allocation) => {
@@ -439,6 +480,10 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
       const demandAllocation = allocationSummaryForLine(line, trace.root.partCode, attributionShare);
       const plannedPurchaseAllocation = plannedAllocationSummaryForLine(line, trace.root.partCode, attributionShare);
       const requirementAvailable = availableForRequirement(stock, line.requirementUomCode);
+      const directValuation = resolveValuation(line.partId, line.materialId, line.requirementUomCode);
+      const valuation = directValuation.priced || !line.partNumber
+        ? directValuation
+        : rootValuationByPartNumber.get(line.partNumber) || directValuation;
       return {
         ...line,
         sourceBoms: [...line.sourceBoms].sort(),
@@ -449,6 +494,7 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
         stock,
         demandAllocation,
         plannedPurchaseAllocation,
+        valuation,
         stockAttribution: attributionShare == null ? null : {
           method: "MATERIAL_PIECE_CONVERSION_HISTORY",
           sourcePartCode: line.partCode,
@@ -459,6 +505,7 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
       };
     }).sort((left, right) => left.category.localeCompare(right.category) || left.minimumLevel - right.minimumLevel || left.partCode.localeCompare(right.partCode));
     const fgStock = stockSummary(stockByPartCode.get(trace.root.partCode) || []);
+    const fgValuation = resolveValuation(trace.root.id, null, trace.root.stockUomCode || "PCS");
     const componentFgStock = { byUom: mergeBreakdowns(traceLines.filter((line) => line.category === "COMPONENT_FG"), "stock") };
     const wipStock = { byUom: mergeBreakdowns(traceLines.filter((line) => line.category === "WIP"), "stock") };
     const materialStock = { byUom: mergeBreakdowns(traceLines.filter((line) => ["MATERIAL", "PURCHASE_PART"].includes(line.category)), "stock") };
@@ -481,6 +528,7 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
       mbomNoReg: trace.rootHeader?.noReg || null,
       mbomRevision: trace.rootHeader?.revision || null,
       fgStock,
+      fgValuation,
       componentFgStock,
       wipStock,
       materialStock,

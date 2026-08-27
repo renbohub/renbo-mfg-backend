@@ -1,4 +1,7 @@
 const { prisma } = require("../../index");
+const { createAiDraftService } = require("../../services/ai/aiDraftService");
+const aiDraftService = createAiDraftService({ prisma });
+const { assertApprovedCurrentMrp } = require("../../services/planning/mrpLifecycleService");
 const { procurementSchedule, subtractWorkingDays } = require("../../services/planning/procurementSchedulingService");
 const {
   loadDemandPlanningConstraintMap,
@@ -12,6 +15,10 @@ const {
   resolveBomPurchaseDefaults,
   resolvePurchaseSuggestionSupplierMaster,
 } = require("../../services/purchasing/purchaseSuggestionMasterDataService");
+const {
+  mergePrimaryAndSplitSupplierAllocations,
+  sumSupplierAllocationQty,
+} = require("../../services/purchasing/purchaseSuggestionSupplierSplitService");
 
 const ACTIVE_PO_STATUSES = [
   "Draft", "Submitted", "Approved", "Sent", "Confirmed", "Partial Receipt",
@@ -383,8 +390,7 @@ Object.assign(exports, { productionScheduleQty, routingMetricKey, routingMetrics
 async function generateForRun(tx, runNumber, user, options = {}) {
   const run = await tx.mRPRun.findFirst({ where: { runNumber, isDeleted: false } });
   if (!run) throw Object.assign(new Error("MRP Run tidak ditemukan"), { status: 404 });
-  if (run.status !== "Completed") throw Object.assign(new Error("MRP harus Completed sebelum Purchase Suggestion dibuat"), { status: 409 });
-  if (!run.isCurrentPlan) throw Object.assign(new Error("MRP ini bukan plan terbaru. Jalankan ulang MPS dan MRP agar Purchase Suggestion memakai Forecast/SO terbaru."), { status: 409 });
+  assertApprovedCurrentMrp(run, "Purchase Suggestion");
   if (run.mpsNumber) {
     const sourceMps = await tx.mPS.findUnique({ where: { mpsNumber: run.mpsNumber }, select: { replanRequired: true, replanReason: true } });
     if (sourceMps?.replanRequired) throw Object.assign(new Error(sourceMps.replanReason || "Forecast/SO berubah. Hitung ulang MPS dan MRP sebelum membuat Purchase Suggestion."), { status: 409 });
@@ -833,7 +839,7 @@ async function refreshHeaderStatus(tx, suggestionNumber) {
 async function refreshDraftForMps(tx, mpsNumber, user) {
   if (!mpsNumber) return null;
   const run = await tx.mRPRun.findFirst({
-    where: { mpsNumber, isDeleted: false, isCurrentPlan: true, status: "Completed" },
+    where: { mpsNumber, isDeleted: false, isCurrentPlan: true, status: "Completed", scenarioStatus: "APPROVED" },
     orderBy: [{ planRevision: "desc" }, { runDate: "desc" }],
     select: { runNumber: true },
   });
@@ -955,7 +961,7 @@ exports.get = async (req, res, next) => {
         ] },
         select: { partCode: true, partNumber: true, partName: true, material: { select: { materialCode: true } } },
       }),
-      prisma.mRPRun.findMany({ where: { isDeleted: false, isCurrentPlan: true, status: "Completed" }, select: { runNumber: true } }),
+      prisma.mRPRun.findMany({ where: { isDeleted: false, isCurrentPlan: true, status: "Completed", scenarioStatus: "APPROVED" }, select: { runNumber: true } }),
       prisma.demandPlanningDecision.findFirst({ where: { isDeleted: false, status: { in: ["REVIEWED", "APPROVED", "LOCKED"] } }, orderBy: { targetDeliveryDate: "desc" }, select: { targetDeliveryDate: true } }),
     ]);
     const relatedPartByCode = new Map(relatedParts.map((part) => [part.partCode, part]));
@@ -1161,6 +1167,7 @@ exports.getSupplierMaster = async (req, res, next) => {
 
 exports.updateItem = async (req, res, next) => {
   try {
+    if (req.body?.aiDraftId) await aiDraftService.validateDraftForOfficial({ draftId: req.body.aiDraftId, actor: req.user, draftType: "PURCHASING_RECOVERY", moduleCode: "purchasing", pageCode: "purchase-suggestions" });
     let item = await prisma.purchaseSuggestionItem.findFirst({ where: { id: req.params.itemId, suggestionNumber: req.params.suggestionNumber, isDeleted: false } });
     if (!item) return res.status(404).json({ message: "Item Purchase Suggestion tidak ditemukan" });
     const confirmationStatus = text(req.body.confirmationStatus) || item.confirmationStatus;
@@ -1217,8 +1224,17 @@ exports.updateItem = async (req, res, next) => {
         }
       }
       const allocations = await tx.purchaseSuggestionSupplierAllocation.findMany({ where: { suggestionItemId: item.id, isDeleted: false } });
-      const allocatedQty = allocations.reduce((sum, row) => sum + number(row.confirmedQty), 0);
-      const effectiveConfirmedQty = allocatedQty > 0 ? allocatedQty : normalizedConfirmedQty;
+      const allConfirmedSupplierAllocations = mergePrimaryAndSplitSupplierAllocations({
+        primaryAllocation: CONFIRMED_STATUSES.has(confirmationStatus) || bypassConfirmationReason
+          ? {
+              supplierCode: selectedSupplierCode,
+              confirmedQty: normalizedConfirmedQty,
+              deliveryDate: date(req.body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
+            }
+          : null,
+        splitAllocations: allocations.filter((allocation) => CONFIRMED_STATUSES.has(allocation.confirmationStatus)),
+      });
+      const effectiveConfirmedQty = sumSupplierAllocationQty(allConfirmedSupplierAllocations);
       if (req.body.moqAllocationEdited === true && Array.isArray(req.body.moqDemandAllocations)) {
         const suggestionItems = await tx.purchaseSuggestionItem.findMany({
           where: { suggestionNumber: item.suggestionNumber, isDeleted: false },
@@ -1339,7 +1355,7 @@ exports.updateItem = async (req, res, next) => {
         ? (number(item.qtyConvertedToPr) + 0.000001 >= effectiveConfirmedQty ? "Converted to PR" : "Partially Converted to PR")
         : (ready || allocations.some((allocation) => CONFIRMED_STATUSES.has(allocation.confirmationStatus)) ? (shortageQty > 0 ? "Partially Ready" : "Ready for PR") : "Waiting Supplier Confirmation");
       const row = await tx.purchaseSuggestionItem.update({ where: { id: item.id }, data: {
-        confirmationStatus, confirmedQty: effectiveConfirmedQty || null, confirmedDeliveryDate: date(req.body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
+        confirmationStatus, confirmedQty: normalizedConfirmedQty || null, confirmedDeliveryDate: date(req.body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
         confirmedMoq, confirmedLeadTimeDays: effectiveLeadTimeDays,
         orderMultiple: effectiveOrderMultiple,
         recommendedOrderDate: recalculatedOrderDate,
@@ -1385,6 +1401,7 @@ exports.updateItem = async (req, res, next) => {
       await refreshHeaderStatus(tx, item.suggestionNumber);
       return row;
     });
+    if (req.body?.aiDraftId) await aiDraftService.markAiDraftConfirmed({ draftId: req.body.aiDraftId, userId: req.user?.id, officialEntityType: "PURCHASE_SUGGESTION_ITEM", officialEntityId: updated.id });
     res.json(updated);
   } catch (error) { if (error.status) return res.status(error.status).json({ message: error.message }); next(error); }
 };
@@ -1395,8 +1412,9 @@ exports.convertToPr = async (req, res, next) => {
       const suggestion = await tx.purchaseSuggestion.findFirst({ where: { suggestionNumber: req.params.suggestionNumber, isDeleted: false }, include: { items: { where: { isDeleted: false, status: { in: ["Ready for PR", "Partially Ready", "Partially Converted to PR"] } }, include: { supplierAllocations: { where: { isDeleted: false, status: "Confirmed" } } } } } });
       if (!suggestion) throw Object.assign(new Error("Purchase Suggestion tidak ditemukan"), { status: 404 });
       if (suggestion.status === "Replan Required") throw Object.assign(new Error("Purchase Suggestion sudah kedaluwarsa karena Forecast/SO berubah. Hitung ulang MPS dan MRP terlebih dahulu."), { status: 409 });
-      const sourceRun = await tx.mRPRun.findFirst({ where: { runNumber: suggestion.runNumber, isDeleted: false }, select: { isCurrentPlan: true, mpsNumber: true } });
-      if (!sourceRun?.isCurrentPlan) throw Object.assign(new Error("Purchase Suggestion bukan hasil MRP terbaru dan tidak dapat dibuat menjadi PR."), { status: 409 });
+      const sourceRun = await tx.mRPRun.findFirst({ where: { runNumber: suggestion.runNumber, isDeleted: false } });
+      if (!sourceRun) throw Object.assign(new Error("Source MRP Purchase Suggestion tidak ditemukan."), { status: 409 });
+      assertApprovedCurrentMrp(sourceRun, "Purchase Requisition");
       if (sourceRun.mpsNumber) {
         const sourceMps = await tx.mPS.findUnique({ where: { mpsNumber: sourceRun.mpsNumber }, select: { replanRequired: true, replanReason: true } });
         if (sourceMps?.replanRequired) throw Object.assign(new Error(sourceMps.replanReason || "Forecast/SO berubah. Hitung ulang MPS dan MRP terlebih dahulu."), { status: 409 });
@@ -1412,23 +1430,41 @@ exports.convertToPr = async (req, res, next) => {
         if (!CONFIRMED_STATUSES.has(item.confirmationStatus) && !item.bypassConfirmationReason && !item.supplierAllocations.length) throw Object.assign(new Error(`${item.materialCode || item.partCode}: konfirmasi supplier atau alasan bypass wajib diisi.`), { status: 409 });
       }
       const groups = new Map();
+      const totalConfirmedQtyById = new Map();
       for (const item of selected) {
         const prCategory = resolvePrCategory(item);
-        const totalConfirmedQty = item.supplierAllocations.length
-          ? item.supplierAllocations.reduce((sum, allocation) => sum + roundedPurchaseQty(allocation.confirmedQty, allocation.moq, allocation.orderMultiple), 0)
-          : roundedPurchaseQty(item.confirmedQty || item.recommendedPurchaseQty, item.confirmedMoq ?? item.moq, item.orderMultiple);
+        const primarySupplierAllocation = CONFIRMED_STATUSES.has(item.confirmationStatus) || item.bypassConfirmationReason
+          ? {
+              supplierCode: item.alternativeSupplierCode || item.suggestedSupplierCode,
+              confirmedQty: roundedPurchaseQty(item.confirmedQty || item.recommendedPurchaseQty, item.confirmedMoq ?? item.moq, item.orderMultiple),
+              moq: item.confirmedMoq ?? item.moq,
+              orderMultiple: item.orderMultiple,
+              deliveryDate: item.confirmedDeliveryDate || item.materialRequiredDate,
+              unitPrice: item.estimatedUnitPrice,
+              currencyCode: item.currencyCode,
+              materialWidth: item.confirmedMaterialWidth,
+              materialLength: item.confirmedMaterialLength,
+              purchasePackageUomCode: item.purchasePackageUomCode,
+              alternativeMaterialCode: item.alternativeMaterialCode,
+              supplierRemark: item.supplierRemark,
+            }
+          : null;
+        const allConfirmedSupplierAllocations = mergePrimaryAndSplitSupplierAllocations({
+          primaryAllocation: primarySupplierAllocation,
+          splitAllocations: item.supplierAllocations.map((allocation) => ({
+            ...allocation,
+            confirmedQty: roundedPurchaseQty(allocation.confirmedQty, allocation.moq, allocation.orderMultiple),
+          })),
+        });
+        const totalConfirmedQty = sumSupplierAllocationQty(allConfirmedSupplierAllocations);
+        totalConfirmedQtyById.set(item.id, totalConfirmedQty);
         const alreadyConvertedQty = number(item.qtyConvertedToPr);
         const availableQty = round(Math.max(totalConfirmedQty - alreadyConvertedQty, 0));
         const requestedQty = requestedQtyById.has(item.id) ? requestedQtyById.get(item.id) : availableQty;
         if (requestedQty <= 0 || requestedQty > availableQty + 0.000001) {
           throw Object.assign(new Error(`${item.materialCode || item.partCode}: qty PR harus lebih dari 0 dan maksimal ${availableQty} sesuai ketersediaan supplier.`), { status: 409 });
         }
-        const baseAllocations = item.supplierAllocations.length ? item.supplierAllocations : [{
-          supplierCode: item.alternativeSupplierCode || item.suggestedSupplierCode,
-          confirmedQty: totalConfirmedQty, moq: item.confirmedMoq ?? item.moq, orderMultiple: item.orderMultiple,
-          deliveryDate: item.confirmedDeliveryDate || item.materialRequiredDate, unitPrice: item.estimatedUnitPrice,
-          materialWidth: item.confirmedMaterialWidth, materialLength: item.confirmedMaterialLength, purchasePackageUomCode: item.purchasePackageUomCode,
-        }];
+        const baseAllocations = allConfirmedSupplierAllocations;
         let remainingQty = requestedQty;
         let qtyToSkip = alreadyConvertedQty;
         const allocations = baseAllocations.map((allocation) => {
@@ -1541,9 +1577,7 @@ exports.convertToPr = async (req, res, next) => {
           const qty = number(allocation.confirmedQty || item.confirmedQty || item.recommendedPurchaseQty);
           const convertedQty = round(number(item.qtyConvertedToPr) + number(convertedThisRequest.get(item.id)) + qty);
           convertedThisRequest.set(item.id, round(number(convertedThisRequest.get(item.id)) + qty));
-          const totalConfirmedQty = item.supplierAllocations.length
-            ? item.supplierAllocations.reduce((sum, row) => sum + roundedPurchaseQty(row.confirmedQty, row.moq, row.orderMultiple), 0)
-            : roundedPurchaseQty(item.confirmedQty || item.recommendedPurchaseQty, item.confirmedMoq ?? item.moq, item.orderMultiple);
+          const totalConfirmedQty = number(totalConfirmedQtyById.get(item.id));
           await tx.purchaseSuggestionItem.update({ where: { id: item.id }, data: {
             prNumber: pr.prNumber,
             qtyConvertedToPr: convertedQty,

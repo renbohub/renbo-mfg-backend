@@ -1,0 +1,18 @@
+"use strict";
+const assert = require("assert");
+const serviceSource = require("fs").readFileSync(require("path").join(__dirname, "../src/prisma/services/planning/monthlyPlanRecommendationService.js"), "utf8");
+const capabilitySource = require("fs").readFileSync(require("path").join(__dirname, "../src/prisma/services/ai/capabilities/ppicCapabilities.js"), "utf8");
+assert.match(serviceSource, /generateAiRecommendationScenario/);
+assert.match(serviceSource, /generateRuleBasedRecommendationScenario/);
+assert.match(serviceSource, /RULE_BASED_FALLBACK/);
+assert.match(serviceSource, /AI_CORRECTED/);
+assert.match(serviceSource, /allowedMachineIds/);
+assert.match(serviceSource, /allowedDates/);
+assert.match(serviceSource, /Prioritas utama adalah FG selesai tepat waktu/);
+assert.match(serviceSource, /Overload boleh direkomendasikan/);
+assert.match(serviceSource, /Jangan menghitung ulang qty, capacity, stock, WIP, atau lead time/);
+assert.match(serviceSource, /buildRecommendation\(input\)/, "ERP rule engine harus menghitung ulang hasil AI");
+assert.doesNotMatch(serviceSource, /AI.*(?:create|update)\([^\n]*productionPlanAllocation/i, "Generation tidak boleh memutasi allocation resmi");
+for (const code of ["ppic.explain_mps", "ppic.explain_mrp_netting", "ppic.get_delivery_blockers"]) assert.ok(capabilitySource.includes(code));
+for (const evidence of ["warehouseStock", "wipStock", "deliveryTargetId", "nettingHistory", "forecast"]) assert.ok(capabilitySource.includes(evidence));
+console.log("AI MPP recommendation contracts: OK");

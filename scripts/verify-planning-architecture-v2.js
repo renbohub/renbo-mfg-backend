@@ -309,6 +309,18 @@ test("PPIC recovery approval requires every required action owner and date", () 
   assert.deepEqual(validateRecoveryChecklist(complete, "2026-08-28"), []);
 });
 
+test("Accept Late may use a commitment date after the original customer due date", () => {
+  const acceptLate = [{
+    id: "ACCEPT_LATE",
+    title: "Accept Late",
+    required: false,
+    selected: true,
+    owner: "PPIC Approver",
+    targetDate: "2026-09-10",
+  }];
+  assert.deepEqual(validateRecoveryChecklist(acceptLate, "2026-09-05"), []);
+});
+
 test("Forecast warning traces multi-level exploded BOM without losing quantities", async () => {
   const supplierItem = { leadTimeDays: 7, moq: 10, orderMultiple: 5, purchaseUomCode: "PCS", supplier: { supplierCode: "S001", supplierName: "Supplier 1", leadTimeDays: 7 } };
   const headers = {

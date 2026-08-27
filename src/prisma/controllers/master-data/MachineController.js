@@ -4,6 +4,7 @@ const { mapDoc } = require("../../utils/mapDoc");
 const { deleteMachineFile } = require("../../middleware/uploads");
 const { convertNumericFields } = require("../../utils/numericConverter");
 const { parseFilter } = require("../../utils/parseFilter");
+const { assertReference } = require("../../utils/referenceValidation");
 
 // Field-field Machine yang tipenya bukan string di schema Prisma
 const MACHINE_NUMERIC_FIELDS = [
@@ -179,6 +180,7 @@ exports.create = async (req, res, next) => {
     if (bodyData.machineCode) bodyData.machineCode = bodyData.machineCode.toUpperCase();
     const specificationError = validateMachineSpecification(bodyData);
     if (specificationError) return res.status(400).json({ message: specificationError });
+    await assertReference({ delegate: prisma.warehouse, field: "warehouseCode", value: bodyData.warehouseCode, key: "warehouseCode", label: "Gudang", activeWhere: { isActive: true } });
 
     // Pasang file uploads ke JSON field masing-masing
     if (req.files?.photos?.length > 0)
@@ -224,6 +226,7 @@ exports.update = async (req, res, next) => {
     }
     const specificationError = validateMachineSpecification(bodyData, currentMachine);
     if (specificationError) return res.status(400).json({ message: specificationError });
+    await assertReference({ delegate: prisma.warehouse, field: "warehouseCode", value: bodyData.warehouseCode, currentValue: currentMachine.warehouseCode, key: "warehouseCode", label: "Gudang", activeWhere: { isActive: true } });
 
     // Jika machineCode berubah, cek duplikat soft-deleted
     if (bodyData.machineCode && bodyData.machineCode !== currentMachine.machineCode) {

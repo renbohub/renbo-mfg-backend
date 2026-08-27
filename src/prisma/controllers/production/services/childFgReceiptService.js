@@ -1,6 +1,6 @@
 const { randomUUID } = require("crypto");
 const { generateMovementNumber } = require("../../../utils/movementNumberGenerator");
-const { assertStockBalanceNotFrozen } = require("../../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../../inventory/utils/stockOpnameFreezeGuard");
 const { buildExcludeSpecialRackCondition } = require("../../inventory/utils/stockReservationHelpers");
 const { assertQuantity } = require("../../../utils/uomQuantity");
 
@@ -31,21 +31,35 @@ function partStockIdentity(part = {}) {
 
 async function resolveReceiptDefinition(tx, schedule, fgPartCode) {
   if (!schedule?.productionPlanId || !fgPartCode) return null;
-  const [plan, receiptLine, header] = await Promise.all([
+  const [plan, receiptLines, allocation, header] = await Promise.all([
     tx.monthlyProductionPlan.findUnique({
       where: { id: schedule.productionPlanId },
       select: { id: true, planNumber: true },
     }),
-    tx.monthlyProductionPlanDetail.findFirst({
+    tx.monthlyProductionPlanDetail.findMany({
       where: {
         planId: schedule.productionPlanId,
         partCode: fgPartCode,
         isDeleted: false,
         notes: { contains: "[FG-RECEIPT:CHILD]" },
       },
-      orderBy: { lineNumber: "asc" },
-      select: { id: true, lineNumber: true, qtyPlanned: true, uomCode: true },
+      orderBy: [{ requiredDate: "asc" }, { lineNumber: "asc" }],
+      select: {
+        id: true,
+        lineNumber: true,
+        qtyPlanned: true,
+        uomCode: true,
+        deliveryPhaseId: true,
+        requiredDate: true,
+        fgRequiredDate: true,
+      },
     }),
+    schedule.productionPlanAllocationId && tx.productionPlanAllocation?.findUnique
+      ? tx.productionPlanAllocation.findUnique({
+          where: { id: schedule.productionPlanAllocationId },
+          select: { id: true, deliveryPhaseId: true, fgRequiredDate: true },
+        })
+      : Promise.resolve(null),
     tx.mBOMHeader.findFirst({
       where: { isDeleted: false, part: { partCode: fgPartCode, isDeleted: false } },
       orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
@@ -78,10 +92,28 @@ async function resolveReceiptDefinition(tx, schedule, fgPartCode) {
       },
     }),
   ]);
+  const phaseId = schedule.deliveryPhaseId || allocation?.deliveryPhaseId || null;
+  const requiredFgDate = schedule.fgRequiredDate || allocation?.fgRequiredDate || null;
+  const sameDay = (left, right) => left && right && new Date(left).toISOString().slice(0, 10) === new Date(right).toISOString().slice(0, 10);
+  const phaseMatches = phaseId ? receiptLines.filter((line) => line.deliveryPhaseId === phaseId) : [];
+  const dateMatches = requiredFgDate
+    ? receiptLines.filter((line) => sameDay(line.fgRequiredDate, requiredFgDate))
+    : [];
+  const receiptLine = phaseMatches.length === 1
+    ? phaseMatches[0]
+    : dateMatches.length === 1
+      ? dateMatches[0]
+      : receiptLines.length === 1
+        ? receiptLines[0]
+        : null;
   if (!plan || !receiptLine || !header?.part || header.details.length !== 1) return null;
   const finalWip = header.details[0];
   if (!finalWip.part?.partCode || String(finalWip.part.itemType || "").trim().toUpperCase() !== "WIP") return null;
   return { plan, receiptLine, header, finalWip };
+}
+
+function childFgReceiptMarker(plan, receiptLine, fgPartCode) {
+  return `[CHILD-FG-RECEIPT:${plan.planNumber}:${receiptLine.id}:${fgPartCode}]`;
 }
 
 async function upsertFgBalance(tx, source, definition, qty, uomCode, now) {
@@ -116,6 +148,12 @@ async function upsertFgBalance(tx, source, definition, qty, uomCode, now) {
     });
     return { balance, qtyBefore, qtyAfter, identity };
   }
+  await assertStockIdentityNotFrozen(tx, {
+    warehouseCode: source.warehouseCode,
+    rackCode: source.rackCode || null,
+    lotNumber: source.lotNumber || null,
+    stockType: "Finished Goods",
+  });
   const balance = await tx.stockBalance.create({
     data: {
       warehouseCode: source.warehouseCode,
@@ -148,7 +186,8 @@ async function materializeChildFgShortage(tx, schedule, fgItem, performedBy = "s
   const definition = await resolveReceiptDefinition(tx, schedule, fgItem.partCode);
   if (!definition) return { convertedQty: 0 };
 
-  const marker = `[CHILD-FG-RECEIPT:${definition.plan.planNumber}:${fgItem.partCode}]`;
+  const marker = childFgReceiptMarker(definition.plan, definition.receiptLine, fgItem.partCode);
+  const legacyMarker = `[CHILD-FG-RECEIPT:${definition.plan.planNumber}:${fgItem.partCode}]`;
   const prior = await tx.stockMovement.aggregate({
     where: {
       isDeleted: false,
@@ -156,7 +195,15 @@ async function materializeChildFgShortage(tx, schedule, fgItem, performedBy = "s
       transactionType: "PRODUCTION",
       stockType: "Finished Goods",
       partCode: fgItem.partCode,
-      notes: { contains: marker },
+      OR: [
+        { notes: { contains: marker } },
+        {
+          AND: [
+            { notes: { contains: legacyMarker } },
+            { notes: { contains: `MPP line ${definition.receiptLine.lineNumber}` } },
+          ],
+        },
+      ],
     },
     _sum: { qty: true },
   });
@@ -282,4 +329,8 @@ async function materializeChildFgShortage(tx, schedule, fgItem, performedBy = "s
   return { convertedQty: qtyToConvert - Math.max(0, remaining), movements, definition };
 }
 
-module.exports = { materializeChildFgShortage };
+module.exports = {
+  childFgReceiptMarker,
+  materializeChildFgShortage,
+  resolveReceiptDefinition,
+};

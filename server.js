@@ -76,11 +76,15 @@ app.use((req, res, next) => {
 // --- Error handler global (tetap paling bawah)
 app.use((err, req, res, _next) => {
   console.error("ERROR:", err);
-  const code = err.status || 500;
+  const statusCode = Number(err.statusCode || err.status || 500);
   const { recordError } = require("./src/prisma/utils/pageContext");
   req.contextErrorRecorded = true;
-  recordError(req, err, code);
-  res.status(code).json({ message: err.message || "Error" });
+  recordError(req, err, statusCode);
+  res.status(statusCode).json({
+    message: err.message || "Error",
+    ...(err.code ? { code: err.code } : {}),
+    ...(err.details ? { details: err.details } : {}),
+  });
 });
 
 app.post("/test-body", express.json(), (req, res) => {
@@ -148,6 +152,33 @@ io.on("connection", (socket) => {
 
 // --- Start
 const PORT = process.env.PORT || 5005;
+let aiRuntimeSupervisor = null;
+let aiShutdownRegistered = false;
+
+function registerAiShutdown() {
+  if (aiShutdownRegistered) return;
+  aiShutdownRegistered = true;
+  const shutdown = async () => {
+    const forceExit = setTimeout(() => process.exit(1), 5000);
+    forceExit.unref?.();
+    try {
+      await aiRuntimeSupervisor?.shutdown();
+    } catch (error) {
+      console.error("AI runtime shutdown error:", error.message);
+    }
+    if (server.listening) {
+      server.close(() => {
+        clearTimeout(forceExit);
+        process.exit(0);
+      });
+    } else {
+      clearTimeout(forceExit);
+      process.exit(0);
+    }
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
 
 // --- Setup Auto-Cleanup Scheduler
 const cron = require('node-cron');
@@ -169,6 +200,10 @@ cron.schedule('0 2 * * *', async () => {
       limitExceeded: summary.limitExceeded,
       timestamp: summary.timestamp
     });
+    const { prisma } = require('./src/prisma');
+    const { cleanupExpiredAiData } = require('./src/prisma/services/ai/aiRetentionService');
+    const aiSummary = await cleanupExpiredAiData(prisma, new Date());
+    console.log('✅ [CRON] AI retention completed:', aiSummary);
   } catch (error) {
     console.error('❌ [CRON] Cleanup error:', error.message);
   }
@@ -221,6 +256,12 @@ async function startServer() {
         expiresAt: licenseStatus.expiresAt,
       });
     }
+
+    ({ aiRuntimeSupervisor } = require("./src/prisma/services/ai/aiRuntimeSupervisor"));
+    const { markStaleAiRequestsFailed } = require("./src/prisma/services/ai/aiConversationService");
+    const { prisma } = require("./src/prisma");
+    await markStaleAiRequestsFailed(prisma);
+    registerAiShutdown();
 
     server.listen(PORT, () => {
       console.log("✅ Server is running on port:", PORT);

@@ -1,9 +1,21 @@
 const assert = require("node:assert/strict");
+const materialReadinessService = require("../src/prisma/services/planning/materialReadinessService");
 const {
   materialGateForJob,
   resolveSuggestionMaterialGate,
   suggestionSystemMaterialDate,
-} = require("../src/prisma/services/planning/materialReadinessService");
+} = materialReadinessService;
+
+assert.equal(typeof materialReadinessService.planningMaterialDisposition, "function",
+  "material readiness planning harus memiliki kebijakan warning non-blocking");
+const planningWarning = materialReadinessService.planningMaterialDisposition({
+  ready: false,
+  issues: [{ code: "SUPPLIER_DATE_MISSING", severity: "BLOCKING", partCode: "MI-M06-N01" }],
+});
+assert.equal(planningWarning.allowed, true, "material shortage tidak boleh memblokir MPP release");
+assert.deepEqual(planningWarning.warnings.map((warning) => ({ code: warning.code, severity: warning.severity })), [
+  { code: "MATERIAL_NOT_READY", severity: "WARNING" },
+]);
 
 const utc = (value) => new Date(`${value}T00:00:00.000Z`);
 
@@ -47,6 +59,73 @@ const selected = materialGateForJob({
   },
 }, { sourceDeliveryTargetId: "delivery-1" });
 assert.equal(selected.source, "PHASE");
+assert.equal(selected.matchStatus, "PHASE_MATCHED");
+
+const stockCoveredPhase = materialGateForJob({
+  planNumber: "PP-001",
+  mpsNumber: "MPS-001",
+  source: "PURCHASE_SUGGESTION_SYSTEM_DUE",
+  readyDate: utc("2026-09-29"),
+  phaseGates: {
+    "delivery-later": { source: "PHASE", readyDate: utc("2026-09-29") },
+  },
+}, { sourceDeliveryTargetId: "delivery-stock-covered" });
+assert.equal(stockCoveredPhase.source, "NO_PHASE_PURCHASE_REQUIREMENT",
+  "phase yang tidak menghasilkan net purchase tidak boleh mewarisi gate global phase lain");
+assert.equal(stockCoveredPhase.readyDate, null);
+assert.equal(stockCoveredPhase.confirmed, true);
+assert.equal(stockCoveredPhase.matchStatus, "PHASE_NOT_IN_PURCHASE_REQUIREMENT");
+
+const bufferGate = materialGateForJob({
+  source: "OVERALL",
+  readyDate: utc("2026-09-29"),
+  phaseGates: { "delivery-1": { source: "PHASE" } },
+}, { isBufferStock: true });
+assert.equal(bufferGate.source, "OVERALL", "buffer tanpa delivery target tetap memakai gate agregat");
+assert.equal(bufferGate.matchStatus, "OVERALL_FALLBACK");
+
+const scopedBufferGate = materialGateForJob({
+  planNumber: "PP-001",
+  mpsNumber: "MPS-001",
+  mrpRunNumber: "MRP-001",
+  suggestionNumber: "PS-001",
+  source: "OVERALL",
+  readyDate: utc("2026-09-29"),
+  phaseGates: {
+    "delivery-fg-a": { source: "PHASE", readyDate: utc("2026-09-29") },
+    "delivery-fg-b": { source: "PHASE", readyDate: utc("2026-08-19") },
+  },
+  items: [
+    {
+      suggestionItemId: "item-fg-a", partCode: "FG-A-PART", materialCode: "MAT-A",
+      deliveryTargetIds: ["delivery-fg-a"], readyDate: utc("2026-09-29"),
+      source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false,
+    },
+    {
+      suggestionItemId: "item-fg-b", partCode: "FG-B-PART", materialCode: "MAT-B",
+      deliveryTargetIds: ["delivery-fg-b"], readyDate: utc("2026-08-19"),
+      source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false,
+    },
+  ],
+}, { isBufferStock: true, materialScopeDeliveryTargetIds: ["delivery-fg-b", "delivery-fg-b-stock-covered"] });
+assert.equal(scopedBufferGate.readyDate.toISOString().slice(0, 10), "2026-08-19",
+  "buffer FG-B tidak boleh mewarisi material gate FG-A");
+assert.equal(scopedBufferGate.itemCount, 1);
+assert.equal(scopedBufferGate.criticalItems[0].materialCode, "MAT-B");
+assert.equal(scopedBufferGate.matchStatus, "FG_TARGETS_MATCHED");
+
+const stockCoveredBufferGate = materialGateForJob({
+  planNumber: "PP-001",
+  phaseGates: { "delivery-other-fg": { source: "PHASE", readyDate: utc("2026-09-29") } },
+  items: [{
+    suggestionItemId: "item-other-fg", deliveryTargetIds: ["delivery-other-fg"],
+    readyDate: utc("2026-09-29"), source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false,
+  }],
+}, { isBufferStock: true, materialScopeDeliveryTargetIds: ["delivery-stock-covered"] });
+assert.equal(stockCoveredBufferGate.source, "NO_FG_PURCHASE_REQUIREMENT");
+assert.equal(stockCoveredBufferGate.readyDate, null);
+assert.equal(stockCoveredBufferGate.confirmed, true);
+assert.equal(stockCoveredBufferGate.matchStatus, "FG_TARGETS_NOT_IN_PURCHASE_REQUIREMENT");
 
 const backwardDue = suggestionSystemMaterialDate({
   customerDeliveryDate: new Date("2026-08-31T07:00:00.000Z"),
@@ -78,4 +157,4 @@ const backwardDue = suggestionSystemMaterialDate({
 }]]));
 assert.equal(backwardDue.toISOString(), "2026-08-14T07:00:00.000Z");
 
-console.log("Capacity material gate contracts PASS (5/5)");
+console.log("Capacity material gate contracts PASS");

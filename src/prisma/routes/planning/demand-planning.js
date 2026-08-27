@@ -10,6 +10,10 @@ const { logger } = require("../../middleware/logger");
 
 router.get("/", authorize("mps", "read"), ctrl.list);
 router.get("/yearly", authorize("mps", "read"), yearlyCtrl.list);
+router.get("/yearly/additional-coverage", authorize("mps", "read"), yearlyCtrl.additionalCoverage);
+router.put("/yearly/rule", authorize("mps", "update"), logger("demandPlanning", "update-efd-rule"), yearlyCtrl.updateRule);
+router.put("/yearly/efd", authorize("mps", "update"), logger("demandPlanning", "update-efd"), yearlyCtrl.updateEfd);
+router.delete("/yearly/efd", authorize("mps", "update"), logger("demandPlanning", "remove-efd-override"), yearlyCtrl.removeEfd);
 router.get("/monthly-review", authorize("mps", "read"), monthlyCtrl.list);
 router.post("/monthly-review/snapshots", authorize("mps", "create"), logger("monthlyDemandSnapshot", "create"), monthlyCtrl.create);
 router.post("/monthly-review/snapshots/:snapshotId/refresh", authorize("mps", "update"), logger("monthlyDemandSnapshot", "refresh"), monthlyCtrl.refresh);

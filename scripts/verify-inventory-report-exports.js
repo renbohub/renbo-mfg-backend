@@ -42,19 +42,44 @@ const detail = {
   alignments: ["left", "left", "left", "left", "left", "left", "center", "right", "right", "right", "right", "right", "right", "right", "center"],
 };
 
+const valueHeaders = matrix.headers.map((header, index) => index < 3 ? header : `${header} (Rp)`);
+const valueRows = matrix.rows.map((row) => row.map((cell, index) => index < 3 ? cell : (cell ? `Rp${(index + 1) * 100000}` : "")));
+const dualMatrix = {
+  ...matrix,
+  subtitle: `${matrix.subtitle} | Tampilan Qty PCS`,
+  sheets: [
+    { name: "Qty PCS", headers: matrix.headers, rows: matrix.rows, groupHeaders: matrix.groupHeaders },
+    { name: "Nilai Rupiah", headers: valueHeaders, rows: valueRows, groupHeaders: matrix.groupHeaders },
+  ],
+  sections: [{
+    title: "Inventory Stock Matrix Rupiah - C002-C004-000",
+    subtitle: "Qty dikali harga referensi aktif dalam IDR",
+    headers: valueHeaders,
+    rows: valueRows,
+    keepColumnsTogether: true,
+    columnWidths: matrix.columnWidths,
+    alignments: matrix.alignments,
+    groupHeaders: matrix.groupHeaders,
+  }],
+};
+
 async function main() {
   const outputDirectory = path.resolve(__dirname, "../tmp/pdfs");
   await fs.mkdir(outputDirectory, { recursive: true });
-  const [matrixPdf, detailPdf] = await Promise.all([buildPdf(matrix), buildPdf(detail)]);
-  const workbook = buildXlsx({ ...matrix, sheets: [{ name: "Stock Matrix", headers: matrix.headers, rows: matrix.rows, groupHeaders: matrix.groupHeaders }] });
+  const [matrixPdf, detailPdf] = await Promise.all([buildPdf(dualMatrix), buildPdf(detail)]);
+  const workbook = buildXlsx(dualMatrix);
   assert.equal(matrixPdf.buffer.subarray(0, 4).toString(), "%PDF");
   assert.equal(detailPdf.buffer.subarray(0, 4).toString(), "%PDF");
   const parsedWorkbook = XLSX.read(workbook.buffer, { type: "buffer" });
-  assert.deepEqual(parsedWorkbook.SheetNames, ["Stock Matrix"]);
-  const rows = XLSX.utils.sheet_to_json(parsedWorkbook.Sheets["Stock Matrix"], { header: 1, defval: "" });
+  assert.deepEqual(parsedWorkbook.SheetNames, ["Qty PCS", "Nilai Rupiah"]);
+  const rows = XLSX.utils.sheet_to_json(parsedWorkbook.Sheets["Qty PCS"], { header: 1, defval: "" });
+  const valueSheetRows = XLSX.utils.sheet_to_json(parsedWorkbook.Sheets["Nilai Rupiah"], { header: 1, defval: "" });
   assert.ok(rows.some((row) => row[0] === "11058-1287" && row[1] === "C002-C005-000" && row[2] === "BRACKET" && row[3].includes("KG") && row[8] === "121 PCS" && row[10] === "7 PCS" && row[18] === "10 PCS"));
   assert.ok(rows.some((row) => row[0] === "270D0600" && row[5] === "100 PCS" && row[6] === "60 PCS" && row[7] === "105 PCS"), "Allocation stok dan purchase suggestion harus terpisah dari free stock");
   assert.ok(rows.some((row) => row.includes("WELD-4")), "Kolom proses BOM berulang wajib tetap terpisah");
+  assert.ok(valueSheetRows.some((row) => row.includes("MAT Stock (Rp)")), "Sheet kedua wajib berisi matrix nilai Rupiah");
+  const pdfPageCount = (matrixPdf.buffer.toString("latin1").match(/\/Type\s*\/Page\b/g) || []).length;
+  assert.equal(pdfPageCount, 2, "PDF matrix ringkas wajib mempunyai halaman Qty dan halaman Rupiah");
   await fs.writeFile(path.join(outputDirectory, matrixPdf.fileName), matrixPdf.buffer);
   await fs.writeFile(path.join(outputDirectory, detailPdf.fileName), detailPdf.buffer);
   await fs.writeFile(path.join(outputDirectory, workbook.fileName), workbook.buffer);

@@ -4,7 +4,7 @@ const { generateMovementNumber } = require("../../utils/movementNumberGenerator"
 const { assertQuantity } = require("../../utils/uomQuantity");
 const {
   assertStockBalanceNotFrozen,
-  assertWarehouseNotFrozen,
+  assertStockIdentityNotFrozen,
 } = require("../inventory/utils/stockOpnameFreezeGuard");
 const { lockStockBalanceIdentity } = require("../../services/inventory/stockBalanceLockService");
 const { autoAllocateMaterialReceipt } = require("../inventory/utils/autoPartAllocation");
@@ -310,7 +310,7 @@ exports.dashboard = async (req, res, next) => {
     const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999Z`) : defaultTo;
     if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return res.status(400).json({ message: "Periode dashboard tidak valid" });
 
-    const [purchaseOrders, actualReceipts] = await Promise.all([
+    const [purchaseOrders, actualReceipts, vendorProcessOrders] = await Promise.all([
       prisma.purchaseOrder.findMany({
         where: {
           isDeleted: false,
@@ -336,6 +336,18 @@ exports.dashboard = async (req, res, next) => {
         orderBy: { receivedDate: "desc" },
         take: 1000,
       }),
+      prisma.vendorProcessOrder.findMany({
+        where: {
+          isDeleted: false,
+          status: { notIn: ["Cancelled", "Closed"] },
+          OR: [
+            { dueDate: { gte: from, lte: to } },
+            { receivedAt: { gte: from, lte: to } },
+          ],
+        },
+        orderBy: [{ dueDate: "asc" }, { orderNumber: "asc" }],
+        take: 1000,
+      }),
     ]);
 
     const currentDay = dayKey(today);
@@ -345,6 +357,8 @@ exports.dashboard = async (req, res, next) => {
     }) : [];
     const dashboardAllocatedBySource = new Map(dashboardAllocatedRows.map((row) => [row.prSourceId, Number(row._sum.allocatedQty || 0)]));
     const planRows = purchaseOrders.flatMap((po) => mapAllocationPlan(po, dashboardAllocatedBySource).details.map((detail) => {
+      const itemType = detail.materialCode ? "MATERIAL" : detail.partCode ? "PURCHASE_PART" : null;
+      if (!itemType) return null;
       const dueDate = dayKey(detail.dueDate);
       const outstandingQty = detail.allocationQty;
       const daysToDue = dueDate ? Math.ceil((new Date(`${dueDate}T00:00:00.000Z`) - new Date(`${currentDay}T00:00:00.000Z`)) / 86400000) : null;
@@ -354,10 +368,12 @@ exports.dashboard = async (req, res, next) => {
         supplierName: po.supplierName || po.vendorName || null,
         poStatus: po.status,
         poDetailId: detail.poDetailId,
+        itemType,
         materialCode: detail.materialCode || detail.partCode || "-",
         materialName: detail.materialName || detail.partName || detail.description || "-",
         spec: detail.spec,
         dueDate,
+        plannedAt: detail.dueDate,
         orderedQty: round(detail.orderedQty * detail.conversionFactor),
         receivedQty: round(detail.receivedQty * detail.conversionFactor),
         outstandingQty,
@@ -367,7 +383,7 @@ exports.dashboard = async (req, res, next) => {
         requirements: detail.sources,
         bufferAllocatedQty: detail.bufferAllocatedQty,
       };
-    })).filter((row) => row.dueDate >= dayKey(from) || row.outstandingQty > 0.000001);
+    })).filter((row) => row && (row.dueDate >= dayKey(from) || row.outstandingQty > 0.000001));
 
     const actualRows = actualReceipts.flatMap((gr) => gr.details.map((detail) => {
       const poDetail = detail.poDetail;
@@ -400,7 +416,27 @@ exports.dashboard = async (req, res, next) => {
       };
     }));
 
-    const uomCodes = [...new Set([...planRows, ...actualRows].map((row) => row.uomCode).filter(Boolean))].sort();
+    const vendorRows = vendorProcessOrders.map((row) => ({
+      itemType: "VENDOR_PROCESS",
+      orderNumber: row.orderNumber,
+      moNumber: row.moNumber,
+      vendorCode: row.vendorCode,
+      vendorName: row.vendorName || row.vendorCode || "Vendor belum ditentukan",
+      partCode: row.outputPartCode || row.inputPartCode || "-",
+      partNumber: row.outputPartNumber || row.inputPartNumber || null,
+      partName: row.outputPartName || row.inputPartName || null,
+      processCode: row.processCode,
+      processName: row.processName,
+      plannedAt: row.dueDate,
+      actualAt: row.receivedAt,
+      plannedQty: round(row.qtyPlanned),
+      receivedQty: round(row.qtyReceived),
+      outstandingQty: round(Math.max(Number(row.qtyPlanned || 0) - Number(row.qtyReceived || 0), 0)),
+      uomCode: row.uomCode,
+      status: row.status,
+    }));
+
+    const uomCodes = [...new Set([...planRows, ...actualRows, ...vendorRows].map((row) => row.uomCode).filter(Boolean))].sort();
     res.json({
       period: { from: dayKey(from), to: dayKey(to) },
       generatedAt: new Date(),
@@ -414,6 +450,7 @@ exports.dashboard = async (req, res, next) => {
       },
       planRows,
       actualRows,
+      vendorRows,
     });
   } catch (error) { next(error); }
 };
@@ -579,7 +616,7 @@ exports.putawayAccepted = async (req, res, next) => {
           await assertStockBalanceNotFrozen(tx, balance.id);
           postedBalance = await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: after, qtyAvailable: after - Number(balance.qtyReserved || 0) - Number(balance.qtyQC || 0), lastMovement: new Date() } });
         } else {
-          await assertWarehouseNotFrozen(tx, identity.warehouseCode);
+          await assertStockIdentityNotFrozen(tx, { ...identity, stockType: inventoryStockType });
           postedBalance = await tx.stockBalance.create({ data: { ...identity, isDeleted: false, materialName, materialType, partName: usesMaterialMaster ? null : detail.poDetail.partName || null, stockType: inventoryStockType, qtyOnHand: stockQty, qtyAvailable: stockQty, qtyQC: 0, lastMovement: new Date() } });
         }
         await autoAllocateMaterialReceipt(tx, {

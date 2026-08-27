@@ -3,6 +3,7 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { parseFilter } = require("../../utils/parseFilter");
 const { deleteEmployeeImage } = require("../../middleware/uploads");
+const { assertReferenceList } = require("../../utils/referenceValidation");
 
 // Include config untuk employee
 const includeEmployee = {
@@ -314,6 +315,7 @@ exports.create = async (req, res, next) => {
     const divisionIds = normalizeDivisionIds(rawData.divisionIds, rawData.divisionId);
     delete rawData.divisionIds;
     const data = normalizeEmployeeData(rawData);
+    await assertReferenceList({ delegate: prisma.division, field: "divisionIds", values: divisionIds, key: "id", label: "Divisi", extraWhere: data.departmentId ? { departmentId: data.departmentId } : {} });
     applyUploadedEmployeeImages({
       data,
       files: req.files,
@@ -372,6 +374,7 @@ exports.update = async (req, res, next) => {
     if (!current) {
       return res.status(404).json({ message: "Karyawan tidak ditemukan" });
     }
+    await assertReferenceList({ delegate: prisma.division, field: "divisionIds", values: divisionIds, key: "id", label: "Divisi", extraWhere: (data.departmentId || current.departmentId) ? { departmentId: data.departmentId || current.departmentId } : {} });
 
     applyUploadedEmployeeImages({
       data,
@@ -458,6 +461,7 @@ exports.bulkCreate = async (req, res, next) => {
         const divisionIds = normalizeDivisionIds(rawEmployeeData.divisionIds, rawEmployeeData.divisionId);
         delete rawEmployeeData.divisionIds;
         const data = normalizeEmployeeData(rawEmployeeData);
+        await assertReferenceList({ delegate: prisma.division, field: "divisionIds", values: divisionIds, key: "id", label: "Divisi", extraWhere: data.departmentId ? { departmentId: data.departmentId } : {} });
 
         const existing = await prisma.employee.findUnique({
           where: { employeeId: data.employeeId },

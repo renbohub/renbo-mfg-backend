@@ -9,7 +9,7 @@ const {
 const {
   buildExcludeSpecialRackCondition,
 } = require("../../inventory/utils/stockReservationHelpers");
-const { assertStockBalanceNotFrozen } = require("../../inventory/utils/stockOpnameFreezeGuard");
+const { assertStockBalanceNotFrozen, assertStockIdentityNotFrozen } = require("../../inventory/utils/stockOpnameFreezeGuard");
 const { isSubAssemblyDetail } = require("../../../utils/assemblyPolicy");
 const {
   canonicalizeRoutingOperations,
@@ -596,6 +596,101 @@ async function getAvailableStockSources(tx, item, options = {}) {
       materialId: balance.materialId || null,
       materialCode: balance.materialCode || null,
     });
+    remaining = roundQuantity(remaining - qtyCandidate);
+  }
+
+  return sources;
+}
+
+async function getPartAllocationStockSources(tx, item) {
+  if (
+    String(item.rawType || "").trim().toUpperCase() !== "MATERIAL"
+    || !item.partCode
+  ) {
+    return [];
+  }
+
+  const reservations = await tx.stockReservation.findMany({
+    where: {
+      referenceType: "PART_ALLOCATION",
+      targetPartCode: item.partCode,
+      status: "Active",
+      isDeleted: false,
+      stockBalance: {
+        is: {
+          isDeleted: false,
+          ...buildRequirementUomCondition(item.uomCode),
+          AND: [buildExcludeSpecialRackCondition()],
+        },
+      },
+    },
+    orderBy: { createdAt: "asc" },
+    include: {
+      stockBalance: {
+        select: {
+          id: true,
+          warehouseCode: true,
+          rackCode: true,
+          lotNumber: true,
+          qtyOnHand: true,
+          partCode: true,
+          partNumber: true,
+          partName: true,
+          productId: true,
+          description: true,
+          spec: true,
+          thickness: true,
+          width: true,
+          CSP: true,
+          uomCode: true,
+          materialId: true,
+          materialCode: true,
+        },
+      },
+    },
+  });
+
+  let remaining = toNumber(item.qtyRequired);
+  const allocatedByBalance = new Map();
+  const sources = [];
+
+  for (const reservation of reservations) {
+    if (remaining <= 0) break;
+    const balance = reservation.stockBalance;
+    if (!balance) continue;
+
+    const openQty = Math.max(
+      0,
+      toNumber(reservation.qtyReserved) - toNumber(reservation.qtyReleased),
+    );
+    const alreadyAllocated = toNumber(allocatedByBalance.get(balance.id));
+    const physicalQtyRemaining = Math.max(0, toNumber(balance.qtyOnHand) - alreadyAllocated);
+    const qtyCandidate = Math.min(openQty, physicalQtyRemaining, remaining);
+    if (qtyCandidate <= 0) continue;
+
+    sources.push({
+      reservationId: reservation.id,
+      stockBalanceId: balance.id,
+      warehouseCode: balance.warehouseCode || reservation.warehouseCode || null,
+      rackCode: balance.rackCode || reservation.rackCode || null,
+      lotNumber: balance.lotNumber || reservation.lotNumber || null,
+      qtyReserved: roundQuantity(qtyCandidate),
+      partCode: item.partCode,
+      partNumber: item.partNumber || reservation.targetPartNumber || null,
+      partName: item.partName || reservation.targetPartName || null,
+      productId: balance.productId || null,
+      description: balance.description || null,
+      spec: balance.spec || reservation.spec || null,
+      thickness: balance.thickness ?? reservation.thickness ?? null,
+      width: balance.width ?? reservation.width ?? null,
+      CSP: balance.CSP || reservation.CSP || null,
+      uomCode: balance.uomCode || item.uomCode || null,
+      materialId: balance.materialId || reservation.materialId || null,
+      materialCode: balance.materialCode || reservation.materialCode || null,
+      reservationType: "PART_ALLOCATION",
+      targetPartCode: reservation.targetPartCode || item.partCode,
+    });
+    allocatedByBalance.set(balance.id, roundQuantity(alreadyAllocated + qtyCandidate));
     remaining = roundQuantity(remaining - qtyCandidate);
   }
 
@@ -1377,8 +1472,15 @@ async function buildAvailability(tx, mo, options = {}) {
 
   for (const item of items) {
     const reservationSources = reservationsByLine.get(item.lineNumber) || [];
+    const partAllocationSources = reservationSources.length === 0 && options.includePartAllocations
+      ? await getPartAllocationStockSources(tx, item)
+      : [];
+    const partAllocationQty = roundQuantity(
+      partAllocationSources.reduce((sum, source) => sum + toNumber(source.qtyReserved), 0),
+    );
     const qtyReserved = roundQuantity(
-      reservationSources.reduce((sum, source) => sum + toNumber(source.qtyReserved), 0),
+      reservationSources.reduce((sum, source) => sum + toNumber(source.qtyReserved), 0)
+      + partAllocationQty,
     );
     const stockAgg = await tx.stockBalance.aggregate({
       where: {
@@ -1396,7 +1498,10 @@ async function buildAvailability(tx, mo, options = {}) {
     const qtyAvailable = roundQuantity(stockAgg._sum.qtyAvailable);
     const candidateSources = reservationSources.length > 0
       ? []
-      : await getAvailableStockSources(tx, item, {
+      : await getAvailableStockSources(tx, {
+          ...item,
+          qtyRequired: Math.max(0, roundQuantity(toNumber(item.qtyRequired) - partAllocationQty)),
+        }, {
           allocationStrategy,
           manualAllocations: options.manualAllocations,
         });
@@ -1404,6 +1509,7 @@ async function buildAvailability(tx, mo, options = {}) {
       if (source.warehouseCode) warehouseCodes.add(source.warehouseCode);
     }
     const enrichedReservationSources = await enrichSourceOrigins(tx, reservationSources);
+    const enrichedPartAllocationSources = await enrichSourceOrigins(tx, partAllocationSources);
     const enrichedCandidateSources = await enrichSourceOrigins(tx, candidateSources);
     const qtyIssued = item.isSubAssembly
       ? roundQuantity(consumedReservationQtyByLine.get(item.lineNumber) || 0)
@@ -1452,7 +1558,7 @@ async function buildAvailability(tx, mo, options = {}) {
       ? enrichedReservationSources
       : enrichedHistoricalIssueSources.length > 0
         ? enrichedHistoricalIssueSources
-        : enrichedCandidateSources;
+        : [...enrichedPartAllocationSources, ...enrichedCandidateSources];
     const singleSource = sourceList.length === 1 ? sourceList[0] : null;
     const qtySourceAvailable = roundQuantity(sourceList.reduce((sum, source) => {
       const sourceQty =
@@ -1465,7 +1571,9 @@ async function buildAvailability(tx, mo, options = {}) {
       return sum + toNumber(sourceQty);
     }, 0));
     const displayQtyAvailable =
-      enrichedReservationSources.length > 0 || enrichedHistoricalIssueSources.length > 0
+      enrichedReservationSources.length > 0
+      || enrichedPartAllocationSources.length > 0
+      || enrichedHistoricalIssueSources.length > 0
         ? qtySourceAvailable
         : qtyAvailable;
     const qtyIssuable = roundQuantity(qtySourceAvailable);
@@ -1989,6 +2097,12 @@ async function receiveFinishedGoods(tx, mo, qtyGood, stockTarget, performedBy) {
       },
     });
   } else {
+    await assertStockIdentityNotFrozen(tx, {
+      warehouseCode: stockTarget.warehouseCode,
+      rackCode: stockTarget.rackCode || null,
+      lotNumber: stockTarget.lotNumber || null,
+      stockType: "Finished Goods",
+    });
     await tx.stockBalance.create({
       data: {
         warehouseCode: stockTarget.warehouseCode,

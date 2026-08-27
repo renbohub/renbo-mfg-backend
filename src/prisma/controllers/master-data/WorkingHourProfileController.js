@@ -1,0 +1,20 @@
+"use strict";
+
+const { prisma } = require("../../index");
+const { mapDoc } = require("../../utils/mapDoc");
+
+const include = { rules: { include: { shift: true }, orderBy: [{ dayOfWeek: "asc" }, { shift: { sequence: "asc" } }] }, _count: { select: { machines: true, workCenters: true } } };
+const dateOrNull = (value) => value ? new Date(`${String(value).slice(0, 10)}T00:00:00.000Z`) : null;
+function data(body = {}) { return {
+  profileCode: String(body.profileCode || "").trim().toUpperCase().replace(/\s+/g, "-"), profileName: String(body.profileName || "").trim(),
+  profileType: String(body.profileType || "REGULAR").toUpperCase(), effectiveFrom: dateOrNull(body.effectiveFrom), effectiveUntil: dateOrNull(body.effectiveUntil),
+  priority: Number(body.priority || 0), isActive: body.isActive !== false && body.isActive !== "false", notes: body.notes ? String(body.notes).trim() : null,
+}; }
+function rules(body = {}) { const raw = Array.isArray(body.rules) ? body.rules : []; return raw.map((rule) => ({ shiftId: rule.shiftId, dayOfWeek: Number(rule.dayOfWeek), startTime: String(rule.startTime), endTime: String(rule.endTime), breakMinutes: Number(rule.breakMinutes || 0), overtimeMinutes: Number(rule.overtimeMinutes || 0), isEnabled: rule.isEnabled !== false })); }
+const present = (row) => { const result = mapDoc(row); result.assignmentCount = Number(row?._count?.machines || 0) + Number(row?._count?.workCenters || 0); delete result._count; return result; };
+
+exports.list = async (req, res, next) => { try { const q = String(req.query.q || "").trim(); const where = { isDeleted: req.query.isDeleted === "true", ...(q ? { OR: [{ profileCode: { contains: q, mode: "insensitive" } }, { profileName: { contains: q, mode: "insensitive" } }] } : {}) }; const [items, total] = await Promise.all([prisma.workingHourProfile.findMany({ where, include, orderBy: [{ priority: "desc" }, { profileCode: "asc" }] }), prisma.workingHourProfile.count({ where })]); res.json({ items: items.map(present), total, page: 1, limit: items.length }); } catch (error) { next(error); } };
+exports.get = async (req, res, next) => { try { const row = await prisma.workingHourProfile.findFirst({ where: { OR: [{ id: req.params.id }, { profileCode: req.params.id }], isDeleted: false }, include }); if (!row) return res.status(404).json({ message: "Working Hour Profile tidak ditemukan." }); res.json(present(row)); } catch (error) { next(error); } };
+exports.create = async (req, res, next) => { try { const payload = data(req.body); if (!payload.profileCode || !payload.profileName) return res.status(400).json({ message: "Kode dan nama profile wajib diisi." }); if (payload.effectiveFrom && payload.effectiveUntil && payload.effectiveUntil < payload.effectiveFrom) return res.status(400).json({ message: "Tanggal akhir profile tidak boleh sebelum tanggal mulai." }); const ruleRows = rules(req.body); const saved = await prisma.$transaction(async (tx) => tx.workingHourProfile.create({ data: { ...payload, rules: { create: ruleRows } }, include })); res.status(201).json(present(saved)); } catch (error) { next(error); } };
+exports.update = async (req, res, next) => { try { const ruleRows = rules(req.body); const saved = await prisma.$transaction(async (tx) => { await tx.workingHourRule.deleteMany({ where: { profileId: req.params.id } }); return tx.workingHourProfile.update({ where: { id: req.params.id }, data: { ...data(req.body), rules: { create: ruleRows } }, include }); }); res.json(present(saved)); } catch (error) { next(error); } };
+exports.remove = async (req, res, next) => { try { const used = await prisma.workingHourProfile.findUnique({ where: { id: req.params.id }, include: { _count: { select: { machines: true, workCenters: true } } } }); if (Number(used?._count?.machines || 0) + Number(used?._count?.workCenters || 0) > 0) return res.status(409).json({ message: "Profile masih terhubung ke Work Center atau mesin." }); await prisma.workingHourProfile.update({ where: { id: req.params.id }, data: { isDeleted: true, isActive: false } }); res.json({ ok: true }); } catch (error) { next(error); } };

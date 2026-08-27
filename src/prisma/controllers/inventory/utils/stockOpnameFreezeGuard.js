@@ -1,6 +1,9 @@
+const { stockIdentityMatchesScope } = require("../../../services/inventory/stockOpnameDomain");
+
 const ACTIVE_FROZEN_STO_STATUSES = [
   "DRAFT",
   "COUNTING",
+  "WAITING_CHECK",
   "WAITING_APPROVAL",
   "APPROVED",
 ];
@@ -52,6 +55,22 @@ async function assertStockBalanceNotFrozen(tx, stockBalanceId, options = {}) {
   await assertStockBalancesNotFrozen(tx, [stockBalanceId], options);
 }
 
+async function assertStockIdentityNotFrozen(tx, identity = {}, options = {}) {
+  if (!identity.warehouseCode) return;
+  const locks = await tx.stockOpnameHeader.findMany({
+    where: {
+      warehouseCode: identity.warehouseCode,
+      isDeleted: false,
+      inventoryFrozen: true,
+      status: { in: ACTIVE_FROZEN_STO_STATUSES },
+      ...(options.allowStoNo ? { stoNo: { not: options.allowStoNo } } : {}),
+    },
+    select: { stoNo: true, status: true, scopeJson: true },
+  });
+  const lock = locks.find((row) =>
+    !row.scopeJson || stockIdentityMatchesScope(identity, row.scopeJson));
+  if (lock) throwFrozenStockError({ header: lock });
+}
 async function assertWarehouseNotFrozen(tx, warehouseCode, options = {}) {
   if (!warehouseCode) return;
   const lock = await tx.stockOpnameHeader.findFirst({
@@ -71,6 +90,7 @@ module.exports = {
   ACTIVE_FROZEN_STO_STATUSES,
   assertStockBalanceNotFrozen,
   assertStockBalancesNotFrozen,
+  assertStockIdentityNotFrozen,
   assertWarehouseNotFrozen,
   findFrozenStockOpnameLock,
 };

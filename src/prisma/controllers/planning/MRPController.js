@@ -40,10 +40,30 @@ const {
   routingMetricsForRequests,
 } = require("../purchasing/PurchaseSuggestionController");
 const { procurementView, customerPeggingView } = require("../../services/planning/mrpPresentationService");
+const { getMpsDeliveryGate, assertOfficialMpsDeliveryGate } = require("../../services/planning/mpsDeliveryFeasibilityService");
+const {
+  canonicalMrpLifecycleStatus,
+  mrpCalculationLifecycle,
+  mrpApprovalEligibility,
+  mrpApprovalTransitionData,
+  mrpApprovalCycleMpsNumbers,
+  assertApprovedCurrentMrp,
+  buildMrpSourceSnapshot,
+  mrpSourceSnapshotMatches,
+} = require("../../services/planning/mrpLifecycleService");
+const { deltaMrpMetadata, currentScopeWhere } = require("../../services/planning/planningDeltaMrpService");
+const { attachBaselineMrp } = require("../../services/planning/planningBaselineLockService");
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const GENERATED_MPS_CHILD_NOTE_PREFIX = "[MRP-PRODUCTION]";
+const M_PLUS_ONE_PREVIEW_TREE_VERSION = 3;
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+
+function isCurrentMPlusOnePreviewRun(run = {}) {
+  const assumptions = run?.scenarioAssumptions || {};
+  return String(assumptions.planningMode || "").trim().toUpperCase() === "M_PLUS_ONE_PREVIEW"
+    && Number(assumptions.previewTreeVersion || 0) >= M_PLUS_ONE_PREVIEW_TREE_VERSION;
+}
 
 function createRequirementIdentity(parentRequirementId = null, rootRequirementId = null) {
   const id = randomUUID();
@@ -147,12 +167,88 @@ async function supersedePreviousMrpArtifacts(tx, mpsNumberOrNumbers, currentRunN
   const previousRunNumbers = previousRuns.map((row) => row.runNumber).filter(Boolean);
   if (previousRunNumbers.length === 0) return;
 
+  const generatedMpsDetails = await tx.mPSDetail.findMany({
+    where: {
+      isDeleted: false,
+      notes: { startsWith: GENERATED_MPS_CHILD_NOTE_PREFIX },
+      OR: previousRunNumbers.map((previousRunNumber) => ({ notes: { contains: `Generated from ${previousRunNumber}` } })),
+    },
+    select: { id: true },
+  });
+  const generatedMpsDetailIds = generatedMpsDetails.map((row) => row.id);
+  const executionDetailLineageFilters = [
+    ...(generatedMpsDetailIds.length ? [{ mpsDetailId: { in: generatedMpsDetailIds } }] : []),
+    ...previousRunNumbers.map((previousRunNumber) => ({ notes: { contains: `[MRP-RUN:${previousRunNumber}]` } })),
+  ];
+  const generatedExecutionDetails = executionDetailLineageFilters.length ? await tx.monthlyProductionPlanDetail.findMany({
+    where: { isDeleted: false, OR: executionDetailLineageFilters },
+    select: {
+      plannedOrderNumber: true,
+      qtyReleased: true,
+      status: true,
+      plan: { select: { planNumber: true, status: true } },
+    },
+  }) : [];
+  const generatedExecutionPlanNumbers = [...new Set(generatedExecutionDetails.map((row) => row.plan?.planNumber).filter(Boolean))];
+  const generatedMoCount = generatedExecutionPlanNumbers.length ? await tx.manufacturingOrder.count({
+    where: { isDeleted: false, status: { not: "Cancelled" }, monthlyProductionPlanNumber: { in: generatedExecutionPlanNumbers } },
+  }) : 0;
+  const previousPlannedOrders = await tx.plannedOrder.findMany({
+    where: { isDeleted: false, referenceType: "MRP", runNumber: { in: previousRunNumbers } },
+    select: { orderNumber: true, status: true, qtyReleased: true },
+  });
+  const previousOrderNumbers = previousPlannedOrders.map((row) => row.orderNumber).filter(Boolean);
+  const [linkedManufacturingOrders, releasedPlanDetails] = await Promise.all([
+    previousOrderNumbers.length ? tx.manufacturingOrder.findMany({
+      where: {
+        isDeleted: false,
+        status: { not: "Cancelled" },
+        OR: [
+          { plannedOrderNumber: { in: previousOrderNumbers } },
+          { sourcePlannedOrderNumber: { in: previousOrderNumbers } },
+        ],
+      },
+      select: { plannedOrderNumber: true, sourcePlannedOrderNumber: true },
+    }) : [],
+    previousOrderNumbers.length ? tx.monthlyProductionPlanDetail.findMany({
+      where: {
+        isDeleted: false,
+        plannedOrderNumber: { in: previousOrderNumbers },
+        OR: [
+          { qtyReleased: { gt: 0 } },
+          { status: { in: ["Partially Released", "Released", "Completed"] } },
+          { plan: { status: { in: ["Confirmed", "Released", "Closed"] } } },
+        ],
+      },
+      select: { plannedOrderNumber: true },
+    }) : [],
+  ]);
+  const protectedPreviousOrderNumbers = [...new Set([
+    ...previousPlannedOrders
+      .filter((row) => Number(row.qtyReleased || 0) > 0
+        || !["Draft", "Planned", "Simulation", "Superseded", "Cancelled"].includes(row.status))
+      .map((row) => row.orderNumber),
+    ...linkedManufacturingOrders.flatMap((row) => [row.plannedOrderNumber, row.sourcePlannedOrderNumber]),
+    ...releasedPlanDetails.map((row) => row.plannedOrderNumber),
+    ...generatedExecutionDetails.map((row) => row.plannedOrderNumber),
+  ].filter(Boolean))];
+  const protectedExecutionCount = generatedExecutionDetails.filter((row) => Number(row.qtyReleased || 0) > 0
+    || ["Partially Released", "Released", "Completed"].includes(row.status)
+    || ["Confirmed", "Released", "Closed"].includes(row.plan?.status)).length
+    + linkedManufacturingOrders.length
+    + releasedPlanDetails.length
+    + generatedMoCount;
+  const unprotectedOrderFilter = protectedPreviousOrderNumbers.length
+    ? { orderNumber: { notIn: protectedPreviousOrderNumbers } }
+    : {};
+
   const plannedOrdersToSupersede = await tx.plannedOrder.findMany({
     where: {
       isDeleted: false,
-      status: "Planned",
+      status: { in: ["Planned", "Draft", "Simulation"] },
       referenceType: "MRP",
       runNumber: { in: previousRunNumbers },
+      ...unprotectedOrderFilter,
     },
     select: { orderNumber: true },
   });
@@ -165,9 +261,10 @@ async function supersedePreviousMrpArtifacts(tx, mpsNumberOrNumbers, currentRunN
   await tx.plannedOrder.updateMany({
     where: {
       isDeleted: false,
-      status: "Planned",
+      status: { in: ["Planned", "Draft", "Simulation"] },
       referenceType: "MRP",
       runNumber: { in: previousRunNumbers },
+      ...unprotectedOrderFilter,
     },
     data: {
       status: "Superseded",
@@ -201,6 +298,16 @@ async function supersedePreviousMrpArtifacts(tx, mpsNumberOrNumbers, currentRunN
       notes: `Superseded by MRP run ${currentRunNumber} (${runBy || "system"})`,
     },
   });
+
+  return {
+    mode: protectedPreviousOrderNumbers.length || protectedExecutionCount > 0
+      ? "RESIDUAL_REPLAN_PRESERVE_EXECUTION"
+      : "STANDARD_SUPERSEDE",
+    previousRunNumbers,
+    protectedPlannedOrderNumbers: protectedPreviousOrderNumbers,
+    protectedExecutionCount,
+    supersededPlannedOrderNumbers: plannedOrderNumbersToSupersede,
+  };
 }
 
 function buildMpsPlanNumber(mpsNumber) {
@@ -522,6 +629,18 @@ function isRawMaterialPart(part) {
   return part?.itemType === "RAW" && part?.rawType === "MATERIAL";
 }
 
+// Any RAW component can already be embedded in a downstream WIP/FG output.
+// This includes purchased components (for example NUT-M6), not only material
+// measured in KG. Unit conversion remains material-specific elsewhere.
+function isEmbeddedStockInputPart(part) {
+  return part?.itemType === "RAW";
+}
+
+function filterWipLinesForRequirementPath(lines = [], pathCodes) {
+  if (!(pathCodes instanceof Set)) return lines;
+  return lines.filter((row) => pathCodes.has(normalizePartCode(row.sourcePartCode || row.partCode)));
+}
+
 function planningStockKey(partCode, part = {}) {
   if (isRawMaterialPart(part)) {
     const materialIdentity = part.materialId || part.material?.materialCode;
@@ -689,6 +808,11 @@ function normalizePlanningStockRows(stockRows = [], options = {}) {
 function normalizeStockRowForRequirement(row, targetPart, targetUomCode, fallbackKgPerQty, sourcePartByCode) {
   const sourcePart = sourcePartByCode?.get(normalizePartCode(row.partCode)) || null;
   const sourceItemType = String(sourcePart?.itemType || "").trim().toUpperCase();
+  const sourceProcesses = (sourcePart?.mbomDetails || []).flatMap((detail) => detail.mbomProcesses || []).map((route) => ({
+    code: route.process?.processCode || route.occurrenceCode || null,
+    name: route.process?.processName || route.occurrenceCode || null,
+    sequence: Number(route.sequence || 0),
+  })).filter((route) => route.code || route.name);
   const isConvertedWipStock = ["FG", "WIP", "SFG"].includes(sourceItemType)
     || (!sourcePart && isWipStockType(row.stockType));
   const sourceFactor = Number(resolveKgPerPcs(sourcePart || targetPart).factor || 0);
@@ -707,6 +831,7 @@ function normalizeStockRowForRequirement(row, targetPart, targetUomCode, fallbac
     sourcePartCode: sourcePart?.partCode || row.partCode || null,
     sourcePartName: sourcePart?.partName || null,
     sourceItemType: sourceItemType || null,
+    sourceProcesses,
     supplyClass: isConvertedWipStock ? "WIP_EQUIVALENT" : "WAREHOUSE_MATERIAL",
     conversionFactorKgPerPcs: isConvertedWipStock ? kgPerQty : null,
     sourceUomCode: row.uomCode || null,
@@ -863,7 +988,7 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
   });
   const materialIds = [...new Set(parts.map((part) => part.materialId).filter(Boolean))];
   const materialCodes = [...new Set(parts.map((part) => part.material?.materialCode).filter(Boolean))];
-  const rawRequirements = requirements.filter((row) => isRawMaterialPart(
+  const rawRequirements = requirements.filter((row) => isEmbeddedStockInputPart(
     row.part || parts.find((part) => normalizePartCode(part.partCode) === normalizePartCode(row.partCode)),
   ));
   const sourceMbomNumbers = [...new Set(rawRequirements.map((row) => row.sourceNumber).filter(Boolean))];
@@ -891,6 +1016,7 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
     activeMbomByPartAndMonth: new Map(),
   };
   const requirementPartCodesBySourcePart = new Map();
+  const productionPathCodesByRequirement = new Map();
   for (const requirement of rawRequirements) {
     const requirementPartCode = normalizePartCode(requirement.partCode);
     const sourceMbom = sourceMbomByNumber.get(requirement.sourceNumber);
@@ -910,7 +1036,9 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
           supplyPathCaches,
         )
       : null;
-    for (const sourcePartCode of new Set([...(resolvedCodes || []), ...fallbackCodes])) {
+    const productionPathCodes = new Set([...(resolvedCodes || []), ...fallbackCodes].map(normalizePartCode).filter(Boolean));
+    productionPathCodesByRequirement.set(requirement, productionPathCodes);
+    for (const sourcePartCode of productionPathCodes) {
       if (!sourcePartCode) continue;
       if (!requirementPartCodesBySourcePart.has(sourcePartCode)) {
         requirementPartCodesBySourcePart.set(sourcePartCode, new Set());
@@ -1000,6 +1128,22 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
       materialId: true,
       material: { select: { materialCode: true } },
       partBases: { select: { baseOn: true, grossWeight: true } },
+      mbomDetails: {
+        where: { isDeleted: false },
+        orderBy: { updatedAt: "desc" },
+        take: 1,
+        select: {
+          mbomProcesses: {
+            where: { isDeleted: false },
+            orderBy: { sequence: "asc" },
+            select: {
+              sequence: true,
+              occurrenceCode: true,
+              process: { select: { processCode: true, processName: true } },
+            },
+          },
+        },
+      },
     },
   }) : [];
   const stockPartByCode = new Map(stockParts.map((part) => [normalizePartCode(part.partCode), part]));
@@ -1119,7 +1263,10 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
     const partCode = normalizePartCode(requirement.partCode);
     const stockLines = stocksByPart.get(partCode) || [];
     const warehouseLines = stockLines.filter((row) => row.supplyClass !== "WIP_EQUIVALENT");
-    const wipLines = stockLines.filter((row) => row.supplyClass === "WIP_EQUIVALENT");
+    const wipLines = filterWipLinesForRequirementPath(
+      stockLines.filter((row) => row.supplyClass === "WIP_EQUIVALENT"),
+      productionPathCodesByRequirement.get(requirement),
+    );
     const supplierLines = (supplierByPart.get(partCode) || []).map((row) => ({
       ...row,
       eligibleForRequirement: !row.deliveryDate || new Date(row.deliveryDate) <= new Date(requirement.requiredDate),
@@ -1139,6 +1286,7 @@ async function enrichRequirementSupplyBreakdown(tx, requirements = []) {
         sourcePartCode: row.sourcePartCode,
         sourcePartName: row.sourcePartName,
         sourceItemType: row.sourceItemType,
+        sourceProcesses: row.sourceProcesses,
         supplyClass: row.supplyClass,
         conversionFactorKgPerPcs: row.conversionFactorKgPerPcs,
         sourceUomCode: row.sourceUomCode,
@@ -1489,6 +1637,16 @@ function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
 }
 
 function demandPeggingForPhase(detail) {
+  const referenceSources = (detail.demandSources || []).map((source) => ({
+    sourceType: source.sourceType,
+    sourceNumber: source.sourceNumber,
+    sourceLineId: source.sourceLineId || null,
+    forecastDetailId: source.forecastDetailId || null,
+    customerCode: source.customerCode || null,
+    qty: number(source.qty),
+    uomCode: source.uomCode || null,
+    requiredDate: source.effectiveRequiredDate || source.requiredDate || null,
+  }));
   if (detail._isBufferPhase) {
     return [{
       sourceType: "BUFFER",
@@ -1499,13 +1657,29 @@ function demandPeggingForPhase(detail) {
       fgRequiredDate: detail.endDate,
       fgPartCode: detail.partCode,
       qty: number(detail.qtyPlanned),
+      phaseLabel: "Buffer akhir bulan",
+      deliveryPhaseNumber: null,
+      referenceSources,
     }];
   }
   const targetId = detail._deliveryTargetId || detail.deliveryPhaseId || null;
   const rows = (detail.demandSources || []).flatMap((source) => {
     const sourceRows = Array.isArray(source.sourcePegging) ? source.sourcePegging : [];
     const matching = targetId ? sourceRows.filter((peg) => peg.deliveryTargetId === targetId) : sourceRows;
-    return matching.map((peg) => ({ ...peg, sourceType: source.sourceType, sourceNumber: source.sourceNumber, customerCode: peg.customerCode || source.customerCode || detail.customerCode || null, fgPartCode: detail.partCode, fgRequiredDate: detail._fgRequiredDate || peg.fgRequiredDate || null, fgFinishSplitNumber: detail._fgFinishSplitNumber || null }));
+    return matching.map((peg) => ({
+      ...peg,
+      sourceType: source.sourceType,
+      sourceNumber: source.sourceNumber,
+      sourceLineId: source.sourceLineId || null,
+      forecastDetailId: source.forecastDetailId || null,
+      customerCode: peg.customerCode || source.customerCode || detail.customerCode || null,
+      fgPartCode: detail.partCode,
+      fgRequiredDate: detail._fgRequiredDate || peg.fgRequiredDate || null,
+      fgFinishSplitNumber: detail._fgFinishSplitNumber || null,
+      deliveryPhaseNumber: detail._deliveryPhaseNumber || peg.phaseNumber || null,
+      phaseLabel: detail._deliveryPhaseNumber ? `Phase ${detail._deliveryPhaseNumber}` : null,
+      referenceSources,
+    }));
   });
   if (rows.length) {
     const targetQty = number(detail.qtyPlanned);
@@ -1519,7 +1693,22 @@ function demandPeggingForPhase(detail) {
       return { ...row, qty };
     });
   }
-  return [{ sourceType: detail._deliveryPhaseSourceType || detail.demandSources?.[0]?.sourceType || "MPS", sourceNumber: detail.demandSources?.[0]?.sourceNumber || null, customerCode: detail.customerCode || detail.demandSources?.[0]?.customerCode || null, deliveryTargetId: targetId, targetDeliveryDate: detail._customerTargetDate || detail.customerTargetDate || detail.endDate, fgRequiredDate: detail._fgRequiredDate || detail.endDate, fgFinishSplitNumber: detail._fgFinishSplitNumber || null, fgPartCode: detail.partCode, qty: number(detail.qtyPlanned) }];
+  return [{
+    sourceType: detail._deliveryPhaseSourceType || detail.demandSources?.[0]?.sourceType || "MPS",
+    sourceNumber: detail._deliveryPhaseSourceNumber || detail.demandSources?.[0]?.sourceNumber || null,
+    sourceLineId: detail.demandSources?.[0]?.sourceLineId || null,
+    forecastDetailId: detail.demandSources?.[0]?.forecastDetailId || null,
+    customerCode: detail.customerCode || detail.demandSources?.[0]?.customerCode || null,
+    deliveryTargetId: targetId,
+    targetDeliveryDate: detail._customerTargetDate || detail.customerTargetDate || detail.endDate,
+    fgRequiredDate: detail._fgRequiredDate || detail.endDate,
+    fgFinishSplitNumber: detail._fgFinishSplitNumber || null,
+    deliveryPhaseNumber: detail._deliveryPhaseNumber || null,
+    phaseLabel: detail._deliveryPhaseNumber ? `Phase ${detail._deliveryPhaseNumber}` : "Delivery phase belum dipetakan",
+    fgPartCode: detail.partCode,
+    qty: number(detail.qtyPlanned),
+    referenceSources,
+  }];
 }
 
 async function buildProductionConversionPartMap(tx, requirements = []) {
@@ -2105,6 +2294,14 @@ function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = [], op
   return requirements;
 }
 
+function productionProcessScheduleQty(requirement = {}) {
+  if (requirement.orderType !== "Production") return 0;
+  return Math.max(
+    Number(requirement.grossRequirement || 0) - Number(requirement.onHandQty || 0),
+    0,
+  );
+}
+
 function stripRequirementInternals(requirements = []) {
   const persistedIds = new Set(requirements.map((row) => row.id));
   return requirements.map((row) => {
@@ -2141,7 +2338,17 @@ async function syncProductionRequirementsToMps(tx, mps, requirements, mbomHeader
     // its own operations and the parent BOM operations. Keep it in MPS as a
     // child FG receipt; it is not a second top-level demand.
     const itemType = String(row._partItemType || "").trim().toUpperCase();
-    const qtyPlanned = Number(row._productionScheduleQty || 0);
+    // `_productionScheduleQty` is the child-explosion driver after WIP
+    // netting. It is valid for deciding how far upstream material demand must
+    // continue, but it is not always the quantity of the operation that
+    // produces this row. Stock at a child stage (for example stock before
+    // PAINT) may stop the upstream explosion while PAINT itself is still
+    // required. Keep that downstream transformation through the separate
+    // process-output driver calculated against stock of this exact part.
+    const qtyPlanned = Math.max(
+      Number(row._productionScheduleQty || 0),
+      Number(row._processScheduleQty || 0),
+    );
     if (qtyPlanned <= 0) continue;
     const source = sourceById.get(row.mpsDetailId);
     if (!source) continue;
@@ -2818,6 +3025,16 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       isDeleted: false,
       partCode: { in: normalizedPartCodes },
       status: { in: ["Planned", "Partially Released"] },
+      ...(excludedSourceMpsNumbers.length
+        ? {
+            AND: [{
+              OR: [
+                { plan: { sourceType: { notIn: excludedSourceMpsNumbers.map((value) => `MPS:${value}`) } } },
+                { plan: { status: { in: ["Confirmed", "Released", "In Progress"] } } },
+              ],
+            }],
+          }
+        : {}),
       ...(whereDate
         ? {
             OR: [{ requiredDate: null }, { requiredDate: { lte: whereDate } }],
@@ -2826,9 +3043,6 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       plan: {
         isDeleted: false,
         status: { not: "Cancelled" },
-        ...(excludedSourceMpsNumbers.length
-          ? { sourceType: { notIn: excludedSourceMpsNumbers.map((value) => `MPS:${value}`) } }
-          : {}),
       },
     },
     select: {
@@ -3140,6 +3354,16 @@ async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       isDeleted: false,
       partCode: { in: normalizedPartCodes },
       status: { in: ["Planned", "Partially Released"] },
+      ...(excludedSourceMpsNumbers.length
+        ? {
+            AND: [{
+              OR: [
+                { plan: { sourceType: { notIn: excludedSourceMpsNumbers.map((value) => `MPS:${value}`) } } },
+                { plan: { status: { in: ["Confirmed", "Released", "In Progress"] } } },
+              ],
+            }],
+          }
+        : {}),
       ...(whereDate
         ? {
             OR: [{ requiredDate: null }, { requiredDate: { lte: whereDate } }],
@@ -3148,9 +3372,6 @@ async function buildOpenMppSupplyMap(tx, partCodes, cutoffDate, options = {}) {
       plan: {
         isDeleted: false,
         status: { not: "Cancelled" },
-        ...(excludedSourceMpsNumbers.length
-          ? { sourceType: { notIn: excludedSourceMpsNumbers.map((value) => `MPS:${value}`) } }
-          : {}),
       },
     },
     select: {
@@ -3356,6 +3577,219 @@ exports.list = async (req, res, next) => {
 // ============================================
 // GET MRP RUN BY NUMBER
 // ============================================
+function buildMPlusOneInventoryNettingItem(detail = {}, inventory = {}) {
+  const efdMPlusOne = roundPlanningQty(Math.max(Number(detail.forecastQty || 0), 0));
+  const inventoryStockQty = roundPlanningQty(Math.max(Number(inventory.onHandQty || 0), 0));
+  const reservedStockQty = roundPlanningQty(Math.max(Number(inventory.reservedQty || 0), 0));
+  const freeStockQty = roundPlanningQty(Math.max(Number(inventory.freeQty || 0), 0));
+  const stockCoverageQty = roundPlanningQty(Math.min(efdMPlusOne, inventoryStockQty));
+  const targetEndingBufferMPlusOne = roundPlanningQty(Math.max(
+    Number(detail.targetEndingStockQty || detail.bufferQty || 0),
+    0,
+  ));
+
+  return {
+    partCode: detail.partCode,
+    efdMPlusOne,
+    inventoryStockQty,
+    reservedStockQty,
+    freeStockQty,
+    stockCoverageQty,
+    netDemandOnly: roundPlanningQty(Math.max(efdMPlusOne - inventoryStockQty, 0)),
+    targetEndingBufferMPlusOne,
+    netWithMPlusTwoBuffer: roundPlanningQty(Math.max(
+      efdMPlusOne + targetEndingBufferMPlusOne - inventoryStockQty,
+      0,
+    )),
+  };
+}
+
+async function buildMPlusOneOptionContext(mrpRun) {
+  if (!mrpRun?.mpsNumber || !mrpRun?.mps?.periodStart) {
+    return { available: false, message: "Source MPS official tidak tersedia." };
+  }
+  const periodStart = new Date(mrpRun.mps.periodStart);
+  const horizonEnd = new Date(Date.UTC(periodStart.getUTCFullYear(), periodStart.getUTCMonth() + 3, 1));
+  const documents = await prisma.mPS.findMany({
+    where: {
+      isDeleted: false,
+      status: { notIn: ["Superseded", "Cancelled"] },
+      periodStart: { gte: periodStart, lt: horizonEnd },
+    },
+    orderBy: { periodStart: "asc" },
+    select: {
+      mpsNumber: true,
+      revision: true,
+      status: true,
+      forecastNumber: true,
+      periodStart: true,
+      periodEnd: true,
+      details: {
+        where: { isDeleted: false, status: { not: "Cancelled" }, notes: { not: { startsWith: GENERATED_MPS_CHILD_NOTE_PREFIX } } },
+        select: {
+          id: true,
+          partCode: true,
+          forecastQty: true,
+          bufferQty: true,
+          targetEndingStockQty: true,
+          projectedEndingStockQty: true,
+          firmScheduledReceiptQty: true,
+          demandSources: {
+            select: {
+              sourceType: true,
+              sourceNumber: true,
+              forecastDetail: {
+                select: {
+                  forecastNumber: true,
+                  forecast: { select: { version: true, revisionNumber: true, status: true } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const official = documents.find((row) => row.mpsNumber === mrpRun.mpsNumber) || documents[0];
+  const lookahead = documents.find((row) => new Date(row.periodStart) > new Date(official?.periodStart || periodStart));
+  if (!official || !lookahead) {
+    return { available: false, message: "MPS M+1 belum tersedia pada planning cycle ini." };
+  }
+  const lookaheadPartCodes = [...new Set(lookahead.details.map((row) => normalizePartCode(row.partCode)).filter(Boolean))];
+  const stockRows = lookaheadPartCodes.length ? await prisma.stockBalance.findMany({
+    where: {
+      AND: [
+        { partCode: { in: lookaheadPartCodes }, isDeleted: false },
+        buildExcludeSpecialRackCondition(),
+      ],
+    },
+    select: {
+      partCode: true,
+      qtyOnHand: true,
+      qtyReserved: true,
+      qtyQC: true,
+      qtyAvailable: true,
+    },
+  }) : [];
+  const inventoryByPart = stockRows.reduce((map, row) => {
+    const partCode = normalizePartCode(row.partCode);
+    const current = map.get(partCode) || { onHandQty: 0, reservedQty: 0, freeQty: 0 };
+    current.onHandQty += Number(row.qtyOnHand || 0);
+    current.reservedQty += Number(row.qtyReserved || 0);
+    current.freeQty += row.qtyAvailable == null
+      ? Math.max(Number(row.qtyOnHand || 0) - Number(row.qtyReserved || 0) - Number(row.qtyQC || 0), 0)
+      : Math.max(Number(row.qtyAvailable || 0), 0);
+    map.set(partCode, current);
+    return map;
+  }, new Map());
+  const items = lookahead.details.map((row) => {
+    const netting = buildMPlusOneInventoryNettingItem(
+      row,
+      inventoryByPart.get(normalizePartCode(row.partCode)) || {},
+    );
+    const forecastSources = [...new Map(row.demandSources.flatMap((source) => {
+      const numberValue = source.forecastDetail?.forecastNumber || (String(source.sourceType || "").toUpperCase() === "FORECAST" ? source.sourceNumber : null);
+      if (!numberValue) return [];
+      return [[numberValue, {
+        forecastNumber: numberValue,
+        version: source.forecastDetail?.forecast?.version ?? null,
+        revisionNumber: source.forecastDetail?.forecast?.revisionNumber ?? null,
+        status: source.forecastDetail?.forecast?.status || null,
+      }]];
+    })).values()];
+    return {
+      ...netting,
+      forecastSources,
+    };
+  });
+  const sum = (field) => roundPlanningQty(items.reduce((total, row) => total + Number(row[field] || 0), 0));
+  const forecastSources = [...new Map(items.flatMap((row) => row.forecastSources).map((row) => [row.forecastNumber, row])).values()];
+  return {
+    available: true,
+    officialMpsNumber: official.mpsNumber,
+    officialMpsRevision: official.revision,
+    sourceMpsNumber: lookahead.mpsNumber,
+    sourceMpsRevision: lookahead.revision,
+    sourceMpsStatus: lookahead.status,
+    periodStart: lookahead.periodStart,
+    periodEnd: lookahead.periodEnd,
+    forecastSources,
+    itemCount: items.length,
+    items,
+    totals: {
+      efdMPlusOne: sum("efdMPlusOne"),
+      inventoryStockQty: sum("inventoryStockQty"),
+      reservedStockQty: sum("reservedStockQty"),
+      freeStockQty: sum("freeStockQty"),
+      stockCoverageQty: sum("stockCoverageQty"),
+      targetEndingBufferMPlusOne: sum("targetEndingBufferMPlusOne"),
+      netDemandOnly: sum("netDemandOnly"),
+      netWithMPlusTwoBuffer: sum("netWithMPlusTwoBuffer"),
+    },
+  };
+}
+
+function resolveMPlusOnePreviewBasisQty(optionItem = {}, mode = "NET_CURRENT_STOCK") {
+  const normalizedMode = String(mode || "NET_CURRENT_STOCK").trim().toUpperCase();
+  const field = normalizedMode === "FULL_EFD" ? "efdMPlusOne" : "netDemandOnly";
+  return roundPlanningQty(Math.max(Number(optionItem?.[field] || 0), 0));
+}
+
+function enrichMPlusOnePreviewDisplayQty(requirements = [], optionContext = {}) {
+  const optionItems = Array.isArray(optionContext?.items) ? optionContext.items : [];
+  const optionsByPart = new Map(optionItems.map((item) => [normalizePartCode(item.partCode), item]));
+  const fallbackOption = optionContext?.totals || {};
+
+  return requirements.map((row) => {
+    const planningPartCode = normalizePartCode(
+      row.planningPartCode
+      || row.fgPartCode
+      || row.mpsDetail?.partCode,
+    );
+    const optionItem = optionsByPart.get(planningPartCode) || fallbackOption;
+    const fullBasisQty = resolveMPlusOnePreviewBasisQty(optionItem, "FULL_EFD");
+    const coveredBasisQty = resolveMPlusOnePreviewBasisQty(optionItem, "NET_AFTER_M_COVERAGE");
+    // forecastQty on a dependent requirement retains the theoretical BOM
+    // explosion per delivery phase even when parent WIP makes authoritative
+    // gross/net zero. It is therefore the safe read-only basis for look-ahead.
+    const fullGrossQty = roundPlanningQty(Math.max(Number(row.forecastQty ?? row.grossRequirement ?? 0), 0));
+    const deliveryRequirementQty = roundPlanningQty(Math.max(Number(row.grossRequirement ?? fullGrossQty), 0));
+    const inventoryStockQty = roundPlanningQty(Math.max(Number(row.onHandQty || 0), 0));
+    const reservedStockQty = roundPlanningQty(Math.max(Number(row.allocatedQty || 0), 0));
+    const freeStockQty = roundPlanningQty(Math.max(inventoryStockQty - reservedStockQty, 0));
+    const actualNetQty = roundPlanningQty(Math.max(Number(row.netRequirement || 0), 0));
+    const stockUsedQty = roundPlanningQty(Math.max(deliveryRequirementQty - actualNetQty, 0));
+
+    return {
+      ...row,
+      mPlusOneFullEfdBasisQty: fullBasisQty,
+      mPlusOneCoveredBasisQty: coveredBasisQty,
+      mPlusOneCoverageQty: roundPlanningQty(Math.max(fullBasisQty - coveredBasisQty, 0)),
+      mPlusOneFullEfdGrossQty: fullGrossQty,
+      mPlusOneCoveredGrossQty: actualNetQty,
+      mPlusOneDeliveryRequirementQty: deliveryRequirementQty,
+      mPlusOneInventoryStockQty: inventoryStockQty,
+      mPlusOneReservedStockQty: reservedStockQty,
+      mPlusOneFreeStockQty: freeStockQty,
+      mPlusOneStockUsedQty: stockUsedQty,
+      mPlusOneNetRequirementQty: actualNetQty,
+      mPlusOneActualNetPurchaseQty: actualNetQty,
+    };
+  });
+}
+
+async function enrichMPlusOnePreviewRequirements(tx, requirements = [], optionContext = {}, services = {}) {
+  const qtyEnricher = services.qty || enrichRequirementQtyBreakdown;
+  const supplyEnricher = services.supply || enrichRequirementSupplyBreakdown;
+  const displayEnricher = services.display || enrichMPlusOnePreviewDisplayQty;
+  const groupEnricher = services.group || enrichRequirementPlanningGroups;
+  const withQty = await qtyEnricher(tx, requirements);
+  // Preview M+1 must use the same live warehouse/WIP provenance as official
+  // requirements. Without this step a covered CLAMP row rendered stock 0.
+  const withSupply = await supplyEnricher(tx, withQty);
+  return groupEnricher(displayEnricher(withSupply, optionContext));
+}
+
 exports.get = async (req, res, next) => {
   try {
     const { runNumber } = req.params;
@@ -3427,7 +3861,7 @@ exports.get = async (req, res, next) => {
                 },
               },
             },
-            mpsDetail: { select: { partCode: true, customerCode: true, startDate: true, endDate: true } },
+            mpsDetail: { select: { partCode: true, customerCode: true, startDate: true, endDate: true, fgRequiredDate: true, part: { select: { partCode: true, partNumber: true, partName: true } } } },
           },
         },
         plannedOrders: {
@@ -3457,6 +3891,10 @@ exports.get = async (req, res, next) => {
         sourceType: true,
         sourceNumber: true,
         requiredDate: true,
+        parentRequiredDate: true,
+        materialRequiredDate: true,
+        productionRequiredDate: true,
+        orderDate: true,
         grossRequirement: true,
         onHandQty: true,
         allocatedQty: true,
@@ -3467,11 +3905,13 @@ exports.get = async (req, res, next) => {
         plannedOrderQty: true,
         adjustedOrderQty: true,
         orderType: true,
+        procurementWindow: true,
         mpsDetailId: true,
         customerCode: true,
         fgPartCode: true,
         targetDeliveryDate: true,
         deliveryTargetId: true,
+        mpsDetail: { select: { partCode: true, customerCode: true, startDate: true, endDate: true, fgRequiredDate: true, part: { select: { partCode: true, partNumber: true, partName: true } } } },
         part: { select: { partCode: true, partNumber: true, partName: true, itemType: true, rawType: true, baseUomCode: true, productionUomCode: true, stockUomCode: true } },
         mbomDetail: {
           select: {
@@ -3611,7 +4051,68 @@ exports.get = async (req, res, next) => {
       prisma,
       requirementsWithQtyBreakdown,
     );
-    const groupedRequirements = enrichRequirementPlanningGroups(requirementsWithSupplyBreakdown);
+    let groupedRequirements = enrichRequirementPlanningGroups(requirementsWithSupplyBreakdown);
+    const sourceMpsDetailIds = [...new Set(groupedRequirements.map((row) => row.mpsDetailId).filter(Boolean))];
+    const sourceMpsDetailRows = sourceMpsDetailIds.length ? await prisma.mPSDetail.findMany({
+      where: { id: { in: sourceMpsDetailIds }, isDeleted: false },
+      select: {
+        id: true,
+        mpsNumber: true,
+        demandSources: {
+          select: {
+            sourceType: true,
+            sourceNumber: true,
+            sourceLineId: true,
+            forecastDetailId: true,
+            customerCode: true,
+            qty: true,
+            uomCode: true,
+            requiredDate: true,
+            effectiveRequiredDate: true,
+            sourcePegging: true,
+          },
+        },
+        mps: { select: { forecastNumber: true, revision: true } },
+      },
+    }) : [];
+    const sourceDetailById = new Map(sourceMpsDetailRows.map((row) => [row.id, row]));
+    const deliveryTargetIds = [...new Set(groupedRequirements.flatMap((row) => {
+      const pegging = Array.isArray(row.customerPegging) ? row.customerPegging : [];
+      return [row.deliveryTargetId, ...pegging.map((item) => item.deliveryTargetId)].filter(Boolean);
+    }))];
+    const deliveryPlanRows = deliveryTargetIds.length ? await prisma.mPSDeliveryPlan.findMany({
+      where: { sourceDeliveryTargetId: { in: deliveryTargetIds }, isDeleted: false, status: { not: "Cancelled" } },
+      select: { sourceDeliveryTargetId: true, phaseNumber: true, fgFinishSplitNumber: true, plannedDate: true, fgRequiredDate: true },
+    }) : [];
+    const deliveryPlanByTarget = new Map(deliveryPlanRows.map((row) => [row.sourceDeliveryTargetId, row]));
+    groupedRequirements = groupedRequirements.map((row) => {
+      const sourceDetail = sourceDetailById.get(row.mpsDetailId);
+      const fallbackReferences = (sourceDetail?.demandSources || []).map((source) => ({
+        sourceType: source.sourceType,
+        sourceNumber: source.sourceNumber,
+        sourceLineId: source.sourceLineId,
+        forecastDetailId: source.forecastDetailId,
+        customerCode: source.customerCode,
+        qty: Number(source.qty || 0),
+        uomCode: source.uomCode,
+        requiredDate: source.effectiveRequiredDate || source.requiredDate,
+      }));
+      const persistedPegging = Array.isArray(row.customerPegging) ? row.customerPegging : [];
+      const customerPegging = persistedPegging.map((peg) => {
+        const deliveryPlan = deliveryPlanByTarget.get(peg.deliveryTargetId || row.deliveryTargetId);
+        return {
+          ...peg,
+          deliveryPhaseNumber: peg.deliveryPhaseNumber || peg.phaseNumber || deliveryPlan?.fgFinishSplitNumber || deliveryPlan?.phaseNumber || null,
+          phaseLabel: peg.phaseLabel || (deliveryPlan ? `Phase ${deliveryPlan.fgFinishSplitNumber || deliveryPlan.phaseNumber}` : null),
+          referenceSources: Array.isArray(peg.referenceSources) && peg.referenceSources.length
+            ? peg.referenceSources
+            : fallbackReferences,
+          mpsNumber: sourceDetail?.mpsNumber || row.sourceNumber || null,
+          mpsRevision: sourceDetail?.mps?.revision ?? null,
+        };
+      });
+      return { ...row, customerPegging };
+    });
     const plannedOrdersWithQtyBreakdown = await enrichPlannedOrderQtyBreakdown(
       prisma,
       mrpRun.plannedOrders,
@@ -3702,7 +4203,7 @@ exports.get = async (req, res, next) => {
       runNumber: run.runNumber,
       runDate: run.runDate,
       scenarioKey: run.scenarioKey,
-      scenarioName: run.scenarioName || (run.scenarioStatus === "SIMULATION" ? run.scenarioKey : "Baseline"),
+      scenarioName: run.scenarioName || (["SIMULATION", "SIMULATED"].includes(run.scenarioStatus) ? run.scenarioKey : "Baseline"),
       scenarioStatus: run.scenarioStatus,
       scenarioAssumptions: run.scenarioAssumptions,
       isCurrentPlan: run.isCurrentPlan,
@@ -3713,10 +4214,120 @@ exports.get = async (req, res, next) => {
       atRiskSupplyQty: roundPlanningQty(run.requirements.reduce((sum, row) => sum + Number(row.atRiskSupplyQty || 0), 0)),
       expediteCount: run.requirements.filter((row) => row.procurementWindow === "EXPEDITE" && Number(row.netRequirement || 0) > 0).length,
     }));
+    const revisionHistory = await prisma.mRPRun.findMany({
+      where: {
+        isDeleted: false,
+        ...(mrpRun.planNumber ? { planNumber: mrpRun.planNumber } : { mpsNumber: mrpRun.mpsNumber }),
+      },
+      orderBy: [{ planRevision: "desc" }, { runDate: "desc" }],
+      take: 30,
+      select: {
+        runNumber: true,
+        planNumber: true,
+        planRevision: true,
+        status: true,
+        scenarioStatus: true,
+        scenarioKey: true,
+        scenarioName: true,
+        scenarioAssumptions: true,
+        isCurrentPlan: true,
+        runDate: true,
+        runBy: true,
+        totalRequirements: true,
+        totalPlannedOrders: true,
+      },
+    });
+    const mPlusOneOption = await buildMPlusOneOptionContext(mrpRun);
+    const recentPreviewRuns = mrpRun.mpsNumber ? await prisma.mRPRun.findMany({
+      where: {
+        mpsNumber: mrpRun.mpsNumber,
+        isDeleted: false,
+        status: "Completed",
+        scenarioStatus: { in: ["SIMULATION", "SIMULATED"] },
+      },
+      orderBy: { runDate: "desc" },
+      take: 12,
+      select: { runNumber: true, runDate: true, scenarioName: true, scenarioAssumptions: true },
+    }) : [];
+    const mPlusOnePreviewRun = recentPreviewRuns.find(isCurrentMPlusOnePreviewRun);
+    let mPlusOnePreview = null;
+    if (mPlusOnePreviewRun) {
+      const previewRequirements = await prisma.mRPRequirement.findMany({
+        where: { runNumber: mPlusOnePreviewRun.runNumber, isDeleted: false, orderType: "Purchase" },
+        orderBy: [{ levelMBOM: "asc" }, { requiredDate: "asc" }],
+        include: {
+          part: {
+            select: {
+              partCode: true, partNumber: true, partName: true, itemType: true, rawType: true,
+              material: {
+                select: {
+                  materialCode: true, materialName: true, materialForm: true,
+                  defaultPurchaseUomCode: true, defaultConversionUomCode: true, defaultConversionFactor: true,
+                },
+              },
+            },
+          },
+          mbomDetail: {
+            select: {
+              id: true, noReg: true, qty: true, uomCode: true, grossWeight: true, category: true,
+              mbomHeader: { select: { noReg: true, part: { select: { partCode: true, partNumber: true, partName: true } } } },
+              parentDetail: {
+                select: {
+                  id: true,
+                  part: { select: { partCode: true, partNumber: true, partName: true } },
+                  mbomProcesses: {
+                    where: { isDeleted: false }, orderBy: [{ sequence: "asc" }],
+                    select: { sequence: true, occurrenceCode: true, routingMode: true, process: { select: { processCode: true, processName: true } } },
+                  },
+                },
+              },
+              mbomProcesses: {
+                where: { isDeleted: false }, orderBy: [{ sequence: "asc" }],
+                select: { sequence: true, occurrenceCode: true, routingMode: true, process: { select: { processCode: true, processName: true } } },
+              },
+            },
+          },
+          mpsDetail: { select: { mpsNumber: true, partCode: true, customerCode: true, startDate: true, endDate: true, fgRequiredDate: true, mps: { select: { revision: true } }, part: { select: { partCode: true, partNumber: true, partName: true } } } },
+        },
+      });
+      const previewGrouped = (await enrichMPlusOnePreviewRequirements(
+        prisma,
+        previewRequirements,
+        mPlusOneOption,
+      )).map((row) => ({
+        ...row,
+        customerPegging: (Array.isArray(row.customerPegging) ? row.customerPegging : []).map((peg) => ({
+          ...peg,
+          mpsNumber: row.mpsDetail?.mpsNumber || null,
+          mpsRevision: row.mpsDetail?.mps?.revision ?? null,
+        })),
+      }));
+      mPlusOnePreview = {
+        ...mPlusOnePreviewRun,
+        requirements: previewGrouped,
+      };
+    }
+    const recoveryTargetIds = [...new Set(groupedRequirements.flatMap((row) => {
+      const pegging = Array.isArray(row.customerPegging) ? row.customerPegging : [];
+      return [row.deliveryTargetId, ...pegging.map((item) => item.deliveryTargetId)].filter(Boolean);
+    }))];
+    const recoveryPlans = recoveryTargetIds.length ? await prisma.dueDateRecoveryPlan.findMany({
+      where: { deliveryTargetId: { in: recoveryTargetIds }, isCurrentPlan: true, isDeleted: false },
+      select: {
+        id: true, deliveryTargetId: true, revision: true, status: true, checklist: true, notes: true,
+        requestedDeliveryDate: true, earliestFeasibleDelivery: true, approvedBy: true, approvedAt: true,
+      },
+    }) : [];
     res.json(mapDoc({
       ...mrpRun,
+      lifecycleStatus: canonicalMrpLifecycleStatus(mrpRun.scenarioStatus),
+      approvalEligibility: mrpApprovalEligibility(mrpRun),
       purchaseSuggestion,
       scenarioComparison,
+      revisionHistory,
+      mPlusOneOption,
+      mPlusOnePreview,
+      recoveryPlans,
       requirementTrace,
       productionScheduleTrace,
       requirements: groupedRequirements,
@@ -3849,13 +4460,27 @@ exports.runMRP = async (req, res, next) => {
   try {
     const {
       runNumber: requestedRunNumber, mpsNumber, mpsNumbers: requestedMpsNumbers, planHorizon, cutoffDate, soDemandPartCodes,
-      scenarioKey, scenarioName, scenarioAssumptions, planningSnapshotAt,
+      scenarioKey, scenarioName, scenarioAssumptions, planningSnapshotAt, baselineRunNumber,
     } = req.body;
-    const scenarioStatus = String(req.body?.scenarioStatus || (scenarioKey ? "SIMULATION" : "BASELINE")).toUpperCase();
-    if (!new Set(["BASELINE", "SIMULATION", "APPROVED"]).has(scenarioStatus)) {
-      return res.status(400).json({ message: "scenarioStatus harus BASELINE, SIMULATION, atau APPROVED." });
+    const planningMode = String(
+      req.body?.planningMode || scenarioAssumptions?.planningMode || "OFFICIAL",
+    ).trim().toUpperCase();
+    if (!new Set(["OFFICIAL", "M_PLUS_ONE_PREVIEW"]).has(planningMode)) {
+      return res.status(400).json({ message: "planningMode harus OFFICIAL atau M_PLUS_ONE_PREVIEW." });
     }
-    const isSimulation = scenarioStatus === "SIMULATION";
+    const isMPlusOnePreview = planningMode === "M_PLUS_ONE_PREVIEW";
+    const includeMPlusTwoBuffer = Boolean(
+      req.body?.includeMPlusTwoBuffer ?? scenarioAssumptions?.includeMPlusTwoBuffer,
+    );
+    const calculationLifecycle = mrpCalculationLifecycle(req.body?.scenarioStatus);
+    if (!calculationLifecycle.allowed) {
+      return res.status(409).json({
+        code: calculationLifecycle.code,
+        message: "Perhitungan MRP selalu membuat revision Draft lalu Simulated. Gunakan aksi Approve untuk menjadikannya official.",
+      });
+    }
+    const scenarioStatus = calculationLifecycle.initialStatus;
+    const isSimulation = true;
     const scenarioDemandMultiplier = isSimulation
       ? Math.min(Math.max(Number(scenarioAssumptions?.demandMultiplier || 1), 0), 5)
       : 1;
@@ -3864,7 +4489,9 @@ exports.runMRP = async (req, res, next) => {
     const mpsPrecheck = await prisma.mPS.findUnique({
       where: { mpsNumber },
       select: {
+        id: true,
         mpsNumber: true,
+        revision: true,
         status: true,
         isDeleted: true,
         replanRequired: true,
@@ -3872,11 +4499,28 @@ exports.runMRP = async (req, res, next) => {
         planningAnchorMonth: true,
         periodStart: true,
         periodEnd: true,
+        deliveryFeasibilityStatus: true,
+        deliveryFeasibilityFingerprint: true,
+        officialGateStatus: true,
+        planKind: true,
+        baselineMpsNumber: true,
       },
     });
 
     if (!mpsPrecheck || mpsPrecheck.isDeleted) {
       return res.status(404).json({ message: "MPS tidak ditemukan" });
+    }
+    const requestedPlanKind = String(req.body?.planKind || mpsPrecheck.planKind || "BASELINE").trim().toUpperCase() === "DELTA" ? "DELTA" : "BASELINE";
+    const isDeltaRun = requestedPlanKind === "DELTA";
+    let deltaMetadata = null;
+    if (isDeltaRun) {
+      try {
+        deltaMetadata = deltaMrpMetadata({ deltaMpsNumber: mpsPrecheck.mpsNumber, baselineMpsNumber: mpsPrecheck.baselineMpsNumber, baselineRunNumber });
+      } catch (error) {
+        return res.status(409).json({ code: "DELTA_MRP_BASELINE_REQUIRED", message: error.message });
+      }
+      const baselineRun = await prisma.mRPRun.findFirst({ where: { runNumber: deltaMetadata.baselineRunNumber, planKind: "BASELINE", status: "Completed", scenarioStatus: "APPROVED", isCurrentPlan: true, isDeleted: false } });
+      if (!baselineRun) return res.status(409).json({ code: "DELTA_MRP_BASELINE_NOT_CURRENT", message: "Baseline MRP harus Approved dan masih menjadi current plan sebelum Delta MRP dihitung." });
     }
 
     const explicitSourceMpsNumbers = [...new Set([
@@ -3893,21 +4537,22 @@ exports.runMRP = async (req, res, next) => {
     const cycleWindowEnd = new Date(cycleAnchor);
     cycleWindowEnd.setUTCMonth(cycleWindowEnd.getUTCMonth() + 3, 1);
     cycleWindowEnd.setUTCHours(0, 0, 0, 0);
-    const expectedCycleMps = await prisma.mPS.findMany({
+    const expectedCycleMps = isDeltaRun ? [mpsPrecheck] : await prisma.mPS.findMany({
       where: {
         isDeleted: false,
+        planKind: { not: "DELTA" },
         status: { notIn: ["Superseded", "Cancelled"] },
         ...(mpsPrecheck.planningAnchorMonth
           ? { planningAnchorMonth: mpsPrecheck.planningAnchorMonth }
           : { periodStart: { gte: mpsPrecheck.periodStart, lt: cycleWindowEnd } }),
         periodStart: { gte: cycleAnchor, lt: cycleWindowEnd },
       },
-      select: { mpsNumber: true, status: true, isDeleted: true, replanRequired: true, replanReason: true, planningAnchorMonth: true, periodStart: true, periodEnd: true },
+      select: { id: true, mpsNumber: true, revision: true, status: true, isDeleted: true, replanRequired: true, replanReason: true, planningAnchorMonth: true, periodStart: true, periodEnd: true, deliveryFeasibilityStatus: true, deliveryFeasibilityFingerprint: true, officialGateStatus: true, planKind: true, baselineMpsNumber: true },
       orderBy: { periodStart: "asc" },
       take: 3,
     });
     const expectedCycleNumbers = expectedCycleMps.map((row) => row.mpsNumber);
-    if (Array.isArray(requestedMpsNumbers) && requestedMpsNumbers.length > 0) {
+    if (!isDeltaRun && Array.isArray(requestedMpsNumbers) && requestedMpsNumbers.length > 0) {
       const missingCycleNumbers = expectedCycleNumbers.filter((value) => !explicitSourceMpsNumbers.includes(value));
       if (missingCycleNumbers.length) {
         return res.status(409).json({
@@ -3918,37 +4563,62 @@ exports.runMRP = async (req, res, next) => {
         });
       }
     }
-    let sourceMpsPrechecks;
-    if (Array.isArray(requestedMpsNumbers) && requestedMpsNumbers.length > 0) {
-      sourceMpsPrechecks = await prisma.mPS.findMany({
+    let planningCycleMpsPrechecks;
+    if (isDeltaRun) {
+      planningCycleMpsPrechecks = [mpsPrecheck];
+    } else if (Array.isArray(requestedMpsNumbers) && requestedMpsNumbers.length > 0) {
+      planningCycleMpsPrechecks = await prisma.mPS.findMany({
         where: { mpsNumber: { in: explicitSourceMpsNumbers }, isDeleted: false },
-        select: { mpsNumber: true, status: true, isDeleted: true, replanRequired: true, replanReason: true, planningAnchorMonth: true, periodStart: true, periodEnd: true },
+        select: { id: true, mpsNumber: true, revision: true, status: true, isDeleted: true, replanRequired: true, replanReason: true, planningAnchorMonth: true, periodStart: true, periodEnd: true, deliveryFeasibilityStatus: true, deliveryFeasibilityFingerprint: true, officialGateStatus: true },
         orderBy: { periodStart: "asc" },
       });
-      if (sourceMpsPrechecks.length !== explicitSourceMpsNumbers.length) {
+      if (planningCycleMpsPrechecks.length !== explicitSourceMpsNumbers.length) {
         return res.status(404).json({ message: "Sebagian MPS dalam planning cycle tidak ditemukan." });
       }
     } else {
-      sourceMpsPrechecks = expectedCycleMps;
+      planningCycleMpsPrechecks = expectedCycleMps;
     }
-    const sourceMpsNumbers = sourceMpsPrechecks.map((row) => row.mpsNumber);
-    const invalidStatusMps = sourceMpsPrechecks.find((row) => !["Confirmed", "Released"].includes(row.status));
-    if (invalidStatusMps) {
+    const planningCycleMpsNumbers = planningCycleMpsPrechecks.map((row) => row.mpsNumber);
+    const planningCycleSourceSnapshot = buildMrpSourceSnapshot(planningCycleMpsPrechecks);
+    const invalidStatusMps = planningCycleMpsPrechecks.find((row) => !["Confirmed", "Released"].includes(row.status));
+    if (!isSimulation && invalidStatusMps) {
       return res.status(409).json({
         code: "MPS_CYCLE_NOT_LOCKED",
         message: `Semua MPS dalam planning cycle harus Confirmed/Released. ${invalidStatusMps.mpsNumber} saat ini ${invalidStatusMps.status}.`,
-        sourceMpsNumbers,
+        sourceMpsNumbers: planningCycleMpsNumbers,
       });
     }
 
-    const replanMps = sourceMpsPrechecks.find((row) => row.replanRequired);
-    if (replanMps) {
+    const replanMps = planningCycleMpsPrechecks.find((row) => row.replanRequired);
+    if (!isSimulation && replanMps) {
       return res.status(409).json({
         code: "DEMAND_REPLAN_REQUIRED",
         message: replanMps.replanReason || `${replanMps.mpsNumber} berubah. Hitung ulang dan lock planning cycle sebelum menjalankan MRP.`,
       });
     }
 
+    const deliveryGateSnapshot = isSimulation
+      ? await Promise.all(planningCycleMpsPrechecks.map(async (row) => ({ mpsNumber: row.mpsNumber, ...(await getMpsDeliveryGate(prisma, row)) })))
+      : await assertOfficialMpsDeliveryGate(prisma, planningCycleMpsPrechecks);
+    const primaryMpsPrecheck = planningCycleMpsPrechecks.find((row) => row.mpsNumber === mpsNumber) || mpsPrecheck;
+    const futureMpsPrechecks = planningCycleMpsPrechecks
+      .filter((row) => new Date(row.periodStart) > new Date(primaryMpsPrecheck.periodStart))
+      .sort((left, right) => new Date(left.periodStart) - new Date(right.periodStart));
+    if (isMPlusOnePreview && !futureMpsPrechecks.length) {
+      return res.status(409).json({
+        code: "M_PLUS_ONE_SOURCE_NOT_FOUND",
+        message: "MPS M+1 belum tersedia pada planning cycle ini.",
+        planningCycleMpsNumbers,
+      });
+    }
+    // Official MRP explodes only the authoritative M document. Its qtyPlanned
+    // already contains M-1 carry-over, official M demand, and the ending-stock
+    // buffer sourced from EFD M+1. M+1 is an explicit simulation source so it
+    // cannot be counted a second time in official output.
+    const sourceMpsPrechecks = isMPlusOnePreview
+      ? [futureMpsPrechecks[0]]
+      : [primaryMpsPrecheck];
+    const sourceMpsNumbers = sourceMpsPrechecks.map((row) => row.mpsNumber);
     const cyclePeriodStart = sourceMpsPrechecks.reduce(
       (value, row) => (!value || new Date(row.periodStart) < new Date(value) ? row.periodStart : value),
       null,
@@ -3958,7 +4628,7 @@ exports.runMRP = async (req, res, next) => {
       null,
     );
 
-    const planningMonthKey = new Date(cyclePeriodStart || mpsPrecheck.periodStart).toISOString().slice(0, 7);
+    const planningMonthKey = new Date(primaryMpsPrecheck.periodStart).toISOString().slice(0, 7);
     const generatedIdentity = await nextMonthlyMrpIdentity(prisma, planningMonthKey);
     // Legacy clients may still send the former daily run number. Monthly MRP
     // identity remains authoritative for manual and normal PPIC runs.
@@ -4017,7 +4687,10 @@ exports.runMRP = async (req, res, next) => {
           runNumber,
           ...planIdentity,
           planningMonth: new Date(`${planningMonthKey}-01T00:00:00.000Z`),
-          isCurrentPlan: !isSimulation,
+          planKind: requestedPlanKind,
+          baselineRunNumber: deltaMetadata?.baselineRunNumber || null,
+          sourceDeltaMpsNumber: deltaMetadata?.sourceDeltaMpsNumber || null,
+          isCurrentPlan: calculationLifecycle.isCurrentPlan,
           planHorizon: resolvedPlanHorizon,
           cutoffDate: resolvedCutoffDate,
           planningSnapshotAt: parseDate(planningSnapshotAt) || new Date(),
@@ -4027,8 +4700,19 @@ exports.runMRP = async (req, res, next) => {
           scenarioAssumptions: {
             ...(scenarioAssumptions && typeof scenarioAssumptions === "object" ? scenarioAssumptions : {}),
             planningCycleMonth: planningMonthKey,
+            planningMode,
+            planKind: requestedPlanKind,
+            baselineRunNumber: deltaMetadata?.baselineRunNumber || null,
+            baselineMpsNumber: deltaMetadata?.baselineMpsNumber || null,
+            deliveryGateSnapshot,
+            planningCycleMpsNumbers,
+            ...planningCycleSourceSnapshot,
             sourceMpsNumbers,
             firmHorizonMonths: sourceMpsNumbers.length,
+            officialSourceMpsNumbers: [primaryMpsPrecheck.mpsNumber],
+            lookaheadSourceMpsNumbers: futureMpsPrechecks.map((row) => row.mpsNumber),
+            includeMPlusTwoBuffer: isMPlusOnePreview && includeMPlusTwoBuffer,
+            previewTreeVersion: isMPlusOnePreview ? M_PLUS_ONE_PREVIEW_TREE_VERSION : null,
           },
           status: "Running",
           runBy: req.user?.username || "system",
@@ -4072,6 +4756,7 @@ exports.runMRP = async (req, res, next) => {
           periodStart: cyclePeriodStart || primaryMps.periodStart,
           periodEnd: cyclePeriodEnd || primaryMps.periodEnd,
         };
+        const previewProjectedOpeningMap = {};
 
         // Child production rows hasil MRP ditampilkan di MPS, tetapi bukan demand
         // baru. Hanya row sumber forecast/SO yang boleh diexplode pada run berikutnya.
@@ -4083,7 +4768,9 @@ exports.runMRP = async (req, res, next) => {
           rawSourceMpsDetailsByNumber.set(document.mpsNumber, rawDetails);
           return expandMpsDetailsByDeliveryPhases(rawDetails, document.deliveryPlans || [])
             .map((row) => ({ ...row, _sourceMpsNumber: document.mpsNumber }));
-        }).sort((left, right) => new Date(left.endDate) - new Date(right.endDate));
+        })
+          .filter((row) => !isMPlusOnePreview || includeMPlusTwoBuffer || !row._isBufferPhase)
+          .sort((left, right) => new Date(left.endDate) - new Date(right.endDate));
         const productionRoutingRequests = sourceMpsDetails
           .filter((detail) => detail.mbomHeaderId)
           .map((detail) => ({
@@ -4113,7 +4800,7 @@ exports.runMRP = async (req, res, next) => {
         }
 
         const unlockedMps = mpsDocuments.find((row) => !["Confirmed", "Released"].includes(row.status));
-        if (unlockedMps) {
+        if (!isSimulation && unlockedMps) {
           throw new Error(`MPS ${unlockedMps.mpsNumber} harus Confirmed/Released sebelum run MRP.`);
         }
 
@@ -4244,7 +4931,18 @@ exports.runMRP = async (req, res, next) => {
         // FG stock already reserved for the same demand still covers the MPS
         // target. Use on-hand for production netting; reservation remains
         // visible separately and is not counted twice in later periods.
-        const projectedAvailableMap = mergeQtyMaps(stockPositionMaps.onHand, supplyMap);
+        const projectedAvailableMap = isMPlusOnePreview
+          ? { ...stockPositionMaps.onHand }
+          : mergeQtyMaps(stockPositionMaps.onHand, supplyMap);
+        if (isMPlusOnePreview) {
+          // Preview M+1 is an isolated look-ahead. Its opening pool is the
+          // physical inventory snapshot at run time; it must not be reduced by
+          // month M usage or replaced by projected closing M. The pool is
+          // still consumed chronologically by the M+1 delivery phases below.
+          for (const [partCode, qty] of Object.entries(stockPositionMaps.onHand)) {
+            previewProjectedOpeningMap[partCode] = Number(qty || 0);
+          }
+        }
         const stockAllocatedMap = stockPositionMaps.allocated;
 
         // Debug log untuk audit
@@ -4406,18 +5104,22 @@ exports.runMRP = async (req, res, next) => {
             _productionScheduleQty: grossRequirementAfterSo,
           };
 
-          const availableBefore = projectedAvailableMap[fgPartCode] || 0;
+          const availableBefore = isMPlusOnePreview
+            ? Number(previewProjectedOpeningMap[fgPartCode] || 0)
+            : Number(projectedAvailableMap[fgPartCode] || 0);
           const actualOnHandBefore = stockPositionMaps.onHand[fgPartCode] || 0;
           const allocatedQty = stockAllocatedMap[fgPartCode] || 0;
           requirement.onHandQty = actualOnHandBefore;
           requirement.allocatedQty = allocatedQty;
           // Net MPS already consumed FG stock and ending-stock target.
-          requirement.netRequirement = mpsUsesNetProduction
-            ? requirement.grossRequirement
-            : evaluateFromSet(formulas, "MRP_NET_REQUIREMENT", {
+          requirement.netRequirement = isMPlusOnePreview
+            ? roundPlanningQty(Math.max(requirement.grossRequirement - availableBefore, 0))
+            : mpsUsesNetProduction
+              ? requirement.grossRequirement
+              : evaluateFromSet(formulas, "MRP_NET_REQUIREMENT", {
                 grossRequirement: requirement.grossRequirement,
                 projectedAvailable: availableBefore,
-              });
+                });
           requirement.plannedOrderQty = requirement.netRequirement;
           if (requirement.orderType === "Purchase" && purchaseInitialAvailableMap[fgPartCode] === undefined) {
             purchaseInitialAvailableMap[fgPartCode] = availableBefore;
@@ -4442,12 +5144,17 @@ exports.runMRP = async (req, res, next) => {
           requirement._productionScheduleQty = productionExplosionQty;
 
           // Kurangi projected stock dengan gross requirement pada bucket ini.
-          projectedAvailableMap[fgPartCode] = mpsUsesNetProduction
-            ? 0
-            : Math.max(
-                availableBefore - requirement.grossRequirement,
-                0
-              );
+          projectedAvailableMap[fgPartCode] = isMPlusOnePreview
+            ? Math.max(availableBefore - requirement.grossRequirement, 0)
+            : mpsUsesNetProduction
+              ? 0
+              : Math.max(
+                  availableBefore - requirement.grossRequirement,
+                  0
+                );
+          if (isMPlusOnePreview) {
+            previewProjectedOpeningMap[fgPartCode] = projectedAvailableMap[fgPartCode];
+          }
           projectedMppSupplyMap[fgPartCode] = Math.max(
             mppAvailableBefore - mppDrivenQty,
             0,
@@ -4512,6 +5219,8 @@ exports.runMRP = async (req, res, next) => {
                   initialStockAvailableMap: purchaseInitialStockAvailableMap,
                   targetedReservationPool,
                   formulas,
+                  includeZeroNetForecastTree: isMPlusOnePreview,
+                  ignoreFirmSupply: isMPlusOnePreview,
                   parentBufferPercent: Number(mpsDetail.bufferPercent ?? mpsDetail.part?.bufferStock ?? 0),
                   // Forecast dan buffer harus tetap terpisah di setiap level BOM.
                   // Quantity produksi boleh sudah termasuk buffer, tetapi kolom
@@ -4747,16 +5456,18 @@ exports.runMRP = async (req, res, next) => {
           tx,
           purchaseRequirements.map((requirement) => requirement.partCode),
         );
-        const purchasingSupplyTimeline = await buildPurchasingSupplyTimeline(
-          tx,
-          purchaseRequirements,
-          resolvedCutoffDate || mps.periodEnd,
-          {
-            excludeRunNumber: runNumber,
-            uomCodeByPartCode,
-            poDelayDays: isSimulation ? Number(scenarioAssumptions?.poDelayDays || 0) : 0,
-          },
-        );
+        const purchasingSupplyTimeline = isMPlusOnePreview
+          ? []
+          : await buildPurchasingSupplyTimeline(
+              tx,
+              purchaseRequirements,
+              resolvedCutoffDate || mps.periodEnd,
+              {
+                excludeRunNumber: runNumber,
+                uomCodeByPartCode,
+                poDelayDays: isSimulation ? Number(scenarioAssumptions?.poDelayDays || 0) : 0,
+              },
+            );
         applyTimePhasedPurchaseNetting(purchaseRequirements, purchasingSupplyTimeline, {
           initialStockAvailableMap: purchaseInitialStockAvailableMap,
           partnerMap,
@@ -4892,6 +5603,13 @@ exports.runMRP = async (req, res, next) => {
               plannedOrderNotes = "Raw material belum dikonversi ke kg karena gross weight/pitch/cavity pada MBOM belum lengkap.";
             }
 
+            // Purchase parts with a physical piece UOM cannot be ordered as a
+            // fraction. Round upward so the released supply fully covers the
+            // calculated requirement; weight/length UOMs retain decimals.
+            if (!isProduction && isPcsUom(plannedOrderUomCode)) {
+              plannedOrderQty = normalizeReferencePcs(plannedOrderQty);
+            }
+
             const plannedOrder = {
               orderNumber,
               runNumber,
@@ -4911,7 +5629,7 @@ exports.runMRP = async (req, res, next) => {
               vendorCode: isProduction ? null : partnerMap[mrpReq.partCode]?.vendorCode || null,
               referenceType: "MRP",
               referenceNumber: planIdentity.planNumber || runNumber,
-              status: isSimulation ? "Simulation" : "Planned",
+              status: isSimulation ? "Draft" : "Planned",
               notes: plannedOrderNotes,
             };
 
@@ -4994,6 +5712,7 @@ exports.runMRP = async (req, res, next) => {
           where: { runNumber },
           data: {
             status: "Completed",
+            scenarioStatus: calculationLifecycle.completedStatus,
             totalRequirements: persistedRequirements.length,
             totalPlannedOrders: plannedOrders.length,
             soDemandConsumedQty: nettingRunSummary.totalConsumedQty,
@@ -5053,10 +5772,177 @@ exports.runMRP = async (req, res, next) => {
   }
 };
 
+exports.runDeltaMRP = (req, res, next) => {
+  req.body = { ...(req.body || {}), planKind: "DELTA", planningMode: "OFFICIAL" };
+  return exports.runMRP(req, res, next);
+};
+
+exports.approve = async (req, res, next) => {
+  try {
+    const runNumber = req.params.runNumber;
+    const actor = req.user?.username || req.user?.email || "system";
+    const run = await prisma.mRPRun.findFirst({ where: { runNumber, isDeleted: false } });
+    if (!run) return res.status(404).json({ message: "MRP run tidak ditemukan." });
+
+    const eligibility = mrpApprovalEligibility(run);
+    if (!eligibility.allowed) {
+      const messages = {
+        LOOKAHEAD_PREVIEW_NOT_APPROVABLE: "Preview M+1 hanya untuk look-ahead dan tidak dapat di-approve menjadi MRP official.",
+        MRP_ALREADY_APPROVED: "MRP run ini sudah Approved dan menjadi current plan.",
+        MRP_NOT_SIMULATED: "MRP harus selesai dihitung dan berstatus Simulated sebelum approval.",
+      };
+      return res.status(409).json({ code: eligibility.code, message: messages[eligibility.code] || "MRP belum dapat di-approve." });
+    }
+
+    const approvalCycleMpsNumbers = mrpApprovalCycleMpsNumbers(run);
+    const sourceMpsNumbers = approvalCycleMpsNumbers;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const snapshot = await tx.mRPRun.findUnique({
+        where: { runNumber },
+        include: {
+          requirements: { where: { isDeleted: false }, include: { part: { select: { itemType: true } } } },
+          plannedOrders: { where: { isDeleted: false } },
+        },
+      });
+      const currentEligibility = mrpApprovalEligibility(snapshot || {});
+      if (!snapshot || !currentEligibility.allowed) throw Object.assign(new Error("MRP working revision sudah berubah. Muat ulang halaman sebelum approval."), { statusCode: 409 });
+      const isDeltaApproval = String(snapshot.planKind || "BASELINE").toUpperCase() === "DELTA";
+
+      const [sourceMps, approvalCycleMps] = await Promise.all([
+        tx.mPS.findMany({
+          where: { mpsNumber: { in: sourceMpsNumbers }, isDeleted: false },
+          include: { details: { where: { isDeleted: false } } },
+          orderBy: { periodStart: "asc" },
+        }),
+        tx.mPS.findMany({
+          where: { mpsNumber: { in: approvalCycleMpsNumbers }, isDeleted: false },
+          orderBy: { periodStart: "asc" },
+        }),
+      ]);
+      if (sourceMps.length !== sourceMpsNumbers.length) throw Object.assign(new Error("Sebagian source MPS snapshot sudah tidak tersedia."), { statusCode: 409, code: "MPS_SOURCE_NOT_FOUND" });
+      if (approvalCycleMps.length !== approvalCycleMpsNumbers.length) throw Object.assign(new Error("Sebagian MPS dalam planning cycle sudah tidak tersedia."), { statusCode: 409, code: "MPS_CYCLE_SOURCE_NOT_FOUND" });
+      if (!mrpSourceSnapshotMatches(snapshot.scenarioAssumptions || {}, approvalCycleMps)) {
+        throw Object.assign(new Error("Source MPS atau keputusan delivery berubah setelah MRP dihitung. Hitung revision MRP baru sebelum approval."), {
+          statusCode: 409,
+          code: "MRP_SOURCE_SNAPSHOT_CHANGED",
+        });
+      }
+      const unlockedMps = isDeltaApproval ? null : approvalCycleMps.find((row) => !["Confirmed", "Released"].includes(row.status));
+      if (unlockedMps) throw Object.assign(new Error(`${unlockedMps.mpsNumber} harus Confirmed/Released sebelum MRP di-approve.`), { statusCode: 409, code: "MPS_CYCLE_NOT_LOCKED" });
+      const replanMps = approvalCycleMps.find((row) => row.replanRequired);
+      if (replanMps) throw Object.assign(new Error(replanMps.replanReason || `${replanMps.mpsNumber} harus dihitung ulang sebelum MRP di-approve.`), { statusCode: 409, code: "DEMAND_REPLAN_REQUIRED" });
+      if (!isDeltaApproval) await assertOfficialMpsDeliveryGate(tx, approvalCycleMps);
+
+      const promoted = await tx.mRPRun.updateMany({
+        where: { runNumber, isDeleted: false, status: "Completed", scenarioStatus: { in: ["SIMULATION", "SIMULATED"] }, isCurrentPlan: false },
+        data: mrpApprovalTransitionData(snapshot, actor),
+      });
+      if (promoted.count !== 1) throw Object.assign(new Error("MRP working revision sudah berubah atau diproses oleh pengguna lain."), { statusCode: 409, code: "MRP_APPROVAL_CONFLICT" });
+
+      await tx.mRPRun.updateMany({
+        where: { ...currentScopeWhere(snapshot), runNumber: { not: runNumber }, isDeleted: false, isCurrentPlan: true },
+        data: { isCurrentPlan: false, scenarioStatus: "SUPERSEDED" },
+      });
+      if (String(snapshot.planKind || "BASELINE").toUpperCase() === "BASELINE") {
+        await attachBaselineMrp(tx, { baselineMpsNumber: snapshot.mpsNumber, baselineMrpNumber: runNumber, actor });
+      }
+
+      const residualReplan = await supersedePreviousMrpArtifacts(tx, sourceMpsNumbers, runNumber, actor);
+      if (residualReplan?.mode === "RESIDUAL_REPLAN_PRESERVE_EXECUTION") {
+        await tx.mRPRun.update({
+          where: { runNumber },
+          data: {
+            scenarioAssumptions: {
+              ...(snapshot.scenarioAssumptions && typeof snapshot.scenarioAssumptions === "object" ? snapshot.scenarioAssumptions : {}),
+              residualReplan: {
+                mode: residualReplan.mode,
+                previousRunNumbers: residualReplan.previousRunNumbers,
+                protectedPlannedOrderNumbers: residualReplan.protectedPlannedOrderNumbers,
+                protectedExecutionCount: residualReplan.protectedExecutionCount,
+                supersededPlannedOrderNumbers: residualReplan.supersededPlannedOrderNumbers,
+                approvedAt: new Date().toISOString(),
+                approvedBy: actor,
+              },
+            },
+          },
+        });
+      }
+      await retirePreviousPlanRevisions(tx, snapshot.planNumber, runNumber);
+
+      const productionRequirements = snapshot.requirements
+        .filter((row) => row.orderType === "Production")
+        .map((row) => ({
+          ...row,
+          _partItemType: row.part?.itemType || null,
+          _productionScheduleQty: Number(row.plannedOrderQty || productionProcessScheduleQty(row)),
+          _processScheduleQty: Number(row.plannedOrderQty || productionProcessScheduleQty(row)),
+        }));
+      const mbomHeaderByPartCode = {};
+      for (const requirement of productionRequirements) {
+        if (mbomHeaderByPartCode[requirement.partCode]) continue;
+        const header = await findActiveMbomHeader(tx, requirement.partId, requirement.requiredDate);
+        if (header?.id) mbomHeaderByPartCode[requirement.partCode] = header.id;
+      }
+      for (const document of sourceMps) {
+        const detailIds = new Set(document.details.map((row) => row.id));
+        await syncProductionRequirementsToMps(
+          tx,
+          document,
+          productionRequirements.filter((row) => detailIds.has(row.mpsDetailId)),
+          mbomHeaderByPartCode,
+          runNumber,
+        );
+      }
+
+      const plannedOrderNumbers = snapshot.plannedOrders.map((row) => row.orderNumber).filter(Boolean);
+      const soPeggings = plannedOrderNumbers.length ? await tx.mRPPegging.findMany({
+        where: { supplyType: "PlannedOrder", supplyNumber: { in: plannedOrderNumbers }, demandType: "SO", status: "Active" },
+        select: { demandNumber: true },
+      }) : [];
+      const affectedSoNumbers = [...new Set(soPeggings.map((row) => row.demandNumber).filter(Boolean))];
+
+      await tx.plannedOrder.updateMany({
+        where: { runNumber, isDeleted: false, status: { in: ["Draft", "Simulation"] } },
+        data: { status: "Planned" },
+      });
+      await supersedeSoOnlyPlansCoveredByMps(tx, affectedSoNumbers, runNumber, snapshot.planNumber, actor);
+
+      const approvedRun = await tx.mRPRun.findUnique({ where: { runNumber } });
+      await tx.mPS.updateMany({
+        where: { mpsNumber: { in: sourceMpsNumbers }, isDeleted: false },
+        data: { lifecycleStatus: "RELEASED", simulationOnly: false, replanRequired: false, replanReason: null },
+      });
+      for (const soNumber of affectedSoNumbers) await syncOperationalSalesOrderStatus(tx, soNumber);
+
+      const hasPurchaseOrder = snapshot.plannedOrders.some((row) => row.orderType === "Purchase" && Number(row.qty || 0) > 0);
+      const purchaseSuggestion = hasPurchaseOrder
+        ? await generatePurchaseSuggestionForRun(tx, runNumber, actor)
+        : null;
+      return { ...approvedRun, residualReplan, purchaseSuggestionNumber: purchaseSuggestion?.suggestionNumber || null };
+    }, { timeout: 120000, isolationLevel: "Serializable" });
+
+    emitPlanningMrpRunUpdate(result, "approve", actor);
+    res.json(mapDoc(result));
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ code: error.code, message: error.message });
+    next(error);
+  }
+};
+
 // ============================================
 // HELPER: EXPLODE MBOM
 // ============================================
 const MAX_MBOM_DEPTH = 10;
+
+function shouldExplodeNestedMbom({
+  childExplosionQty = 0,
+  forecastQty = 0,
+  includeZeroNetForecastTree = false,
+} = {}) {
+  return Number(childExplosionQty || 0) > 0
+    || (Boolean(includeZeroNetForecastTree) && Number(forecastQty || 0) > 0);
+}
 
 async function explodeMBOM(
   tx,
@@ -5182,7 +6068,7 @@ async function explodeMBOM(
       },
     }) : [];
     const stockPartByCode = new Map(stockParts.map((part) => [normalizePartCode(part.partCode), part]));
-    const supplyMap = await buildOpenSupplyMap(
+    const supplyMap = options.ignoreFirmSupply ? {} : await buildOpenSupplyMap(
       tx,
       unresolvedPartCodes,
       requiredDate,
@@ -5194,11 +6080,11 @@ async function explodeMBOM(
         ...materialPlanningRules,
       },
     );
-    const mppSupplyMap = await buildOpenMppSupplyMap(tx, unresolvedPartCodes, requiredDate, {
+    const mppSupplyMap = options.ignoreFirmSupply ? {} : await buildOpenMppSupplyMap(tx, unresolvedPartCodes, requiredDate, {
       excludeSourceMpsNumbers: options.excludeSourceMpsNumbers,
       excludeSourceMpsNumber: options.excludeSourceMpsNumber,
     });
-    const moSupplyMap = await buildOpenMoSupplyMap(tx, unresolvedPartCodes, requiredDate);
+    const moSupplyMap = options.ignoreFirmSupply ? {} : await buildOpenMoSupplyMap(tx, unresolvedPartCodes, requiredDate);
     for (const partCode of unresolvedPartCodes) {
       const part = partByCode.get(partCode);
       const stockKey = planningStockKey(partCode, part);
@@ -5469,10 +6355,26 @@ async function explodeMBOM(
         options.parentBufferPercent ?? detail.part?.bufferStock ?? 0,
       ),
       _partItemType: detail.part?.itemType || null,
-      _bufferFromMps: Boolean(options.parentBufferQty || options.parentBufferBaseQty),
+      // Presence of mpsDetailId is the ownership marker. Customer delivery
+      // phases intentionally carry bufferQty=0, but they still originate from
+      // an MPS whose ending-stock policy has already been resolved. Checking
+      // the numeric buffer alone made MRP add another child-material buffer.
+      _bufferFromMps: Boolean(
+        options.mpsDetailId || options.parentBufferQty || options.parentBufferBaseQty,
+      ),
       _productionScheduleQty: orderType === "Production"
         ? productionExplosionQty
         : 0,
+      // Physical stock of this exact output may cover its operation. Stock at
+      // a deeper/earlier WIP stage may only stop earlier operations and raw
+      // material explosion; it must not erase the transformation from that
+      // stage to this output. Example: C002-C004-030 (before painting) still
+      // requires the C002-C004-020 PAINT route and final inspection.
+      _processScheduleQty: productionProcessScheduleQty({
+        orderType,
+        grossRequirement,
+        onHandQty,
+      }),
       _planningStockKey: stockKey,
     };
 
@@ -5498,7 +6400,11 @@ async function explodeMBOM(
     // output juga harus mengurangi schedule process dan material turunannya;
     // karena itu inline memakai net requirement, bukan gross demand.
     const childExplosionQty = Math.max(productionExplosionQty, 0);
-    if (childExplosionQty > 0) {
+    if (shouldExplodeNestedMbom({
+      childExplosionQty,
+      forecastQty,
+      includeZeroNetForecastTree: options.includeZeroNetForecastTree,
+    })) {
       const submBom = await findActiveMbomHeader(tx, detail.part.id, orderDate);
       if (submBom) {
         mbomHeaderByPartCode[detail.part.partCode] = submBom.id;
@@ -6618,9 +7524,9 @@ const createPurchaseRequestOutputLegacy = async (req, res, next) => {
 exports.createProductionPlanOutput = async (req, res, next) => {
   try {
     const runNumber = await resolveCurrentRunNumber(req.params.runNumber);
-    const run = runNumber && await prisma.mRPRun.findFirst({ where: { runNumber, isDeleted: false }, select: { mpsNumber: true, status: true } });
+    const run = runNumber && await prisma.mRPRun.findFirst({ where: { runNumber, isDeleted: false } });
     if (!run) return res.status(404).json({ message: "MRP Run tidak ditemukan" });
-    if (run.status !== "Completed") return res.status(409).json({ message: "MRP harus Completed sebelum membuat Production Planning" });
+    assertApprovedCurrentMrp(run, "Production Plan");
     if (!run.mpsNumber) return res.status(409).json({ message: "MRP ini tidak terhubung ke MPS sehingga Production Planning tidak dapat dibuat" });
     const monthlyPlan = require("./MonthlyProductionPlanController");
     const delegatedReq = Object.create(req);
@@ -7064,10 +7970,28 @@ exports.bulkRemove = async (req, res, next) => {
 };
 
 exports.__test = {
+  canonicalMrpLifecycleStatus,
   expandMpsDetailsByDeliveryPhases,
   demandPeggingForPhase,
   planningStockKey,
   explicitSalesOrderNumbersForMpsDetail,
   consumeSalesOrdersAlreadyRepresentedByMps,
+  productionProcessScheduleQty,
+  buildMPlusOneInventoryNettingItem,
+  resolveMPlusOnePreviewBasisQty,
+  enrichMPlusOnePreviewDisplayQty,
+  shouldExplodeNestedMbom,
+  isCurrentMPlusOnePreviewRun,
+  mrpApprovalEligibility,
+  mrpApprovalTransitionData,
+  mrpApprovalCycleMpsNumbers,
+  mrpCalculationLifecycle,
+  assertApprovedCurrentMrp,
+  buildMrpSourceSnapshot,
+  mrpSourceSnapshotMatches,
+  isEmbeddedStockInputPart,
+  filterWipLinesForRequirementPath,
+  enrichMPlusOnePreviewRequirements,
+  supersedePreviousMrpArtifacts,
 };
 

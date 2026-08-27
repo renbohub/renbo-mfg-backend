@@ -1,7 +1,7 @@
 const { prisma } = require("../../index");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { syncReservationsForConfirmedSO } = require("../../services/production/sales-order/soReservationService");
-const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
+const { replaceDeliveryTargets, retireDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
 const { resolveSalesLinePreview } = require("../../services/sales/salesPricingService");
 
 const include = {
@@ -217,6 +217,12 @@ exports.revise = async (req, res, next) => {
         where: { soNumber: existing.soNumber },
         data: { status: "Superseded", notes: [existing.notes, `Digantikan oleh ${soNumber}: ${reason}`].filter(Boolean).join("; ") },
       });
+      await retireDeliveryTargets(tx, {
+        sourceType: "SALES_ORDER",
+        sourceNumber: existing.soNumber,
+        status: "SUPERSEDED",
+        user: req.user?.username || req.user?.email,
+      });
       await markDownstreamDemandChange(tx, {
         sourceType: "SALES_ORDER",
         sourceNumbers: [existing.soNumber],
@@ -234,7 +240,7 @@ exports.revise = async (req, res, next) => {
     next(error);
   }
 };
-exports.remove = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); if (!["Draft", "Cancelled"].includes(doc.status)) return res.status(400).json({ message: "Hanya Sales Order Draft/Cancelled yang dapat dihapus" }); await prisma.$transaction(async (tx) => { await tx.salesOrderHeader.update({ where: { soNumber: doc.soNumber }, data: { isDeleted: true, details: { updateMany: { where: {}, data: { isDeleted: true } } } } }); await queueDirtyPartCodes(tx, doc.details.map((row) => row.partCode), { reason: "SO", sourceNumber: doc.soNumber, notes: "Sales Order dihapus; net-change MRP dijadwalkan." }); }); res.json({ ok: true }); } catch (error) { next(error); } };
+exports.remove = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); if (!["Draft", "Cancelled"].includes(doc.status)) return res.status(400).json({ message: "Hanya Sales Order Draft/Cancelled yang dapat dihapus" }); await prisma.$transaction(async (tx) => { await retireDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: doc.soNumber, status: "CANCELLED", user: req.user?.username || req.user?.email, markDeleted: true }); await tx.salesOrderHeader.update({ where: { soNumber: doc.soNumber }, data: { isDeleted: true, details: { updateMany: { where: {}, data: { isDeleted: true } } } } }); await queueDirtyPartCodes(tx, doc.details.map((row) => row.partCode), { reason: "SO", sourceNumber: doc.soNumber, notes: "Sales Order dihapus; net-change MRP dijadwalkan." }); }); res.json({ ok: true }); } catch (error) { next(error); } };
 
 exports.confirm = async (req, res, next) => {
   try {

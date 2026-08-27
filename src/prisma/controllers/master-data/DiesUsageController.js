@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const { Prisma } = require("@prisma/client");
 const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
+const { assertReference } = require("../../utils/referenceValidation");
 const {
   incrementDiesShotCounter,
   decrementDiesShotCounter,
@@ -166,6 +167,7 @@ exports.create = async (req, res, next) => {
 
     // Start transaction
     const result = await prisma.$transaction(async (tx) => {
+      await assertReference({ delegate: tx.machine, field: "machineCode", value: usageData.machineCode, key: "machineCode", label: "Mesin", activeWhere: { status: "Active" } });
       // Get current dies
       const dies = await tx.dies.findUnique({
         where: { id: diesId },
@@ -231,6 +233,7 @@ exports.update = async (req, res, next) => {
     if (currentUsage.isDeleted) {
       return res.status(409).json({ message: USAGE_ALREADY_DELETED_CONFLICT });
     }
+    await assertReference({ delegate: prisma.machine, field: "machineCode", value: usageData.machineCode, currentValue: currentUsage.machineCode, key: "machineCode", label: "Mesin", activeWhere: { status: "Active" } });
 
     // Start transaction jika shotCount berubah
     if (shotCount !== undefined && shotCount !== currentUsage.shotCount) {

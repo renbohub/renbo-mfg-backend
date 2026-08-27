@@ -57,7 +57,10 @@ function cycleMinutes(workOrder, machine) {
 async function nextScheduleNumber(tx, date) {
   const key = dateOnly(date).toISOString().slice(0, 10).replace(/-/g, "");
   const prefix = `DPS-${key}`;
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${prefix}))`;
+  // pg_advisory_xact_lock returns PostgreSQL `void`. Prisma cannot
+  // deserialize that value through $queryRaw, so execute the statement
+  // without asking Prisma to materialize a result row.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${prefix}))`;
   const last = await tx.dailyProductionSchedule.findFirst({
     where: { scheduleNumber: { startsWith: prefix } },
     orderBy: { scheduleNumber: "desc" },

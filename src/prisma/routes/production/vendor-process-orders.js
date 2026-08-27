@@ -39,6 +39,7 @@ router.patch(
 );
 
 router.get("/", authorize("vendorProcessOrders", "read"), ctrl.list);
+router.get("/:orderNumber/send-options", authorize("vendorProcessOrders", "read"), ctrl.getSendOptions);
 router.get("/:orderNumber", authorize("vendorProcessOrders", "read"), ctrl.get);
 router.patch(
   "/:orderNumber",
