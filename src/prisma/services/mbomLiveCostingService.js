@@ -10,6 +10,8 @@ const priceValue = (record, costingDate) => legacyPriceValue(record, costingDate
 const emptyEstimate = () => ({
   total: 0,
   material: 0,
+  rawMaterial: 0,
+  purchase: 0,
   process: 0,
   vendor: 0,
   lines: 0,
@@ -19,6 +21,8 @@ const emptyEstimate = () => ({
 const addScaled = (target, source, factor) => {
   target.total += source.total * factor;
   target.material += source.material * factor;
+  target.rawMaterial += source.rawMaterial * factor;
+  target.purchase += source.purchase * factor;
   target.process += source.process * factor;
   target.vendor += source.vendor * factor;
   target.lines += source.lines;
@@ -266,7 +270,11 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
         const amount = price.value * pricedQty;
         result.total += amount;
         if (price.kind === "vendor") result.vendor += amount;
-        else result.material += amount;
+        else {
+          result.material += amount;
+          if (price.kind === "material") result.rawMaterial += amount;
+          else result.purchase += amount;
+        }
         result.lines += 1;
         if (price.found) result.covered += 1;
       }
@@ -293,6 +301,9 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
         {
           currencyCode: "IDR",
           materialCost: estimate.material,
+          rawMaterialCost: estimate.rawMaterial,
+          purchasePartCost: estimate.purchase,
+          vendorCost: estimate.vendor,
           processCost: estimate.process + estimate.vendor,
           overheadCost: 0,
           totalCost: estimate.total,

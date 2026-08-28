@@ -1,5 +1,6 @@
 const { prisma } = require("../../index");
 const { mapDoc } = require("../../utils/mapDoc");
+const { buildProductionCostReport } = require("../../services/productionCostReportService");
 
 const num = value => Number(value || 0);
 
@@ -26,6 +27,16 @@ function addQty(target, log) {
 function rate(part, total) {
   return total > 0 ? parseFloat(((part / total) * 100).toFixed(2)) : 0;
 }
+
+// Cost plan vs actual ditelusuri sampai sumber demand. Seluruh kalkulasi dan
+// fallback harga berada di service agar dapat diuji tanpa HTTP layer.
+exports.productionCostActual = async (req, res, next) => {
+  try {
+    res.json(await buildProductionCostReport(prisma, req.query));
+  } catch (error) {
+    next(error);
+  }
+};
 // ============================================================
 // PRODUCTION REPORT - DASHBOARD (KPI Utama Produksi)
 // ============================================================

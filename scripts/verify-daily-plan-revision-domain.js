@@ -8,6 +8,7 @@ const {
 
 assert.strictEqual(toMinute("07:30"), 450, "07:30 must be represented as minute 450");
 assert.strictEqual(toMinute("24:00"), 1440, "24:00 is a valid shift boundary");
+assert.strictEqual(toMinute("32:04"), 1924, "legacy absolute hour must remain readable until Auto Correct normalizes placement");
 assert.strictEqual(toMinute("7.30"), null, "malformed time must not be guessed");
 
 const base = {
@@ -21,6 +22,8 @@ const base = {
 };
 
 assert.deepStrictEqual(validateScheduleItems([base]), { blockers: [], warnings: [] });
+assert.deepStrictEqual(validateScheduleItems([{ ...base, plannedStartTime: "23:08", plannedEndTime: "00:08" }]), { blockers: [], warnings: [] },
+  "rentang melewati tengah malam tetap valid dalam operation day 07:00–07:00");
 const materialWarningValidation = validateScheduleItems([{
   ...base,
   materialReadinessStatus: "WARNING_MATERIAL_SHORTAGE",
@@ -37,6 +40,13 @@ const overlap = validateScheduleItems([
   { ...base, id: "b", scheduleNumber: "DPS-2", plannedStartTime: "08:30", plannedEndTime: "10:00" },
 ]);
 assert.strictEqual(overlap.blockers[0].code, "MACHINE_TIME_OVERLAP");
+
+const differentDates = validateScheduleItems([
+  { ...base, scheduleDate: "2026-09-07" },
+  { ...base, id: "b", scheduleNumber: "DPS-2", scheduleDate: "2026-09-08" },
+]);
+assert.strictEqual(differentDates.blockers.some((item) => item.code === "MACHINE_TIME_OVERLAP"), false,
+  "jam yang sama pada tanggal berbeda tidak boleh dianggap overlap");
 
 assert.strictEqual(validateScheduleItems([{ ...base, machineId: null }]).blockers[0].code, "MACHINE_REQUIRED");
 assert.strictEqual(validateScheduleItems([{ ...base, plannedQty: 0 }]).blockers[0].code, "PLANNED_QTY_REQUIRED");

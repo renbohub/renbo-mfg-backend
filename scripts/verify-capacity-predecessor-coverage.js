@@ -8,14 +8,17 @@ const {
   allocationFinishMoment,
   crossPlanPredecessorStatus,
   resolveVendorReturnDeadline,
+  MINIMUM_SUCCESSOR_GAP_MINUTES,
 } = require("../src/prisma/services/planning/capacityPlanningService");
 const {
   generatedBatchQuantity,
   priorityNetBatchQuantity,
+  capacityTaskSegmentQuantity,
   phaseJobs,
   combineSingleDeliveryBufferCampaigns,
   splitCampaignTransferBatches,
   campaignDetailForBatch,
+  campaignSegmentForBatch,
   fitFirstBatchStrategies,
   scorePlacementCandidate,
   SCORING_MODEL,
@@ -61,6 +64,12 @@ function predecessorBatch(id, qty, finishTime, transferBatchNumber) {
 }
 
 const successorStart = new Date("2026-08-10T10:00:00.000Z");
+const twoHourGap = groupPredecessorAllocations([
+  predecessorBatch("PRED-GAP", 100, "09:00", 1),
+], successorStart, null, MINIMUM_SUCCESSOR_GAP_MINUTES)[0];
+assert.deepStrictEqual([twoHourGap.availableOutputQty, twoHourGap.lateOutputQty], [0, 100],
+  "predecessor yang selesai satu jam sebelum successor harus diblokir karena jeda minimal adalah dua jam");
+
 const split292 = groupPredecessorAllocations([
   predecessorBatch("PRED-146-A", 146, "08:00", 1),
   predecessorBatch("PRED-146-B", 146, "09:00", 2),
@@ -190,6 +199,18 @@ const bufferJobs = phaseJobs(
 assert.deepStrictEqual(bufferJobs.map((job) => [job.targetType, job.qty, job.stockCoverageQty || 0, job.configurationError || null]), [["CUSTOMER", 280, 20, null], ["INTERNAL_STOCK", 150, 0, null]], "Priority 1 harus mengonsumsi stock FG lebih dulu, sedangkan buffer tetap diproduksi setelah demand customer");
 assert.deepStrictEqual(bufferJobs[0].stockCoverageHistory.map((line) => [line.warehouseCode, line.rackCode, line.lotNumber, line.usedQty, line.coverageSource, line.reservationNumber]), [["FG", "R01", "LOT-001", 20, "RESERVED_TO_DEMAND", "RSV-001"]], "Audit priority demand harus menyimpan asal warehouse, rack, lot, reservation SO, dan qty stock yang dipakai");
 
+const nettedPhaseJobs = phaseJobs(
+  { periodEnd: new Date("2026-09-30T00:00:00.000Z") },
+  [{ id: "receipt-net", mpsDetailId: "mps-net", partCode: "FG-NET", uomCode: "pcs", qtyPlanned: 93, actualSalesOrderQty: 93.333333, effectiveDemandQty: 93.333333, bufferQty: 0, notes: "[MRP-TARGET:target-net]" }],
+  [{ id: "phase-net", mpsDetailId: "mps-net", sourceDeliveryTargetId: "target-net", phaseNumber: 1, plannedDate: new Date("2026-09-10T00:00:00.000Z"), qtyPlanned: 100, targetType: "CUSTOMER", targetCode: "C-NET", sourceType: "SALES_ORDER", sourceNumber: "SO-NET" }],
+  { finishedGoodStockBalances: [{ id: "stock-net", partCode: "FG-NET", uomCode: "pcs", warehouseCode: "FG", qtyOnHand: 20, qtyReserved: 0, qtyQC: 0, qtyAvailable: 20, stockReservations: [] }] },
+);
+assert.deepStrictEqual(
+  nettedPhaseJobs.map((job) => [job.qty, job.stockCoverageQty]),
+  [[93, 7]],
+  "Delivery phase gross 100 dengan MRP net production 93 harus memakai 7 PCS stock tanpa shortage palsu",
+);
+
 const continuousCampaign = combineSingleDeliveryBufferCampaigns(bufferJobs);
 assert.strictEqual(continuousCampaign.length, 1, "Satu delivery customer dan buffer dengan FG due yang sama harus menjadi satu production campaign");
 assert.strictEqual(continuousCampaign[0].qty, 430, "Campaign harus memproduksi total 280 customer + 150 buffer tanpa memecah eksekusi route");
@@ -238,6 +259,23 @@ const campaignTask = {
 phaseScopedCampaigns[1].campaignSegments[0].sourceDeliveryTargetId = "target-phase-2";
 assert.strictEqual(campaignDetailForBatch(campaignTask, phaseScopedCampaigns[1], 4000, 0).id, "detail-customer", "Batch sebelum qty customer terpenuhi harus memakai line delivery");
 assert.strictEqual(campaignDetailForBatch(campaignTask, phaseScopedCampaigns[1], 5000, 0).id, "detail-buffer", "Batch setelah qty customer terpenuhi harus memakai line buffer");
+assert.strictEqual(campaignSegmentForBatch(phaseScopedCampaigns[1], 4000, 0).sourceDeliveryTargetId, "target-phase-2", "Allocation customer harus menyimpan delivery phase customer");
+assert.strictEqual(campaignSegmentForBatch(phaseScopedCampaigns[1], 5000, 0).isBufferStock, true, "Allocation buffer harus tetap memiliki lineage buffer, bukan memakai delivery phase customer");
+
+const segmentedRouteTask = {
+  detail: { qtyPlanned: 12000, uomCode: "pcs" },
+  sourceDetails: [
+    { qtyPlanned: 4500, uomCode: "pcs", notes: "[MRP-TARGET:target-phase-2]" },
+    { qtyPlanned: 7500, uomCode: "pcs", notes: "[MRP-TARGET:BUFFER:2026-09-30]" },
+  ],
+};
+const customerRouteQty = capacityTaskSegmentQuantity(segmentedRouteTask, phaseScopedCampaigns[1], 5000, 0, 0);
+const bufferRouteQty = capacityTaskSegmentQuantity(segmentedRouteTask, phaseScopedCampaigns[1], 6000, 5000, 0);
+assert.deepStrictEqual(
+  [customerRouteQty, bufferRouteQty],
+  [4500, 7500],
+  "Campaign customer+buffer harus memakai qty MRP target masing-masing, bukan menghabiskan aggregate route di customer pertama",
+);
 
 const priorityRoutePhase1 = priorityNetBatchQuantity(280, 0, 341, 430, "pcs");
 const priorityRouteBuffer = priorityNetBatchQuantity(150, 280, 341, 430, "pcs");
@@ -326,4 +364,4 @@ assert.strictEqual(crossPlanPredecessorStatus(
   { ...septemberSuccessor, plan: { ...septemberSuccessor.plan, sourceType: "MPS:MPS-LAIN" } },
 ), "SOURCE_MISMATCH", "Cross-MPP predecessor wajib berasal dari source MPS yang sama");
 
-console.log("Capacity predecessor, cumulative WIP reservation, vendor deadline, priority stock, allocation, buffer, fit-first, scoring, and cross-MPP checks passed: 39/39 cases");
+console.log("Capacity predecessor, cumulative WIP reservation, vendor deadline, priority stock, allocation, buffer, fit-first, scoring, and cross-MPP checks passed: 41/41 cases");

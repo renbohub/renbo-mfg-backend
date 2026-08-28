@@ -394,8 +394,8 @@ const mrpSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/control
 const purchaseSuggestionSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/purchasing/PurchaseSuggestionController.js"), "utf8");
 const monthlyPlanSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MonthlyProductionPlanController.js"), "utf8");
 const executionCockpitSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/planningExecutionCockpitService.js"), "utf8");
-const uiSource = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/ppic-dashboard.js"), "utf8");
-const monthlyPlanUiSource = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/operations-detail.js"), "utf8");
+const uiSource = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/ppic-dashboard.js"), "utf8");
+const monthlyPlanUiSource = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/operations-detail.js"), "utf8");
 const lifecycleMigration = fs.readFileSync(path.resolve(__dirname, "../prisma/migrations/20260823150000_mrp_lifecycle_status/migration.sql"), "utf8");
 assert(mrpSource.includes('code: "MPS_CYCLE_INCOMPLETE"'), "Backend harus menolak subset planning cycle");
 assert(mrpSource.includes("expectedMpsNumbers"), "Error cycle parsial harus menjelaskan MPS yang diharapkan");

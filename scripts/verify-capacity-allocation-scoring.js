@@ -21,6 +21,7 @@ const {
   deliveryJitExecutionFloor,
   shouldScheduleLateVisibility,
   buildNextCampaignStartByPhase,
+  shiftCapacityTransferQuantity,
 } = require("../src/prisma/services/planning/capacityRecommendationService");
 
 assert.strictEqual(
@@ -40,12 +41,29 @@ assert.strictEqual(shouldScheduleLateVisibility("MATERIAL_READY_AFTER_FG_DUE"), 
 assert.strictEqual(shouldScheduleLateVisibility("ROUTING_MISSING"), false, "Routing missing tidak dapat dibuat menjadi allocation semu");
 assert.strictEqual(effectiveCycleMinutes({ cycleTime: 121 }, {}, 100), 2.42, "Monthly runtime harus memakai CT x 1,2 walaupun efficiency master 100%");
 assert.strictEqual(Number((effectiveCycleMinutes({ cycleTime: 121 }, {}, 100) * 192).toFixed(2)), 464.64, "Campaign WELD-1 192 PCS harus mempunyai load CT x qty x 1,2");
+assert.strictEqual(Number(effectiveCycleMinutes({ cycleTime: 121 }, {}, 85).toFixed(6)), 2.847059,
+  "Scheduler harus menggabungkan runtime allowance dan efficiency agar tidak menghasilkan overload tersembunyi");
+assert.strictEqual(
+  shiftCapacityTransferQuantity(
+    17500,
+    { ordered: [{ route: { routingMode: "INHOUSE", machineSpecificationCode: "ARC" }, detail: { qtyPlanned: 12000 } }] },
+    17500,
+    new Map([["ARC", [{ cycleTime: 20 }]]]),
+    { shifts: [{ start: "08:00", end: "16:00" }], shiftCount: 1, efficiency: 85 },
+  ),
+  1020,
+  "Transfer batch common/WIP harus memakai faktor FIFO 1:1 dan effective efficiency agar runtime aktual tetap muat di satu shift",
+);
 
 const jitGraph = {
   ordered: [{ route: { id: "paint" } }, { route: { id: "inspect" } }],
   predecessors: new Map([["paint", new Set()], ["inspect", new Set(["paint"])]]),
 };
-assert.strictEqual(criticalRouteDurationMinutes(jitGraph, (task) => task.route.id === "paint" ? 5 * 1440 : 120), 7320);
+assert.strictEqual(
+  criticalRouteDurationMinutes(jitGraph, (task) => task.route.id === "paint" ? 5 * 1440 : 120),
+  7440,
+  "Critical route duration must include the mandatory 120-minute successor gap",
+);
 assert.strictEqual(
   deliveryJitExecutionFloor({ due: 20 * 1440, executionFloor: 0, criticalDurationMinutes: 5 * 1440, safetyDays: 2 }),
   13 * 1440,
@@ -317,4 +335,4 @@ assert.deepStrictEqual(
   "Controller must receive an explicit scope for post-persist authoritative readiness validation",
 );
 
-console.log("Advanced capacity allocation scoring checks passed: 42/42 cases");
+console.log("Advanced capacity allocation scoring checks passed: 43/43 cases");

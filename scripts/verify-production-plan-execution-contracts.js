@@ -18,8 +18,8 @@ const productionNgDisposition = read("src", "prisma", "controllers", "production
 const materialIssue = read("src", "prisma", "controllers", "production", "MaterialIssueController.js");
 const workflow = read("src", "prisma", "controllers", "production", "services", "productionWorkflowService.js");
 const capacity = read("src", "prisma", "services", "planning", "capacityPlanningService.js");
-const capacityUi = read("..", "frontend", "public", "js", "ppic-capacity.js");
-const capacityView = read("..", "frontend", "views", "ppic", "capacity.ejs");
+const capacityUi = read("..", "renbo-mfg-frontend", "public", "js", "ppic-capacity.js");
+const capacityView = read("..", "renbo-mfg-frontend", "views", "ppic", "capacity.ejs");
 const monthlyPlanController = read("src", "prisma", "controllers", "planning", "MonthlyProductionPlanController.js");
 const capacityPresetController = read("src", "prisma", "controllers", "planning", "CapacityPlanningController.js");
 const capacityPresetService = read("src", "prisma", "services", "planning", "capacitySimulationPresetService.js");
@@ -31,19 +31,19 @@ const supplyChainRead = read("src", "prisma", "controllers", "supply-chain", "Su
 const vendorProcessOrder = read("src", "prisma", "controllers", "production", "VendorProcessOrderController.js");
 const outgoingTransaction = read("src", "prisma", "controllers", "outgoing", "OutgoingTransactionController.js");
 const deliveryReadiness = read("src", "prisma", "services", "outgoing", "deliveryReadinessService.js");
-const operationsDetail = read("..", "frontend", "public", "js", "operations-detail.js");
-const operationsDetailView = read("..", "frontend", "views", "operations", "detail.ejs");
-const operationsDashboardView = read("..", "frontend", "views", "operations", "dashboard.ejs");
-const productionScheduleForm = read("..", "frontend", "public", "js", "production-schedule-form.js");
-const productionScheduleView = read("..", "frontend", "views", "production", "schedule-form.ejs");
+const operationsDetail = read("..", "renbo-mfg-frontend", "public", "js", "operations-detail.js");
+const operationsDetailView = read("..", "renbo-mfg-frontend", "views", "operations", "detail.ejs");
+const operationsDashboardView = read("..", "renbo-mfg-frontend", "views", "operations", "dashboard.ejs");
+const productionScheduleForm = read("..", "renbo-mfg-frontend", "public", "js", "production-schedule-form.js");
+const productionScheduleView = read("..", "renbo-mfg-frontend", "views", "production", "schedule-form.ejs");
 const numberingService = read("src", "prisma", "services", "numberingService.js");
-const fgReceiptView = read("..", "frontend", "views", "production", "fg-receipt.ejs");
-const productionLogForm = read("..", "frontend", "public", "js", "production-log-form.js");
-const productionLogView = read("..", "frontend", "views", "production", "log-form.ejs");
-const moduleRegistry = read("..", "frontend", "src", "moduleRegistry.js");
-const operationsDashboard = read("..", "frontend", "public", "js", "operations-dashboard.js");
+const fgReceiptView = read("..", "renbo-mfg-frontend", "views", "production", "fg-receipt.ejs");
+const productionLogForm = read("..", "renbo-mfg-frontend", "public", "js", "production-log-form.js");
+const productionLogView = read("..", "renbo-mfg-frontend", "views", "production", "log-form.ejs");
+const moduleRegistry = read("..", "renbo-mfg-frontend", "src", "moduleRegistry.js");
+const operationsDashboard = read("..", "renbo-mfg-frontend", "public", "js", "operations-dashboard.js");
 const incomingController = read("src", "prisma", "controllers", "incoming", "IncomingTransactionController.js");
-const incomingForm = read("..", "frontend", "public", "js", "supply-chain-form.js");
+const incomingForm = read("..", "renbo-mfg-frontend", "public", "js", "supply-chain-form.js");
 const shortfallCarryover = read("src", "prisma", "services", "planning", "productionShortfallCarryoverService.js");
 const diesCapacity = read("src", "prisma", "services", "planning", "diesCapacityService.js");
 const {
@@ -52,6 +52,7 @@ const {
   isPressResource,
   plannedInterval,
 } = require("../src/prisma/services/planning/diesCapacityService");
+const { capacityOperationCode } = require("../src/prisma/services/planning/capacityPlanningService");
 
 verify("Work Order stores exact MBOM routing occurrence", /model WorkOrder[\s\S]*mbomProcessId\s+String\?/.test(schema));
 verify("Daily Plan stores MPP allocation lineage", /model DailyProductionSchedule[\s\S]*productionPlanAllocationId\s+String\?/.test(schema));
@@ -66,8 +67,10 @@ verify("Daily Plan material scope resolves legacy operation output", dailyPlan.i
 verify("Nested FG receipt is capped by its MPP child receipt line", childFgReceipt.includes("[CHILD-FG-RECEIPT:") && childFgReceipt.includes("receiptLine.qtyPlanned"));
 verify("Nested FG receipt consumes final WIP with paired movements", childFgReceipt.includes('stockType: "WIP"') && childFgReceipt.includes('stockType: "Finished Goods"') && childFgReceipt.includes("transferGroupId"));
 verify("Daily Plan rejects an empty Material Issue", dailyPlan.includes('code: "DPP_BOM_INPUT_EMPTY"') && dailyPlan.includes('code: "MATERIAL_ISSUE_EMPTY"'));
+verify("Rework Daily Plan bypasses MPP and new Material Issue gates only for rework WO", dailyPlan.includes("isReworkSchedule") && dailyPlan.includes("reworkNoMaterialIssue") && dailyPlan.includes('referencedWorkOrder?.isReworkOrder === true') && productionLog.includes('scheduleWorkOrder?.isReworkOrder === true'));
 verify("In Progress Daily Plan can be revised without overwriting actual output", dailyPlan.includes('["Draft", "Released", "In Progress"].includes(existing.status)') && dailyPlan.includes("plannedQty + 0.000001 < executedQty") && !/exports\.update[\s\S]*body\.actualQty[\s\S]*dailyProductionSchedule\.update/.test(dailyPlan));
 verify("Daily Plan revision form loads and patches an existing command", productionScheduleForm.includes('config.mode === "edit"') && productionScheduleForm.includes('method: editing ? "PATCH" : "POST"') && productionScheduleView.includes("Simpan Revisi"));
+verify("Manual Daily Plan tolerates a missing MBOM routing occurrence", capacityOperationCode(null) === null && capacityOperationCode({ processCode: "WELD" }) === "WELD");
 verify("Production Log rejects direct MO or WO input", productionLog.includes('code: "PRODUCTION_PLAN_REQUIRED"'));
 verify(
   "Monthly Production Plan accepts every MPS month covered by one rolling MRP cycle",
@@ -83,7 +86,7 @@ verify("Monthly Planning exposes separate INHOUSE and VENDOR operation views", o
 verify("Production Log requires an In Progress Daily Plan", productionLog.includes('code: "DAILY_PLAN_NOT_IN_PROGRESS"'));
 verify("Daily Production Schedule stays Draft while stock is incomplete", dailyPlan.includes('code: "DPP_STOCK_NOT_READY"') && dailyPlan.includes("Daily Production Schedule tetap Draft"));
 verify("Production Log requires complete MPP trace", productionLog.includes('code: "DAILY_PLAN_TRACE_INCOMPLETE"'));
-verify("Capacity checks predecessor time", capacity.includes('code: "PLAN_PREDECESSOR_FINISH_AFTER_SUCCESSOR"'));
+verify("Capacity checks the two-hour predecessor gap", capacity.includes('code: "PLAN_PREDECESSOR_GAP_SHORT"') && capacity.includes("MINIMUM_SUCCESSOR_GAP_MINUTES = 120"));
 verify("Capacity checks predecessor quantity", capacity.includes('code: "PLAN_PREDECESSOR_QTY_SHORT"'));
 verify("Capacity checks machine time overlap", capacity.includes('code: "PLAN_MACHINE_TIME_OVERLAP"'));
 verify("Capacity blocks overlapping Dies across machines", capacity.includes('code: "PLAN_DIES_TIME_OVERLAP"') && capacity.includes('category: "DIES"'));
@@ -104,7 +107,7 @@ verify("Capacity recommendation replaces stale Draft proposals but cannot regene
 verify("In Progress MPP replans only unexecuted Draft capacity", capacityRecommendation.includes('const allowedStatuses = ["Draft", "Confirmed", "Released", "In Progress"]') && capacityRecommendation.includes("firmAllocationIds") && capacityRecommendation.includes('status: "Draft"'));
 verify("Capacity preset adoption preserves completed DPP", monthlyPlanController.includes("firmSchedules") && monthlyPlanController.includes("preservedCompletedDppCount") && monthlyPlanController.includes('row.status === "Completed"'));
 verify("Past daily preset overrides cannot be changed", capacityPresetController.includes("assertPastPresetDaysUnchanged") && capacityPresetController.includes('code: "CAPACITY_HISTORY_LOCKED"'));
-verify("Capacity UI explains Current Use promotion and history lock", capacityView.includes("Tetapkan sebagai Current Use") && capacityView.includes("Hari yang sudah lewat") && capacityUi.includes("isPastDate"));
+verify("Capacity UI exposes Current Use promotion and enforces past-date lock", capacityView.includes("Tetapkan sebagai Current Use") && capacityView.includes("capacity-production-guide-lock") && capacityUi.includes("isPastDate"));
 verify("Capacity keeps exactly one Current Use preset", capacityPresetService.includes("CAPACITY_CURRENT_USE_PRESET_V1") && capacityPresetService.includes("activatePreset") && capacityPresetController.includes("currentPresetId"));
 verify("Auto recommendation supports the two primary algorithms", capacityRecommendation.includes("FULL_COMPLETION_SEQUENCE") && capacityRecommendation.includes("SHIFT_CAPACITY_TRANSFER") && capacityRecommendation.includes("shiftCapacityTransferQuantity"));
 verify("Auto recommendation keeps each process whole when its own slot fits", capacityRecommendation.includes("scheduleFitFirstPerRoute") && capacityRecommendation.includes("const fullPlacement") && capacityRecommendation.includes("qty: totalQty"));
@@ -138,6 +141,7 @@ verify("Lot naming rules cover incoming and production flows", numberingService.
 verify("FG receipt generates one configured production lot per QC batch", qualityInspection.includes('ensureDefaultNumberingRule("LOT_PRODUCTION", tx)') && qualityInspection.includes('generateConfiguredNumber("LOT_PRODUCTION"') && qualityInspection.includes("priorFgReceipt?.lotNumber") && fgReceiptView.includes("Otomatis saat simpan"));
 verify("Goods Receipt supports multiple supplier lots per PO detail", !incomingController.includes("Satu detail PO hanya boleh dicatat satu kali") && incomingController.includes("receivedInRequest") && incomingForm.includes("data-add-lot"));
 verify("Material Issue exposes adjustable lot and quantity allocation", operationsDetail.includes("data-mi-stock-source") && operationsDetail.includes("data-mi-save-lots") && operationsDetail.includes("qtyIssued"));
+verify("Material Issue readiness includes reservations owned by its MO or target part", materialIssue.includes("reservedForDetail") && materialIssue.includes('referenceType: "PART_ALLOCATION"') && materialIssue.includes("qtyAvailable || 0) + reservedForDetail"));
 verify("Material Issue lot splits preserve the original requested quantity", operationsDetail.includes("Quantity diminta tetap di line utama") && operationsDetail.includes("qtyRequired: isClonedLot ? 0 : sourceRequiredQty") && materialIssue.includes("qtyRequired: Number(detail.qtyRequired || 0)") && materialIssue.includes("qtyRequired: 0"));
 verify("DPP raw material issue follows material-code stock lineage", materialIssue.includes("const materialCode = String(noteTokens.material") && materialIssue.includes("{ OR: sourceIdentityFilters }") && materialIssue.includes("!materialCode ? buildIdentityWhere(identity) : null"));
 verify("Production Log stores multiple coil phases under one output lot", /model ProductionLogCoilPhase[\s\S]*inputLotNumber\s+String[\s\S]*productionLotNumber\s+String/.test(schema) && productionLog.includes("normalizeProductionCoilPhases") && productionLogForm.includes("collectCoilPhases"));
@@ -160,7 +164,8 @@ verify("Each production phase stores multiple HMI-backed NG reasons", /model Pro
 verify("Production form consistently presents reject output as NG", productionLogView.includes("Qty NG *") && !productionLogView.includes("Qty Reject *") && productionLogForm.includes("total qty reason harus sama dengan Qty NG"));
 verify("Downtime reasons use HMI master hierarchy with manual fallback", productionLog.includes("hmi_list_downtime") && productionLog.includes("hmi_list_downtime_sub") && productionLogForm.includes("hmiDowntimeId") && productionLogView.includes("Alasan Manual"));
 verify("QC judgment allocates every NG quantity to rework or final reject", productionNgDisposition.includes("qtyRework + qtyReject") && productionNgDisposition.includes('"PENDING_QC"') && productionNgDisposition.includes('"MIXED"') && operationsDetail.includes("QC Judgment"));
-verify("Production approval waits for QC judgment and creates rework WO", productionLog.includes("pendingNgJudgments") && productionLog.includes("createProductionReworkWorkOrder") && productionLog.includes("judgmentQtyReject") && operationsDetail.includes("Menunggu Judgment QC"));
+verify("Production approval preserves good output while QC judgment creates rework WO", productionLog.includes("pendingCount") && productionLog.includes("finalizeProductionLogNgDisposition") && productionLog.includes("createProductionReworkWorkOrder") && productionLog.includes("qtyReject"));
+verify("QC release does not double-consume Production NG", qualityInspection.includes("const totalNgQty = qtyFailed") && !qualityInspection.includes("const totalNgQty = productionLogNgQty + qtyFailed"));
 verify("Production approval creates a visible QC stock release queue", productionLog.includes("ensureProductionQualityInspection") && productionLog.includes('status: selfCheck ? "Completed" : "Draft"') && moduleRegistry.includes('"QC Release Stock"') && operationsDetail.includes("QC OK & Release Stock") && operationsDetail.includes("Warehouse tujuan stok OK") && operationsDetail.includes("passedDestination"));
 verify("Approved legacy logs can recover a missing QC release queue", productionLog.includes("exports.ensureQcRelease") && productionLog.includes("Stock movement QC Hold hasil OK tidak ditemukan") && operationsDetail.includes("Buka / Buat QC Release Stock"));
 verify("Operator self-check is audited and releases OK stock without separate QC queue", /model ProductionLog[\s\S]*qualityCheckMode\s+String[\s\S]*selfCheckedBy\s+String\?/.test(schema) && productionLog.includes('"OPERATOR_SELF_CHECK"') && productionLog.includes('transactionType: "QUALITY_RELEASE"') && productionLogView.includes("QC dilakukan operator") && productionLogForm.includes("selfCheckNotes"));

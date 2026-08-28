@@ -288,7 +288,7 @@ async function buildScheduleMaterialAvailability(tx, schedule, mo, options = {})
   };
 }
 
-async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
+async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system", options = {}) {
   if (!schedule?.moId) return null;
   const existing = await tx.materialIssue.findFirst({
     where: { moId: schedule.moId, woId: schedule.woId || null, isDeleted: false, notes: { contains: `[DPS-CONSUME:${schedule.scheduleNumber}]` } },
@@ -300,7 +300,10 @@ async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
   const mo = await tx.manufacturingOrder.findUnique({ where: { id: schedule.moId }, select: { id: true, moNumber: true, partId: true, qtyPlanned: true, uomCode: true, materialRequirementUomMode: true, inputSourceType: true, sourceStockBalanceId: true, sourceQtyPlanned: true, sourcePartCode: true, sourcePartNumber: true, sourceWarehouseCode: true, sourceRackCode: true, sourceLotNumber: true } });
   const availability = mo
     ? await buildScheduleMaterialAvailability(tx, schedule, mo, {
-        materializeChildFg: true,
+        // Planning release may happen before a predecessor/incoming receipt.
+        // In that case the MI must expose the future requirement without
+        // materializing a synthetic child-FG receipt.
+        materializeChildFg: options.allowShortage !== true,
         performedBy,
       })
     : { items: [] };
@@ -356,6 +359,45 @@ async function ensureMaterialIssueDraft(tx, schedule, performedBy = "system") {
         ].filter(Boolean).join("; "),
       });
       remaining = Math.max(0, remaining - qty);
+    }
+
+    if (remaining > 0 && options.allowShortage === true) {
+      issueDetails.push({
+        lineNumber: issueDetails.length + 1,
+        partCode: item.partCode,
+        partNumber: item.partNumber,
+        partName: item.partName,
+        spec: item.spec,
+        thickness: item.thickness,
+        width: item.width,
+        CSP: item.CSP,
+        stockBalanceId: null,
+        requirementSource: item.requirementSource || "MBOM",
+        rackCode: null,
+        qtyRequired: remaining,
+        // This is the requested preparation quantity, not a stock posting.
+        // Inventory resolves the actual balance/lot atomically when Issue is
+        // posted, so future incoming/predecessor stock can satisfy this line.
+        qtyIssued: remaining,
+        uomCode: item.uomCode,
+        lotNumber: null,
+        notes: [
+          "Prepared from Daily Production Plan release; stock source pending",
+          item.requirementSource ? `source=${item.requirementSource}` : null,
+          item.parentPartCode ? `parent=${item.parentPartCode}` : null,
+          item.itemType ? `itemType=${item.itemType}` : null,
+          item.materialCode ? `material=${item.materialCode}` : null,
+          availability.mbomHeader?.noReg ? `mbom=${availability.mbomHeader.noReg}` : null,
+          item.detailId ? `mbomDetail=${item.detailId}` : null,
+          `dppQty=${Number(schedule.plannedQty || 0)}`,
+          schedule.uomCode ? `dppUom=${schedule.uomCode}` : null,
+          `qtyPer=${Number(item.qtyPer || 0)}`,
+          `scrap=${Number(item.scrapFactor || 0)}`,
+          item.kgPerQty != null ? `kgPerQty=${Number(item.kgPerQty || 0)}` : null,
+          `totalRequired=${Number(item.qtyRequired || 0)}`,
+        ].filter(Boolean).join("; "),
+      });
+      remaining = 0;
     }
 
     if (remaining > 0) {
@@ -441,9 +483,10 @@ async function attachScheduleMachines(client, schedules = []) {
   const processIds = [...new Set(items.map((row) => row?.processId).filter(Boolean))];
   const mbomProcessIds = [...new Set(items.map((row) => row?.mbomProcessId).filter(Boolean))];
   const diesIds = [...new Set(items.map((row) => row?.diesId).filter(Boolean))];
+  const workOrderIds = [...new Set(items.map((row) => row?.woId).filter(Boolean))];
   const partIds = [...new Set(items.map((row) => row?.partId).filter(Boolean))];
   const partCodes = [...new Set(items.map((row) => row?.partCode).filter(Boolean))];
-  const [machines, processes, routes, dies, parts] = await Promise.all([
+  const [machines, processes, routes, dies, workOrders, parts] = await Promise.all([
     machineIds.length
       ? client.machine.findMany({ where: { id: { in: machineIds } }, select: machineSelect })
       : [],
@@ -462,6 +505,12 @@ async function attachScheduleMachines(client, schedules = []) {
     diesIds.length
       ? client.dies.findMany({ where: { id: { in: diesIds }, isDeleted: false }, select: { id: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true, status: true } })
       : [],
+    workOrderIds.length
+      ? client.workOrder.findMany({
+          where: { id: { in: workOrderIds }, isDeleted: false },
+          select: { id: true, outputPartId: true, outputPartCode: true, outputPartNumber: true, outputPartName: true, isReworkOrder: true },
+        })
+      : [],
     partIds.length || partCodes.length
       ? client.part.findMany({
           where: {
@@ -479,16 +528,30 @@ async function attachScheduleMachines(client, schedules = []) {
   const processById = new Map(processes.map((row) => [row.id, row]));
   const routeById = new Map(routes.map((row) => [row.id, row]));
   const diesById = new Map(dies.map((row) => [row.id, row]));
+  const workOrderById = new Map(workOrders.map((row) => [row.id, row]));
   const partById = new Map(parts.map((row) => [row.id, row]));
   const partByCode = new Map(parts.map((row) => [row.partCode, row]));
-  const hydrated = items.map((row) => row ? {
-    ...row,
-    machine: machineById.get(row.machineId) || null,
-    process: processById.get(row.processId) || null,
-    mbomProcess: routeById.get(row.mbomProcessId) || null,
-    dies: diesById.get(row.diesId) || null,
-    part: partByCode.get(row.partCode) || partById.get(row.partId) || null,
-  } : row);
+  const hydrated = items.map((row) => {
+    if (!row) return row;
+    const workOrder = workOrderById.get(row.woId) || null;
+    const operationOutputPart = workOrder?.outputPartCode
+      ? {
+          id: workOrder.outputPartId || null,
+          partCode: workOrder.outputPartCode,
+          partNumber: workOrder.outputPartNumber || null,
+          partName: workOrder.outputPartName || null,
+        }
+      : null;
+    return {
+      ...row,
+      machine: machineById.get(row.machineId) || null,
+      process: processById.get(row.processId) || null,
+      mbomProcess: routeById.get(row.mbomProcessId) || null,
+      dies: diesById.get(row.diesId) || null,
+      workOrder,
+      part: operationOutputPart || partByCode.get(row.partCode) || partById.get(row.partId) || null,
+    };
+  });
   return Array.isArray(schedules) ? hydrated : hydrated[0];
 }
 
@@ -608,6 +671,15 @@ exports.list = async (req, res, next) => {
     const { q, scheduleDate, shift, status, machineId, machineCode, lineCode, dateScope, isDeleted, page = 1, limit = 100 } = req.query;
       const where = {
         isDeleted: isDeleted === undefined ? false : isDeleted === "true",
+        // A released DPP revision is superseded as soon as PPIC releases its
+        // replacement. Keep the old schedule addressable by its document
+        // number for audit, but never duplicate it in operational queues.
+        AND: [{
+          OR: [
+            { dailyPlanRevisionId: null },
+            { dailyPlanRevision: { is: { isDeleted: false, status: { not: "Superseded" } } } },
+          ],
+        }],
       };
       // Vendor operations have their own outbound/inbound queues. Keep legacy
       // VENDOR schedules readable by key, but never mix them into Daily Plan.
@@ -616,7 +688,17 @@ exports.list = async (req, res, next) => {
       }
 
     if (String(req.query.sourceModule || "").toUpperCase() === "PPIC") {
-      where.productionPlanId = { not: null };
+      // Production Entry normally consumes PPIC-published schedules. Rework
+      // schedules are the only supported exception because they originate
+      // from an approved Production Log/QC judgment, not from MPP.
+      const reworkWorkOrders = await prisma.workOrder.findMany({
+        where: { isDeleted: false, isReworkOrder: true },
+        select: { id: true },
+      });
+      where.OR = [
+        { productionPlanId: { not: null } },
+        { woId: { in: reworkWorkOrders.map((row) => row.id) } },
+      ];
     }
     if (req.query.planNumber) {
       where.productionPlan = { planNumber: String(req.query.planNumber).trim(), isDeleted: false };
@@ -686,7 +768,10 @@ exports.get = async (req, res, next) => {
     });
     if (!schedule || schedule.isDeleted) return res.status(404).json({ message: "Daily production schedule tidak ditemukan" });
     if (String(req.query.sourceModule || "").toUpperCase() === "PPIC" && !schedule.productionPlanId) {
-      return res.status(404).json({ message: "Daily Production Plan PPIC tidak ditemukan" });
+      const reworkWorkOrder = schedule.woId
+        ? await prisma.workOrder.findFirst({ where: { id: schedule.woId, isDeleted: false, isReworkOrder: true }, select: { id: true } })
+        : null;
+      if (!reworkWorkOrder) return res.status(404).json({ message: "Daily Production Plan PPIC tidak ditemukan" });
     }
     const [manufacturingOrder, workOrder, materialIssues, productionLogs] = await Promise.all([
       schedule.moId ? prisma.manufacturingOrder.findFirst({
@@ -836,8 +921,8 @@ exports.create = async (req, res, next) => {
         moNumber: body.moNumber || mo?.moNumber || null,
         woId: body.woId || wo?.id || null,
         woNumber: body.woNumber || wo?.woNumber || null,
-        partId: body.partId || mo?.partId || null,
-        partCode: body.partCode || mo?.part?.partCode || null,
+        partId: body.partId || wo?.outputPartId || wo?.mbomProcess?.mbomDetail?.partId || mo?.partId || null,
+        partCode: body.partCode || wo?.outputPartCode || mo?.part?.partCode || null,
         processId: body.processId || wo?.processId || null,
         machineId,
         diesId: diesAssignment.dies?.id || body.diesId || wo?.diesId || null,
@@ -940,8 +1025,15 @@ const setStatus = (status) => async (req, res, next) => {
     const schedule = await prisma.$transaction(async (tx) => {
       const current = await tx.dailyProductionSchedule.findUnique({ where: { scheduleNumber: req.params.scheduleNumber } });
       if (!current || current.isDeleted) throw Object.assign(new Error("Daily Production Plan tidak ditemukan."), { statusCode: 404 });
+      const referencedWorkOrder = current.woId
+        ? await tx.workOrder.findFirst({
+            where: { id: current.woId, isDeleted: false },
+            select: { status: true, woNumber: true, isReworkOrder: true },
+          })
+        : null;
+      const isReworkSchedule = referencedWorkOrder?.isReworkOrder === true;
       if (["Released", "In Progress", "Completed"].includes(status)) {
-        if (!current.productionPlanId || !current.productionPlanAllocationId || !current.mbomProcessId) {
+        if (!isReworkSchedule && (!current.productionPlanId || !current.productionPlanAllocationId || !current.mbomProcessId)) {
           throw Object.assign(new Error("Daily Production Plan harus dipublikasikan dari MPP Capacity Planning dan memiliki allocation/routing trace lengkap."), { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" });
         }
         if (String(current.shift || "").toUpperCase() !== "VENDOR" && (!current.moId || !current.woId)) {
@@ -974,6 +1066,11 @@ const setStatus = (status) => async (req, res, next) => {
         throw Object.assign(new Error(`Daily Production Plan tidak dapat berubah dari ${current.status} menjadi ${status}.`), { statusCode: 409, code: "DAILY_PLAN_STATUS_TRANSITION_INVALID" });
       }
       if (status === "In Progress" && String(current.shift || "").toUpperCase() !== "VENDOR") {
+        if (isReworkSchedule) {
+          if (!referencedWorkOrder || !["Rework", "Released", "Material Issued", "In Production"].includes(referencedWorkOrder.status)) {
+            throw Object.assign(new Error(`WO rework ${referencedWorkOrder?.woNumber || current.woNumber || "-"} belum siap diproduksi.`), { statusCode: 409, code: "REWORK_ORDER_NOT_READY" });
+          }
+        } else {
         const [workOrder, openMaterialIssue, postedMaterialIssue, allocation] = await Promise.all([
           tx.workOrder.findFirst({ where: { id: current.woId, isDeleted: false }, select: { status: true, woNumber: true } }),
           tx.materialIssue.count({ where: { woId: current.woId, isDeleted: false, status: { in: ["Draft", "Pending", "Released"] } } }),
@@ -1046,6 +1143,7 @@ const setStatus = (status) => async (req, res, next) => {
             throw Object.assign(new Error(message), { statusCode: 409, code: "PREDECESSOR_OUTPUT_NOT_READY" });
           }
         }
+        }
       }
       let completedActualQty = null;
       if (status === "Completed") {
@@ -1100,7 +1198,14 @@ exports.consume = async (req, res, next) => {
     const result = await prisma.$transaction(async (tx) => {
       const schedule = await tx.dailyProductionSchedule.findUnique({ where: { scheduleNumber: req.params.scheduleNumber } });
       if (!schedule || schedule.isDeleted) throw Object.assign(new Error("Daily production schedule tidak ditemukan"), { statusCode: 404 });
-      if (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId) {
+      const workOrder = schedule.woId
+        ? await tx.workOrder.findFirst({
+            where: { id: schedule.woId, isDeleted: false },
+            select: { isReworkOrder: true },
+          })
+        : null;
+      const isReworkSchedule = workOrder?.isReworkOrder === true;
+      if (!isReworkSchedule && (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId)) {
         throw Object.assign(new Error("Daily Production Plan harus berasal dari MPP Capacity Planning sebelum material dikonsumsi."), { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" });
       }
       if (String(schedule.shift || "").toUpperCase() !== "VENDOR" && (!schedule.moId || !schedule.woId)) {
@@ -1125,12 +1230,22 @@ exports.consume = async (req, res, next) => {
       }
       const updated = schedule.status === "Draft" ? await tx.dailyProductionSchedule.update({ where: { scheduleNumber: schedule.scheduleNumber }, data: { status: "Released" } }) : schedule;
       if (updated.woId) await tx.workOrder.updateMany({ where: { id: updated.woId, isDeleted: false, status: { in: ["Draft", "Planned"] } }, data: { status: "Released", machineId: updated.machineId || undefined, diesId: updated.diesId || undefined, shift: updated.shift || undefined } });
-      const materialIssue = await ensureMaterialIssueDraft(tx, updated, req.user?.username || req.user?.email || "system");
-      return { schedule: mapScheduleDoc(await attachScheduleMachines(tx, updated)), materialIssue };
+      const materialIssue = isReworkSchedule
+        ? null
+        : await ensureMaterialIssueDraft(tx, updated, req.user?.username || req.user?.email || "system");
+      return {
+        schedule: mapScheduleDoc(await attachScheduleMachines(tx, updated)),
+        materialIssue,
+        reworkNoMaterialIssue: isReworkSchedule,
+      };
     });
     res.json(result);
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code || null }); next(error); }
 };
+
+// Shared with the official Daily Plan release service so Inventory receives
+// its preparation queue at PPIC handoff time, before Production is started.
+exports.ensureMaterialIssueDraft = ensureMaterialIssueDraft;
 
 exports.dispatchFromWorkOrders = async (req, res, next) => {
   try {

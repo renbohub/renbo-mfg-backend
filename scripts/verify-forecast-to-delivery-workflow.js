@@ -1,0 +1,72 @@
+"use strict";
+
+const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
+
+const backendRoot = path.resolve(__dirname, "..");
+const frontendRoot = path.resolve(backendRoot, "..", "renbo-mfg-frontend");
+const readBackend = (...segments) => fs.readFileSync(path.join(backendRoot, ...segments), "utf8");
+const readFrontend = (...segments) => fs.readFileSync(path.join(frontendRoot, ...segments), "utf8");
+const checks = [];
+const verify = (name, condition) => {
+  assert(condition, name);
+  checks.push(name);
+};
+
+const forecast = readBackend("src", "prisma", "controllers", "planning", "ForecastController.js");
+const demandPlanning = readBackend("src", "prisma", "controllers", "planning", "DemandPlanningController.js");
+const mps = readBackend("src", "prisma", "controllers", "planning", "MPSController.js");
+const mpsFeasibility = readBackend("src", "prisma", "services", "planning", "mpsDeliveryFeasibilityService.js");
+const mpsWorkbench = readBackend("src", "prisma", "services", "planning", "mpsWorkbenchService.js");
+const mrp = readBackend("src", "prisma", "controllers", "planning", "MRPController.js");
+const capacityRecommendation = readBackend("src", "prisma", "services", "planning", "capacityRecommendationService.js");
+const dailyRelease = readBackend("src", "prisma", "services", "planning", "dailyReleaseSchedulingService.js");
+const dailyRevision = readBackend("src", "prisma", "services", "planning", "dailyPlanRevisionDomain.js");
+const materialIssue = readBackend("src", "prisma", "controllers", "production", "MaterialIssueController.js");
+const materialIssueRoutes = readBackend("src", "prisma", "routes", "production", "material-issues.js");
+const incoming = readBackend("src", "prisma", "controllers", "incoming", "IncomingTransactionController.js");
+const incomingRoutes = readBackend("src", "prisma", "routes", "incoming", "transactions.js");
+const productionLog = readBackend("src", "prisma", "controllers", "production", "ProductionLogController.js");
+const ngDisposition = readBackend("src", "prisma", "controllers", "production", "ProductionNgDispositionController.js");
+const outgoingRoutes = readBackend("src", "prisma", "routes", "outgoing", "transactions.js");
+const outgoingMatrix = readBackend("src", "prisma", "services", "outgoing", "outgoingDeliveryMatrixService.js");
+const forecastPolicy = readBackend("src", "prisma", "services", "planning", "forecastStatusPolicy.js");
+const yearlyDemand = readBackend("src", "prisma", "services", "planning", "yearlyDemandService.js");
+const sourceReset = readBackend("src", "prisma", "services", "system", "sourcePlanningResetService.js");
+const frontendDetail = readFrontend("public", "js", "operations-detail.js");
+const frontendRoutes = readFrontend("src", "routes", "modules.js");
+const frontendSalesDetail = readFrontend("public", "js", "sales-detail.js");
+const frontendYearlyDemand = readFrontend("public", "js", "ppic-yearly-demand.js");
+const frontendWorkflowStrip = readFrontend("public", "js", "ppic-workflow-strip.js");
+const monthlyPlanController = readBackend("src", "prisma", "controllers", "planning", "MonthlyProductionPlanController.js");
+const monthlyPlanning = readBackend("src", "prisma", "services", "planning", "monthlyPlanningService.js");
+
+verify("Forecast has Submit -> Confirmed approval", forecast.includes('forecast.status !== "Submitted"') && forecast.includes('status: "Confirmed"'));
+verify("Draft and Submitted forecasts are excluded from planning demand", forecastPolicy.includes('["Confirmed", "Consumed", "Partial Product"]') && yearlyDemand.includes("isOpenForecast(row.forecastDetail.forecast)"));
+verify("Forecast reset removes stale workflow notes", sourceReset.includes("stripWorkflowNotes") && sourceReset.includes("notes: stripWorkflowNotes(forecast.notes)"));
+verify("Frontend GET proxy preserves query filters", frontendRoutes.includes('if (method === "GET")') && frontendRoutes.includes("!url.searchParams.has(key)"));
+verify("Forecast reconciliation formats discrete quantities consistently", frontendSalesDetail.includes("qty(row.forecastQty,row.uomCode)") && frontendSalesDetail.includes("qty(row.qtyVariance,row.uomCode)"));
+verify("Per-FG monthly EFD cells open the override dialog", frontendYearlyDemand.includes('if (type !== "efd")') && frontendYearlyDemand.includes("data-edit-efd"));
+verify("Demand Planning replaces forecast with firm sales order", demandPlanning.includes("FORECAST_REPLACED_BY_SO") && demandPlanning.includes("actualSalesOrderQty"));
+verify("MPS confirmation is gated and persisted", mps.includes("exports.confirm") && mps.includes('status: "Confirmed"'));
+verify("MPS supports approved Accept Late", mpsFeasibility.includes("ACCEPT_LATE_APPROVED") && mpsFeasibility.includes("effectiveCommitmentDate"));
+verify("Forecast override keeps SO phases plus unconsumed Forecast residual", mpsWorkbench.includes('const forecastSelected = efdSource.startsWith("FORECAST")') && mpsWorkbench.includes('sourceType === "FORECAST" && (forecastSelected || forecastDeliveryFallback)'));
+verify("Monthly MPS persists SO plus Forecast residual for Forecast EFD", monthlyPlanning.includes('if (forecastSelected) return [...salesOrderTargets, ...forecastTargets]'));
+verify("Discrete MPP phase splitting receives canonical UOM before rounding", monthlyPlanController.includes("uomCode: rowUomCode") && monthlyPlanController.includes("final phase"));
+verify("Planning workflow strip prioritizes URL month over initial control value", frontendWorkflowStrip.includes('query.get("month") || query.get("date")?.slice(0, 7) || monthControl?.value'));
+verify("MRP requires confirmed/released MPS and explicit approval", mrp.includes("harus Confirmed/Released sebelum run MRP") && mrp.includes("exports.approve"));
+verify("Monthly capacity recommendation inserts a 120-minute successor gap", capacityRecommendation.includes("MINIMUM_SUCCESSOR_GAP_MINUTES = 120") && capacityRecommendation.includes("+ MINIMUM_SUCCESSOR_GAP_MINUTES"));
+verify("Daily release defaults to a 120-minute successor gap", dailyRelease.includes("MINIMUM_SUCCESSOR_GAP_MINUTES = 120") && !dailyRelease.includes("dependencyGapMinutes ?? 60"));
+verify("Daily-plan validation blocks gaps under two hours", dailyRevision.includes("MINIMUM_SUCCESSOR_GAP_MINUTES = 120") && dailyRevision.includes("minimal 2 jam"));
+verify("Material Issue has Draft -> Preparing -> Issued transitions", materialIssue.includes("exports.prepare") && materialIssue.includes('existing.status !== "Preparing"') && materialIssueRoutes.includes('/:issueNumber/prepare'));
+verify("Material Issue frontend exposes preparation start and completion", frontendDetail.includes('actionButton("prepare", "Mulai Persiapan"') && frontendDetail.includes("Selesai Persiapan & Issue"));
+verify("GR supports audited direct release without QC", incoming.includes("exports.releaseWithoutInspection") && incoming.includes('decision: "QC Bypassed"') && incoming.includes("exports.putawayAccepted(req, res, next)"));
+verify("Direct release endpoint and UI choice are wired", incomingRoutes.includes("release-without-qc") && frontendRoutes.includes("release-without-qc") && frontendDetail.includes("Release Tanpa QC"));
+verify("Production captures NG and downtime", productionLog.includes("qtyReject") && productionLog.includes("downtime"));
+verify("QC disposition separates rework and final reject", ngDisposition.includes("qtyRework") && ngDisposition.includes("qtyReject"));
+verify("Outgoing supports pick, pack, ship, POD, and failure", ["pick", "pack", "ship", "pod", "fail"].every((action) => outgoingRoutes.includes(`/${action}`)));
+verify("Delivery matrix includes every FG with an active BOM", outgoingMatrix.includes('itemType: "FG"') && outgoingMatrix.includes("mbomHeaders: { some: { isDeleted: false } }") && !outgoingMatrix.includes('partType: "COMP"'));
+verify("Delivery matrix exposes last and next delivery", outgoingMatrix.includes("lastDelivery") && outgoingMatrix.includes("nextDelivery"));
+
+console.log(`Forecast-to-delivery workflow contracts passed: ${checks.length}/${checks.length} checks.`);

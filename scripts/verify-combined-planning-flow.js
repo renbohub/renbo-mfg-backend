@@ -7,7 +7,7 @@ const { procurementSchedule } = require("../src/prisma/services/planning/procure
 const { resolveProductionRequirementDates } = require("../src/prisma/services/planning/mrpDueDateService");
 const { isUncommittedPlannedSupply } = require("../src/prisma/services/planning/plannedSupplyCommitmentService");
 
-assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 60, policy: "MTO" }), 60, "MTO harus mengganti forecast dengan SO aktual");
+assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 60, policy: "MTO" }), 100, "SO parsial hanya mengonsumsi forecast yang cocok; sisa forecast provisional tetap dipertahankan");
 assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 60, policy: "MTS" }), 100, "MTS harus mempertahankan forecast yang lebih besar");
 assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 140, policy: "MTS" }), 140, "SO harus menjadi floor MTS");
 
@@ -16,7 +16,7 @@ const mtoTargets = consumeDeliveryTargets({
   forecastTargets: [{ id: "fc-1", targetDate: "2026-09-30", qty: 100 }],
   salesOrderTargets: [{ id: "so-1", targetDate: "2026-09-10", qty: 60 }],
 });
-assert.deepStrictEqual(mtoTargets.map((row) => [row.sourceType, row.qty]), [["SALES_ORDER", 60]], "MTO dengan SO tidak boleh menyisakan forecast provisional");
+assert.deepStrictEqual(mtoTargets.map((row) => [row.sourceType, row.qty]), [["SALES_ORDER", 60], ["FORECAST", 40]], "SO parsial harus mengganti 60 forecast dan menyisakan 40 forecast provisional");
 
 const phased = netTimePhasedDemand({
   openingQty: 100,

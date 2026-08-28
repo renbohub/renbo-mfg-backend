@@ -7,6 +7,7 @@ const {
   classifyCapacity,
 } = require("../src/prisma/services/planning/workingHourCalendarService");
 const { resolveDailyCapacity } = require("../src/prisma/services/planning/capacityPlanningService");
+const { normalizeCapacityShiftOverrides } = require("../src/prisma/controllers/planning/MonthlyProductionPlanController");
 
 assert.strictEqual(calculateShiftMinutes("22:00", "06:00", 60), 420,
   "shift lintas tengah malam harus dikurangi break");
@@ -61,5 +62,35 @@ const machineDay = resolveDailyCapacity({
 });
 assert.strictEqual(machineDay.availableMinutes, 960,
   "jam shift plan-specific dan overtime harian harus menjadi capacity efektif");
+
+const structuredShifts = normalizeCapacityShiftOverrides([
+  {
+    startTime: "08:00", endTime: "16:00", breakMinutes: 0,
+    overtimeBeforeStart: "06:00", overtimeBeforeEnd: "08:00",
+    overtimeAfterStart: "16:00", overtimeAfterEnd: "18:00",
+  },
+  {
+    startTime: "16:00", endTime: "00:00", breakMinutes: 0,
+    overtimeBeforeStart: "14:00", overtimeBeforeEnd: "16:00",
+    overtimeAfterStart: "00:00", overtimeAfterEnd: "02:00",
+  },
+], 2);
+assert.deepStrictEqual(structuredShifts.map((shift) => shift.overtimeMinutes), [240, 240],
+  "lembur awal dan akhir harus dijumlahkan terpisah untuk setiap shift");
+const structuredMachineDay = resolveDailyCapacity({
+  key: "2026-09-07",
+  override: { dayStatus: "WORKING", shiftsPerDay: 2, shiftOverrides: structuredShifts },
+  shiftHours: 8,
+  defaultShiftsPerDay: 2,
+  defaultOvertimeHours: 0,
+  efficiencyPercent: 100,
+  includeSaturday: false,
+  includeSunday: false,
+  formulas: [],
+});
+assert.strictEqual(structuredMachineDay.overtimeMinutes, 480,
+  "capacity rule harus melaporkan total lembur seluruh shift");
+assert.strictEqual(structuredMachineDay.availableMinutes, 1440,
+  "dua shift delapan jam ditambah empat rentang lembur harus menjadi 1.440 menit");
 
 console.log("Working hour capacity contract passed.");

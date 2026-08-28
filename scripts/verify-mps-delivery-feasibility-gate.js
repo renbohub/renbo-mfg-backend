@@ -7,6 +7,8 @@ const {
   deriveMpsDeliveryGate,
   normalizeDeliveryFeasibility,
   shouldRetireOfficialMrp,
+  isPromotableCustomerDeliverySource,
+  deliveryTargetIdsFromMps,
 } = require("../src/prisma/services/planning/mpsDeliveryFeasibilityService");
 
 const root = path.resolve(__dirname, "..");
@@ -69,10 +71,27 @@ assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "BLOCKED" }), t
 assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "OFFICIAL" }), false);
 assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "APPROVED_WITH_EXCEPTION" }), false);
 
+const mixedDetail = {
+  actualSalesOrderQty: 2500,
+  calculationTrace: { efd: { source: "PO" } },
+  demandSources: [
+    { sourceType: "FORECAST", qty: 2000, deliveryTargetId: "forecast-target", sourcePegging: [{ deliveryTargetId: "forecast-target" }] },
+    { sourceType: "SALES_ORDER", qty: 2500, deliveryTargetId: "so-target", sourcePegging: [{ deliveryTargetId: "so-target" }] },
+  ],
+};
+assert.strictEqual(isPromotableCustomerDeliverySource(mixedDetail, mixedDetail.demandSources[0]), false, "Forecast tidak boleh menjadi delivery commitment ketika SO sudah ada");
+assert.deepStrictEqual(deliveryTargetIdsFromMps({ details: [mixedDetail] }), ["so-target"], "Delivery gate harus mengikuti target SO saja");
+const forecastFallbackDetail = {
+  actualSalesOrderQty: 0,
+  calculationTrace: { efd: { source: "FORECAST" } },
+  demandSources: [{ sourceType: "FORECAST", qty: 2000, sourcePegging: [{ deliveryTargetId: "forecast-fallback" }] }],
+};
+assert.deepStrictEqual(deliveryTargetIdsFromMps({ details: [forecastFallbackDetail] }), ["forecast-fallback"], "Forecast tetap menjadi delivery fallback saat SO nol dan EFD Forecast dipilih");
+
 const mpsController = source("src/prisma/controllers/planning/MPSController.js");
 const mrpController = source("src/prisma/controllers/planning/MRPController.js");
 const workbenchService = source("src/prisma/services/planning/mpsWorkbenchService.js");
-const workbenchUi = source("../frontend/public/js/ppic-mps-workbench.js");
+const workbenchUi = source("../renbo-mfg-frontend/public/js/ppic-mps-workbench.js");
 
 assert.match(mpsController, /assertMpsDeliveryApprovalAllowed/);
 assert.match(mrpController, /assertOfficialMpsDeliveryGate/);

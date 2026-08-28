@@ -14,6 +14,7 @@ const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pri
 const {
   resolveBomPurchaseDefaults,
   resolvePurchaseSuggestionSupplierMaster,
+  findPricedPurchaseSuggestionSupplierMaster,
 } = require("../../services/purchasing/purchaseSuggestionMasterDataService");
 const {
   mergePrimaryAndSplitSupplierAllocations,
@@ -836,6 +837,120 @@ async function refreshHeaderStatus(tx, suggestionNumber) {
   return tx.purchaseSuggestion.update({ where: { suggestionNumber }, data: { status } });
 }
 
+function autoConfirmationResult(item, status, reasonCode = null, message = null) {
+  return {
+    itemId: item.id,
+    identity: item.materialCode || item.partCode || item.plannedOrderNumber,
+    supplierCode: item.alternativeSupplierCode || item.suggestedSupplierCode || null,
+    status,
+    reasonCode,
+    message,
+  };
+}
+
+async function autoConfirmSupplierItem(tx, item, actor, asOf) {
+  if (number(item.qtyConvertedToPr) > 0 || /converted/i.test(item.status || "")) {
+    return autoConfirmationResult(item, "SKIPPED", "ALREADY_CONVERTED", "Item sudah pernah dibuat menjadi PR.");
+  }
+  if (item.status === "Covered by MOQ") {
+    return autoConfirmationResult(item, "SKIPPED", "ALREADY_COVERED", "Kebutuhan item sudah dicakup oleh kelebihan MOQ item sebelumnya.");
+  }
+  if (CONFIRMED_STATUSES.has(item.confirmationStatus) || ["Ready for PR", "Partially Ready"].includes(item.status)) {
+    return autoConfirmationResult(item, "SKIPPED", "ALREADY_CONFIRMED", "Konfirmasi supplier sudah terisi.");
+  }
+  if (Array.isArray(item.supplierAllocations) && item.supplierAllocations.length) {
+    return autoConfirmationResult(item, "SKIPPED", "SUPPLIER_ALLOCATION_EXISTS", "Item memiliki split supplier/delivery dan perlu dilanjutkan manual.");
+  }
+  const pricedSupplier = await findPricedPurchaseSuggestionSupplierMaster(tx, item, { asOf });
+  const master = pricedSupplier.master;
+  if (!master) {
+    const checkedSuppliers = pricedSupplier.supplierCodes.length ? pricedSupplier.supplierCodes.join(", ") : "supplier terkait";
+    return autoConfirmationResult(item, "SKIPPED", "PRICE_NOT_FOUND", `Harga aktif tidak tersedia dari ${checkedSuppliers}; status tidak dikonfirmasi.`);
+  }
+
+  const confirmedQty = number(item.recommendedPurchaseQty);
+  if (!(confirmedQty > 0)) {
+    return autoConfirmationResult(item, "SKIPPED", "SUGGESTION_QTY_NOT_FOUND", "Qty Purchase Suggestion tidak tersedia.");
+  }
+  const purchasePackageUomCode = String(master.purchasePackageUomCode || item.purchasePackageUomCode || "").trim().toUpperCase() || null;
+  const materialWidth = optionalNumber(master.materialWidth) ?? optionalNumber(item.confirmedMaterialWidth);
+  const materialLength = optionalNumber(item.confirmedMaterialLength);
+  if (item.materialCode && !["SHEET", "COIL", "PCS"].includes(purchasePackageUomCode)) {
+    return autoConfirmationResult(item, "SKIPPED", "PURCHASE_FORM_NOT_FOUND", "Bentuk pembelian material belum tersedia di BOM/master.");
+  }
+  if (item.materialCode && !(number(materialWidth) > 0)) {
+    return autoConfirmationResult(item, "SKIPPED", "MATERIAL_WIDTH_NOT_FOUND", "Lebar material belum tersedia di BOM/master.");
+  }
+  if (item.materialCode && purchasePackageUomCode === "SHEET" && !(number(materialLength) > 0)) {
+    return autoConfirmationResult(item, "SKIPPED", "SHEET_LENGTH_NOT_FOUND", "Panjang sheet belum tersedia dan perlu dikonfirmasi manual.");
+  }
+
+  const effectiveLeadTimeDays = 2;
+  const recalculatedSchedule = procurementSchedule({
+    materialRequiredDate: item.materialRequiredDate,
+    supplierLeadTimeDays: effectiveLeadTimeDays,
+    ...(item.productionLeadTimeBreakdown?.procurementPolicy || {}),
+  });
+  const shortageQty = round(Math.max(number(item.netRequirement) - confirmedQty, 0));
+  const row = await tx.purchaseSuggestionItem.update({
+    where: { id: item.id },
+    data: {
+      confirmationStatus: "Confirmed",
+      confirmedQty,
+      confirmedDeliveryDate: item.materialRequiredDate,
+      confirmedMoq: optionalNumber(master.moq) ?? number(item.moq),
+      confirmedLeadTimeDays: effectiveLeadTimeDays,
+      orderMultiple: optionalNumber(master.orderMultiple) ?? number(item.orderMultiple),
+      recommendedOrderDate: recalculatedSchedule.latestPoDate,
+      latestPrDate: recalculatedSchedule.latestPrDate,
+      procurementWindow: recalculatedSchedule.procurementWindow,
+      confirmedMaterialWidth: item.materialCode ? materialWidth : null,
+      confirmedMaterialLength: item.materialCode && purchasePackageUomCode === "SHEET" ? materialLength : null,
+      purchasePackageUomCode: item.materialCode ? purchasePackageUomCode : null,
+      estimatedUnitPrice: master.unitPrice,
+      currencyCode: master.currencyCode || item.currencyCode || null,
+      priceSource: master.sources?.price || item.priceSource,
+      priceEffectiveFrom: master.priceEffectiveFrom || null,
+      priceEffectiveUntil: master.priceEffectiveUntil || null,
+      productionLeadTimeBreakdown: {
+        ...(item.productionLeadTimeBreakdown || {}),
+        procurementSchedule: recalculatedSchedule,
+        effectivePurchasingLeadTimeDays: effectiveLeadTimeDays,
+        supplierConfirmationMaster: {
+          supplierCode: master.supplierCode,
+          supplierName: master.supplierName,
+          lookupDate: master.lookupDate,
+          moq: master.moq,
+          orderMultiple: master.orderMultiple,
+          unitPrice: master.unitPrice,
+          currencyCode: master.currencyCode,
+          leadTimeDays: master.leadTimeDays,
+          purchasePackageUomCode: master.purchasePackageUomCode,
+          materialWidth: master.materialWidth,
+          sources: master.sources,
+          priceListId: master.priceListId,
+          priceEffectiveFrom: master.priceEffectiveFrom,
+          priceEffectiveUntil: master.priceEffectiveUntil,
+          bom: master.bom,
+          autoConfirmed: true,
+          autoConfirmedBy: actor,
+          autoConfirmedAt: asOf,
+        },
+      },
+      alternativeSupplierCode: master.supplierCode,
+      shortageQty,
+      status: shortageQty > 0 ? "Partially Ready" : "Ready for PR",
+    },
+  });
+  return {
+    ...autoConfirmationResult(item, "CONFIRMED"),
+    supplierCode: master.supplierCode,
+    confirmedQty: row.confirmedQty,
+    unitPrice: row.estimatedUnitPrice,
+    currencyCode: row.currencyCode,
+  };
+}
+
 async function refreshDraftForMps(tx, mpsNumber, user) {
   if (!mpsNumber) return null;
   const run = await tx.mRPRun.findFirst({
@@ -1159,6 +1274,49 @@ exports.getSupplierMaster = async (req, res, next) => {
       asOf: req.query.asOf || new Date(),
     });
     res.json(master);
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ message: error.message });
+    next(error);
+  }
+};
+
+exports.autoConfirmSuppliers = async (req, res, next) => {
+  try {
+    const asOf = new Date();
+    const actor = req.user?.username || req.user?.email || "system";
+    const result = await prisma.$transaction(async (tx) => {
+      const suggestion = await tx.purchaseSuggestion.findFirst({
+        where: { suggestionNumber: req.params.suggestionNumber, isDeleted: false },
+        include: {
+          items: {
+            where: { isDeleted: false },
+            orderBy: [{ materialRequiredDate: "asc" }, { materialCode: "asc" }, { partCode: "asc" }],
+            include: { supplierAllocations: { where: { isDeleted: false }, select: { id: true } } },
+          },
+        },
+      });
+      if (!suggestion) throw Object.assign(new Error("Purchase Suggestion tidak ditemukan"), { status: 404 });
+      if (suggestion.status === "Replan Required") {
+        throw Object.assign(new Error("Purchase Suggestion sudah kedaluwarsa. Hitung ulang MPS dan MRP sebelum auto konfirmasi supplier."), { status: 409 });
+      }
+
+      const results = [];
+      for (const item of suggestion.items) {
+        results.push(await autoConfirmSupplierItem(tx, item, actor, asOf));
+      }
+      const header = await refreshHeaderStatus(tx, suggestion.suggestionNumber);
+      const confirmedCount = results.filter((row) => row.status === "CONFIRMED").length;
+      const skipped = results.filter((row) => row.status === "SKIPPED");
+      return {
+        suggestionNumber: suggestion.suggestionNumber,
+        status: header.status,
+        confirmedCount,
+        skippedCount: skipped.length,
+        skippedWithoutPriceCount: skipped.filter((row) => row.reasonCode === "PRICE_NOT_FOUND").length,
+        results,
+      };
+    }, { timeout: 60000 });
+    res.json(result);
   } catch (error) {
     if (error.status) return res.status(error.status).json({ message: error.message });
     next(error);

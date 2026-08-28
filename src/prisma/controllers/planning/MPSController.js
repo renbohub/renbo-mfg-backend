@@ -14,7 +14,8 @@ const { resolveMbomRevision, selectedRevisionId } = require("../../services/plan
 const { getMpsWorkbench } = require("../../services/planning/mpsWorkbenchService");
 const { assertMpsApprovalAllowed, invalidateRccp } = require("../../services/planning/rccpService");
 const { assertMpsDeliveryApprovalAllowed, invalidateMpsDeliveryGate, reviewMpsDeliveryFeasibility } = require("../../services/planning/mpsDeliveryFeasibilityService");
-const { previewBaselineLocks, lockBaselineForMps } = require("../../services/planning/planningBaselineLockService");
+const { previewBaselineLocks, lockBaselineForMps, refreshBaselineLocksForMps } = require("../../services/planning/planningBaselineLockService");
+const { loadAdditionalDemandCoverage } = require("../../services/planning/additionalDemandCoverageService");
 const { previewDeltaMps, generateDeltaMps } = require("../../services/planning/planningDeltaMpsService");
 const { previewProductionCut, createProductionCut, approveProductionCut } = require("../../services/planning/productionCutService");
 
@@ -912,6 +913,21 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
       selectedDeliveryTargetIds,
       selectionRequired: explicitSelection,
     });
+    if (req.body.simulationOnly !== true && normalizedSelection.months.length) {
+      const locked = await prisma.planningBaselineLock.findFirst({
+        where: {
+          status: "ACTIVE",
+          periodMonth: { in: normalizedSelection.months.map((month) => utcMonthStart(month)) },
+        },
+        select: { periodMonth: true },
+      });
+      if (locked) {
+        return res.status(409).json({
+          code: "MPS_LOCKED",
+          message: `MPS ${monthKey(locked.periodMonth)} sudah dikunci. Gunakan tombol Recalculate ketika PO+ berubah.`,
+        });
+      }
+    }
     const result = await prisma.$transaction((tx) => syncMonthlyMps(tx, {
       months: normalizedSelection.months.length ? normalizedSelection.months : undefined,
       planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(new Date()),
@@ -941,6 +957,92 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
 
 exports.createFromForecast = (req, res, next) => syncMonthlyDemand(req, res, next, true);
 exports.syncMonthly = (req, res, next) => syncMonthlyDemand(req, res, next, false);
+
+exports.recalculateLocked = async (req, res, next) => {
+  try {
+    const month = text(req.body?.planningAnchorMonth) || text(req.body?.months?.[0]);
+    if (!/^\d{4}-\d{2}$/.test(month || "")) {
+      return res.status(400).json({ message: "Periode MPS wajib diisi dalam format YYYY-MM." });
+    }
+    const actor = req.user?.username || req.user?.email || "system";
+    const result = await prisma.$transaction(async (tx) => {
+      const coverage = await loadAdditionalDemandCoverage(tx, { year: Number(month.slice(0, 4)) });
+      const monthLocks = coverage.items.filter((row) => row.month === month);
+      if (!monthLocks.length) {
+        const error = new Error("Lock MPS terlebih dahulu sebelum melakukan recalculation.");
+        error.statusCode = 409;
+        error.code = "MPS_NOT_LOCKED";
+        throw error;
+      }
+      const poDeltaQty = [...coverage.byPartMonth.values()]
+        .filter((row) => row.month === month)
+        .reduce((sum, row) => sum + number(row.poDeltaQty), 0);
+      const hasPoDelta = [...coverage.byPartMonth.values()]
+        .some((row) => row.month === month && Math.abs(number(row.poDeltaQty)) > 0.000001);
+      if (!hasPoDelta) {
+        const error = new Error("Tidak ada perubahan PO+ yang perlu dihitung ulang.");
+        error.statusCode = 409;
+        error.code = "PO_DELTA_EMPTY";
+        throw error;
+      }
+      const baselineMpsNumbers = [...new Set(monthLocks.map((row) => row.baselineMpsNumber).filter(Boolean))];
+      const released = await tx.mPS.findFirst({
+        where: { mpsNumber: { in: baselineMpsNumbers }, isDeleted: false, status: "Released" },
+        select: { mpsNumber: true },
+      });
+      if (released) {
+        const error = new Error(`${released.mpsNumber} sudah Released dan tidak dapat dihitung ulang langsung. Buat revision MPS terlebih dahulu.`);
+        error.statusCode = 409;
+        error.code = "MPS_RELEASED";
+        throw error;
+      }
+      const synced = await syncMonthlyMps(tx, {
+        months: [month],
+        planningAnchorMonth: month,
+        simulationOnly: false,
+        runBy: actor,
+      });
+      if (!synced.docs.length) {
+        const error = new Error("Tidak ada demand Forecast/SO aktif pada periode yang dipilih.");
+        error.statusCode = 400;
+        error.code = "MPS_DEMAND_EMPTY";
+        throw error;
+      }
+      const lockIds = monthLocks.map((row) => row.baselineLockId);
+      await tx.mPS.updateMany({
+        where: {
+          planKind: "DELTA",
+          baselineMpsNumber: { in: baselineMpsNumbers },
+          isDeleted: false,
+          status: { notIn: ["Cancelled", "Superseded"] },
+        },
+        data: { status: "Superseded", lifecycleStatus: "SUPERSEDED" },
+      });
+      await tx.planningAdjustment.updateMany({
+        where: { baselineLockId: { in: lockIds }, status: { in: ["PENDING_APPROVAL", "APPROVED", "APPLIED"] } },
+        data: { status: "SUPERSEDED" },
+      });
+      await tx.additionalDemandCoverage.updateMany({
+        where: { baselineLockId: { in: lockIds }, status: "ALLOCATED" },
+        data: { status: "RELEASED", releasedBy: actor, releasedAt: new Date() },
+      });
+      const baseline = await refreshBaselineLocksForMps(tx, {
+        mpsNumbers: synced.docs.map((document) => document.mpsNumber),
+        actor,
+      });
+      return { ...synced, baseline, poDeltaQty };
+    }, { maxWait: 10000, timeout: 120000 });
+    return res.status(200).json({
+      ...mpsResponse(result.docs, { idempotent: false, createdCount: 0 }),
+      months: result.months,
+      appliedPoDeltaQty: result.poDeltaQty,
+      message: `PO+ ${number(result.poDeltaQty) >= 0 ? "+" : ""}${number(result.poDeltaQty)} sudah diterapkan ke MPS dan baseline PO diperbarui.`,
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    return next(error);
+  }
+};
 
 exports.previewBaseline = async (req, res, next) => {
   try {
@@ -1033,21 +1135,21 @@ exports.generateDelta = async (req, res, next) => {
 exports.previewProductionCut = async (req, res, next) => {
   try {
     const result = await previewProductionCut(prisma, { baselineLockId: req.body?.baselineLockId, requestedQty: req.body?.requestedQty });
-    res.json(mapDoc(result));
+    res.json(result);
   } catch (error) { next(error); }
 };
 
 exports.createProductionCut = async (req, res, next) => {
   try {
     const result = await prisma.$transaction((tx) => createProductionCut(tx, { baselineLockId: req.body?.baselineLockId, requestedQty: req.body?.requestedQty, expectedFingerprint: req.body?.expectedFingerprint, reason: req.body?.reason, actor: req.user?.username || req.user?.email || "system" }));
-    res.status(201).json(mapDoc(result));
+    res.status(201).json(result);
   } catch (error) { next(error); }
 };
 
 exports.approveProductionCut = async (req, res, next) => {
   try {
     const result = await prisma.$transaction((tx) => approveProductionCut(tx, { adjustmentNumber: req.params.adjustmentNumber, actor: req.user?.username || req.user?.email || "system" }));
-    res.json(mapDoc(result));
+    res.json(result);
   } catch (error) { next(error); }
 };
 

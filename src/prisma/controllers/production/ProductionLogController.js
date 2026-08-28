@@ -1348,7 +1348,14 @@ async function normalizeProductionLogInput(tx, data = {}, options = {}) {
       { statusCode: 409, code: "PRODUCTION_PLAN_REQUIRED" },
     );
   }
-  if (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId) {
+  const scheduleWorkOrder = schedule.woId
+    ? await tx.workOrder.findFirst({
+        where: { id: schedule.woId, isDeleted: false },
+        select: { isReworkOrder: true },
+      })
+    : null;
+  const isReworkSchedule = scheduleWorkOrder?.isReworkOrder === true;
+  if (!isReworkSchedule && (!schedule.productionPlanId || !schedule.productionPlanAllocationId || !schedule.mbomProcessId)) {
     throw Object.assign(
       new Error("Daily Production Plan belum memiliki trace MPP, allocation, dan routing yang lengkap. Publikasikan ulang dari Capacity Planning."),
       { statusCode: 409, code: "DAILY_PLAN_TRACE_INCOMPLETE" },

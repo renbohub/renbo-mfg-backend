@@ -1,3 +1,5 @@
+const { isOpenForecast } = require("./forecastStatusPolicy");
+
 const EPSILON = 0.000001;
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -131,8 +133,7 @@ async function replaceDeliveryTargets(tx, options) {
     const byId = new Map(selectedForecasts.map((row) => [row.id, row]));
     for (const row of data.filter((item) => item.consumesForecastTargetId)) {
       const forecast = byId.get(row.consumesForecastTargetId);
-      if (!forecast || forecast.forecastDetail?.isDeleted || forecast.forecastDetail?.forecast?.isDeleted
-        || !forecast.forecastDetail?.forecast?.isCurrentVersion || forecast.forecastDetail?.forecast?.status === "Obsolete") {
+      if (!forecast || forecast.forecastDetail?.isDeleted || !isOpenForecast(forecast.forecastDetail?.forecast)) {
         throw Object.assign(new Error("Forecast target yang dipilih sudah tidak aktif. Muat ulang pilihan Forecast."), { statusCode: 409, code: "FORECAST_TARGET_INACTIVE" });
       }
       if (String(forecast.partCode).toUpperCase() !== String(row.partCode).toUpperCase()

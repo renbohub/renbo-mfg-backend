@@ -61,6 +61,14 @@ const materialIssueQty = (value) => Math.round((Number(value || 0) + Number.EPSI
 const hasEnoughMaterialIssueQty = (available, required) => materialIssueQty(available) >= materialIssueQty(required);
 const formatMaterialIssueQty = (value) => materialIssueQty(value).toFixed(3);
 
+function summarizeMaterialIssueChildParts(details = []) {
+  const uniqueText = (values) => [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+  return {
+    childPartCodes: uniqueText(details.map((detail) => detail.partCode || detail.partNumber || detail.product?.productCode)),
+    childPartNames: uniqueText(details.map((detail) => detail.partName || detail.product?.productName || detail.description)),
+  };
+}
+
 function stockMatchesMaterialIssueDetail(balance, detail) {
   if (detail.stockBalanceId && balance.id === detail.stockBalanceId) return true;
   const identityMatch = (detail.partCode && (sameText(balance.partCode, detail.partCode) || sameText(balance.materialCode, detail.partCode)))
@@ -103,25 +111,75 @@ async function attachMaterialIssueStock(doc) {
     },
     orderBy: [{ qtyAvailable: "desc" }, { rackCode: "asc" }, { lotNumber: "asc" }],
   }) : [];
+  const balanceIds = balances.map((balance) => balance.id);
+  const moNumber = doc.manufacturingOrder?.moNumber || doc.moNumber || null;
+  const reservations = balanceIds.length ? await prisma.stockReservation.findMany({
+    where: {
+      stockBalanceId: { in: balanceIds },
+      status: "Active",
+      isDeleted: false,
+      OR: [
+        ...(moNumber ? [{
+          referenceType: "MANUFACTURING_ORDER",
+          OR: [
+            { referenceNumber: moNumber },
+            { referenceNumber: { startsWith: `${moNumber}#` } },
+          ],
+        }] : []),
+        ...(partCodes.length ? [{
+          referenceType: "PART_ALLOCATION",
+          targetPartCode: { in: partCodes, mode: "insensitive" },
+        }] : []),
+      ],
+    },
+    select: {
+      stockBalanceId: true,
+      referenceType: true,
+      referenceNumber: true,
+      targetPartCode: true,
+      qtyReserved: true,
+      qtyReleased: true,
+    },
+  }) : [];
+  const reservedForDetail = (balanceId, detail) => reservations.reduce((total, reservation) => {
+    if (reservation.stockBalanceId !== balanceId) return total;
+    const belongsToMo = reservation.referenceType === "MANUFACTURING_ORDER"
+      && moNumber
+      && (reservation.referenceNumber === moNumber || String(reservation.referenceNumber || "").startsWith(`${moNumber}#`));
+    const belongsToTargetPart = reservation.referenceType === "PART_ALLOCATION"
+      && detail.partCode
+      && sameText(reservation.targetPartCode, detail.partCode);
+    return belongsToMo || belongsToTargetPart
+      ? total + Math.max(Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0), 0)
+      : total;
+  }, 0);
   let enrichedDetails = details.map((detail) => {
     const matched = balances.filter((balance) => stockMatchesMaterialIssueDetail(balance, detail));
     const sum = (key) => matched.reduce((total, balance) => total + Number(balance[key] || 0), 0);
     const requestedQty = Number(detail.qtyRequired || 0);
-    const availableQty = sum("qtyAvailable");
+    const issuableQty = (balance) => Number(balance.qtyAvailable || 0) + reservedForDetail(balance.id, detail);
+    const availableQty = matched.reduce((total, balance) => total + issuableQty(balance), 0);
+    const reservedForIssueQty = matched.reduce((total, balance) => total + reservedForDetail(balance.id, detail), 0);
     const stockType = matched.find((row) => row.stockType)?.stockType || null;
-    const isMaterial = Boolean(matched.some((row) => row.materialId || row.materialCode || /MATERIAL/i.test(row.stockType || "")) || /MATERIAL/i.test(detail.requirementSource || ""));
+    const detailTokens = materialIssueNoteTokens(detail.notes);
+    const isMaterial = Boolean(
+      matched.some((row) => row.materialId || row.materialCode || /MATERIAL/i.test(row.stockType || ""))
+      || /MATERIAL/i.test(detail.requirementSource || "")
+      || /^(RAW|MATERIAL)$/i.test(detailTokens.itemType || "")
+      || detailTokens.material,
+    );
     return {
       ...detail,
       requestedQty,
       itemCategory: isMaterial ? "MATERIAL" : detail.isSubAssembly ? "SUB_ASSEMBLY" : stockType || "PART",
       stockAvailability: {
-        qtyOnHand: sum("qtyOnHand"), qtyReserved: sum("qtyReserved"), qtyQC: sum("qtyQC"), qtyAvailable: availableQty,
+        qtyOnHand: sum("qtyOnHand"), qtyReserved: sum("qtyReserved"), qtyReservedForIssue: reservedForIssueQty, qtyQC: sum("qtyQC"), qtyAvailable: availableQty,
         shortageQty: Math.max(materialIssueQty(requestedQty) - materialIssueQty(availableQty), 0), coveragePercent: requestedQty > 0 ? Math.min(availableQty / requestedQty * 100, 999.99) : 100,
         status: hasEnoughMaterialIssueQty(availableQty, requestedQty) ? "READY" : availableQty > 0 ? "PARTIAL" : "OUT_OF_STOCK",
         balanceCount: matched.length,
         locations: matched.slice(0, 12).map((balance) => ({
           stockBalanceId: balance.id, warehouseCode: balance.warehouseCode, rackCode: balance.rackCode, lotNumber: balance.lotNumber,
-          qtyOnHand: Number(balance.qtyOnHand || 0), qtyReserved: Number(balance.qtyReserved || 0), qtyQC: Number(balance.qtyQC || 0), qtyAvailable: Number(balance.qtyAvailable || 0), uomCode: balance.uomCode,
+          qtyOnHand: Number(balance.qtyOnHand || 0), qtyReserved: Number(balance.qtyReserved || 0), qtyReservedForIssue: reservedForDetail(balance.id, detail), qtyQC: Number(balance.qtyQC || 0), qtyAvailable: issuableQty(balance), uomCode: balance.uomCode,
         })),
       },
     };
@@ -143,6 +201,7 @@ async function attachMaterialIssueStock(doc) {
   for (const group of requirementGroups.values()) {
     group.qtyOnHand = [...group.balances.values()].reduce((sum, row) => sum + Number(row.qtyOnHand || 0), 0);
     group.qtyReserved = [...group.balances.values()].reduce((sum, row) => sum + Number(row.qtyReserved || 0), 0);
+    group.qtyReservedForIssue = [...group.balances.values()].reduce((sum, row) => sum + Number(row.qtyReservedForIssue || 0), 0);
     group.qtyQC = [...group.balances.values()].reduce((sum, row) => sum + Number(row.qtyQC || 0), 0);
     group.qtyAvailable = [...group.balances.values()].reduce((sum, row) => sum + Number(row.qtyAvailable || 0), 0);
     group.shortageQty = Math.max(materialIssueQty(group.requestedQty) - materialIssueQty(group.qtyAvailable), 0);
@@ -158,6 +217,7 @@ async function attachMaterialIssueStock(doc) {
         requestedQty: group.requestedQty,
         qtyOnHand: group.qtyOnHand,
         qtyReserved: group.qtyReserved,
+        qtyReservedForIssue: group.qtyReservedForIssue,
         qtyQC: group.qtyQC,
         qtyAvailable: group.qtyAvailable,
         shortageQty: group.shortageQty,
@@ -170,9 +230,10 @@ async function attachMaterialIssueStock(doc) {
   const totals = new Map();
   for (const group of requirementGroups.values()) {
     const uom = group.uomCode;
-    const current = totals.get(uom) || { uomCode: uom, requestedQty: 0, availableQty: 0, shortageQty: 0 };
+    const current = totals.get(uom) || { uomCode: uom, requestedQty: 0, availableQty: 0, reservedQty: 0, shortageQty: 0 };
     current.requestedQty += Number(group.requestedQty || 0);
     current.availableQty += Number(group.qtyAvailable || 0);
+    current.reservedQty += Number(group.qtyReservedForIssue || 0);
     current.shortageQty += Number(group.shortageQty || 0);
     totals.set(uom, current);
   }
@@ -751,7 +812,18 @@ exports.list = async (req, res, next) => {
           },
           warehouse: { select: { warehouseCode: true, warehouseName: true } },
           _count: { select: { details: true } },
-          details: { where: { isDeleted: false }, select: { qtyRequired: true, qtyIssued: true } },
+          details: {
+            where: { isDeleted: false },
+            select: {
+              partCode: true,
+              partNumber: true,
+              partName: true,
+              description: true,
+              qtyRequired: true,
+              qtyIssued: true,
+              product: { select: { productCode: true, productName: true } },
+            },
+          },
         },
       }),
       prisma.materialIssue.count({ where }),
@@ -775,6 +847,7 @@ exports.list = async (req, res, next) => {
     const scheduleByNumber = new Map(schedules.map((schedule) => [schedule.scheduleNumber, schedule]));
     const preparationStatus = (statusValue) => ({
       Draft: "TO_PREPARE",
+      Preparing: "PREPARING",
       Issued: "ISSUED_TO_PRODUCTION",
       "Partially Returned": "PARTIALLY_RETURNED",
       Closed: "COMPLETED",
@@ -785,8 +858,11 @@ exports.list = async (req, res, next) => {
       items: items.map((item) => {
         const requiredScheduleNumber = String(item.notes || "").match(/\[DPS-CONSUME:([^\]]+)\]/)?.[1] || null;
         const schedule = scheduleByNumber.get(requiredScheduleNumber);
+        const childParts = summarizeMaterialIssueChildParts(item.details);
         return mapDoc({
           ...item,
+          childPartCodes: childParts.childPartCodes.join(", "),
+          childPartNames: childParts.childPartNames.join(", "),
           requiredScheduleNumber,
           requiredDate: schedule?.scheduleDate || item.issueDate,
           requiredShift: schedule?.shift || null,
@@ -795,7 +871,7 @@ exports.list = async (req, res, next) => {
           totalRequiredQty: item.details.reduce((sum, detail) => sum + Number(detail.qtyRequired || 0), 0),
           totalIssuedQty: item.details.reduce((sum, detail) => sum + Number(detail.qtyIssued || 0), 0),
           preparationStatus: preparationStatus(item.status),
-          preparationRequired: item.status === "Draft",
+          preparationRequired: ["Draft", "Preparing"].includes(item.status),
         });
       }),
       total,
@@ -940,8 +1016,8 @@ exports.update = async (req, res, next) => {
     if (existing.status === "Closed") {
       return res.status(409).json({ message: "Material Issue yang sudah ditutup tidak dapat diubah." });
     }
-    if (Array.isArray(details) && existing.status !== "Draft") {
-      return res.status(409).json({ message: "Alokasi lot dan qty hanya dapat diubah saat Material Issue masih Draft." });
+    if (Array.isArray(details) && !["Draft", "Preparing"].includes(existing.status)) {
+      return res.status(409).json({ message: "Alokasi lot dan qty hanya dapat diubah saat Material Issue masih Draft atau Preparing." });
     }
 
     const doc = await prisma.$transaction(async (tx) => {
@@ -999,6 +1075,9 @@ exports.update = async (req, res, next) => {
       return res.status(404).json({ message: "Data Material Issue tidak ditemukan." });
     }
     if (e.statusCode) return res.status(e.statusCode).json({ message: e.message });
+    if (process.env.NODE_ENV !== "production") {
+      return res.status(500).json({ message: `Material Issue gagal diperbarui: ${e.message}` });
+    }
     next(e);
   }
 };
@@ -1083,7 +1162,38 @@ exports.generateNumber = async (req, res, next) => {
   } catch (e) { next(e); }
 };
 
-// Draft → Issued (penerbitan material ke lantai produksi + auto stock deduction)
+// Draft → Preparing (warehouse mulai menyiapkan rack, lot, dan quantity)
+exports.prepare = async (req, res, next) => {
+  try {
+    const existing = await prisma.materialIssue.findUnique({
+      where: { issueNumber: req.params.issueNumber },
+      include: { details: { where: { isDeleted: false } } },
+    });
+    if (!existing || existing.isDeleted) return res.status(404).json({ message: "Data Material Issue tidak ditemukan." });
+    if (existing.status !== "Draft") {
+      return res.status(409).json({ message: `Persiapan Material Issue tidak bisa dimulai dari status "${existing.status}".` });
+    }
+    if (!existing.details.length || !existing.details.some((detail) => Number(detail.qtyIssued || 0) > 0)) {
+      return res.status(409).json({ message: "Simpan minimal satu alokasi rack/lot dengan qty issue sebelum memulai persiapan." });
+    }
+    const updated = await prisma.materialIssue.updateMany({
+      where: { id: existing.id, status: "Draft", isDeleted: false },
+      data: { status: "Preparing" },
+    });
+    if (!updated.count) return res.status(409).json({ message: "Status Material Issue berubah. Muat ulang data sebelum memulai persiapan." });
+    const doc = await prisma.materialIssue.findUnique({
+      where: { id: existing.id },
+      include: {
+        details: { where: { isDeleted: false } },
+        manufacturingOrder: { select: { moNumber: true } },
+        workOrder: { select: { id: true, woNumber: true } },
+      },
+    });
+    res.json(mapDoc(doc));
+  } catch (e) { next(e); }
+};
+
+// Preparing → Issued (persiapan selesai, posting material ke lantai produksi + auto stock deduction)
 exports.issue = async (req, res, next) => {
   try {
     const issuedBy = getAuthenticatedIssuer(req.user);
@@ -1096,7 +1206,7 @@ exports.issue = async (req, res, next) => {
       },
     });
     if (!existing || existing.isDeleted) return res.status(404).json({ message: "Data Material Issue tidak ditemukan." });
-    if (existing.status !== "Draft") {
+    if (existing.status !== "Preparing") {
       return res.status(409).json({ message: `Material Issue tidak bisa diterbitkan dari status "${existing.status}".` });
     }
 

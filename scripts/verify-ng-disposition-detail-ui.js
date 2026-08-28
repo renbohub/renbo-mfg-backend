@@ -3,9 +3,9 @@ const path = require("path");
 
 const root = path.resolve(__dirname, "..");
 const read = (...segments) => fs.readFileSync(path.join(root, ...segments), "utf8");
-const detail = read("..", "frontend", "views", "operations", "detail.ejs");
-const script = read("..", "frontend", "public", "js", "operations-detail.js");
-const css = read("..", "frontend", "public", "css", "production-ng-disposition-detail.css");
+const detail = read("..", "renbo-mfg-frontend", "views", "operations", "detail.ejs");
+const script = read("..", "renbo-mfg-frontend", "public", "js", "operations-detail.js");
+const css = read("..", "renbo-mfg-frontend", "public", "css", "production-ng-disposition-detail.css");
 
 const checks = [
   [

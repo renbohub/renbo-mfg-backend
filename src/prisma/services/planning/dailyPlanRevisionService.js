@@ -1,5 +1,7 @@
 const { prisma } = require("../../index");
 const { validateScheduleItems, summarizeRevision, buildExecutionExceptions } = require("./dailyPlanRevisionDomain");
+const { autoCorrectWorkPlacements } = require("./dailyReleaseSchedulingService");
+const { ensureMaterialIssueDraft } = require("../../controllers/production/DailyProductionScheduleController");
 
 function dateKey(value) {
   const date = value instanceof Date ? value : new Date(`${String(value).slice(0, 10)}T00:00:00.000Z`);
@@ -106,7 +108,7 @@ async function getProductionHandoff(client, range) {
   windowEnd.setUTCDate(windowEnd.getUTCDate() + 62);
   const [upcomingSchedule, upcomingRevision, plan] = await Promise.all([
     client.dailyProductionSchedule.findFirst({
-      where: { scheduleDate: { gte: range.start, lte: windowEnd }, status: { in: ["Draft", "Released", "In Progress", "Completed"] }, shift: { not: "VENDOR" }, isDeleted: false },
+      where: { scheduleDate: { gte: range.start, lte: windowEnd }, status: { in: ["Released", "In Progress", "Completed"] }, shift: { not: "VENDOR" }, isDeleted: false },
       orderBy: [{ scheduleDate: "asc" }, { sequence: "asc" }, { scheduleNumber: "asc" }],
       select: { scheduleNumber: true, scheduleDate: true, status: true, mppNumber: true },
     }),
@@ -191,15 +193,20 @@ async function hydrateSchedules(client, schedules = []) {
 async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
   const range = dayRange(date || new Date());
   const productionMode = String(mode || "").toUpperCase() === "PRODUCTION";
+  const executionStatuses = ["Released", "In Progress", "Completed"];
   const revisions = await client.dailyPlanRevision.findMany({
     where: {
       isDeleted: false,
-      ...(revisionId ? { id: revisionId } : { planDate: { gte: range.start, lte: range.end }, status: productionMode ? "Released" : { not: "Superseded" } }),
+      ...(revisionId
+        ? { id: revisionId }
+        : productionMode
+          ? { planDate: { gte: range.start, lte: range.end }, schedules: { some: { isDeleted: false, status: { in: executionStatuses } } } }
+          : { planDate: { gte: range.start, lte: range.end }, status: { not: "Superseded" } }),
     },
     orderBy: [{ version: "desc" }, { createdAt: "desc" }],
     include: {
       schedules: {
-        where: { isDeleted: false },
+        where: { isDeleted: false, ...(productionMode ? { status: { in: executionStatuses } } : {}) },
         include: {
           productionLogs: {
             where: { isDeleted: false },
@@ -212,9 +219,9 @@ async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
   });
   const revision = revisionId || productionMode
     ? revisions[0]
-    : revisions.find((row) => ["Draft", "Ready"].includes(row.status)) || revisions.find((row) => row.status === "Released") || revisions[0];
+    : revisions.find((row) => ["Draft", "Ready", "Partially Released"].includes(row.status)) || revisions.find((row) => row.status === "Released") || revisions[0];
   const legacy = revision ? [] : await client.dailyProductionSchedule.findMany({
-    where: { scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false, productionPlanId: { not: null }, shift: { not: "VENDOR" } },
+    where: { scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false, productionPlanId: { not: null }, shift: { not: "VENDOR" }, ...(productionMode ? { status: { in: executionStatuses } } : {}) },
     include: { productionLogs: { where: { isDeleted: false }, select: { id: true, logNumber: true, status: true, qtyProduced: true, qtyGood: true, qtyReject: true, qtyRework: true, startTime: true, endTime: true, downtime: true } } },
     orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }],
   });
@@ -285,7 +292,7 @@ async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
 async function createDraft({ date, sourcePlanNumber, userId } = {}) {
   const range = dayRange(date);
   return prisma.$transaction(async (tx) => {
-    const existing = await tx.dailyPlanRevision.findFirst({ where: { planDate: { gte: range.start, lte: range.end }, status: { in: ["Draft", "Ready"] }, isDeleted: false }, orderBy: { version: "desc" } });
+    const existing = await tx.dailyPlanRevision.findFirst({ where: { planDate: { gte: range.start, lte: range.end }, status: { in: ["Draft", "Ready", "Partially Released"] }, isDeleted: false }, orderBy: { version: "desc" } });
     if (existing) {
       await tx.dailyProductionSchedule.updateMany({ where: { scheduleDate: { gte: range.start, lte: range.end }, productionPlanId: { not: null }, dailyPlanRevisionId: null, isDeleted: false }, data: { dailyPlanRevisionId: existing.id } });
       return existing;
@@ -307,11 +314,15 @@ async function updateItem({ revisionId, scheduleId, expectedVersion, changes = {
   return prisma.$transaction(async (tx) => {
     const revision = await tx.dailyPlanRevision.findUnique({ where: { id: revisionId } });
     if (!revision || revision.isDeleted) throw Object.assign(new Error("Revision Daily Plan tidak ditemukan."), { statusCode: 404 });
-    if (revision.status !== "Draft") throw Object.assign(new Error("Revision Released tidak dapat diubah; buat revision baru."), { statusCode: 409, code: "DAILY_PLAN_IMMUTABLE" });
+    if (!["Draft", "Ready", "Partially Released"].includes(revision.status)) throw Object.assign(new Error("Revision Released tidak dapat diubah; buat revision baru."), { statusCode: 409, code: "DAILY_PLAN_IMMUTABLE" });
     if (expectedVersion != null && Number(expectedVersion) !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Muat ulang revision terbaru."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+    const existingSchedule = await tx.dailyProductionSchedule.findFirst({ where: { id: scheduleId, dailyPlanRevisionId: revisionId, isDeleted: false } });
+    if (!existingSchedule) throw Object.assign(new Error("Operation Daily Plan tidak ditemukan."), { statusCode: 404 });
+    if (existingSchedule.status !== "Draft") throw Object.assign(new Error("Operation yang sudah direlease tidak dapat diubah."), { statusCode: 409, code: "DAILY_PLAN_ITEM_IMMUTABLE" });
     const data = Object.fromEntries(allowed.filter((key) => changes[key] !== undefined).map((key) => [key, changes[key]]));
     const schedule = await tx.dailyProductionSchedule.update({ where: { id: scheduleId }, data });
-    await tx.dailyPlanRevision.update({ where: { id: revisionId }, data: { version: { increment: 1 }, validationSummary: null } });
+    const releasedCount = await tx.dailyProductionSchedule.count({ where: { dailyPlanRevisionId: revisionId, isDeleted: false, status: { in: ["Released", "In Progress", "Completed"] } } });
+    await tx.dailyPlanRevision.update({ where: { id: revisionId }, data: { version: { increment: 1 }, validationSummary: null, status: releasedCount ? "Partially Released" : "Draft" } });
     return schedule;
   });
 }
@@ -320,23 +331,252 @@ async function validateRevision(revisionId) {
   const revision = await prisma.dailyPlanRevision.findUnique({ where: { id: revisionId }, include: { schedules: { where: { isDeleted: false } } } });
   if (!revision || revision.isDeleted) throw Object.assign(new Error("Revision Daily Plan tidak ditemukan."), { statusCode: 404 });
   const validation = validateScheduleItems(revision.schedules);
-  await prisma.dailyPlanRevision.update({ where: { id: revisionId }, data: { validationSummary: validation, status: validation.blockers.length ? "Draft" : "Ready" } });
+  const releasedCount = revision.schedules.filter((item) => ["Released", "In Progress", "Completed"].includes(item.status)).length;
+  await prisma.dailyPlanRevision.update({ where: { id: revisionId }, data: { validationSummary: validation, status: releasedCount ? "Partially Released" : validation.blockers.length ? "Draft" : "Ready" } });
   return validation;
+}
+
+function placementHorizon(value, days = 31) {
+  const range = dayRange(value);
+  const end = new Date(range.end);
+  end.setUTCDate(end.getUTCDate() + Math.max(Number(days) || 0, 0));
+  return { ...range, end };
+}
+
+async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId } = {}) {
+  const range = dayRange(date || new Date());
+  const revision = revisionId
+    ? await prisma.dailyPlanRevision.findFirst({ where: { id: revisionId, isDeleted: false }, include: { schedules: { where: { isDeleted: false }, orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }] } } })
+    : await prisma.dailyPlanRevision.findFirst({ where: { planDate: { gte: range.start, lte: range.end }, status: { in: ["Draft", "Ready", "Partially Released"] }, isDeleted: false }, orderBy: { version: "desc" }, include: { schedules: { where: { isDeleted: false }, orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }] } } });
+
+  if (revision) {
+    if (!["Draft", "Ready", "Partially Released"].includes(revision.status)) throw Object.assign(new Error("Daily Plan Released tidak dapat dikoreksi otomatis."), { statusCode: 409, code: "DAILY_PLAN_IMMUTABLE" });
+    if (expectedVersion != null && Number(expectedVersion) !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Muat ulang sebelum Auto Correct."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+    // Auto Correct must be able to roll long operations into the following
+    // working day. Limiting work windows to the selected date leaves valid
+    // successors in their old (and dependency-invalid) positions.
+    const windowsByMachine = await placementWindowsByMachine(prisma, placementHorizon(range.start), revision.schedules);
+    const result = autoCorrectWorkPlacements(revision.schedules.map((item) => ({ ...item, movable: item.status === "Draft" })), { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+    if (!result.changes.length) return { scope: "DAILY_REVISION", changedCount: 0, warnings: result.warnings, revisionId: revision.id };
+    const correctedById = new Map(result.items.map((item) => [item.id, item]));
+    const updated = await prisma.$transaction(async (tx) => {
+      const current = await tx.dailyPlanRevision.findUnique({ where: { id: revision.id } });
+      if (!current || current.version !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Muat ulang sebelum Auto Correct."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+      for (const change of result.changes) {
+        const corrected = correctedById.get(change.id);
+        await tx.dailyProductionSchedule.updateMany({
+          where: { id: change.id, dailyPlanRevisionId: revision.id, status: "Draft", isDeleted: false },
+          data: { scheduleDate: corrected.scheduleDate, plannedStartTime: corrected.plannedStartTime, plannedEndTime: corrected.plannedEndTime, shift: corrected.shift, notes: [change.notes, `[AUTO-CORRECT:${userId || "system"}]`].filter(Boolean).join("; ") },
+        });
+      }
+      return tx.dailyPlanRevision.update({ where: { id: revision.id }, data: { version: { increment: 1 }, validationSummary: null, status: revision.schedules.some((item) => ["Released", "In Progress", "Completed"].includes(item.status)) ? "Partially Released" : "Draft" } });
+    });
+    return { scope: "DAILY_REVISION", changedCount: result.changes.length, warnings: result.warnings, revisionId: revision.id, version: updated.version };
+  }
+
+  const horizon = placementHorizon(range.start);
+  const legacySchedules = await prisma.dailyProductionSchedule.findMany({
+    where: { scheduleDate: { gte: horizon.start, lte: horizon.end }, isDeleted: false, productionPlanId: { not: null }, shift: { not: "VENDOR" }, status: { in: ["Draft", "Released", "In Progress", "Completed"] } },
+    orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }],
+  });
+  const currentLegacySchedules = legacySchedules.filter((item) => dateKey(item.scheduleDate) === range.key);
+  if (currentLegacySchedules.length) {
+    const windowsByMachine = await placementWindowsByMachine(prisma, horizon, legacySchedules);
+    const result = autoCorrectWorkPlacements(legacySchedules.map((item) => ({ ...item, movable: dateKey(item.scheduleDate) === range.key && item.status === "Draft" })), { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+    if (!result.changes.length) return { scope: "LEGACY_DAILY_PLAN", changedCount: 0, warnings: result.warnings };
+    const correctedById = new Map(result.items.map((item) => [item.id, item]));
+    await prisma.$transaction(async (tx) => {
+      for (const change of result.changes) {
+        const corrected = correctedById.get(change.id);
+        await tx.dailyProductionSchedule.updateMany({
+          where: { id: change.id, status: "Draft", isDeleted: false },
+          data: { scheduleDate: corrected.scheduleDate, plannedStartTime: corrected.plannedStartTime, plannedEndTime: corrected.plannedEndTime, shift: corrected.shift, notes: [change.notes, `[AUTO-CORRECT:${userId || "system"}]`].filter(Boolean).join("; ") },
+        });
+      }
+    });
+    return { scope: "LEGACY_DAILY_PLAN", changedCount: result.changes.length, warnings: result.warnings };
+  }
+
+  const allocations = await prisma.productionPlanAllocation.findMany({
+    where: { scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false, planningMode: "PRODUCTION", routingMode: "INHOUSE", status: "Draft" },
+    include: { plan: { select: { id: true, planNumber: true, status: true } }, mbomProcess: { select: { sequence: true, mbomDetail: { select: { part: { select: { partCode: true } } } } } } },
+    orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { lineNumber: "asc" }],
+  });
+  if (!allocations.length) throw Object.assign(new Error("Tidak ada allocation Draft yang dapat dikoreksi pada tanggal ini."), { statusCode: 404, code: "DAILY_PLACEMENT_NOT_FOUND" });
+  const lockedPlan = allocations.find((item) => !["Draft", "Confirmed"].includes(item.plan?.status));
+  if (lockedPlan) throw Object.assign(new Error(`${lockedPlan.plan?.planNumber || "Monthly Plan"} ${lockedPlan.plan?.status || "terkunci"}; placement tidak dapat diubah.`), { statusCode: 409, code: "MONTHLY_PLAN_IMMUTABLE" });
+  const prepared = allocations.map((item) => ({
+    ...item,
+    partCode: item.mbomProcess?.mbomDetail?.part?.partCode || null,
+    sequence: item.mbomProcess?.sequence || item.lineNumber,
+    movable: true,
+  }));
+  const windowsByMachine = await placementWindowsByMachine(prisma, range, prepared);
+  const result = autoCorrectWorkPlacements(prepared, { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+  if (!result.changes.length) return { scope: "ALLOCATION_PREVIEW", changedCount: 0, warnings: result.warnings, planNumbers: [...new Set(allocations.map((item) => item.plan.planNumber))] };
+  const correctedById = new Map(result.items.map((item) => [item.id, item]));
+  await prisma.$transaction(async (tx) => {
+    for (const change of result.changes) {
+      const corrected = correctedById.get(change.id);
+      await tx.productionPlanAllocation.updateMany({
+        where: { id: change.id, status: "Draft", isDeleted: false },
+        data: { scheduleDate: corrected.scheduleDate, plannedStartTime: corrected.plannedStartTime, plannedEndTime: corrected.plannedEndTime, shift: corrected.shift, allocationSource: "MANUAL", recommendationReason: `Placement dikoreksi otomatis dari Daily Plan oleh ${userId || "system"}.`, recommendationScore: null, recommendationScoreBreakdown: null },
+      });
+    }
+  });
+  return { scope: "ALLOCATION_PREVIEW", changedCount: result.changes.length, warnings: result.warnings, planNumbers: [...new Set(allocations.map((item) => item.plan.planNumber))] };
+}
+
+function placementWindowsForMachine(machine = {}, override = null, scheduleDate = new Date()) {
+  if (["HOLIDAY", "CLOSED", "UNAVAILABLE", "OFF"].includes(String(override?.dayStatus || "WORKING").toUpperCase())) return [];
+  const day = new Date(scheduleDate).getUTCDay() || 7;
+  const profileRules = (machine.workingHourProfile?.rules || [])
+    .filter((rule) => Number(rule.dayOfWeek) === day && rule.isEnabled !== false)
+    .sort((left, right) => Number(left.shift?.sequence || 0) - Number(right.shift?.sequence || 0));
+  const machineShifts = [1, 2, 3].map((shift) => ({ shift: String(shift), startTime: machine[`shift${shift}Start`], endTime: machine[`shift${shift}End`] })).filter((row) => row.startTime && row.endTime);
+  const fallbackShifts = [
+    { shift: "1", startTime: "08:00", endTime: "16:00" },
+    { shift: "2", startTime: "16:00", endTime: "00:00" },
+    { shift: "3", startTime: "00:00", endTime: "08:00" },
+  ];
+  const overrideShifts = Array.isArray(override?.shiftOverrides) ? override.shiftOverrides : [];
+  const hasWorkingProfileRules = Boolean(machine.workingHourProfile?.rules?.length);
+  if (!overrideShifts.length && hasWorkingProfileRules && !profileRules.length) return [];
+  const usingFallback = !overrideShifts.length && !profileRules.length && !machineShifts.length;
+  if (usingFallback && [6, 7].includes(day)) return [];
+  const base = overrideShifts.length
+    ? overrideShifts.map((row, index) => ({ ...row, shift: String(index + 1) }))
+    : profileRules.length
+      ? profileRules.map((rule, index) => ({ shift: String(index + 1), startTime: rule.startTime, endTime: rule.endTime }))
+      : machineShifts.length ? machineShifts : fallbackShifts;
+  const shiftCount = Math.min(Math.max(Number(override?.shiftsPerDay ?? (usingFallback ? 2 : base.length)) || 1, 1), 3);
+  const windows = [];
+  base.slice(0, shiftCount).forEach((row, index) => {
+    const shift = String(row.shift || index + 1);
+    if (row.overtimeBeforeStart && row.overtimeBeforeEnd) windows.push({ shift, startTime: row.overtimeBeforeStart, endTime: row.overtimeBeforeEnd });
+    if (row.startTime && row.endTime) windows.push({ shift, startTime: row.startTime, endTime: row.endTime });
+    if (row.overtimeAfterStart && row.overtimeAfterEnd) windows.push({ shift, startTime: row.overtimeAfterStart, endTime: row.overtimeAfterEnd });
+  });
+  if (override?.overtimeStart && override?.overtimeEnd) windows.push({ shift: String(shiftCount), startTime: override.overtimeStart, endTime: override.overtimeEnd });
+  return windows.filter((row, index, rows) => rows.findIndex((candidate) => candidate.shift === row.shift && candidate.startTime === row.startTime && candidate.endTime === row.endTime) === index);
+}
+
+async function placementWindowsByMachine(client, range, items) {
+  const machineIds = [...new Set(items.map((item) => item.machineId).filter(Boolean))];
+  const planIds = [...new Set(items.map((item) => item.planId || item.productionPlanId).filter(Boolean))];
+  const [machines, planOverrides, globalOverrides] = await Promise.all([
+    machineIds.length ? client.machine.findMany({
+      where: { id: { in: machineIds }, isDeleted: false },
+      select: { id: true, shift1Start: true, shift1End: true, shift2Start: true, shift2End: true, shift3Start: true, shift3End: true, workingHourProfile: { select: { rules: { include: { shift: true } } } } },
+    }) : [],
+    planIds.length ? client.capacityDayOverride.findMany({ where: { planId: { in: planIds }, scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false } }) : [],
+    machineIds.length ? client.capacityCalendarOverride.findMany({ where: { machineId: { in: machineIds }, scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false } }) : [],
+  ]);
+  const machineById = new Map(machines.map((row) => [row.id, row]));
+  const globalByMachine = new Map(globalOverrides.map((row) => [`${dateKey(row.scheduleDate)}|${row.machineId}`, row]));
+  const contextByMachine = new Map();
+  items.forEach((item) => {
+    if (!item.machineId || contextByMachine.has(item.machineId)) return;
+    contextByMachine.set(item.machineId, { planId: item.planId || item.productionPlanId || null });
+  });
+  const windows = new Map();
+  for (let cursor = new Date(range.start); cursor <= range.end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    const scheduleDate = new Date(cursor);
+    const scheduleKey = dateKey(scheduleDate);
+    contextByMachine.forEach((context, machineId) => {
+      const planOverride = planOverrides.find((row) => dateKey(row.scheduleDate) === scheduleKey && row.planId === context.planId && row.machineId === machineId)
+        || planOverrides.find((row) => dateKey(row.scheduleDate) === scheduleKey && row.planId === context.planId && !row.machineId)
+        || null;
+      const key = `${scheduleKey}|${machineId}`;
+      windows.set(key, placementWindowsForMachine(machineById.get(machineId), planOverride || globalByMachine.get(key), scheduleDate));
+    });
+  }
+  return windows;
+}
+
+function validationForSchedule(schedule, schedules) {
+  const fullValidation = validateScheduleItems(schedules);
+  const belongsToSchedule = (issue) => issue.scheduleNumber === schedule.scheduleNumber || issue.conflictScheduleNumber === schedule.scheduleNumber;
+  return {
+    blockers: fullValidation.blockers.filter(belongsToSchedule),
+    warnings: fullValidation.warnings.filter((issue) => issue.scheduleNumber === schedule.scheduleNumber),
+  };
+}
+
+async function releaseSchedule({ revisionId, scheduleId, expectedVersion, warningReason, userId }) {
+  return prisma.$transaction(async (tx) => {
+    const revision = await tx.dailyPlanRevision.findUnique({ where: { id: revisionId }, include: { schedules: { where: { isDeleted: false } } } });
+    if (!revision || revision.isDeleted) throw Object.assign(new Error("Revision Daily Plan tidak ditemukan."), { statusCode: 404 });
+    if (!["Draft", "Ready", "Partially Released"].includes(revision.status)) throw Object.assign(new Error("Revision ini tidak menerima release operation baru."), { statusCode: 409 });
+    if (expectedVersion != null && Number(expectedVersion) !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Muat ulang sebelum release operation."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+    const schedule = revision.schedules.find((item) => item.id === scheduleId);
+    if (!schedule) throw Object.assign(new Error("Operation Daily Plan tidak ditemukan."), { statusCode: 404 });
+    if (schedule.status !== "Draft") throw Object.assign(new Error("Operation ini sudah direlease ke Production."), { statusCode: 409, code: "DAILY_PLAN_ITEM_ALREADY_RELEASED" });
+    const validation = validationForSchedule(schedule, revision.schedules);
+    if (validation.blockers.length) throw Object.assign(new Error("Operation masih memiliki blocker."), { statusCode: 409, code: "DAILY_PLAN_ITEM_VALIDATION_BLOCKED", validation });
+    if (validation.warnings.length && !String(warningReason || "").trim()) throw Object.assign(new Error("Alasan acknowledgement wajib diisi untuk warning operation ini."), { statusCode: 400, code: "WARNING_REASON_REQUIRED", validation });
+
+    await tx.dailyPlanRevision.updateMany({ where: { planDate: revision.planDate, status: "Released", isDeleted: false, id: { not: revision.id } }, data: { status: "Superseded" } });
+    const releasedSchedule = await tx.dailyProductionSchedule.update({ where: { id: schedule.id }, data: { status: "Released" } });
+    if (releasedSchedule.woId) {
+      await tx.workOrder.updateMany({
+        where: { id: releasedSchedule.woId, isDeleted: false, status: { in: ["Draft", "Planned"] } },
+        data: { status: "Released" },
+      });
+      await ensureMaterialIssueDraft(tx, releasedSchedule, userId || "system", { allowShortage: true });
+    }
+    const remainingCount = revision.schedules.filter((item) => item.id !== schedule.id && item.status === "Draft").length;
+    const nextStatus = remainingCount ? "Partially Released" : "Released";
+    const updatedRevision = await tx.dailyPlanRevision.update({
+      where: { id: revision.id },
+      data: {
+        status: nextStatus,
+        version: { increment: 1 },
+        validationSummary: validateScheduleItems(revision.schedules.map((item) => item.id === schedule.id ? { ...item, status: "Released" } : item)),
+        warningReason: warningReason || revision.warningReason || null,
+        releasedBy: userId || revision.releasedBy || null,
+        releasedAt: nextStatus === "Released" ? new Date() : revision.releasedAt,
+      },
+    });
+    return { revision: updatedRevision, schedule: releasedSchedule, validation };
+  });
 }
 
 async function releaseRevision({ revisionId, expectedVersion, warningReason, userId }) {
   return prisma.$transaction(async (tx) => {
     const revision = await tx.dailyPlanRevision.findUnique({ where: { id: revisionId }, include: { schedules: { where: { isDeleted: false } } } });
     if (!revision || revision.isDeleted) throw Object.assign(new Error("Revision Daily Plan tidak ditemukan."), { statusCode: 404 });
-    if (!['Draft', 'Ready'].includes(revision.status)) throw Object.assign(new Error("Hanya revision Draft/Ready yang dapat dirilis."), { statusCode: 409 });
-    if (expectedVersion != null && Number(expectedVersion) !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Validasi ulang sebelum release."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+    if (!["Draft", "Ready", "Partially Released"].includes(revision.status)) throw Object.assign(new Error("Revision ini tidak menerima release baru."), { statusCode: 409, code: "DAILY_PLAN_IMMUTABLE" });
+    if (expectedVersion != null && Number(expectedVersion) !== revision.version) throw Object.assign(new Error("Daily Plan telah berubah. Muat ulang sebelum Release Semua."), { statusCode: 409, code: "REVISION_VERSION_CONFLICT" });
+    const draftSchedules = revision.schedules.filter((item) => item.status === "Draft");
+    if (!draftSchedules.length) throw Object.assign(new Error("Tidak ada operation Draft yang perlu direlease."), { statusCode: 409, code: "DAILY_PLAN_NOTHING_TO_RELEASE" });
     const validation = validateScheduleItems(revision.schedules);
-    if (validation.blockers.length) throw Object.assign(new Error("Daily Plan masih memiliki blocker."), { statusCode: 409, code: "DAILY_PLAN_VALIDATION_BLOCKED", validation });
-    if (validation.warnings.length && !String(warningReason || "").trim()) throw Object.assign(new Error("Alasan acknowledgement wajib diisi untuk warning."), { statusCode: 400, code: "WARNING_REASON_REQUIRED", validation });
+    if (validation.blockers.length) throw Object.assign(new Error("Daily Plan masih memiliki blocker. Jalankan Cek Kesiapan dan perbaiki blocker sebelum release."), { statusCode: 409, code: "DAILY_PLAN_VALIDATION_BLOCKED", validation });
+    if (validation.warnings.length && !String(warningReason || "").trim()) throw Object.assign(new Error("Acknowledgement wajib diisi untuk release Daily Plan yang memiliki warning."), { statusCode: 400, code: "WARNING_REASON_REQUIRED", validation });
+
     await tx.dailyPlanRevision.updateMany({ where: { planDate: revision.planDate, status: "Released", isDeleted: false, id: { not: revision.id } }, data: { status: "Superseded" } });
-    await tx.dailyProductionSchedule.updateMany({ where: { dailyPlanRevisionId: revision.id, isDeleted: false }, data: { status: "Released" } });
-    return tx.dailyPlanRevision.update({ where: { id: revision.id }, data: { status: "Released", validationSummary: validation, warningReason: warningReason || null, releasedBy: userId || null, releasedAt: new Date() } });
+    const draftIds = draftSchedules.map((item) => item.id);
+    await tx.dailyProductionSchedule.updateMany({ where: { id: { in: draftIds }, status: "Draft", isDeleted: false }, data: { status: "Released" } });
+    const woIds = [...new Set(draftSchedules.map((item) => item.woId).filter(Boolean))];
+    if (woIds.length) await tx.workOrder.updateMany({ where: { id: { in: woIds }, isDeleted: false, status: { in: ["Draft", "Planned"] } }, data: { status: "Released" } });
+    for (const schedule of draftSchedules) {
+      if (!schedule.woId) continue;
+      await ensureMaterialIssueDraft(tx, { ...schedule, status: "Released" }, userId || "system", { allowShortage: true });
+    }
+    const releasedSchedules = revision.schedules.map((item) => item.status === "Draft" ? { ...item, status: "Released" } : item);
+    const updatedRevision = await tx.dailyPlanRevision.update({
+      where: { id: revision.id },
+      data: {
+        status: "Released",
+        version: { increment: 1 },
+        validationSummary: validateScheduleItems(releasedSchedules),
+        warningReason: warningReason || revision.warningReason || null,
+        releasedBy: userId || revision.releasedBy || null,
+        releasedAt: new Date(),
+      },
+    });
+    return { revision: updatedRevision, releasedCount: draftSchedules.length, validation };
   });
 }
 
-module.exports = { buildRevisionNumber, copyScheduleData, productionHandoffView, getWorkspace, createDraft, updateItem, validateRevision, releaseRevision };
+module.exports = { buildRevisionNumber, copyScheduleData, productionHandoffView, placementWindowsForMachine, placementWindowsByMachine, getWorkspace, createDraft, autoCorrectPlacement, updateItem, validateRevision, validationForSchedule, releaseSchedule, releaseRevision };

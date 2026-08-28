@@ -6340,7 +6340,7 @@ model IncomingInspection {
   inspectionDate   DateTime  @default(now()) @map("inspection_date")
   grNumber         String    @map("gr_number")
   status           String    @default("Open") // Open, In Progress, Completed, Cancelled
-  decision         String    @default("Pending") // Pending, Accepted, Partially Accepted, Rejected
+  decision         String    @default("Pending") // Pending, Accepted, Partially Accepted, Rejected, QC Bypassed
   inspectedBy      String?   @map("inspected_by")
   approvedBy       String?   @map("approved_by")
   approvedAt       DateTime? @map("approved_at")
@@ -6679,7 +6679,7 @@ model DailyPlanRevision {
   revisionNumber         String    @unique @map("revision_number")
   planDate               DateTime  @map("plan_date")
   version                Int       @default(1)
-  status                 String    @default("Draft") // Draft, Ready, Released, Superseded, Cancelled
+  status                 String    @default("Draft") // Draft, Ready, Partially Released, Released, Superseded, Cancelled
   sourceProductionPlanId String?   @map("source_production_plan_id")
   sourcePlanNumber       String?   @map("source_plan_number")
   supersedesId           String?   @map("supersedes_id")
@@ -7121,7 +7121,7 @@ model MaterialIssue {
   warehouseCode String   @map("warehouse_code")
   issuedBy      String?  @map("issued_by")
   receivedBy    String?  @map("received_by")
-  // Draft / Issued / Partially Returned / Closed
+  // Draft / Preparing / Issued / Partially Returned / Closed
   status        String   @default("Draft")
   notes         String?
   isDeleted     Boolean  @default(false) @map("is_deleted")

@@ -216,12 +216,13 @@ async function buildFgCompStockTraceability(prisma, options = {}) {
   const asOf = options.asOf ? new Date(options.asOf) : new Date();
   const warehouseCode = String(options.warehouseCode || "").trim();
   const search = String(options.q || "").trim().toLowerCase();
+  const requestedPartCodes = [...new Set((options.partCodes || []).map((value) => String(value || "").trim()).filter(Boolean))];
   const [roots, headers] = await Promise.all([
     prisma.part.findMany({
       // Inventory matrix must be usable for every finished good. Child FG
       // components are still exploded recursively, while ordinary/non-COMP FG
       // can now be selected as the report root as well.
-      where: { itemType: "FG", isDeleted: false },
+      where: { itemType: "FG", isDeleted: false, ...(requestedPartCodes.length ? { partCode: { in: requestedPartCodes } } : {}) },
       select: { id: true, partCode: true, partNumber: true, partName: true, stockUomCode: true },
       orderBy: [{ partCode: "asc" }],
     }),

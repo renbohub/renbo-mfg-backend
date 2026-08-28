@@ -187,8 +187,71 @@ async function resolvePurchaseSuggestionSupplierMaster(db, item, supplierCodeInp
   };
 }
 
+async function findPricedPurchaseSuggestionSupplierMaster(db, item, options = {}) {
+  const lookupDate = options.asOf ? new Date(options.asOf) : new Date();
+  if (Number.isNaN(lookupDate.getTime())) {
+    throw Object.assign(new Error("Tanggal lookup master supplier tidak valid."), { status: 400 });
+  }
+  const material = item.materialId ? await db.material.findFirst({
+    where: { id: item.materialId, isDeleted: false },
+    select: { id: true, materialSubstanceId: true, materialGradeId: true, thickness: true },
+  }) : null;
+  const materialPriceWhere = material ? {
+    isDeleted: false,
+    isActive: true,
+    supplierId: { not: null },
+    OR: [
+      { materialId: material.id },
+      ...(material.materialSubstanceId && material.materialGradeId ? [{
+        materialId: null,
+        materialSubstanceId: material.materialSubstanceId,
+        materialGradeId: material.materialGradeId,
+        OR: [{ thickness: null }, { thickness: material.thickness }],
+      }] : []),
+    ],
+  } : null;
+  const [supplierItems, partPrices, materialPrices] = await Promise.all([
+    item.partId ? db.supplierItem.findMany({
+      where: { partId: item.partId, isActive: true },
+      orderBy: [{ isPreferred: "desc" }, { priority: "asc" }, { updatedAt: "desc" }],
+      select: { validFrom: true, validUntil: true, supplier: { select: { supplierCode: true, status: true, isDeleted: true } } },
+    }) : [],
+    item.partId ? db.partPriceList.findMany({
+      where: { partId: item.partId, supplierId: { not: null }, isDeleted: false, isActive: true },
+      orderBy: [{ effectiveFrom: "desc" }, { updatedAt: "desc" }],
+      select: { supplier: { select: { supplierCode: true, status: true, isDeleted: true } } },
+    }) : [],
+    materialPriceWhere ? db.materialPriceList.findMany({
+      where: materialPriceWhere,
+      orderBy: [{ effectiveFrom: "desc" }, { updatedAt: "desc" }],
+      select: { supplier: { select: { supplierCode: true, status: true, isDeleted: true } } },
+    }) : [],
+  ]);
+  const activeSupplierCode = (row) => row?.supplier && !row.supplier.isDeleted && row.supplier.status !== "Inactive"
+    ? row.supplier.supplierCode
+    : null;
+  const supplierCodes = [...new Set([
+    item.alternativeSupplierCode,
+    item.suggestedSupplierCode,
+    ...supplierItems.filter((row) => supplierItemIsEffective(row, lookupDate)).map(activeSupplierCode),
+    ...partPrices.map(activeSupplierCode),
+    ...materialPrices.map(activeSupplierCode),
+  ].filter(Boolean))];
+
+  for (const supplierCode of supplierCodes) {
+    try {
+      const master = await resolvePurchaseSuggestionSupplierMaster(db, item, supplierCode, { asOf: lookupDate });
+      if (asNumber(master?.unitPrice) > 0) return { master, supplierCodes };
+    } catch (error) {
+      if (![400, 404].includes(error.status)) throw error;
+    }
+  }
+  return { master: null, supplierCodes };
+}
+
 module.exports = {
   normalizePurchaseFormCode,
   resolveBomPurchaseDefaults,
   resolvePurchaseSuggestionSupplierMaster,
+  findPricedPurchaseSuggestionSupplierMaster,
 };

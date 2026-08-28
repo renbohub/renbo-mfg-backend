@@ -5,6 +5,7 @@ const { logger } = require("../../middleware/logger");
 router.get("/dashboard", authorize("purchaseOrder", "read"), ctrl.dashboard);
 router.get("/goods-receipts/allocation-plan/:poNumber", authorize("purchaseOrder", "read"), ctrl.getAllocationPlan);
 router.post("/goods-receipts", authorize("purchaseOrder", "create"), logger("goods-receipt", "create"), ctrl.receivePurchaseOrder);
+router.post("/goods-receipts/:grNumber/release-without-qc", authorize("purchaseOrder", "update"), logger("goods-receipt", "release-without-qc"), ctrl.releaseWithoutInspection);
 router.post("/incoming-inspections", authorize("purchaseOrder", "create"), logger("incoming-inspection", "create"), ctrl.createInspection);
 router.post("/incoming-inspections/:inspectionNumber/complete", authorize("purchaseOrder", "update"), logger("incoming-inspection", "complete"), ctrl.completeInspection);
 router.post("/incoming-inspections/:inspectionNumber/putaway", authorize("purchaseOrder", "update"), logger("incoming-inspection", "putaway"), ctrl.putawayAccepted);

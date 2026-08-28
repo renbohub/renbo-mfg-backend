@@ -131,6 +131,10 @@ function evaluateBuffer(formulas, variables) {
   return Math.max(result, 0);
 }
 
+function resolveBufferBaseQty({ nextEfd, yearlyEfdLookahead, forecastLookaheadQty }) {
+  return number(nextEfd?.value ?? yearlyEfdLookahead ?? forecastLookaheadQty);
+}
+
 function fgFinishSplitsForTarget(target, decision, uomCode) {
   const targetQty = normalizeQuantity(target?.qty, uomCode);
   const raw = Array.isArray(decision?.fgFinishSplits)
@@ -469,6 +473,19 @@ function effectiveDeliveryTargets(bucket) {
   });
 }
 
+// A Forecast-selected EFD keeps the firm SO phases and the unconsumed
+// Forecast residual. consumeDeliveryTargets() has already netted SO against
+// Forecast FIFO, so retaining Forecast rows here does not duplicate demand.
+// For PO-selected EFD, only the firm SO phases are customer commitments.
+function customerDeliveryTargets({ targets = [], actualSalesOrderQty = 0, efdSource = null } = {}) {
+  const salesOrderTargets = targets.filter((target) => String(target?.sourceType || "").toUpperCase() === "SALES_ORDER");
+  const forecastSelected = String(efdSource || "").toUpperCase().startsWith("FORECAST");
+  const forecastTargets = targets.filter((target) => String(target?.sourceType || "").toUpperCase() === "FORECAST");
+  if (forecastSelected) return [...salesOrderTargets, ...forecastTargets];
+  if (number(actualSalesOrderQty) > 0 || salesOrderTargets.length) return salesOrderTargets;
+  return [];
+}
+
 async function nextMonthlyMpsNumber(tx, month) {
   const preferred = `MPS-${month.replace("-", "")}`;
   const occupied = await tx.mPS.findUnique({ where: { mpsNumber: preferred }, select: { sourceKey: true } });
@@ -569,16 +586,18 @@ async function syncMonthlyMps(tx, options = {}) {
   const formulas = await getFormulaSet(tx, "planning");
   const partCodes = uniq([...buckets.values()].map((row) => row.partCode));
   const historyMonths = uniq(monthKeys.flatMap((month) => [previousPlanningMonthKey(month), month]));
-  const historyYears = uniq(historyMonths.map((month) => Number(month.slice(0, 4))));
+  const bufferLookaheadMonths = uniq(monthKeys.map((month) => nextPlanningMonthKey(month)));
+  const demandReferenceMonths = uniq([...historyMonths, ...bufferLookaheadMonths]);
+  const historyYears = uniq(demandReferenceMonths.map((month) => Number(month.slice(0, 4))));
   const [historyPayloads, deliveryPerformances] = await Promise.all([
     Promise.all(historyYears.map((year) => buildYearlyDemand(tx, { year, unpaginated: true }))),
     Promise.all(monthKeys.map((month) => buildDeliveryPerformance(tx, { month, partCodes }))),
   ]);
-  const historicalEfdByPartMonth = new Map();
+  const referenceEfdByPartMonth = new Map();
   for (const payload of historyPayloads) {
     for (const row of payload.items || []) {
-      for (const month of historyMonths) {
-        if (row.months?.[month]) historicalEfdByPartMonth.set(`${month}|${row.partCode}`, number(row.months[month].efd ?? row.months[month].eff));
+      for (const month of demandReferenceMonths) {
+        if (row.months?.[month]) referenceEfdByPartMonth.set(`${month}|${row.partCode}`, number(row.months[month].efd ?? row.months[month].eff));
       }
     }
   }
@@ -720,7 +739,11 @@ async function syncMonthlyMps(tx, options = {}) {
       // time, but it must still drive the current month's safety buffer.
       const nextForecastKey = `${nextPlanningMonthKey(month)}|${bucket.partCode}`;
       const nextEfd = efdByPartMonth.get(nextForecastKey);
-      const bufferBaseQty = number(nextEfd?.value ?? forecastLookahead.get(nextForecastKey));
+      const bufferBaseQty = resolveBufferBaseQty({
+        nextEfd,
+        yearlyEfdLookahead: referenceEfdByPartMonth.get(nextForecastKey),
+        forecastLookaheadQty: forecastLookahead.get(nextForecastKey),
+      });
       const bufferPercent = existing?.bufferOverridden
         ? number(existing.bufferPercent)
         : Math.max(number(bucket.part?.bufferStock), 0);
@@ -747,11 +770,16 @@ async function syncMonthlyMps(tx, options = {}) {
         partCode: bucket.partCode,
         month,
       }, efdConfiguration);
+      const deliveryTargets = customerDeliveryTargets({
+        targets: effectiveTargets,
+        actualSalesOrderQty,
+        efdSource: currentEfd.source,
+      });
       // EFD M is the current bucket. Undelivered EFD M-1 is carried into the
       // official gross demand, while EFD M+1 remains the buffer reference.
       const policyDemandQty = normalizeQuantity(currentEfd.value, uomCode);
       const previousMonth = previousPlanningMonthKey(month);
-      const previousEfdQty = normalizeQuantity(historicalEfdByPartMonth.get(`${previousMonth}|${bucket.partCode}`) || efdByPartMonth.get(`${previousMonth}|${bucket.partCode}`)?.value || 0, uomCode);
+      const previousEfdQty = normalizeQuantity(referenceEfdByPartMonth.get(`${previousMonth}|${bucket.partCode}`) || efdByPartMonth.get(`${previousMonth}|${bucket.partCode}`)?.value || 0, uomCode);
       const deliveredPreviousQty = normalizeQuantity(deliveryPerformanceByMonth.get(month)?.byPart.get(bucket.partCode)?.deliveredPreviousQty || 0, uomCode);
       const carryoverShortageQty = normalizeQuantity(Math.max(previousEfdQty - deliveredPreviousQty, 0), uomCode);
       const grossDemandWithCarryoverQty = normalizeQuantity(policyDemandQty + carryoverShortageQty, uomCode);
@@ -793,14 +821,14 @@ async function syncMonthlyMps(tx, options = {}) {
       const forecastDetailIds = uniq(bucket.forecastDetailIds);
       const offsets = uniq(bucket.forecastOffsets);
       const decisionForTarget = (target) => decisionByTarget.get(target.matchedForecastTargetId || target.id) || decisionByTarget.get(target.id);
-      const targetDecisions = effectiveTargets.map((target) => ({ target, decision: decisionForTarget(target) })).filter((row) => row.decision);
+      const targetDecisions = deliveryTargets.map((target) => ({ target, decision: decisionForTarget(target) })).filter((row) => row.decision);
       const leadingDecision = [...targetDecisions].sort((left, right) => number(right.decision.finalPriorityScore) - number(left.decision.finalPriorityScore))[0]?.decision || null;
-      const earliestTarget = [...effectiveTargets].sort((left, right) => new Date(left.targetDate) - new Date(right.targetDate))[0] || null;
+      const earliestTarget = [...deliveryTargets].sort((left, right) => new Date(left.targetDate) - new Date(right.targetDate))[0] || null;
       const finishSplitsByTarget = new Map(effectiveTargets.map((target) => [
         target.id,
         fgFinishSplitsForTarget(target, decisionForTarget(target), uomCode),
       ]));
-      const earliestFgRequired = [...finishSplitsByTarget.values()].flat()
+      const earliestFgRequired = deliveryTargets.flatMap((target) => finishSplitsByTarget.get(target.id) || [])
         .map((row) => row.targetFinishDate).filter(Boolean)
         .sort((left, right) => new Date(left) - new Date(right))[0]
         || earliestTarget?.targetDate || null;
@@ -834,7 +862,7 @@ async function syncMonthlyMps(tx, options = {}) {
           }),
           efd: { month, qty: policyDemandQty, source: currentEfd.source, ruleMode: currentEfd.ruleMode, override: currentEfd.override || null },
           previousEfd: { month: previousMonth, qty: previousEfdQty, deliveredQty: deliveredPreviousQty, shortageQty: carryoverShortageQty },
-          bufferEfd: { month: nextPlanningMonthKey(month), qty: bufferBaseQty, source: nextEfd?.source || "FORECAST_FALLBACK", ruleMode: nextEfd?.ruleMode || currentEfd.ruleMode },
+          bufferEfd: { month: nextPlanningMonthKey(month), qty: bufferBaseQty, source: nextEfd?.source || (referenceEfdByPartMonth.has(nextForecastKey) ? "YEARLY_EFD_LOOKAHEAD" : "FORECAST_FALLBACK"), ruleMode: nextEfd?.ruleMode || currentEfd.ruleMode },
           bufferAllocationMode: existing?.calculationTrace?.bufferAllocationMode === "DISTRIBUTE_TO_PHASES"
             ? "DISTRIBUTE_TO_PHASES"
             : "SEPARATE_END_MONTH",
@@ -849,7 +877,7 @@ async function syncMonthlyMps(tx, options = {}) {
           : (existing?.status || "Planned"),
         soNumber: uniq(bucket.soSources).join(",") || null,
         customerCode: customerCodes.length === 1 ? customerCodes[0] : (customerCodes.length ? "MULTI" : null),
-        deliveryPhaseId: effectiveTargets.length === 1 ? effectiveTargets[0].id : null,
+        deliveryPhaseId: deliveryTargets.length === 1 ? deliveryTargets[0].id : null,
         customerTargetDate: earliestTarget?.targetDate || null,
         fgRequiredDate: earliestFgRequired,
         mbomSelectionMode: mbomResolution.mode,
@@ -907,8 +935,8 @@ async function syncMonthlyMps(tx, options = {}) {
             return { ...source, effectiveRequiredDate: effectiveDateBySource.get(`${source.sourceType}|${source.sourceLineId}`) || source.effectiveRequiredDate, deliveryTargetId: sourceTargets.length === 1 ? sourceTargets[0].id : null, targetDeliveryDate: sourceTargets.map((target) => target.targetDate).filter(Boolean).sort((left, right) => new Date(left) - new Date(right))[0] || source.requiredDate, fgRequiredDate: sourceDecision?.fgRequiredDate || null, priorityScore: sourceDecision?.finalPriorityScore ?? null, priorityClass: sourceDecision?.priorityClass || null, bufferPercent: number(sourceDecision?.bufferPercent), bufferQty: number(sourceDecision?.bufferQty), sourcePegging: sourceTargets.map((target) => ({ deliveryTargetId: target.id, targetDeliveryDate: target.targetDate?.toISOString?.() || target.targetDate, matchedForecastTargetId: target.matchedForecastTargetId || null, forecastTargetDate: target.forecastTargetDate?.toISOString?.() || target.forecastTargetDate || null, qty: number(target.qty), customerCode: target.customerCode || null, priorityScore: decisionForTarget(target)?.finalPriorityScore ?? null, priorityClass: decisionForTarget(target)?.priorityClass || null, fgFinishSplits: (finishSplitsByTarget.get(target.id) || []).map((split) => ({ ...split, targetFinishDate: split.targetFinishDate?.toISOString?.() || split.targetFinishDate })) })), mpsDetailId: savedDetail.id };
           }),
         });
-        if (effectiveTargets.length) {
-          await tx.mPSDeliveryPlan.createMany({ data: effectiveTargets.flatMap((target) => (finishSplitsByTarget.get(target.id) || []).map((split) => ({
+        if (deliveryTargets.length) {
+          await tx.mPSDeliveryPlan.createMany({ data: deliveryTargets.flatMap((target) => (finishSplitsByTarget.get(target.id) || []).map((split) => ({
             mpsNumber: doc.mpsNumber,
             mpsDetailId: savedDetail.id,
             phaseNumber: nextDeliveryPhase++,
@@ -1068,6 +1096,8 @@ module.exports = {
   resolveActiveCanonicalMpsLifecycle,
   normalizeMpsRunSelection,
   targetIncludedInMpsSelection,
+  resolveBufferBaseQty,
+  customerDeliveryTargets,
   syncMonthlyMps,
   previewMonthlyMbomSelections,
 };

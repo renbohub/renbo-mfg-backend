@@ -2,6 +2,7 @@
 
 const { assessDemandFeasibility } = require("./demandFeasibilityService");
 const { buildCapacitySnapshot } = require("./capacityPlanningService");
+const { isOpenForecast } = require("./forecastStatusPolicy");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const asDate = (value) => { const date = value instanceof Date ? new Date(value) : new Date(value); return Number.isNaN(date.getTime()) ? null : date; };
@@ -314,7 +315,7 @@ async function buildDemandRows(prisma, filters = {}) {
     prisma.demandDeliveryTarget.findMany({ where: { isDeleted: false, status: "ACTIVE", sourceType: "SALES_ORDER", soDetail: { isDeleted: false, status: { not: "Cancelled" }, soHeader: { isDeleted: false, status: { notIn: ["Cancelled", "Superseded"] } } }, ...(filters.startDate || filters.endDate ? { targetDate: { ...(filters.startDate ? { gte: asDate(filters.startDate) } : {}), ...(filters.endDate ? { lte: asDate(filters.endDate) } : {}) } } : {}), ...(filters.customerCode ? { customerCode: filters.customerCode } : {}), ...(filters.partCode ? { partCode: filters.partCode } : {}) }, include: { soDetail: { include: { soHeader: true } } }, orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }] }),
     prisma.demandPlanningDecision.findMany({ where: { isDeleted: false, ...(filters.status ? { status: filters.status } : {}) } }),
   ]);
-  const activeForecastTargets = forecastTargets.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && row.forecastDetail.forecast && !row.forecastDetail.forecast.isDeleted && row.forecastDetail.forecast.isCurrentVersion && row.forecastDetail.forecast.status !== "Obsolete");
+  const activeForecastTargets = forecastTargets.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && isOpenForecast(row.forecastDetail.forecast));
   const validSalesTargets = salesOrderTargets.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
   const activeSalesTargets = validSalesTargets.filter((row) => row.soDetail.soHeader.status !== "Draft").map((row) => ({ ...row, deliveredQty: number(row.soDetail.qtyDelivered), soStatus: row.soDetail.soHeader.status }));
   const draftSalesTargets = validSalesTargets.filter((row) => row.soDetail.soHeader.status === "Draft").map((row) => ({ ...row, deliveredQty: number(row.soDetail.qtyDelivered), soStatus: "Draft" }));

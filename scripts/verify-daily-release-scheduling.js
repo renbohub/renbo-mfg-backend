@@ -4,7 +4,9 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const {
+  autoCorrectWorkPlacements,
   scheduleDailyReleaseAllocations,
+  toMinute,
 } = require("../src/prisma/services/planning/dailyReleaseSchedulingService");
 
 const common = {
@@ -16,6 +18,9 @@ const common = {
   plannedQty: 100,
   uomCode: "PCS",
 };
+
+assert.strictEqual(toMinute("32:04"), 1924,
+  "jam absolut legacy harus tetap dapat dibaca agar durasi tidak berubah saat Auto Correct");
 
 const independent = scheduleDailyReleaseAllocations([
   { ...common, id: "A", partCode: "PART-A", machineId: "M-050", predecessorAllocationIds: [] },
@@ -37,8 +42,8 @@ const dependency = scheduleDailyReleaseAllocations([
 ]);
 const successor = dependency.items.find((item) => item.id === "NEXT");
 assert.strictEqual(successor.machineId, "M-051", "dependency tidak memaksa dua part ke mesin yang sama");
-assert.strictEqual(successor.plannedStartTime, "10:00", "successor wajib mulai satu jam setelah predecessor selesai");
-assert.strictEqual(successor.plannedEndTime, "11:00", "durasi successor tetap dipertahankan setelah digeser");
+assert.strictEqual(successor.plannedStartTime, "11:00", "successor wajib mulai dua jam setelah predecessor selesai");
+assert.strictEqual(successor.plannedEndTime, "12:00", "durasi successor tetap dipertahankan setelah digeser");
 
 const samePart = scheduleDailyReleaseAllocations([
   { ...common, id: "A-1", partCode: "PART-A", machineId: "M-050", plannedStartTime: "07:00", plannedEndTime: "08:00", predecessorAllocationIds: [] },
@@ -66,6 +71,67 @@ const unavailable = scheduleDailyReleaseAllocations([
 ]);
 assert.strictEqual(unavailable.items[0].machineId, null, "allocation tidak boleh dipasang pada mesin yang ditutup");
 assert.strictEqual(unavailable.warnings[0].code, "DAILY_RELEASE_MACHINE_UNAVAILABLE");
+
+const workWindows = new Map([["2026-09-07|M-050", [
+  { shift: "1", startTime: "08:00", endTime: "16:00" },
+  { shift: "2", startTime: "16:00", endTime: "00:00" },
+]]]);
+const correctedOverlap = autoCorrectWorkPlacements([
+  { ...common, id: "C-1", machineId: "M-050", shift: "1", plannedStartTime: "08:00", plannedEndTime: "10:00", sequence: 1, predecessorAllocationIds: [] },
+  { ...common, id: "C-2", machineId: "M-050", shift: "1", plannedStartTime: "08:30", plannedEndTime: "09:30", sequence: 2, predecessorAllocationIds: [] },
+], { windowsByMachine: workWindows });
+assert.deepStrictEqual(correctedOverlap.items.map((item) => [item.plannedStartTime, item.plannedEndTime]), [["08:00", "10:00"], ["10:00", "11:00"]],
+  "Auto Correct harus mengantrikan operation overlap pada mesin yang sama");
+assert.strictEqual(correctedOverlap.changes.length, 1);
+
+const correctedOutsideShift = autoCorrectWorkPlacements([
+  { ...common, id: "EARLY", machineId: "M-050", shift: "1", plannedStartTime: "07:00", plannedEndTime: "08:00", sequence: 1, predecessorAllocationIds: [] },
+], { windowsByMachine: workWindows });
+assert.deepStrictEqual([correctedOutsideShift.items[0].plannedStartTime, correctedOutsideShift.items[0].plannedEndTime], ["08:00", "09:00"],
+  "Operation di luar jam kerja harus digeser ke awal shift aktif");
+
+const correctedAgainstReleased = autoCorrectWorkPlacements([
+  { ...common, id: "FIXED", status: "Released", movable: false, machineId: "M-050", shift: "1", plannedStartTime: "08:00", plannedEndTime: "10:00", sequence: 1, predecessorAllocationIds: [] },
+  { ...common, id: "DRAFT", status: "Draft", machineId: "M-050", shift: "1", plannedStartTime: "08:00", plannedEndTime: "09:00", sequence: 2, predecessorAllocationIds: [] },
+], { windowsByMachine: workWindows });
+assert.strictEqual(correctedAgainstReleased.items[0].plannedStartTime, "08:00", "Released operation harus tetap immutable");
+assert.deepStrictEqual([correctedAgainstReleased.items[1].plannedStartTime, correctedAgainstReleased.items[1].plannedEndTime], ["10:00", "11:00"],
+  "Draft operation harus menghindari slot Released");
+
+const correctedAbsoluteTime = autoCorrectWorkPlacements([
+  { ...common, id: "ABSOLUTE", machineId: "M-050", shift: "2", plannedStartTime: "32:04", plannedEndTime: "35:04", sequence: 1, predecessorAllocationIds: [] },
+], { windowsByMachine: workWindows });
+assert.deepStrictEqual([correctedAbsoluteTime.items[0].plannedStartTime, correctedAbsoluteTime.items[0].plannedEndTime], ["08:00", "11:00"],
+  "jam absolut di luar operation day harus dipindahkan ke work window tanpa mengubah durasi");
+
+const rollingWorkWindows = new Map([
+  ...workWindows,
+  ["2026-09-08|M-050", [
+    { shift: "1", startTime: "08:00", endTime: "16:00" },
+    { shift: "2", startTime: "16:00", endTime: "00:00" },
+  ]],
+]);
+const correctedToNextDay = autoCorrectWorkPlacements([
+  { ...common, id: "LATE-PRE", status: "Released", movable: false, machineId: "M-051", plannedStartTime: "21:00", plannedEndTime: "23:00", predecessorAllocationIds: [] },
+  { ...common, id: "NEXT-DAY", machineId: "M-050", plannedStartTime: "23:00", plannedEndTime: "26:00", predecessorAllocationIds: ["LATE-PRE"] },
+], { windowsByMachine: rollingWorkWindows });
+assert.strictEqual(String(correctedToNextDay.items[1].scheduleDate).slice(0, 10), "2026-09-08",
+  "operation yang tidak muat harus diteruskan ke hari kerja berikutnya");
+assert.deepStrictEqual([correctedToNextDay.items[1].plannedStartTime, correctedToNextDay.items[1].plannedEndTime], ["08:00", "11:00"],
+  "rolling placement harus memakai jam normal pada tanggal tujuan dan mempertahankan durasi");
+assert.strictEqual(correctedToNextDay.warnings.length, 0, "rolling placement yang menemukan slot tidak boleh menyisakan warning");
+
+const thirdShiftWindows = new Map([["2026-09-07|M-050", [
+  { shift: "3", startTime: "00:00", endTime: "08:00" },
+]]]);
+const correctedAcrossOperationalBoundary = autoCorrectWorkPlacements([
+  { ...common, id: "NIGHT", machineId: "M-050", plannedStartTime: "06:50", plannedEndTime: "07:20", predecessorAllocationIds: [] },
+], { windowsByMachine: thirdShiftWindows });
+assert.deepStrictEqual(
+  [correctedAcrossOperationalBoundary.items[0].plannedStartTime, correctedAcrossOperationalBoundary.items[0].plannedEndTime],
+  ["30:50", "31:20"],
+  "shift malam yang melewati batas operational day harus tetap menjadi rentang absolut yang valid",
+);
 
 const controller = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/planning/MonthlyProductionPlanController.js"), "utf8");
 assert(controller.includes("scheduleDailyReleaseAllocations(desired.map"),

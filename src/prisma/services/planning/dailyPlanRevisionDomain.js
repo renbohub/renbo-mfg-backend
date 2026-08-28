@@ -1,9 +1,18 @@
+const MINIMUM_SUCCESSOR_GAP_MINUTES = 120;
+const DAY_MINUTES = 1440;
+
+function dateOrdinal(value) {
+  const parsed = new Date(value || "1970-01-01T00:00:00.000Z");
+  const time = parsed.getTime();
+  return Number.isFinite(time) ? Math.floor(time / 86400000) : 0;
+}
+
 function toMinute(value) {
   const match = String(value || "").match(/^(\d{2}):(\d{2})$/);
   if (!match) return null;
   const hour = Number(match[1]);
   const minute = Number(match[2]);
-  if (minute > 59 || hour > 24 || (hour === 24 && minute !== 0)) return null;
+  if (minute > 59 || hour > 47) return null;
   return hour * 60 + minute;
 }
 
@@ -16,6 +25,12 @@ function toTime(value) {
   return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 }
 
+function operationalMinute(value, dayStart = 420) {
+  const minute = toMinute(value);
+  if (minute == null) return null;
+  return minute < dayStart ? minute + 1440 : minute;
+}
+
 function validateScheduleItems(items = []) {
   const blockers = [];
   const warnings = [];
@@ -24,12 +39,13 @@ function validateScheduleItems(items = []) {
   for (const item of items) {
     if (!item.machineId) blockers.push(issue("MACHINE_REQUIRED", item, "Mesin wajib dipilih."));
     if (!(Number(item.plannedQty) > 0)) blockers.push(issue("PLANNED_QTY_REQUIRED", item, "Planned quantity harus lebih dari 0."));
-    const start = toMinute(item.plannedStartTime);
-    const end = toMinute(item.plannedEndTime);
-    if (start == null || end == null || end <= start) {
+    const localStart = operationalMinute(item.plannedStartTime);
+    const localEnd = operationalMinute(item.plannedEndTime);
+    if (localStart == null || localEnd == null || localEnd <= localStart) {
       blockers.push(issue("TIME_RANGE_INVALID", item, "Jam mulai dan selesai tidak valid."));
     } else if (item.machineId) {
-      validRanges.push({ item, start, end });
+      const dayBase = dateOrdinal(item.scheduleDate) * DAY_MINUTES;
+      validRanges.push({ item, start: dayBase + localStart, end: dayBase + localEnd, dayBase });
     }
     if (!item.woId && String(item.shift || "").toUpperCase() !== "VENDOR") {
       warnings.push(issue("WORK_ORDER_MISSING", item, "Work Order belum terhubung."));
@@ -69,15 +85,16 @@ function validateScheduleItems(items = []) {
     for (const predecessorId of predecessorIds) {
       const predecessor = rangeByAllocationId.get(String(predecessorId));
       if (!predecessor) continue;
-      const requiredStart = predecessor.end + 60;
+      const requiredStart = predecessor.end + MINIMUM_SUCCESSOR_GAP_MINUTES;
       if (current.start < requiredStart) {
         blockers.push(issue(
           "DIRECT_PREDECESSOR_GAP_SHORT",
           current.item,
-          `Proses successor harus mulai minimal 1 jam setelah predecessor ${predecessor.item.scheduleNumber || predecessorId} selesai.`,
+          `Proses successor harus mulai minimal 2 jam setelah predecessor ${predecessor.item.scheduleNumber || predecessorId} selesai.`,
           {
             predecessorScheduleNumber: predecessor.item.scheduleNumber || null,
-            requiredStartTime: toTime(requiredStart),
+            requiredStartDate: new Date(Math.floor(requiredStart / DAY_MINUTES) * 86400000).toISOString().slice(0, 10),
+            requiredStartTime: toTime(requiredStart - current.dayBase),
           },
         ));
       }
@@ -89,13 +106,14 @@ function validateScheduleItems(items = []) {
 
 function summarizeRevision(revision = {}) {
   const schedules = Array.isArray(revision.schedules) ? revision.schedules : [];
+  const releasedStatuses = new Set(["Released", "In Progress", "Completed"]);
   return {
     status: revision.status || "Draft",
     version: Number(revision.version || 1),
     itemCount: schedules.length,
     totalQty: schedules.reduce((sum, item) => sum + Number(item.plannedQty || 0), 0),
-    editable: String(revision.status || "Draft") === "Draft",
-    releasedCount: schedules.filter((item) => item.status === "Released").length,
+    editable: ["Draft", "Ready", "Partially Released"].includes(String(revision.status || "Draft")),
+    releasedCount: schedules.filter((item) => releasedStatuses.has(item.status)).length,
   };
 }
 
@@ -148,4 +166,4 @@ function buildExecutionExceptions(schedules = []) {
   return rows;
 }
 
-module.exports = { toMinute, validateScheduleItems, summarizeRevision, buildExecutionExceptions };
+module.exports = { MINIMUM_SUCCESSOR_GAP_MINUTES, toMinute, validateScheduleItems, summarizeRevision, buildExecutionExceptions };

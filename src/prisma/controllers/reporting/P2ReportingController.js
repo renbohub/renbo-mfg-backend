@@ -3,6 +3,7 @@ const {
   calculateLiveMbomCosts,
 } = require("../../services/mbomLiveCostingService");
 const { buildFgCompStockTraceability } = require("../../services/inventory/fgCompStockTraceabilityService");
+const { buildOutgoingDeliveryMatrix } = require("../../services/outgoing/outgoingDeliveryMatrixService");
 const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pricing/effectivePriceService");
 
 const MONTH_FIELDS = [
@@ -375,6 +376,16 @@ exports.inventory = async (req, res, next) => {
   }
 };
 
+exports.outgoingDeliveryMatrix = async (req, res, next) => {
+  try {
+    // Client scope also follows the Sales Order for shared/root FG whose
+    // Part master intentionally has no fixed customerCode.
+    res.json(await buildOutgoingDeliveryMatrix(prisma, req.query));
+  } catch (error) {
+    next(error);
+  }
+};
+
 function sumBy(rows, key) {
   return rows.reduce((total, row) => total + number(row[key]), 0);
 }
@@ -585,6 +596,142 @@ exports.costTrend = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+const pricingReportTypes = new Set(["material", "purchase-part", "vendor-process"]);
+const monthPriceSeries = (records, year) => MONTH_FIELDS.map((_field, monthIndex) => {
+  const at = new Date(year, monthIndex + 1, 0, 23, 59, 59, 999);
+  return round(legacyPriceValue(resolveEffectiveRecord(records, at), at));
+});
+const pricingReportRows = (records, identity) => {
+  const groups = new Map();
+  records.forEach((record) => {
+    const info = identity(record);
+    if (!groups.has(info.key)) groups.set(info.key, { info, records: [] });
+    groups.get(info.key).records.push(record);
+  });
+  return [...groups.values()].map(({ info, records: groupRecords }) => {
+    const prices = monthPriceSeries(groupRecords, info.year);
+    const available = prices.filter((value) => value > 0);
+    const exchangeRate = number(info.exchangeRate) || 1;
+    const changedMonths = prices.filter((value, index) => index > 0 && value > 0 && prices[index - 1] > 0 && value !== prices[index - 1]).length;
+    return {
+      ...info,
+      ...Object.fromEntries(MONTH_FIELDS.map((field, index) => [field, prices[index]])),
+      averagePrice: available.length ? round(available.reduce((sum, value) => sum + value, 0) / available.length) : 0,
+      latestPrice: [...prices].reverse().find((value) => value > 0) || 0,
+      missingMonths: prices.filter((value) => value <= 0).length,
+      changedMonths,
+      monthlyIdr: prices.map((value) => round(value * exchangeRate)),
+    };
+  });
+};
+
+exports.purchasePricing = async (req, res, next) => {
+  try {
+    const type = String(req.query.type || "material").trim().toLowerCase();
+    if (!pricingReportTypes.has(type)) return res.status(400).json({ message: "Tipe pricing report tidak tersedia." });
+    const year = Math.max(2000, Number(req.query.year) || new Date().getFullYear());
+    const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
+    const page = safePage(req.query.page);
+    const limit = safeLimit(req.query.limit || 100);
+    let rows;
+
+    if (type === "material") {
+      const records = await prisma.materialPriceList.findMany({
+        where: { isDeleted: false },
+        include: { material: true, materialGrade: true, materialSubstance: true, supplier: true, currency: true },
+        orderBy: [{ materialId: "asc" }, { materialGradeId: "asc" }, { supplierId: "asc" }, { effectiveFrom: "asc" }],
+      });
+      rows = pricingReportRows(records, (record) => ({
+        key: `${record.materialId || record.materialGradeId || record.materialSubstanceId || "GENERIC"}|${record.supplierId || "NO-SUPPLIER"}|${record.currencyCode}|${record.uomCode || ""}`,
+        year,
+        itemCode: record.material?.materialCode || record.materialGrade?.gradeCode || record.materialSubstance?.substanceCode || "MATERIAL GENERIK",
+        itemName: record.material?.materialName || record.materialGrade?.gradeName || record.materialSubstance?.substanceName || "Material generik",
+        comparisonKey: `material:${record.material?.materialCode || record.materialGrade?.gradeCode || record.materialSubstance?.substanceCode || "GENERIC"}:${record.thickness || ""}:${record.uomCode || ""}`,
+        comparisonLabel: [record.material?.materialCode || record.materialGrade?.gradeCode || record.materialSubstance?.substanceCode, record.material?.materialName || record.materialGrade?.gradeName || record.materialSubstance?.substanceName].filter(Boolean).join(" · ") || "Material generik",
+        specification: [record.materialSubstance?.substanceName, record.materialGrade?.gradeCode, record.thickness ? `${record.thickness} mm` : null].filter(Boolean).join(" · "),
+        partnerCode: record.supplier?.supplierCode || "-",
+        partnerName: record.supplier?.supplierName || "Tanpa supplier",
+        currencyCode: record.currencyCode,
+        uomCode: record.uomCode || "-",
+        exchangeRate: record.currency?.exchangeRate,
+      }));
+    } else if (type === "purchase-part") {
+      const records = await prisma.partPriceList.findMany({
+        where: { isDeleted: false },
+        include: { part: true, supplier: true, currency: true },
+        orderBy: [{ partId: "asc" }, { supplierId: "asc" }, { effectiveFrom: "asc" }],
+      });
+      rows = pricingReportRows(records, (record) => ({
+        key: `${record.partId || "NO-PART"}|${record.supplierId || "NO-SUPPLIER"}|${record.currencyCode}|${record.uomCode || ""}`,
+        year,
+        itemCode: record.part?.partCode || "PART TIDAK TERHUBUNG",
+        itemName: [record.part?.partNumber, record.part?.partName].filter(Boolean).join(" · ") || "Purchase part",
+        comparisonKey: `part:${record.part?.partCode || "UNLINKED"}:${record.uomCode || record.part?.purchaseUomCode || ""}`,
+        comparisonLabel: [record.part?.partCode, record.part?.partNumber, record.part?.partName].filter(Boolean).join(" · ") || "Purchase part",
+        specification: [record.part?.rawType, record.statusService].filter(Boolean).join(" · "),
+        partnerCode: record.supplier?.supplierCode || "-",
+        partnerName: record.supplier?.supplierName || "Tanpa supplier",
+        currencyCode: record.currencyCode,
+        uomCode: record.uomCode || record.part?.purchaseUomCode || "-",
+        exchangeRate: record.currency?.exchangeRate,
+      }));
+    } else {
+      const details = await prisma.vendorPriceListDetail.findMany({
+        where: { isDeleted: false, vendorPriceList: { isDeleted: false } },
+        include: { vendorProcess: true, vendorPriceList: { include: { vendor: true, part: true, currency: true } } },
+        orderBy: [{ vendorProcessId: "asc" }, { vendorPriceListId: "asc" }],
+      });
+      const records = details.map((detail) => ({
+        ...detail,
+        effectiveFrom: detail.vendorPriceList.effectiveFrom,
+        effectiveUntil: detail.vendorPriceList.effectiveUntil,
+        pricingYear: detail.vendorPriceList.pricingYear,
+        isActive: detail.vendorPriceList.isActive,
+        updatedAt: detail.vendorPriceList.updatedAt,
+      }));
+      rows = pricingReportRows(records, (record) => ({
+        key: `${record.vendorPriceList.vendorId || "NO-VENDOR"}|${record.vendorPriceList.partId || "NO-PART"}|${record.vendorProcessId}|${record.vendorPriceList.currencyCode}|${record.uomCode || ""}`,
+        year,
+        itemCode: record.vendorProcess?.vendorProcessCode || "PROSES TIDAK TERHUBUNG",
+        itemName: record.vendorProcess?.vendorProcessName || "Vendor process",
+        comparisonKey: `vendor-process:${record.vendorPriceList.part?.partCode || "NO-PART"}:${record.vendorProcess?.vendorProcessCode || "NO-PROCESS"}:${record.uomCode || ""}`,
+        comparisonLabel: [record.vendorPriceList.part?.partCode, record.vendorPriceList.part?.partNumber, record.vendorProcess?.vendorProcessCode, record.vendorProcess?.vendorProcessName].filter(Boolean).join(" · ") || "Vendor process",
+        specification: [record.vendorPriceList.part?.partCode, record.vendorPriceList.part?.partNumber, record.vendorPriceList.category].filter(Boolean).join(" · "),
+        partnerCode: record.vendorPriceList.vendor?.vendorCode || "-",
+        partnerName: record.vendorPriceList.vendor?.vendorName || "Tanpa vendor",
+        currencyCode: record.vendorPriceList.currencyCode,
+        uomCode: record.uomCode || "-",
+        exchangeRate: record.vendorPriceList.currency?.exchangeRate,
+      }));
+    }
+
+    if (q) rows = rows.filter((row) => [row.itemCode, row.itemName, row.specification, row.partnerCode, row.partnerName, row.currencyCode, row.uomCode].some((value) => String(value || "").toLowerCase().includes(q)));
+    rows.sort((left, right) => String(left.itemCode).localeCompare(String(right.itemCode), "id", { numeric: true }) || String(left.partnerName).localeCompare(String(right.partnerName), "id"));
+    const total = rows.length;
+    const monthAveragesIdr = MONTH_FIELDS.map((_field, index) => {
+      const values = rows.map((row) => row.monthlyIdr[index]).filter((value) => value > 0);
+      return values.length ? round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0;
+    });
+    const latestAverageIdr = [...monthAveragesIdr].reverse().find((value) => value > 0) || 0;
+    res.json({
+      type,
+      year,
+      items: rows.slice((page - 1) * limit, page * limit).map(({ exchangeRate, year: _rowYear, ...row }) => row),
+      total,
+      page,
+      limit,
+      summary: {
+        priceLines: total,
+        completeLines: rows.filter((row) => row.missingMonths === 0).length,
+        changedLines: rows.filter((row) => row.changedMonths > 0).length,
+        missingPriceLines: rows.filter((row) => row.missingMonths > 0).length,
+        latestAverageIdr,
+      },
+      chart: { labels: MONTH_FIELDS.map((field) => field.slice(0, 3).toUpperCase()), series: [{ name: "Rata-rata harga (IDR)", data: monthAveragesIdr }] },
+    });
+  } catch (error) { next(error); }
 };
 
 exports.purchasing = async (req, res, next) => {

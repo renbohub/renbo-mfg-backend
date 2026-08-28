@@ -199,6 +199,92 @@ async function lockBaselineForMps(tx, { mpsNumbers, actor, expectedFingerprint }
   return { ...preview, rows: lockedRows, createdCount, idempotent: createdCount === 0 };
 }
 
+async function refreshBaselineLocksForMps(tx, { mpsNumbers, actor }) {
+  const documents = await loadMpsDocuments(tx, mpsNumbers);
+  const rows = buildBaselineRows(documents);
+  const fingerprint = fingerprintBaselineRows(rows);
+  const documentNumbers = documents.map((row) => row.mpsNumber);
+  const scopeFilters = rows.map((row) => ({
+    periodMonth: row.periodMonth,
+    customerCode: row.customerCode,
+    partCode: row.partCode,
+  }));
+  const existingRows = await tx.planningBaselineLock.findMany({
+    where: {
+      OR: [
+        { baselineMpsNumber: { in: documentNumbers }, status: "ACTIVE" },
+        ...scopeFilters,
+      ],
+    },
+  });
+  const keyFor = (row) => `${monthStart(row.periodMonth).toISOString()}|${row.customerCode}|${row.partCode}`;
+  const existingByScope = new Map(existingRows.map((row) => [keyFor(row), row]));
+  const refreshedScopes = new Set();
+  const appliedAt = new Date();
+  let createdCount = 0;
+  let updatedCount = 0;
+
+  for (const row of rows) {
+    const scope = keyFor(row);
+    refreshedScopes.add(scope);
+    const existing = existingByScope.get(scope);
+    const sourceSnapshot = {
+      ...(row.sourceSnapshot || {}),
+      recalculatedAt: appliedAt.toISOString(),
+      recalculatedBy: actor || "system",
+    };
+    if (existing) {
+      await tx.planningBaselineLock.update({
+        where: { id: existing.id },
+        data: {
+          uomCode: row.uomCode,
+          forecastQtyLocked: row.forecastQtyLocked,
+          poQtyLocked: row.poQtyLocked,
+          efdQtyLocked: row.efdQtyLocked,
+          baselineMpsNumber: row.baselineMpsNumber,
+          sourceFingerprint: fingerprint,
+          sourceSnapshot,
+          status: "ACTIVE",
+        },
+      });
+      updatedCount += 1;
+      continue;
+    }
+    await tx.planningBaselineLock.create({
+      data: {
+        ...row,
+        sourceFingerprint: fingerprint,
+        sourceSnapshot,
+        status: "ACTIVE",
+        lockedBy: actor || "system",
+      },
+    });
+    createdCount += 1;
+  }
+
+  for (const existing of existingRows) {
+    if (!documentNumbers.includes(existing.baselineMpsNumber) || refreshedScopes.has(keyFor(existing))) continue;
+    await tx.planningBaselineLock.update({
+      where: { id: existing.id },
+      data: {
+        forecastQtyLocked: 0,
+        poQtyLocked: 0,
+        efdQtyLocked: 0,
+        sourceFingerprint: fingerprint,
+        sourceSnapshot: {
+          mpsNumber: existing.baselineMpsNumber,
+          sources: [],
+          recalculatedAt: appliedAt.toISOString(),
+          recalculatedBy: actor || "system",
+        },
+      },
+    });
+    updatedCount += 1;
+  }
+
+  return { rows, fingerprint, createdCount, updatedCount, appliedAt };
+}
+
 async function attachBaselineMrp(tx, { baselineMpsNumber, baselineMrpNumber, actor }) {
   const result = await tx.planningBaselineLock.updateMany({
     where: { baselineMpsNumber, status: "ACTIVE", baselineMrpNumber: null },
@@ -216,5 +302,6 @@ module.exports = {
   fingerprintBaselineRows,
   previewBaselineLocks,
   lockBaselineForMps,
+  refreshBaselineLocksForMps,
   attachBaselineMrp,
 };

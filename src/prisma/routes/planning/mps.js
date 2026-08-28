@@ -14,6 +14,7 @@ router.get("/workbench", authorize("mps", "read"), ctrl.workbench);
 router.get("/mbom-revision-options", authorize("mps", "read"), ctrl.mbomRevisionOptions);
 router.post("/from-forecast", authorize("mps", "create"), logger("mps", "create-from-forecast"), ctrl.createFromForecast);
 router.post("/monthly-sync", authorize("mps", "create"), guardMonthBody, logger("mps", "sync-monthly-demand"), ctrl.syncMonthly);
+router.post("/recalculate", authorize("mps", "update"), guardMonthBody, logger("mps", "recalculate-locked-mps"), ctrl.recalculateLocked);
 router.post("/baseline/preview", authorize("mps", "read"), ctrl.previewBaseline);
 router.post("/baseline/generate", authorize("mps", "create"), logger("mps", "generate-baseline"), ctrl.generateBaseline);
 router.post("/delta/preview", authorize("mps", "read"), ctrl.previewDelta);

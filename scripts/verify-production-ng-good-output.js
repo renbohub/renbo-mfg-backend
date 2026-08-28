@@ -5,7 +5,7 @@ const root = path.resolve(__dirname, "..");
 const read = (...segments) => fs.readFileSync(path.join(root, ...segments), "utf8");
 const productionLog = read("src", "prisma", "controllers", "production", "ProductionLogController.js");
 const ngDisposition = read("src", "prisma", "controllers", "production", "ProductionNgDispositionController.js");
-const detailUi = read("..", "frontend", "public", "js", "operations-detail.js");
+const detailUi = read("..", "renbo-mfg-frontend", "public", "js", "operations-detail.js");
 
 const checks = [
   [

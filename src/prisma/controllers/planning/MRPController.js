@@ -4316,6 +4316,7 @@ exports.get = async (req, res, next) => {
       select: {
         id: true, deliveryTargetId: true, revision: true, status: true, checklist: true, notes: true,
         requestedDeliveryDate: true, earliestFeasibleDelivery: true, approvedBy: true, approvedAt: true,
+        decisionType: true, originalDeliveryDate: true, acceptedDeliveryDate: true, acceptLateReason: true,
       },
     }) : [];
     res.json(mapDoc({

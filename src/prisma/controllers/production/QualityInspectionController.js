@@ -686,8 +686,10 @@ async function applyProductionLogQcDisposition(tx, inspection, dispositions = {}
 
   const qtyPassed = Number(inspection.qtyPassed || 0);
   const qtyFailed = Number(inspection.qtyFailed || 0);
-  const productionLogNgQty = getProductionLogNgQty(inspection.productionLog || {});
-  const totalNgQty = productionLogNgQty + qtyFailed;
+  // Production-declared NG is owned by the dedicated NG disposition workflow.
+  // This inspection covers the OK output placed in QC Hold; only failures
+  // discovered by this inspection belong to its disposition.
+  const totalNgQty = qtyFailed;
   if (hasExplicitQty(dispositions.passed)) {
     assertDispositionQtyMatches("Passed", dispositions.passed.qty, qtyPassed);
   }
@@ -757,7 +759,6 @@ async function applyProductionLogQcDisposition(tx, inspection, dispositions = {}
   }
 
   const pools = [
-    { sourceMovement: rejectSource, remainingQty: Math.max(0, productionLogNgQty) },
     { sourceMovement: goodSource || primarySource, remainingQty: Math.max(0, qtyFailed) },
   ].filter(pool => pool.sourceMovement?.warehouseCode && pool.remainingQty > 0);
 
@@ -3144,8 +3145,10 @@ exports.complete = async (req, res, next) => {
 
     const finalDecision = decision || calculateDecision(existing) || existing.decision || "Pending";
     const qtyFailed = Number(existing.qtyFailed || 0);
-    const productionLogNgQty = Number(existing.productionLog?.qtyReject || 0);
-    const totalNgQty = productionLogNgQty + qtyFailed;
+    // Production Entry NG already owns a separate QC judgment/disposition
+    // queue. Adding it again here would post the same reject/rework quantity a
+    // second time when the GOOD-output inspection is released.
+    const totalNgQty = qtyFailed;
     const requestedNgDisposition = ngDisposition || {};
     const normalizedNgMode = String(requestedNgDisposition.mode || "LATER").trim().toUpperCase() === "NOW"
       ? "NOW"

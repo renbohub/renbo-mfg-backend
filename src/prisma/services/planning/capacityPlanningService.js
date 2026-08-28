@@ -20,6 +20,7 @@ const capacityQtyText = (value, uomCode) => String(capacityQty(value, uomCode));
 const bool = (value, fallback = false) => value === undefined || value === null || value === "" ? fallback : ![false, 0, "0", "false", "no", "off"].includes(typeof value === "string" ? value.trim().toLowerCase() : value);
 const COVERAGE_EPSILON = 0.00001;
 const MONTHLY_PLAN_RUNTIME_ALLOWANCE_FACTOR = 1.2;
+const MINIMUM_SUCCESSOR_GAP_MINUTES = 120;
 const UNSCHEDULED_NOTICE_CODES = new Set([
   "PLAN_ROUTING_MISSING",
   "PLAN_MACHINE_MISSING",
@@ -45,7 +46,7 @@ function applyUnscheduledNoticePolicy(issues, unscheduled) {
 }
 
 function capacityOperationCode(route = {}) {
-  return route.occurrenceCode || route.process?.processCode || route.processCode || null;
+  return route?.occurrenceCode || route?.process?.processCode || route?.processCode || null;
 }
 
 function capacityPlanRouteKey(planNumber, lineNumber, mbomProcessId, processId) {
@@ -107,7 +108,8 @@ function logicalPredecessorGroupKey(allocation = {}) {
  * A successor can legitimately depend on several finite-capacity chunks from
  * the same routing operation. Quantity readiness belongs to that logical
  * route/MPP-line/delivery-phase, not to each physical chunk. Only chunks that
- * finish no later than the successor start can contribute available WIP.
+ * are ready no later than the successor start can contribute available WIP.
+ * Monthly-plan release requires a two-hour handoff gap after physical finish.
  */
 function predecessorOutputQuantity(predecessor = {}) {
   return String(predecessor.routingMode || "INHOUSE").toUpperCase() === "VENDOR"
@@ -131,9 +133,10 @@ function ensurePredecessorWipEntry(wipState, predecessor, outputQty = predecesso
   return entry;
 }
 
-function groupPredecessorAllocations(predecessors = [], successorStart, wipState = null) {
+function groupPredecessorAllocations(predecessors = [], successorStart, wipState = null, minimumGapMinutes = 0) {
   const start = successorStart instanceof Date ? successorStart : new Date(successorStart);
   const startTime = start.getTime();
+  const gapMilliseconds = Math.max(number(minimumGapMinutes), 0) * 60 * 1000;
   const groups = new Map();
   const seenAllocationIds = new Set();
 
@@ -149,7 +152,8 @@ function groupPredecessorAllocations(predecessors = [], successorStart, wipState
     const wipEntry = ensurePredecessorWipEntry(wipState, predecessor, originalOutputQty);
     const outputQty = wipEntry ? Math.max(number(wipEntry.remainingOutputQty), 0) : originalOutputQty;
     const reservedOutputQty = Math.max(originalOutputQty - outputQty, 0);
-    const finishedBeforeSuccessor = Number.isFinite(startTime) && finishAt.getTime() <= startTime;
+    const readyAt = new Date(finishAt.getTime() + gapMilliseconds);
+    const finishedBeforeSuccessor = Number.isFinite(startTime) && readyAt.getTime() <= startTime;
     const key = logicalPredecessorGroupKey(predecessor);
     const current = groups.get(key) || {
       key,
@@ -188,6 +192,7 @@ function groupPredecessorAllocations(predecessors = [], successorStart, wipState
       reservedOutputQty: round(reservedOutputQty, 3),
       uomCode: predecessor.uomCode || null,
       finishAt,
+      readyAt,
       finishedBeforeSuccessor,
       priorReservations: (wipEntry?.reservations || []).map((reservation) => ({ ...reservation })),
     });
@@ -582,6 +587,7 @@ function resolveDailyCapacity({
     : defaultOvertimeHours * 60;
   const isClosed = dayStatus === "HOLIDAY" || shiftsPerDay <= 0 || weekendClosed;
   const shiftOverrides = hasOverride && Array.isArray(override.shiftOverrides) ? override.shiftOverrides : [];
+  const shiftOvertimeMinutes = shiftOverrides.reduce((sum, shift) => sum + number(shift.overtimeMinutes), 0);
   const overrideWorkingMinutes = shiftOverrides.reduce((sum, shift) => sum
     + calculateShiftMinutes(shift.startTime, shift.endTime, shift.breakMinutes)
     + number(shift.overtimeMinutes), 0);
@@ -602,7 +608,7 @@ function resolveDailyCapacity({
     dayStatus: isClosed ? "HOLIDAY" : dayStatus === "OVERLOAD" ? "OVERLOAD" : "WORKING",
     shiftsPerDay,
     shiftHours: effectiveShiftHours,
-    overtimeMinutes: dailyOvertimeMinutes,
+    overtimeMinutes: dailyOvertimeMinutes + shiftOvertimeMinutes,
     shifts: shiftOverrides,
     efficiencyPercent,
     availableMinutes,
@@ -1118,9 +1124,18 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       pushIssue(issues, { ...common, severity: "blocking", category: "CALENDAR", code: "PLAN_ALLOCATION_OUTSIDE_HORIZON", message: `Tanggal allocation ${dateKey(allocation.scheduleDate)} berada di luar horizon Capacity Planning.`, resolution: "Pindahkan allocation ke periode MPP atau perluas horizon." }, issueKeys);
     }
 
+    const allocationPhase = deliveryPhases.find((phase) => phase.id === allocation.deliveryPhaseId) || null;
+    const sourceMpsDetailId = String(detail?.notes || "").match(/\[MPS-SOURCE:([^\]]+)\]/)?.[1]
+      || detail?.mpsDetailId
+      || null;
+    const siblingPhases = sourceMpsDetailId
+      ? deliveryPhases.filter((phase) => phase.mpsDetailId === sourceMpsDetailId)
+      : [];
     const allocationMaterialGate = materialGateForJob(materialGate, {
       id: allocation.deliveryPhaseId,
-      sourceDeliveryTargetId: deliveryPhases.find((phase) => phase.id === allocation.deliveryPhaseId)?.sourceDeliveryTargetId || null,
+      sourceDeliveryTargetId: allocationPhase?.sourceDeliveryTargetId || null,
+      fgPartCode: allocationPhase?.partCode || siblingPhases[0]?.partCode || null,
+      materialScopeDeliveryTargetIds: siblingPhases.map((phase) => phase.sourceDeliveryTargetId).filter(Boolean),
     });
     if (allocationMaterialGate?.readyDate && dateKey(allocation.scheduleDate) < dateKey(allocationMaterialGate.readyDate)) {
       const confirmedLabel = allocationMaterialGate.confirmed
@@ -1194,7 +1209,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     // One logical predecessor can be split into several finite-capacity
     // allocations. Validate the cumulative ready WIP once per route/line/phase
     // rather than incorrectly requiring every split to cover the successor.
-    for (const predecessorGroup of groupPredecessorAllocations(linkedPredecessors, successorStart, predecessorWipState)) {
+    for (const predecessorGroup of groupPredecessorAllocations(linkedPredecessors, successorStart, predecessorWipState, MINIMUM_SUCCESSOR_GAP_MINUTES)) {
       const predecessor = allocationById.get(predecessorGroup.batches[0]?.allocationId);
       if (!predecessor) continue;
       const predecessorProcessCode = predecessorGroup.processCode || "Proses sebelumnya";
@@ -1233,7 +1248,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         const requiredLateReservations = reservation.batchReservations.filter((item) => !item.finishedBeforeSuccessor);
         const requiredLateIds = new Set(requiredLateReservations.map((item) => String(item.predecessorAllocationId)));
         const requiredLateBatches = lateBatches.filter((batch) => requiredLateIds.has(String(batch.allocationId)));
-        const unblockAt = requiredLateBatches.at(-1)?.finishAt || lateBatches.at(-1).finishAt;
+        const unblockAt = requiredLateBatches.at(-1)?.readyAt || lateBatches.at(-1).readyAt;
         const requiredLateQty = reservation.lateReservedQty;
         pushIssue(issues, {
           ...common,
@@ -1241,12 +1256,12 @@ async function buildCapacitySnapshot(prisma, query = {}) {
           relatedAllocationIds,
           severity: "blocking",
           category: "SEQUENCE",
-          code: "PLAN_PREDECESSOR_FINISH_AFTER_SUCCESSOR",
-          message: `${predecessorProcessCode} memiliki WIP siap ${capacityQtyText(predecessorGroup.availableOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""}; masih perlu ${capacityQtyText(additionalPredecessorQty, predecessorGroup.uomCode)} dari ${requiredLateBatches.length} split batch yang baru selesai setelah ${successorProcessCode} mulai.`,
-          resolution: `Majukan batch predecessor yang dibutuhkan sebelum ${successorStart.toISOString()}, atau mundurkan successor setelah ${unblockAt.toISOString()}.`,
+          code: "PLAN_PREDECESSOR_GAP_SHORT",
+          message: `${predecessorProcessCode} memiliki WIP siap ${capacityQtyText(predecessorGroup.availableOutputQty, predecessorGroup.uomCode)} ${predecessorGroup.uomCode || ""}; masih perlu ${capacityQtyText(additionalPredecessorQty, predecessorGroup.uomCode)} dari ${requiredLateBatches.length} split batch yang belum memenuhi jeda 2 jam sebelum ${successorProcessCode} mulai.`,
+          resolution: `Majukan batch predecessor agar selesai minimal 2 jam sebelum ${successorStart.toISOString()}, atau mundurkan successor sampai ${unblockAt.toISOString()}.`,
           blockerDetail: {
-            cause: "Jumlah total predecessor mencukupi, tetapi sebagian output yang dibutuhkan belum selesai saat successor mulai.",
-            impact: `${successorProcessCode} hanya dapat memakai WIP dari batch yang telah selesai sebelum waktu mulai.`,
+            cause: "Jumlah total predecessor mencukupi, tetapi sebagian output belum memenuhi jeda handoff 2 jam saat successor mulai.",
+            impact: `${successorProcessCode} hanya dapat memakai WIP dari batch yang sudah selesai minimal 2 jam sebelum waktu mulai.`,
             predecessorGroupKey: predecessorGroup.key,
             shortageQtyAtStart: round(additionalPredecessorQty, 3),
             linkedBatchCount: predecessorGroup.batches.length,
@@ -1259,7 +1274,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
             lateOutputQty: predecessorGroup.lateOutputQty,
             requiredPredecessorOutput: round(requiredPredecessorOutput, 3),
             uomCode: predecessorGroup.uomCode,
-            batches: predecessorGroup.batches.map((batch) => ({ ...batch, finishAt: batch.finishAt.toISOString(), requiredToUnblock: requiredLateIds.has(String(batch.allocationId)) })),
+            batches: predecessorGroup.batches.map((batch) => ({ ...batch, finishAt: batch.finishAt.toISOString(), readyAt: batch.readyAt.toISOString(), requiredToUnblock: requiredLateIds.has(String(batch.allocationId)) })),
             successor: { allocationId: allocation.id, processCode: successorProcessCode, startAt: successorStart.toISOString(), unblockAt: unblockAt.toISOString() },
           },
         }, issueKeys);
@@ -2468,4 +2483,5 @@ module.exports = {
   capacityPlanRouteKey,
   findRouteWorkOrder,
   applyUnscheduledNoticePolicy,
+  MINIMUM_SUCCESSOR_GAP_MINUTES,
 };

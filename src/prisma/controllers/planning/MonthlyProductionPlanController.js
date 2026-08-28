@@ -83,8 +83,8 @@ function normalizeCapacityFlowRule(input = {}) {
       maximumWip: boundedNumber(flow.maximumWip, 0, 1e12, 0),
     },
     interProcessDelay: {
-      mode: enumValue(delay.mode, ["NONE", "FIXED", "ROUTING_PROCESS"], "NONE"),
-      value: boundedNumber(delay.value, 0, 1e9, 0),
+      mode: enumValue(delay.mode, ["NONE", "FIXED", "ROUTING_PROCESS"], "FIXED"),
+      value: boundedNumber(delay.value, 0, 1e9, 120),
       unit: enumValue(delay.unit, ["MINUTE", "HOUR", "DAY"], "MINUTE"),
     },
     releaseConditions,
@@ -486,8 +486,17 @@ function derivePlanDetails(mpsDetails, productionPercent, netProductionByMpsDeta
   }));
   return mpsDetails.map((row) => {
     if (!isProcess(row)) {
+      const rowUomCode = row.part?.productionUomCode
+        || row.part?.baseUomCode
+        || row.part?.stockUomCode
+        || (["FG", "WIP"].includes(String(row.part?.itemType || "").trim().toUpperCase()) ? "PCS" : row.uomCode);
       return {
         ...row,
+        // Carry the canonical UOM into phase splitting. Discrete quantities
+        // must be rounded while distributing the total so the final phase
+        // receives the remainder (for example 280 -> 93 + 93 + 94), instead
+        // of rounding every persisted phase independently to 93.
+        uomCode: rowUomCode,
         productionPercent,
         qtyPlanned: adjustedReceiptQty.get(row.id),
       };
@@ -3102,7 +3111,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
       };
     }), {
       dayStart: "07:00",
-      dependencyGapMinutes: 60,
+      dependencyGapMinutes: 120,
       defaultDurationMinutes: 60,
     });
 
@@ -3859,20 +3868,51 @@ function normalizeCapacityShiftOverrides(value, shiftsPerDay) {
     throw Object.assign(new Error("Jam shift harus lengkap sesuai jumlah shift yang dipilih."), { statusCode: 400 });
   }
   const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const rangeMinutes = (start, end) => {
+    const [startHour, startMinute] = start.split(":").map(Number);
+    const [endHour, endMinute] = end.split(":").map(Number);
+    const startValue = (startHour * 60) + startMinute;
+    const endValue = (endHour * 60) + endMinute;
+    return endValue >= startValue ? endValue - startValue : endValue + 1440 - startValue;
+  };
   return value.map((shift, index) => {
     const startTime = String(shift?.startTime || "");
     const endTime = String(shift?.endTime || "");
     const breakMinutes = Number(shift?.breakMinutes || 0);
-    const overtimeMinutes = Number(shift?.overtimeMinutes || 0);
+    const optionalTime = (field, label) => {
+      const raw = shift?.[field];
+      if (raw == null || raw === "") return null;
+      const value = String(raw);
+      if (!validTime.test(value)) throw Object.assign(new Error(`${label} Shift ${index + 1} tidak valid.`), { statusCode: 400 });
+      return value;
+    };
+    const overtimeBeforeStart = optionalTime("overtimeBeforeStart", "Jam mulai lembur awal");
+    const overtimeBeforeEnd = optionalTime("overtimeBeforeEnd", "Jam selesai lembur awal");
+    const overtimeAfterStart = optionalTime("overtimeAfterStart", "Jam mulai lembur akhir");
+    const overtimeAfterEnd = optionalTime("overtimeAfterEnd", "Jam selesai lembur akhir");
+    const overtimePairs = [
+      [overtimeBeforeStart, overtimeBeforeEnd, "Lembur awal"],
+      [overtimeAfterStart, overtimeAfterEnd, "Lembur akhir"],
+    ];
+    for (const [rangeStart, rangeEnd, label] of overtimePairs) {
+      if (Boolean(rangeStart) !== Boolean(rangeEnd)) throw Object.assign(new Error(`${label} Shift ${index + 1} harus memiliki jam mulai dan selesai.`), { statusCode: 400 });
+      if (rangeStart && rangeEnd && rangeStart === rangeEnd) throw Object.assign(new Error(`${label} Shift ${index + 1} tidak boleh berdurasi nol.`), { statusCode: 400 });
+    }
+    const hasStructuredOvertime = overtimePairs.some(([rangeStart]) => Boolean(rangeStart));
+    const overtimeMinutes = hasStructuredOvertime
+      ? overtimePairs.reduce((sum, [rangeStart, rangeEnd]) => sum + (rangeStart && rangeEnd ? rangeMinutes(rangeStart, rangeEnd) : 0), 0)
+      : Number(shift?.overtimeMinutes || 0);
     if (!validTime.test(startTime) || !validTime.test(endTime) || startTime === endTime) {
       throw Object.assign(new Error(`Jam mulai dan selesai Shift ${index + 1} wajib valid dan tidak boleh sama.`), { statusCode: 400 });
     }
     if (!Number.isFinite(breakMinutes) || breakMinutes < 0 || breakMinutes > 480 || !Number.isFinite(overtimeMinutes) || overtimeMinutes < 0 || overtimeMinutes > 480) {
       throw Object.assign(new Error(`Break atau overtime Shift ${index + 1} tidak valid.`), { statusCode: 400 });
     }
-    return { startTime, endTime, breakMinutes, overtimeMinutes };
+    return { startTime, endTime, breakMinutes, overtimeMinutes, overtimeBeforeStart, overtimeBeforeEnd, overtimeAfterStart, overtimeAfterEnd };
   });
 }
+
+exports.normalizeCapacityShiftOverrides = normalizeCapacityShiftOverrides;
 
 exports.setCapacityDay = async (req, res, next) => {
   try {
@@ -3941,14 +3981,15 @@ exports.setGlobalCapacityDay = async (req, res, next) => {
     const time = (value) => value && /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value)) ? String(value) : null;
     const overtimeStart = time(req.body?.overtimeStart);
     const overtimeEnd = time(req.body?.overtimeEnd);
+    const shiftOverrides = normalizeCapacityShiftOverrides(req.body?.shiftOverrides, shiftsPerDay);
     if (Boolean(overtimeStart) !== Boolean(overtimeEnd)) return res.status(400).json({ message: 'Jam mulai dan selesai lembur harus diisi berpasangan.' });
     if (overtimeStart && overtimeEnd && overtimeEnd <= overtimeStart) return res.status(400).json({ message: 'Jam selesai lembur harus setelah jam mulai.' });
     if (reason.length < 5) return res.status(400).json({ message: 'Alasan perubahan capacity harian minimal 5 karakter.' });
     if (!await prisma.machine.findFirst({ where: { id: machineId, isDeleted: false }, select: { id: true } })) return res.status(400).json({ message: 'Mesin tidak ditemukan.' });
     const row = await prisma.capacityCalendarOverride.upsert({
       where: { machineId_scheduleDate: { machineId, scheduleDate } },
-      create: { machineId, scheduleDate, dayStatus, shiftsPerDay, overtimeStart, overtimeEnd, reason, changedBy: req.user?.username || req.user?.email || 'system' },
-      update: { dayStatus, shiftsPerDay, overtimeStart, overtimeEnd, reason, changedBy: req.user?.username || req.user?.email || 'system', changedAt: new Date(), isDeleted: false },
+      create: { machineId, scheduleDate, dayStatus, shiftsPerDay, shiftOverrides, overtimeStart, overtimeEnd, reason, changedBy: req.user?.username || req.user?.email || 'system' },
+      update: { dayStatus, shiftsPerDay, shiftOverrides, overtimeStart, overtimeEnd, reason, changedBy: req.user?.username || req.user?.email || 'system', changedAt: new Date(), isDeleted: false },
     });
     await invalidateRccpByMachineCalendar(prisma, machineId, scheduleDate);
     res.json({ scope: 'GLOBAL', ...row });
@@ -4005,10 +4046,15 @@ exports.commitCapacityEditor = async (req, res, next) => {
 
 exports.__test = {
   consolidateGeneratedExecutionDetails,
+  derivePlanDetails,
+  splitPlanDetailsByMrpExecutionMonth,
+  netProductionByMpsDetailForRun,
+  syncDraftPlanWithCurrentMps,
   requirementExecutionQty,
   productionPlanHorizon,
   productionPlanOwnerWindow,
   groupDetailsIntoProductionHorizon,
   canonicalMrpExecutionNotes,
   sourceMrpRunNumbers,
+  buildSourceReconciliation,
 };

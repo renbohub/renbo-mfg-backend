@@ -37,6 +37,7 @@ router.put("/:deliveryTargetId/recovery-plan", authorize("mps", "update"), logge
 router.post("/recovery-plans/:planId/submit", authorize("mps", "update"), logger("demandPlanning", "submit-due-date-recovery"), ctrl.submitRecoveryPlan);
 router.patch("/recovery-plans/:planId/approve", authorize("mps", "approve"), logger("demandPlanning", "approve-due-date-recovery"), ctrl.approveRecoveryPlan);
 router.patch("/recovery-plans/:planId/reject", authorize("mps", "approve"), logger("demandPlanning", "reject-due-date-recovery"), ctrl.rejectRecoveryPlan);
+router.post("/recovery-plans/bulk-accept-late", authorize("mps", "approve"), logger("demandPlanning", "bulk-accept-late"), ctrl.bulkAcceptLate);
 router.patch("/:deliveryTargetId/review", authorize("mps", "update"), logger("demandPlanning", "review"), ctrl.review);
 router.post("/:deliveryTargetId/simulate-impact", authorize("mps", "update"), logger("demandPlanning", "simulate-impact"), ctrl.simulateImpact);
 router.post("/:deliveryTargetId/displacement-proposals", authorize("mps", "update"), logger("demandPlanning", "propose-displacement"), ctrl.createDisplacementProposal);

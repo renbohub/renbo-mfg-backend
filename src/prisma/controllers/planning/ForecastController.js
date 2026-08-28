@@ -3,6 +3,7 @@ const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
+const { OPEN_FORECAST_STATUSES } = require("../../services/planning/forecastStatusPolicy");
 
 const include = { details: { where: { isDeleted: false, part: { is: { isDeleted: false, itemType: "FG" } } }, orderBy: { lineNumber: "asc" }, include: { part: true, deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, orderBy: { phaseNumber: "asc" } } } } };
 const text = (value) => String(value ?? "").trim() || null;
@@ -167,7 +168,12 @@ async function buildConsumptionProgress(forecast) {
 }
 
 async function buildDemandSummary({ forecastNumber = null, startDate = null, endDate = null }) {
-  const where = { isDeleted: false, status: { not: "Obsolete" }, ...(forecastNumber ? { forecastNumber } : { isCurrentVersion: true }) };
+  const where = {
+    isDeleted: false,
+    ...(forecastNumber
+      ? { forecastNumber }
+      : { isCurrentVersion: true, status: { in: OPEN_FORECAST_STATUSES } }),
+  };
   const forecasts = await prisma.forecast.findMany({ where, include });
   const rows = forecasts.flatMap((forecast) => toMonthlyRows(forecast.details).map((detail) => ({ forecast, detail }))).filter(({ detail }) => {
     const key = monthKey(detail.forecastMonth); return key && (!startDate || key >= startDate) && (!endDate || key <= endDate);
@@ -411,7 +417,7 @@ exports.monthlyConsumptionDetail = async (req, res, next) => {
     const inMonth = (value) => monthKey(value) === range.key;
     const [forecasts, salesLines, mps, plannedPurchases] = await Promise.all([
       prisma.forecast.findMany({
-        where: { isDeleted: false, isCurrentVersion: true, status: { not: "Obsolete" } },
+        where: { isDeleted: false, isCurrentVersion: true, status: { in: OPEN_FORECAST_STATUSES } },
         include,
       }),
       prisma.salesOrderDetail.findMany({

@@ -5,6 +5,7 @@ const { authorize } = require("../../middleware/auth");
 // Semua endpoint read-only — tidak memerlukan logger
 router.get("/dashboard", authorize("productionReports", "read"), ctrl.dashboard);
 router.get("/machine-daily", authorize("productionReports", "read"), ctrl.machineDailyReport);
+router.get("/cost-actual", authorize("productionReports", "read"), ctrl.productionCostActual);
 router.get("/oee", authorize("productionReports", "read"), ctrl.oeeReport);
 router.get("/yield", authorize("productionReports", "read"), ctrl.yieldReport);
 router.get("/scrap", authorize("productionReports", "read"), ctrl.scrapReport);

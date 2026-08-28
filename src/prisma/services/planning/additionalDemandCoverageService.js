@@ -4,6 +4,11 @@ const { additionalDemandQty, pendingDeltaQty } = require("./additionalDemandDoma
 
 const number = (value) => (Number.isFinite(Number(value)) ? Math.max(Number(value), 0) : 0);
 const rounded = (value) => Math.round((number(value) + Number.EPSILON) * 1000000) / 1000000;
+const signedNumber = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+const signedRounded = (value) => {
+  const result = Math.round((signedNumber(value) + Number.EPSILON) * 1000000) / 1000000;
+  return Math.abs(result) <= 0.000001 ? 0 : result;
+};
 const monthKey = (value) => {
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 7);
@@ -35,6 +40,7 @@ function aggregateCoverageByPartMonth(items = []) {
       poQtyLocked: 0,
       lockedEfdQty: 0,
       currentSoQty: 0,
+      poDeltaQty: 0,
       additionalQty: 0,
       coveredFgStockQty: 0,
       coveredFirmReceiptQty: 0,
@@ -55,6 +61,7 @@ function aggregateCoverageByPartMonth(items = []) {
       "coveredFgStockQty", "coveredFirmReceiptQty", "generatedDeltaQty", "pendingDeltaQty",
       "uncoveredQty", "reductionQty",
     ]) output[field] = rounded(output[field] + number(item[field]));
+    output.poDeltaQty = signedRounded(output.poDeltaQty + signedNumber(item.poDeltaQty));
     output.customerCodes.push(item.customerCode);
     output.baselineMpsNumbers.push(item.baselineMpsNumber);
     output.baselineMrpNumbers.push(item.baselineMrpNumber);
@@ -149,6 +156,7 @@ async function loadAdditionalDemandCoverage(prisma, options = {}) {
       poQtyLocked: rounded(lock.poQtyLocked),
       lockedEfdQty: rounded(lock.efdQtyLocked),
       currentSoQty: rounded(sales.qty),
+      poDeltaQty: signedRounded(number(sales.qty) - number(lock.poQtyLocked)),
       additionalQty: rounded(additionalQty),
       coveredFgStockQty,
       coveredFirmReceiptQty,
@@ -170,7 +178,17 @@ async function loadAdditionalDemandCoverage(prisma, options = {}) {
       },
     };
   });
-  return { year, items, byPartMonth: aggregateCoverageByPartMonth(items) };
+  const byPartMonth = aggregateCoverageByPartMonth(items);
+  const currentPoByPartMonth = new Map();
+  for (const row of rawSales.filter(activeSalesOrderTarget)) {
+    const key = `${monthKey(row.targetDate)}|${row.partCode}`;
+    currentPoByPartMonth.set(key, rounded((currentPoByPartMonth.get(key) || 0) + number(row.qty)));
+  }
+  for (const [key, coverage] of byPartMonth.entries()) {
+    coverage.currentSoQty = currentPoByPartMonth.get(key) || 0;
+    coverage.poDeltaQty = signedRounded(coverage.currentSoQty - coverage.poQtyLocked);
+  }
+  return { year, items, byPartMonth };
 }
 
 module.exports = { activeSalesOrderTarget, aggregateCoverageByPartMonth, loadAdditionalDemandCoverage };

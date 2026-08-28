@@ -3,6 +3,8 @@ const path = require("path");
 const controller = require("../src/prisma/controllers/planning/MRPController");
 const { DEFAULT_FORMULAS, evaluateFormula } = require("../src/prisma/services/masterFormulaService");
 const { procurementSchedule } = require("../src/prisma/services/planning/procurementSchedulingService");
+const { resolveBufferBaseQty, customerDeliveryTargets } = require("../src/prisma/services/planning/monthlyPlanningService");
+const { buildLedger, isCustomerDeliveryPhase } = require("../src/prisma/services/planning/mpsWorkbenchService");
 
 const checks = [];
 function check(name, condition) {
@@ -59,6 +61,78 @@ check(
   "MPS gross buffer does not net FG stock before MRP",
   evaluateFormula(DEFAULT_FORMULAS.MPS_BUFFER_QTY, { bufferBaseQty: 300, bufferPercent: 50, stockAvailableQty: 20 }) === 150,
 );
+check(
+  "MPS buffer uses the displayed yearly EFD when M+1 is still Submitted",
+  resolveBufferBaseQty({ nextEfd: undefined, yearlyEfdLookahead: 15000, forecastLookaheadQty: 0 }) === 15000,
+);
+const mixedDeliveryTargets = [
+  { id: "forecast-target", sourceType: "FORECAST", qty: 300 },
+  { id: "so-target", sourceType: "SALES_ORDER", qty: 120 },
+];
+const soCustomerDeliveryTargets = customerDeliveryTargets({
+  targets: mixedDeliveryTargets,
+  actualSalesOrderQty: 120,
+  efdSource: "PO",
+});
+check(
+  "MPS Batch Delivery follows Sales Order targets as soon as PO exists",
+  soCustomerDeliveryTargets.length === 1 && soCustomerDeliveryTargets[0].id === "so-target",
+);
+const forecastOverrideMixedTargets = customerDeliveryTargets({
+  targets: mixedDeliveryTargets,
+  actualSalesOrderQty: 120,
+  efdSource: "FORECAST",
+});
+check(
+  "Forecast EFD keeps firm SO and unconsumed Forecast residual delivery targets",
+  forecastOverrideMixedTargets.length === 2
+    && forecastOverrideMixedTargets.some((target) => target.id === "so-target")
+    && forecastOverrideMixedTargets.some((target) => target.id === "forecast-target"),
+);
+const forecastCustomerDeliveryTargets = customerDeliveryTargets({
+  targets: mixedDeliveryTargets.filter((target) => target.sourceType === "FORECAST"),
+  actualSalesOrderQty: 0,
+  efdSource: "FORECAST_FALLBACK",
+});
+check(
+  "MPS Batch Delivery falls back to Forecast when PO is zero and EFD selects Forecast",
+  forecastCustomerDeliveryTargets.length === 1 && forecastCustomerDeliveryTargets[0].id === "forecast-target",
+);
+check(
+  "Workbench shows Forecast batch while PO is zero",
+  isCustomerDeliveryPhase({ actualSalesOrderQty: 0, calculationTrace: { efd: { source: "FORECAST" } } }, { sourceType: "FORECAST" }),
+);
+check(
+  "Workbench keeps Forecast residual after an SO exists when EFD selects Forecast",
+  isCustomerDeliveryPhase({ actualSalesOrderQty: 1, calculationTrace: { efd: { source: "FORECAST" } } }, { sourceType: "FORECAST" })
+    && isCustomerDeliveryPhase({ actualSalesOrderQty: 1 }, { sourceType: "SALES_ORDER" }),
+);
+const bufferLedger = buildLedger({
+  detail: {
+    id: "mps-buffer-test",
+    mpsNumber: "MPS-202609",
+    startDate: new Date("2026-09-01T00:00:00.000Z"),
+    endDate: new Date("2026-09-30T00:00:00.000Z"),
+    actualSalesOrderQty: 8000,
+    openingAvailableQty: 0,
+    targetEndingStockQty: 7500,
+    projectedEndingStockQty: 7500,
+    qtyPlanned: 15500,
+    calculationTrace: { efd: { source: "PO" } },
+    demandSources: [
+      { id: "so-source", sourceType: "SALES_ORDER", sourceNumber: "SO-001", qty: 8000, effectiveRequiredDate: "2026-09-15" },
+      { id: "forecast-source", sourceType: "FORECAST", sourceNumber: "FCT-001", qty: 12000, effectiveRequiredDate: "2026-09-20" },
+    ],
+  },
+  stockLines: [],
+  reservations: [],
+  receipts: [],
+});
+const bufferEvent = bufferLedger.ledger.find((row) => row.eventType === "BUFFER_TARGET");
+check(
+  "SO-backed netting no longer consumes Forecast remainder before ending buffer",
+  bufferLedger.metrics.grossDemandQty === 8000 && bufferEvent?.plannedProductionQty === 7500,
+);
 
 const mrpSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MRPController.js"), "utf8");
 const explodeStart = mrpSource.indexOf("async function explodeMBOM");
@@ -66,7 +140,7 @@ const explodeSource = mrpSource.slice(explodeStart, explodeStart + 30000);
 const hybridSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/hybridMrpService.js"), "utf8");
 const monthlySource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
 const mpsSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MPSController.js"), "utf8");
-const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/ppic-detail.js"), "utf8");
+const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/ppic-detail.js"), "utf8");
 const suggestionSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/purchasing/PurchaseSuggestionController.js"), "utf8");
 check("MBOM explosion no longer references out-of-scope MPS precheck", !explodeSource.includes("mpsPrecheck"));
 check("Raw material follows the parent net production driver", explodeSource.includes("const parentOutputMap = netOutputQtyByMbomDetailId") && !explodeSource.includes("relatedSourceCodes.has(sourceCode)"));
@@ -76,7 +150,8 @@ check("Monthly MPS sync invalidates previous downstream plans", monthlySource.in
 check("Monthly MPS removes stale MRP-generated child rows", monthlySource.includes('notes: { startsWith: "[MRP-PRODUCTION]" }') && monthlySource.includes("data: { isDeleted: true }"));
 check("MPS exposes persisted BOM hierarchy for generated child rows", mpsSource.includes("treePath: true") && mpsSource.includes("bomHierarchy:"));
 check("MPS detail renders a fixed BOM tree instead of alphabetical part groups", ppicDetailSource.includes('fixedGrouping: true') && ppicDetailSource.includes('data-bom-level='));
-check("Monthly MPS uses next forecast month as buffer look-ahead", monthlySource.includes("forecastLookahead") && monthlySource.includes("nextForecastKey"));
+check("Monthly MPS uses next EFD month as buffer look-ahead", monthlySource.includes("yearlyEfdLookahead") && monthlySource.includes("nextForecastKey"));
+check("Monthly MPS persists delivery plans from the selected customer targets", monthlySource.includes("data: deliveryTargets.flatMap") && monthlySource.includes("customerDeliveryTargets({"));
 check("Monthly MPS keeps unprocessed forecast periods Partial Product", monthlySource.includes("partialForecasts") && monthlySource.includes('data: { status: "Partial Product" }'));
 check(
   "Purchase Suggestion matches delivery phase by target lineage, not material due date",

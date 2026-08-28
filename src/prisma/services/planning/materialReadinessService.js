@@ -695,6 +695,7 @@ async function buildProductionMaterialGate(prisma, planOrNumber) {
       partCode: item.partCode,
       materialCode: item.materialCode,
       deliveryTargetIds: [...new Set(sources.map((source) => source.deliveryTargetId).filter(Boolean))],
+      fgPartCodes: [...new Set(sources.map((source) => source.fgPartCode).filter(Boolean))],
       storedSystemDueDate: day(item.materialRequiredDate || item.plannedProductionStart),
       calculationSource: calculatedSystemDate ? "PURCHASE_SUGGESTION_BACKWARD_DUE" : "PURCHASE_SUGGESTION_STORED_DUE",
       ...gate,
@@ -718,7 +719,40 @@ async function buildProductionMaterialGate(prisma, planOrNumber) {
 
 function materialGateForJob(gate, job = {}) {
   const targetId = job.sourceDeliveryTargetId || job.deliveryTargetId || job.id || null;
+  const fgPartCode = job.fgPartCode || job.partCode || job.group?.receipt?.partCode || null;
   if (!gate) return null;
+  // A customer phase consolidated with month-end buffer must include purchase
+  // requirements without a delivery target. Scope those rows by FG so a
+  // buffer for C001 never inherits the latest material date from C002.
+  if (fgPartCode && (job.hasBufferCampaign || !targetId)) {
+    const scopedItems = (gate.items || []).filter((item) =>
+      (item.fgPartCodes || []).some((code) => String(code) === String(fgPartCode)));
+    const identity = {
+      planNumber: gate.planNumber || null,
+      mpsNumber: gate.mpsNumber || null,
+      mrpRunNumber: gate.mrpRunNumber || null,
+      suggestionNumber: gate.suggestionNumber || null,
+      suggestionStatus: gate.suggestionStatus || null,
+      fgPartCode,
+    };
+    if (scopedItems.length) {
+      return {
+        ...summarizeMaterialGates(scopedItems, identity),
+        matchStatus: "FG_PART_MATCHED",
+      };
+    }
+    return {
+      ...identity,
+      readyDate: null,
+      source: "NO_FG_PURCHASE_REQUIREMENT",
+      confirmed: true,
+      itemCount: 0,
+      confirmedItemCount: 0,
+      fallbackItemCount: 0,
+      criticalItems: [],
+      matchStatus: "FG_PART_NOT_IN_PURCHASE_REQUIREMENT",
+    };
+  }
   if (targetId && gate.phaseGates?.[targetId]) {
     return { ...gate.phaseGates[targetId], matchStatus: "PHASE_MATCHED" };
   }

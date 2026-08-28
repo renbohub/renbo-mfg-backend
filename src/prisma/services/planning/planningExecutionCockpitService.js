@@ -126,7 +126,17 @@ async function loadMonthData(prisma, month) {
         },
         orderBy: [{ lineNumber: "asc" }, { scheduleDate: "asc" }],
       },
-      dailyProductionSchedules: { where: { isDeleted: false, status: { not: "Cancelled" } }, select: { id: true, status: true, lateRisk: true, scheduleDate: true } },
+      dailyProductionSchedules: {
+        where: {
+          isDeleted: false,
+          status: { not: "Cancelled" },
+          OR: [
+            { dailyPlanRevisionId: null },
+            { dailyPlanRevision: { is: { isDeleted: false, status: { not: "Superseded" } } } },
+          ],
+        },
+        select: { id: true, status: true, lateRisk: true, scheduleDate: true },
+      },
     },
     orderBy: { periodStart: "asc" },
   });

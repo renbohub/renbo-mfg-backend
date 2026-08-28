@@ -8,6 +8,7 @@ router.get("/generate-number", authorize("materialIssues", "create"), ctrl.gener
 router.patch("/bulk-remove", authorize("materialIssues", "delete"), logger("materialIssues", "bulk-remove", { modelName: "MaterialIssue" }), ctrl.bulkRemove);
 
 // Status transitions
+router.patch("/:issueNumber/prepare", authorize("materialIssues", "issue"), logger("materialIssues", "prepare", { modelName: "MaterialIssue" }), ctrl.prepare);
 router.patch("/:issueNumber/issue", authorize("materialIssues", "issue"), logger("materialIssues", "issue", { modelName: "MaterialIssue" }), ctrl.issue);
 router.patch("/:issueNumber/close", authorize("materialIssues", "close"), logger("materialIssues", "close", { modelName: "MaterialIssue" }), ctrl.close);
 

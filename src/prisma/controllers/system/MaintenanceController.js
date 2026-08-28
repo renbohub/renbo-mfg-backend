@@ -23,7 +23,7 @@ exports.resetPlanningFlow = async (req, res, next) => {
         message: "Kirim confirmation RESET_MPS_TO_DELIVERY untuk menghapus transaksi MRP sampai Delivery.",
       });
     }
-    const result = await resetPlanningFlow(prisma, { forecastStatus: "Confirmed" });
+    const result = await resetPlanningFlow(prisma, { forecastStatus: "Draft" });
     return res.json(result);
   } catch (error) {
     return next(error);

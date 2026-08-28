@@ -27,6 +27,8 @@
     "test:p2-contracts": "node scripts/verify-p2-contracts.js",
     "test:p3-contracts": "node scripts/verify-encoding.js",
     "test:purchasing-p0-p2": "node scripts/verify-purchasing-p0-p2.js",
+    "test:purchase-pricing-report": "node scripts/verify-purchase-pricing-report.js",
+    "test:production-cost-report": "node scripts/verify-production-cost-report.js",
     "test:purchase-order-pdf": "node scripts/verify-purchase-order-pdf.js",
     "test:purchase-order-moq": "node scripts/verify-purchase-order-moq-quantity.js",
     "db:repair:po-moq": "node scripts/repair-po-moq-remainders.js",
@@ -42,6 +44,7 @@
     "test:production-shortfall-carryover": "node scripts/verify-production-shortfall-carryover.js",
     "test:production-approval-recovery": "node scripts/verify-production-approval-recovery.js",
     "test:forecast-due-date-flow": "node scripts/verify-forecast-due-date-flow.js",
+    "test:forecast-to-delivery": "node scripts/verify-forecast-to-delivery-workflow.js",
     "test:capacity-predecessor-coverage": "node scripts/verify-capacity-predecessor-coverage.js",
     "test:capacity-allocation-scoring": "node scripts/verify-capacity-allocation-scoring.js",
     "test:capacity-calendar-constraints": "node scripts/verify-capacity-calendar-constraints.js",
@@ -68,6 +71,7 @@
     "test:mps-delivery-feasibility-gate": "node scripts/verify-mps-delivery-feasibility-gate.js",
     "test:mps-delivery-review": "node scripts/verify-mps-delivery-review.js",
     "test:purchase-suggestion-master-defaults": "node scripts/verify-purchase-suggestion-master-defaults.js",
+    "test:purchase-suggestion-auto-confirm": "node scripts/verify-purchase-suggestion-auto-confirm.js",
     "test:table-documents": "node scripts/verify-table-document-contracts.js",
     "test:inventory-mrp-matrix": "node scripts/verify-inventory-mrp-management-matrix.js",
     "test:stock-opname-domain": "node scripts/verify-stock-opname-domain.js && node scripts/verify-stock-opname-schema.js && node scripts/verify-stock-opname-scope.js && node scripts/verify-stock-opname-freeze.js && node scripts/verify-stock-opname-counting.js && node scripts/verify-stock-opname-workflow.js && node scripts/verify-stock-opname-adjustment.js && node scripts/verify-stock-opname-ui.js",
@@ -119,6 +123,6 @@
     "xlsx": "0.18.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.10"
+    "nodemon": "^3.1.14"
   }
 }

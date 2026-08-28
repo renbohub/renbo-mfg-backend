@@ -2,6 +2,7 @@
 
 const crypto = require("crypto");
 const { aggregateYearlyDemand } = require("./yearlyDemandService");
+const { isOpenForecast } = require("./forecastStatusPolicy");
 const { buildPhaseLeadTimes, leadTimeSummary } = require("./monthlyDemandLeadTimeService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -124,7 +125,7 @@ async function buildLiveMonthlyDemand(prisma, periodValue) {
       orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }],
     }),
   ]);
-  const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && row.forecastDetail.forecast && !row.forecastDetail.forecast.isDeleted && row.forecastDetail.forecast.isCurrentVersion && row.forecastDetail.forecast.status !== "Obsolete");
+  const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && isOpenForecast(row.forecastDetail.forecast));
   const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
   const partCodes = unique([...forecasts, ...sales].map((row) => row.partCode));
   const parts = partCodes.length ? await prisma.part.findMany({

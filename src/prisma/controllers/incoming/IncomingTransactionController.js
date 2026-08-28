@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 const { prisma } = require("../../index");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
-const { assertQuantity } = require("../../utils/uomQuantity");
+const { assertQuantity, isDiscreteUom } = require("../../utils/uomQuantity");
 const {
   assertStockBalanceNotFrozen,
   assertStockIdentityNotFrozen,
@@ -106,6 +106,16 @@ exports.receivePurchaseOrder = async (req, res, next) => {
         const allocationUomCode = usesPurchaseConversion ? poDetail.conversionUomCode : poDetail.uomCode;
         const sources = poDetail.prDetail?.sources || [];
         const sourceById = new Map(sources.map((source) => [source.id, source]));
+        const normalizedSourcePlanById = new Map(normalizeAllocationPlanSources(sources.map((source) => {
+          const previouslyAllocatedQty = Number(previouslyAllocatedBySource.get(source.id) || 0);
+          return {
+            id: source.id,
+            requiredQty: round(source.qty),
+            previouslyAllocatedQty: round(previouslyAllocatedQty),
+            remainingQty: round(Math.max(Number(source.qty || 0) - previouslyAllocatedQty, 0)),
+            uomCode: source.uomCode || allocationUomCode,
+          };
+        }), allocationUomCode).map((source) => [source.id, source]));
         const requestedAllocations = Array.isArray(line.allocations) && line.allocations.length
           ? line.allocations
           : sources.length
@@ -133,9 +143,9 @@ exports.receivePurchaseOrder = async (req, res, next) => {
           }
           if (source) {
             seenDemandSources.add(source.id);
-            const previouslyAllocated = Number(previouslyAllocatedBySource.get(source.id) || 0);
             const inRequest = Number(allocatedInRequest.get(source.id) || 0);
-            const remainingDemand = Math.max(Number(source.qty || 0) - previouslyAllocated - inRequest, 0);
+            const normalizedSourcePlan = normalizedSourcePlanById.get(source.id);
+            const remainingDemand = Math.max(Number(normalizedSourcePlan?.remainingQty || 0) - inRequest, 0);
             if (allocatedQty > remainingDemand + 0.000001) {
               throw Object.assign(new Error(`Alokasi ${source.partCode || source.fgPartCode || source.plannedOrderNumber} melebihi sisa kebutuhan ${round(remainingDemand)} ${allocationUomCode || ""}`.trim()), { statusCode: 409 });
             }
@@ -149,7 +159,7 @@ exports.receivePurchaseOrder = async (req, res, next) => {
             partCode: source?.partCode || input.partCode || null,
             fgPartCode: source?.fgPartCode || input.fgPartCode || null,
             requiredDate: source?.requiredDate || (input.requiredDate ? new Date(input.requiredDate) : null),
-            requiredQty: source ? Number(source.qty || 0) : 0,
+            requiredQty: source ? Number(normalizedSourcePlanById.get(source.id)?.requiredQty || 0) : 0,
             allocatedQty,
             uomCode: allocationUomCode || source?.uomCode || null,
             notes: String(input.notes || "").trim() || (type === "BUFFER" ? "MOQ / order multiple excess buffer" : null),
@@ -228,6 +238,32 @@ const allocationPlanInclude = {
   },
 };
 
+// MRP netting may split one common purchase part proportionally across several
+// BOM/delivery sources.  The proportional audit quantities can be fractional,
+// but Inventory must never receive or issue a fraction of a discrete item.
+// Reconcile the remaining source demand with a largest-remainder allocation so
+// every PCS/SHEET/COIL line is integral and the rounded aggregate is preserved.
+function normalizeAllocationPlanSources(rows = [], fallbackUomCode = null) {
+  if (!rows.length || !rows.every((row) => isDiscreteUom(row.uomCode || fallbackUomCode))) return rows;
+  const prepared = rows.map((row, index) => {
+    const rawRemaining = Math.max(Number(row.remainingQty || 0), 0);
+    const integralRemaining = Math.floor(rawRemaining);
+    return { ...row, _index: index, _fraction: rawRemaining - integralRemaining, remainingQty: integralRemaining };
+  });
+  const target = Math.max(0, Math.round(rows.reduce((sum, row) => sum + Math.max(Number(row.remainingQty || 0), 0), 0)));
+  let remainder = target - prepared.reduce((sum, row) => sum + row.remainingQty, 0);
+  const ranked = [...prepared].sort((left, right) => right._fraction - left._fraction || left._index - right._index);
+  for (const row of ranked) {
+    if (remainder <= 0) break;
+    row.remainingQty += 1;
+    remainder -= 1;
+  }
+  return prepared.sort((left, right) => left._index - right._index).map(({ _index, _fraction, ...row }) => ({
+    ...row,
+    requiredQty: Math.round(Number(row.previouslyAllocatedQty || 0) + Number(row.remainingQty || 0)),
+  }));
+}
+
 function mapAllocationPlan(po, globalAllocatedBySource = null) {
   return {
     poNumber: po.poNumber,
@@ -246,7 +282,7 @@ function mapAllocationPlan(po, globalAllocatedBySource = null) {
           else if (allocation.prSourceId) previouslyAllocatedBySource.set(allocation.prSourceId, Number(previouslyAllocatedBySource.get(allocation.prSourceId) || 0) + Number(allocation.allocatedQty || 0));
         }
       }
-      const sources = (detail.prDetail?.sources || []).map((source) => {
+      const sources = normalizeAllocationPlanSources((detail.prDetail?.sources || []).map((source) => {
         const previouslyAllocatedQty = Number((globalAllocatedBySource || previouslyAllocatedBySource).get(source.id) || 0);
         return {
           id: source.id,
@@ -261,7 +297,7 @@ function mapAllocationPlan(po, globalAllocatedBySource = null) {
           remainingQty: round(Math.max(Number(source.qty || 0) - previouslyAllocatedQty, 0)),
           uomCode: source.uomCode || allocationUomCode,
         };
-      });
+      }), allocationUomCode);
       const outstandingReceiptQty = Math.max(Number(detail.qty || 0) - Number(detail.qtyReceived || 0), 0);
       return {
         poDetailId: detail.id,
@@ -467,6 +503,68 @@ exports.createInspection = async (req, res, next) => {
     });
     res.status(201).json(inspection);
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
+};
+
+// GR Pending Inspection → Completed audit record → direct stock putaway.
+// The synthetic completed inspection keeps the same traceability and stock
+// posting path as IQC, while recording that QC was explicitly bypassed.
+exports.releaseWithoutInspection = async (req, res, next) => {
+  try {
+    const bypassReason = String(req.body?.bypassReason || "").trim();
+    if (bypassReason.length < 3) return res.status(400).json({ message: "Alasan release tanpa QC wajib diisi." });
+    const actor = req.user?.username || req.user?.email || "system";
+    const inspection = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "tbl_goods_receipt" WHERE "gr_number" = ${req.params.grNumber} FOR UPDATE`;
+      const gr = await tx.goodsReceipt.findFirst({
+        where: { grNumber: req.params.grNumber, isDeleted: false },
+        include: {
+          details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } },
+          incomingInspections: { where: { isDeleted: false }, select: { inspectionNumber: true } },
+        },
+      });
+      if (!gr) throw Object.assign(new Error("Goods Receipt not found"), { statusCode: 404 });
+      if (gr.status !== "Received Pending Inspection") throw Object.assign(new Error("Goods Receipt tidak tersedia untuk release langsung"), { statusCode: 409 });
+      if (gr.incomingInspections.length) throw Object.assign(new Error(`Goods Receipt sudah memiliki inspection ${gr.incomingInspections[0].inspectionNumber}`), { statusCode: 409 });
+      if (!gr.details.length) throw Object.assign(new Error("Goods Receipt tidak memiliki detail untuk diposting"), { statusCode: 409 });
+      const created = await tx.incomingInspection.create({
+        data: {
+          inspectionNumber: number("IQC"),
+          grNumber: gr.grNumber,
+          status: "Completed",
+          decision: "QC Bypassed",
+          inspectedBy: actor,
+          approvedBy: actor,
+          approvedAt: new Date(),
+          notes: `Release langsung tanpa QC: ${bypassReason}`,
+          details: {
+            create: gr.details.map((detail, index) => ({
+              grDetailId: detail.id,
+              lineNumber: index + 1,
+              qtyInspected: Number(detail.qtyReceived || 0),
+              qtyAccepted: Number(detail.qtyReceived || 0),
+              qtyRejected: 0,
+              disposition: "QC_BYPASS_ACCEPT",
+              notes: bypassReason,
+            })),
+          },
+        },
+      });
+      await Promise.all(gr.details.map((detail) => tx.goodsReceiptDetail.update({
+        where: { id: detail.id },
+        data: { qtyInspected: Number(detail.qtyReceived || 0) },
+      })));
+      await tx.goodsReceipt.update({ where: { grNumber: gr.grNumber }, data: { status: "Partially Inspected" } });
+      return created;
+    });
+
+    // Reuse the guarded QUALITY_RELEASE posting path. If posting fails, the
+    // completed audit record remains retryable from Incoming Inspection.
+    req.params.inspectionNumber = inspection.inspectionNumber;
+    return exports.putawayAccepted(req, res, next);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
+    next(error);
+  }
 };
 
 exports.completeInspection = async (req, res, next) => {

@@ -127,6 +127,27 @@ assert.equal(stockCoveredBufferGate.readyDate, null);
 assert.equal(stockCoveredBufferGate.confirmed, true);
 assert.equal(stockCoveredBufferGate.matchStatus, "FG_TARGETS_NOT_IN_PURCHASE_REQUIREMENT");
 
+const fgScopedBufferGate = materialGateForJob({
+  planNumber: "PP-001",
+  source: "OVERALL",
+  readyDate: utc("2026-09-29"),
+  items: [
+    { suggestionItemId: "item-a", fgPartCodes: ["FG-A"], deliveryTargetIds: [], readyDate: utc("2026-09-29"), source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false },
+    { suggestionItemId: "item-b", fgPartCodes: ["FG-B"], deliveryTargetIds: [], readyDate: utc("2026-09-10"), source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false },
+  ],
+}, { fgPartCode: "FG-B" });
+assert.equal(fgScopedBufferGate.readyDate.toISOString().slice(0, 10), "2026-09-10",
+  "allocation buffer tanpa delivery phase harus memakai gate material FG yang sama");
+assert.equal(fgScopedBufferGate.matchStatus, "FG_PART_MATCHED");
+
+const combinedCampaignGate = materialGateForJob({
+  planNumber: "PP-001",
+  phaseGates: { "delivery-fg-b": { readyDate: null, source: "NO_PHASE_PURCHASE_REQUIREMENT" } },
+  items: [{ suggestionItemId: "buffer-b", fgPartCodes: ["FG-B"], deliveryTargetIds: [], readyDate: utc("2026-09-10"), source: "PURCHASE_SUGGESTION_SYSTEM_DUE", confirmed: false }],
+}, { sourceDeliveryTargetId: "delivery-fg-b", fgPartCode: "FG-B", hasBufferCampaign: true });
+assert.equal(combinedCampaignGate.readyDate.toISOString().slice(0, 10), "2026-09-10",
+  "campaign customer+buffer harus ikut menunggu purchase requirement buffer tanpa target phase");
+
 const backwardDue = suggestionSystemMaterialDate({
   customerDeliveryDate: new Date("2026-08-31T07:00:00.000Z"),
   materialRequiredDate: new Date("2026-08-11T07:00:00.000Z"),

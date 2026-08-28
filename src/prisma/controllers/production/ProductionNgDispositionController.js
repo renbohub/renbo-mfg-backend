@@ -17,7 +17,16 @@ const include = {
           part: { select: { partCode: true, partNumber: true, partName: true } },
         },
       },
-      workOrder: { select: { woNumber: true, process: { select: { processCode: true, processName: true } } } },
+      workOrder: {
+        select: {
+          woNumber: true,
+          outputPartCode: true,
+          outputPartNumber: true,
+          outputPartName: true,
+          uomCode: true,
+          process: { select: { processCode: true, processName: true } },
+        },
+      },
     },
   },
   coilPhase: { select: { phaseNumber: true, coilNumber: true, inputLotNumber: true, productionLotNumber: true } },
@@ -33,10 +42,13 @@ const present = (row) => mapDoc({
   woNumber: row.productionLog?.workOrder?.woNumber,
   processCode: row.productionLog?.workOrder?.process?.processCode || row.productionLog?.processCode,
   processName: row.productionLog?.workOrder?.process?.processName,
-  partCode: row.productionLog?.manufacturingOrder?.part?.partCode,
-  partNumber: row.productionLog?.manufacturingOrder?.part?.partNumber,
-  partName: row.productionLog?.manufacturingOrder?.part?.partName,
-  uomCode: row.productionLog?.manufacturingOrder?.uomCode,
+  // NG belongs to the operation output, which can be a WIP/child part. The
+  // parent MO FG is only a fallback for legacy work orders without a persisted
+  // output snapshot.
+  partCode: row.productionLog?.workOrder?.outputPartCode || row.productionLog?.manufacturingOrder?.part?.partCode,
+  partNumber: row.productionLog?.workOrder?.outputPartNumber || row.productionLog?.manufacturingOrder?.part?.partNumber,
+  partName: row.productionLog?.workOrder?.outputPartName || row.productionLog?.manufacturingOrder?.part?.partName,
+  uomCode: row.productionLog?.workOrder?.uomCode || row.productionLog?.manufacturingOrder?.uomCode,
   productionLotNumber: row.coilPhase?.productionLotNumber,
   inputLotNumber: row.coilPhase?.inputLotNumber,
 });

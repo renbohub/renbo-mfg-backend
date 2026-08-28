@@ -837,7 +837,10 @@ const upsertOrDeletePartBase = (existing, partId, baseOn, data) => {
 // Mengembalikan jumlah file yang dikonsumsi (untuk dilanjutkan ke proses berikutnya).
 const saveAttachmentFiles = async (partId, attachmentFiles, attachmentsRaw, uploadedBy) => {
   if (!attachmentFiles.length) return 0;
-  const attachmentsData = parseJsonField(attachmentsRaw, []);
+  let attachmentsData = parseJsonField(attachmentsRaw, []);
+  if ((!Array.isArray(attachmentsData) || !attachmentsData.length) && attachmentFiles.length) {
+    attachmentsData = [{ title: "Drawing / Dokumen Teknik", description: "Attachment dari Master Part", fileCount: attachmentFiles.length }];
+  }
   if (!Array.isArray(attachmentsData) || !attachmentsData.length) return 0;
   let fileOffset = 0;
   // Pre-compute slices secara sinkron sebelum async ops

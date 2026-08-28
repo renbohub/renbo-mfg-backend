@@ -3,6 +3,7 @@
 const { consumeDeliveryTargets, planningPolicy } = require("./demandConsumptionService");
 const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
 const { loadAdditionalDemandCoverage } = require("./additionalDemandCoverageService");
+const { isOpenForecast } = require("./forecastStatusPolicy");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const roundQty = (value) => Math.round((number(value) + Number.EPSILON) * 1000000) / 1000000;
@@ -213,7 +214,7 @@ async function buildYearlyDemand(prisma, options = {}) {
       orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }],
     }),
   ]);
-  const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && row.forecastDetail.forecast && !row.forecastDetail.forecast.isDeleted && row.forecastDetail.forecast.isCurrentVersion && row.forecastDetail.forecast.status !== "Obsolete");
+  const forecasts = rawForecasts.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && isOpenForecast(row.forecastDetail.forecast));
   const sales = rawSales.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Draft", "Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
   const customerOptions = unique([...forecasts, ...sales].map((row) => row.customerCode)).sort();
   const customerCode = String(options.customerCode || "").trim();

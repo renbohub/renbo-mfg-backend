@@ -114,6 +114,7 @@ profiles.json
 *.md
 !README.md
 !.github/*.md
+!docs/forecast-to-delivery-workflow-validation.md
 
 # Keep package-lock.json / yarn.lock in repo (recommended) — remove above if you prefer to ignore lock
 /src/generated/prisma

@@ -7,6 +7,11 @@ const LAYERS = Object.freeze({
 const SOURCE_TYPES = new Set(["FORECAST", "SALES_ORDER"]);
 
 const unique = (values) => [...new Set((values || []).filter(Boolean).map(String))];
+const stripWorkflowNotes = (value) => String(value || "")
+  .split(";")
+  .map((entry) => entry.trim())
+  .filter((entry) => entry && !/^(Submitted for approval by|Approved by|Closed by)\b/i.test(entry))
+  .join("; ") || null;
 
 function normalizeRequest(input = {}) {
   const sourceType = String(input.sourceType || "").trim().toUpperCase();
@@ -200,6 +205,30 @@ async function resolveGraph(db, normalized) {
       select: { sourceType: true, sourceNumber: true },
     })
     : [];
+  const deliveryPlanSources = mpsNumbers.length
+    ? await db.mPSDeliveryPlan.findMany({
+      where: { mpsNumber: { in: mpsNumbers }, sourceNumber: { not: null } },
+      distinct: ["sourceType", "sourceNumber"],
+      select: { sourceType: true, sourceNumber: true },
+    })
+    : [];
+  const gateSourceKeys = new Map();
+  [{ sourceType, sourceNumber: null }, ...mixedSources, ...deliveryPlanSources]
+    .forEach((row) => {
+      const type = String(row.sourceType || "").trim().toUpperCase();
+      const numbers = row.sourceNumber ? [row.sourceNumber] : sourceNumbers;
+      numbers.forEach((number) => {
+        if (type && number) gateSourceKeys.set(`${type}|${number}`, { sourceType: type, sourceNumber: number });
+      });
+    });
+  const gateSources = [...gateSourceKeys.values()];
+  const planningDecisionRows = gateSources.length
+    ? await db.demandPlanningDecision.findMany({
+      where: { OR: gateSources, isDeleted: false },
+      select: { id: true, deliveryTargetId: true },
+    })
+    : [];
+  const deliveryTargetIds = unique(planningDecisionRows.map((row) => row.deliveryTargetId));
 
   return {
     sourceType,
@@ -219,6 +248,8 @@ async function resolveGraph(db, normalized) {
     allocationIds,
     scheduleIds,
     revisionIds: unique(revisionIds),
+    demandPlanningDecisionIds: planningDecisionRows.map((row) => row.id),
+    deliveryTargetIds,
     mixedSources,
   };
 }
@@ -288,6 +319,31 @@ async function deleteMrp(tx, graph, removed) {
 
 async function deleteMps(tx, graph, removed) {
   if (!graph.mpsIds.length) return;
+  removed.dppDisplacementProposal = graph.deliveryTargetIds.length
+    ? (await tx.dPPDisplacementProposal.deleteMany({ where: { deliveryTargetId: { in: graph.deliveryTargetIds } } })).count
+    : 0;
+  removed.dueDateRecoveryPlan = graph.deliveryTargetIds.length
+    ? (await tx.dueDateRecoveryPlan.deleteMany({ where: { deliveryTargetId: { in: graph.deliveryTargetIds } } })).count
+    : 0;
+  removed.demandPlanningDecision = graph.demandPlanningDecisionIds.length
+    ? (await tx.demandPlanningDecision.deleteMany({ where: { id: { in: graph.demandPlanningDecisionIds } } })).count
+    : 0;
+  const baselineLocks = await tx.planningBaselineLock.findMany({
+    where: {
+      OR: [
+        { baselineMpsNumber: { in: graph.mpsNumbers } },
+        ...(graph.runNumbers.length ? [{ baselineMrpNumber: { in: graph.runNumbers } }] : []),
+      ],
+    },
+    select: { id: true },
+  });
+  const baselineLockIds = baselineLocks.map((row) => row.id);
+  removed.planningAdjustment = baselineLockIds.length
+    ? (await tx.planningAdjustment.deleteMany({ where: { baselineLockId: { in: baselineLockIds } } })).count
+    : 0;
+  removed.planningBaselineLock = baselineLockIds.length
+    ? (await tx.planningBaselineLock.deleteMany({ where: { id: { in: baselineLockIds } } })).count
+    : 0;
   removed.rccpRun = (await tx.rccpRun.deleteMany({ where: { mpsId: { in: graph.mpsIds } } })).count;
   removed.mPS = (await tx.mPS.deleteMany({ where: { id: { in: graph.mpsIds } } })).count;
 }
@@ -317,10 +373,22 @@ async function resetSourcePlanning(prisma, input, actor = null) {
     if (selected.has(LAYERS.MPS)) await deleteMps(tx, graph, removed);
 
     if (normalized.sourceType === "FORECAST") {
-      removed.sourcesReopened = (await tx.forecast.updateMany({
+      const forecasts = await tx.forecast.findMany({
         where: { forecastNumber: { in: normalized.sourceNumbers }, isDeleted: false },
-        data: { status: "Draft", approvedBy: null, approvedDate: null },
-      })).count;
+        select: { forecastNumber: true, notes: true },
+      });
+      for (const forecast of forecasts) {
+        await tx.forecast.update({
+          where: { forecastNumber: forecast.forecastNumber },
+          data: {
+            status: "Draft",
+            approvedBy: null,
+            approvedDate: null,
+            notes: stripWorkflowNotes(forecast.notes),
+          },
+        });
+      }
+      removed.sourcesReopened = forecasts.length;
     } else {
       removed.sourcesReopened = (await tx.salesOrderHeader.updateMany({
         where: { soNumber: { in: normalized.sourceNumbers }, isDeleted: false },

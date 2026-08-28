@@ -34,7 +34,7 @@ const controller = fs.readFileSync(
   "utf8",
 );
 const frontend = fs.readFileSync(
-  path.join(root, "..", "frontend", "public", "js", "operations-detail.js"),
+  path.join(root, "..", "renbo-mfg-frontend", "public", "js", "operations-detail.js"),
   "utf8",
 );
 

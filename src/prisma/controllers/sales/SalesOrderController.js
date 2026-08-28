@@ -3,6 +3,7 @@ const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { syncReservationsForConfirmedSO } = require("../../services/production/sales-order/soReservationService");
 const { replaceDeliveryTargets, retireDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
 const { resolveSalesLinePreview } = require("../../services/sales/salesPricingService");
+const { OPEN_FORECAST_STATUSES } = require("../../services/planning/forecastStatusPolicy");
 
 const include = {
   customer: true, currency: true, quotation: true,
@@ -84,7 +85,7 @@ exports.forecastTargets = async (req, res, next) => {
         isDeleted: false,
         forecastDetail: {
           isDeleted: false,
-          forecast: { isDeleted: false, isCurrentVersion: true, status: { not: "Obsolete" } },
+          forecast: { isDeleted: false, isCurrentVersion: true, status: { in: OPEN_FORECAST_STATUSES } },
         },
       },
       include: { forecastDetail: { include: { forecast: { select: { forecastName: true, status: true } } } } },

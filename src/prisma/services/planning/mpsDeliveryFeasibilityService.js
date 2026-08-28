@@ -13,6 +13,29 @@ const iso = (value) => {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 };
 const sameInstant = (left, right) => iso(left) === iso(right);
+const EPSILON = 0.000001;
+
+function normalizedSourceType(value) {
+  const type = text(value).toUpperCase();
+  if (["SO", "SALES_ORDER", "SALES ORDER"].includes(type)) return "SALES_ORDER";
+  return type || "DEMAND";
+}
+
+// Delivery promotion follows the same customer-commitment rule as the MPS
+// workbench: SO dates replace provisional Forecast dates. Forecast remains a
+// delivery source only while there is no SO and EFD is Forecast-selected.
+function isPromotableCustomerDeliverySource(detail = {}, source = {}) {
+  const sourceType = normalizedSourceType(source.sourceType);
+  if (sourceType === "SALES_ORDER") return true;
+  if (sourceType !== "FORECAST") return true;
+  const demandSources = Array.isArray(detail.demandSources) ? detail.demandSources : [];
+  const hasSalesOrder = number(detail.actualSalesOrderQty) > EPSILON
+    || demandSources.some((row) => normalizedSourceType(row.sourceType) === "SALES_ORDER" && number(row.qty) > EPSILON);
+  if (hasSalesOrder) return false;
+  const efdSource = text(detail.calculationTrace?.efd?.source).toUpperCase();
+  const hasForecast = demandSources.some((row) => normalizedSourceType(row.sourceType) === "FORECAST" && number(row.qty) > EPSILON);
+  return efdSource.startsWith("FORECAST") || (!efdSource && hasForecast);
+}
 
 function normalizeDeliveryFeasibility(value) {
   const status = text(value).toUpperCase();
@@ -116,7 +139,9 @@ function fingerprint(value) {
 }
 
 async function buildSnapshotInputs(tx, doc) {
-  const sources = (doc.details || []).flatMap((detail) => (detail.demandSources || []).flatMap((source) => {
+  const sources = (doc.details || []).flatMap((detail) => (detail.demandSources || [])
+    .filter((source) => isPromotableCustomerDeliverySource(detail, source))
+    .flatMap((source) => {
     const pegging = Array.isArray(source.sourcePegging) ? source.sourcePegging.filter((row) => row.deliveryTargetId) : [];
     if (pegging.length) return pegging.map((row) => ({
       detail,
@@ -230,7 +255,9 @@ async function refreshMpsDeliveryFeasibility(tx, mpsNumber) {
 }
 
 function deliveryTargetIdsFromMps(doc = {}) {
-  const ids = (doc.details || []).flatMap((detail) => (detail.demandSources || []).flatMap((source) => {
+  const ids = (doc.details || []).flatMap((detail) => (detail.demandSources || [])
+    .filter((source) => isPromotableCustomerDeliverySource(detail, source))
+    .flatMap((source) => {
     const pegging = Array.isArray(source.sourcePegging)
       ? source.sourcePegging.map((row) => text(row?.deliveryTargetId)).filter(Boolean)
       : [];
@@ -274,12 +301,16 @@ async function reviewMpsDeliveryFeasibility(tx, mpsNumber, options = {}, service
 }
 
 async function getMpsDeliveryGate(tx, mpsOrNumber) {
-  const doc = typeof mpsOrNumber === "string"
-    ? await tx.mPS.findFirst({ where: { mpsNumber: mpsOrNumber, isDeleted: false } })
+  const sourceDoc = typeof mpsOrNumber === "string"
+    ? await tx.mPS.findFirst({ where: { mpsNumber: mpsOrNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, include: { demandSources: true } } } })
     : mpsOrNumber;
+  const doc = sourceDoc && !Array.isArray(sourceDoc.details)
+    ? await tx.mPS.findFirst({ where: { id: sourceDoc.id, isDeleted: false }, include: { details: { where: { isDeleted: false }, include: { demandSources: true } } } })
+    : sourceDoc;
   if (!doc) throw Object.assign(new Error("MPS tidak ditemukan."), { statusCode: 404 });
+  const activeTargetIds = deliveryTargetIdsFromMps(doc);
   const rows = await tx.mPSDeliveryFeasibilitySnapshot.findMany({
-    where: { mpsId: doc.id, mpsRevision: doc.revision },
+    where: { mpsId: doc.id, mpsRevision: doc.revision, deliveryTargetId: { in: activeTargetIds } },
     orderBy: [{ originalTargetDate: "asc" }, { sourceNumber: "asc" }],
   });
   const targetIds = rows.map((row) => row.deliveryTargetId);
@@ -338,6 +369,7 @@ async function assertOfficialMpsDeliveryGate(tx, docs) {
 
 module.exports = {
   normalizeDeliveryFeasibility,
+  isPromotableCustomerDeliverySource,
   deriveMpsDeliveryGate,
   shouldRetireOfficialMrp,
   refreshMpsDeliveryFeasibility,

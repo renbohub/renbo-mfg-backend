@@ -68,6 +68,26 @@ function validateAcceptLate(plan) {
   return errors;
 }
 
+function autoAcceptLateChecklist(recommendation = {}, reason, evidenceReference) {
+  return (recommendation.actions || []).map((item) => ({
+    ...item,
+    selected: Boolean(item.required || item.id === "ACCEPT_LATE"),
+    owner: text(item.ownerRole) || "PPIC",
+    targetDate: item.id === "ACCEPT_LATE"
+      ? recommendation.earliestFeasibleDeliveryDate
+      : item.targetDate || recommendation.earliestFeasibleDeliveryDate,
+    notes: item.id === "ACCEPT_LATE" ? reason : `Tindakan pendukung Auto Accept Late: ${reason}`,
+    evidenceReference,
+  }));
+}
+
+function deliveryTargetIdsFromRequirements(requirements = []) {
+  return [...new Set(requirements.flatMap((row) => {
+    const pegging = Array.isArray(row.customerPegging) ? row.customerPegging : [];
+    return [row.deliveryTargetId, ...pegging.map((item) => item.deliveryTargetId)].filter(Boolean);
+  }).map(String))];
+}
+
 async function displacementSimulation(deliveryTargetId, proposedCompletion = null) {
   const target = await prisma.demandDeliveryTarget.findFirst({ where: { id: deliveryTargetId, isDeleted: false } });
   if (!target) throw Object.assign(new Error("Delivery target tidak ditemukan."), { statusCode: 404 });
@@ -175,6 +195,125 @@ exports.approveRecoveryPlan = async (req, res, next) => {
     const errors = [...validateRecoveryChecklist(plan.checklist, plan.requestedDeliveryDate), ...validateAcceptLate(plan)];
     if (errors.length) return res.status(400).json({ message: "Checklist tidak valid untuk approval.", errors });
     res.json(await prisma.dueDateRecoveryPlan.update({ where: { id: plan.id }, data: { status: "APPROVED", approvedBy: actor(req), approvedAt: new Date(), approvalReason: reason, updatedBy: actor(req) } }));
+  } catch (error) { next(error); }
+};
+
+exports.bulkAcceptLate = async (req, res, next) => {
+  try {
+    const runNumber = text(req.body.runNumber);
+    const reason = text(req.body.reason);
+    const requestedIds = [...new Set((Array.isArray(req.body.deliveryTargetIds) ? req.body.deliveryTargetIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+    if (!runNumber) return res.status(400).json({ message: "MRP Run wajib diisi." });
+    if (!reason || reason.length < 10) return res.status(400).json({ message: "Alasan Auto Accept Late minimal 10 karakter." });
+    if (req.body.acknowledgedRisk !== true) return res.status(400).json({ message: "Risiko perubahan komitmen delivery wajib dikonfirmasi." });
+    if (!requestedIds.length) return res.status(400).json({ message: "Tidak ada delivery target terlambat yang dipilih." });
+    if (requestedIds.length > 100) return res.status(400).json({ message: "Maksimal 100 delivery target per proses massal." });
+
+    const run = await prisma.mRPRun.findFirst({ where: { runNumber, isDeleted: false }, select: { runNumber: true } });
+    if (!run) return res.status(404).json({ message: "MRP Run tidak ditemukan." });
+    const requirements = await prisma.mRPRequirement.findMany({
+      where: { runNumber, isDeleted: false },
+      select: { deliveryTargetId: true, customerPegging: true },
+    });
+    const linkedTargetIds = new Set(deliveryTargetIdsFromRequirements(requirements));
+    const actorName = actor(req);
+    const processed = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const deliveryTargetId of requestedIds) {
+      if (!linkedTargetIds.has(deliveryTargetId)) {
+        skipped.push({ deliveryTargetId, reason: "TARGET_NOT_LINKED_TO_MRP" });
+        continue;
+      }
+      try {
+        const context = await targetFeasibility(deliveryTargetId);
+        if (String(context.target.sourceType || "").toUpperCase() === "FORECAST" && number(context.demandRow?.actualSalesOrderQty) > 0) {
+          skipped.push({ deliveryTargetId, reason: "FORECAST_REPLACED_BY_SO" });
+          continue;
+        }
+        const requestedDeliveryDate = new Date(context.recommendation.requestedDeliveryDate);
+        const acceptedDeliveryDate = new Date(context.recommendation.earliestFeasibleDeliveryDate);
+        if (Number.isNaN(requestedDeliveryDate.getTime()) || Number.isNaN(acceptedDeliveryDate.getTime()) || acceptedDeliveryDate <= requestedDeliveryDate) {
+          skipped.push({ deliveryTargetId, reason: "NO_LATE_CUSTOMER_COMMITMENT" });
+          continue;
+        }
+        const current = await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } });
+        if (current?.status === "APPROVED" && current?.decisionType === "ACCEPT_LATE") {
+          skipped.push({ deliveryTargetId, reason: "ALREADY_ACCEPTED_LATE", planId: current.id });
+          continue;
+        }
+        const now = new Date();
+        if (current?.status === "PENDING_APPROVAL") {
+          if (current.decisionType !== "ACCEPT_LATE") {
+            skipped.push({ deliveryTargetId, reason: "PENDING_NON_ACCEPT_LATE", planId: current.id });
+            continue;
+          }
+          const targetChanged = context.target.updatedAt > current.updatedAt
+            || context.target.targetDate.getTime() !== current.requestedDeliveryDate.getTime();
+          const currentErrors = [
+            ...validateRecoveryChecklist(current.checklist, current.requestedDeliveryDate),
+            ...validateAcceptLate(current),
+          ];
+          if (targetChanged || currentErrors.length) {
+            failed.push({ deliveryTargetId, reason: targetChanged ? "RECOVERY_RECHECK_REQUIRED" : "VALIDATION_FAILED", errors: currentErrors });
+            continue;
+          }
+          const approved = await prisma.dueDateRecoveryPlan.update({
+            where: { id: current.id },
+            data: { status: "APPROVED", approvedBy: actorName, approvedAt: now, approvalReason: reason, updatedBy: actorName },
+          });
+          processed.push({ deliveryTargetId, planId: approved.id, acceptedDeliveryDate: approved.acceptedDeliveryDate, approvedPending: true });
+          continue;
+        }
+        const evidenceReference = `Auto Accept Late ${runNumber}`;
+        const checklist = autoAcceptLateChecklist(context.recommendation, reason, evidenceReference);
+        const validationErrors = [
+          ...validateRecoveryChecklist(checklist, requestedDeliveryDate),
+          ...validateAcceptLate({ decisionType: "ACCEPT_LATE", acceptedDeliveryDate, requestedDeliveryDate, acceptLateReason: reason }),
+        ];
+        if (validationErrors.length) {
+          failed.push({ deliveryTargetId, reason: "VALIDATION_FAILED", errors: validationErrors });
+          continue;
+        }
+        const data = {
+          requestedDeliveryDate,
+          fgRequiredDate: context.recommendation.fgRequiredDate ? new Date(context.recommendation.fgRequiredDate) : null,
+          earliestFeasibleFgDate: context.recommendation.earliestFeasibleFgDate ? new Date(context.recommendation.earliestFeasibleFgDate) : null,
+          earliestFeasibleDelivery: acceptedDeliveryDate,
+          recoveryGapDays: context.recommendation.recoveryGapDays,
+          criticalConstraint: context.recommendation.criticalConstraint,
+          feasibilitySnapshot: json(context.feasibility),
+          checklist: json(checklist),
+          notes: reason,
+          status: "APPROVED",
+          submittedBy: actorName,
+          submittedAt: now,
+          approvedBy: actorName,
+          approvedAt: now,
+          approvalReason: reason,
+          decisionType: "ACCEPT_LATE",
+          originalDeliveryDate: requestedDeliveryDate,
+          acceptedDeliveryDate,
+          acceptLateReason: reason,
+          rejectedBy: null,
+          rejectedAt: null,
+          rejectionReason: null,
+          updatedBy: actorName,
+        };
+        const plan = await prisma.$transaction(async (tx) => {
+          if (current && ["DRAFT", "REJECTED", "REPLAN_REQUIRED"].includes(current.status)) {
+            return tx.dueDateRecoveryPlan.update({ where: { id: current.id }, data });
+          }
+          if (current) await tx.dueDateRecoveryPlan.update({ where: { id: current.id }, data: { isCurrentPlan: false, updatedBy: actorName } });
+          return tx.dueDateRecoveryPlan.create({ data: { ...data, deliveryTargetId, revision: number(current?.revision) + 1 || 1, isCurrentPlan: true, createdBy: actorName } });
+        });
+        processed.push({ deliveryTargetId, planId: plan.id, acceptedDeliveryDate: plan.acceptedDeliveryDate });
+      } catch (error) {
+        failed.push({ deliveryTargetId, reason: "PROCESSING_FAILED", message: error.message });
+      }
+    }
+    res.json({ runNumber, requested: requestedIds.length, processed, skipped, failed });
   } catch (error) { next(error); }
 };
 

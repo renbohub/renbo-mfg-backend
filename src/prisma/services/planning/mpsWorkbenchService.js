@@ -339,6 +339,23 @@ function normalizedSourceType(value) {
   return type || "DEMAND";
 }
 
+function isCustomerDeliveryPhase(detail, phase) {
+  const sourceType = normalizedSourceType(phase?.sourceType);
+  if (sourceType === "SALES_ORDER") return true;
+  const efdSource = String(detail?.calculationTrace?.efd?.source || "").toUpperCase();
+  const hasSalesOrderSource = (detail?.demandSources || []).some((source) => normalizedSourceType(source?.sourceType) === "SALES_ORDER" && number(source?.qty) > EPSILON);
+  const hasForecastSource = (detail?.demandSources || []).some((source) => normalizedSourceType(source?.sourceType) === "FORECAST" && number(source?.qty) > EPSILON);
+  // A FORECAST override keeps the SO-backed phase and the unconsumed
+  // Forecast residual. Source pegging already reduces the Forecast phase by
+  // the quantity consumed by SO, so excluding it here makes phase production
+  // smaller than the official MPS quantity and causes RCCP to reject the run.
+  const forecastSelected = efdSource.startsWith("FORECAST");
+  const forecastDeliveryFallback = number(detail?.actualSalesOrderQty) <= EPSILON
+    && !hasSalesOrderSource
+    && (forecastSelected || (!efdSource && hasForecastSource));
+  return sourceType === "FORECAST" && (forecastSelected || forecastDeliveryFallback);
+}
+
 function phaseSimulationKey(source = {}) {
   const type = normalizedSourceType(source.sourceType);
   const sourceNumber = text(source.sourceNumber);
@@ -557,7 +574,13 @@ function buildLedger({ detail, stockLines, reservations, receipts, comparePhysic
   const otherReservations = reservations.filter((row) => !peggedReservations.includes(row));
   const reservationPools = new Map();
   peggedReservations.forEach((row) => reservationPools.set(text(row.referenceNumber), number(reservationPools.get(text(row.referenceNumber))) + remainingReservation(row)));
-  const phases = demandPhases(detail);
+  // Carryover remains an internal demand obligation. For the current month,
+  // however, netting must use the same source rule as Batch Delivery: SO wins
+  // once present; Forecast is only the fallback while PO/SO is still zero.
+  // Otherwise Forecast remainder and SO are both consumed, exhausting the
+  // official MPS quantity before it can form the ending-buffer batch.
+  const phases = demandPhases(detail).filter((phase) => normalizedSourceType(phase.sourceType) === "CARRYOVER"
+    || isCustomerDeliveryPhase(detail, phase));
   const soDemandByReference = new Map();
   phases.filter((row) => row.sourceType === "SALES_ORDER").forEach((row) => soDemandByReference.set(text(row.sourceNumber), number(soDemandByReference.get(text(row.sourceNumber))) + number(row.qty)));
   const physicalFreeOpeningQty = stockLines.reduce((sum, row) => sum + Math.max(number(row.qtyAvailable), 0), 0);
@@ -910,7 +933,11 @@ async function getMpsWorkbench(tx, options = {}) {
     const netting = buildLedger({ detail, stockLines: stockLines.filter((row) => row.partCode === detail.partCode), reservations: reservations.filter((row) => row.partCode === detail.partCode), receipts: receipts.filter((row) => row.part?.partCode === detail.partCode), comparePhysicalOpening: planningMonthKey(doc.planningAnchorMonth || doc.periodStart) === month });
     const demandEvents = netting.ledger.filter((row) => row.eventType === "GROSS_DEMAND");
     const performance = deliveryPerformance.byPart.get(detail.partCode) || null;
-    const phasesWithProduction = netting.phases.map((phase, index) => ({ ...phase, plannedProductionQty: number(demandEvents[index]?.plannedProductionQty), deliveryStatus: phaseDeliveryStatus(performance, phase) }));
+    // Forecast dates are provisional while PO/SO is still zero. Once an SO
+    // exists, only SO-backed phases remain visible as Batch Delivery.
+    const phasesWithProduction = netting.phases
+      .map((phase, index) => ({ ...phase, plannedProductionQty: number(demandEvents[index]?.plannedProductionQty), deliveryStatus: phaseDeliveryStatus(performance, phase) }))
+      .filter((phase) => isCustomerDeliveryPhase(detail, phase));
     const bufferEvent = netting.ledger.find((row) => row.eventType === "BUFFER_TARGET");
     const allocationMode = bufferAllocationMode(detail.calculationTrace?.bufferAllocationMode);
     const rawBufferPhase = number(detail.bufferQty) > EPSILON ? {
@@ -1141,7 +1168,7 @@ async function getMpsWorkbench(tx, options = {}) {
     const baselineMpsQty = number(netting.metrics?.plannedProductionQty);
     const deltaMpsQty = number(deltaQtyByPart.get(detail.partCode));
     const approvedCutQty = number(cutQtyByPart.get(detail.partCode));
-    return { id: detail.id, mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode: detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, efdM1, deliveredM1: delivery.deliveredPreviousQty, shortageM1: round(Math.max(efdM1 - delivery.deliveredPreviousQty, 0)), efdM: number(window[demandWindow.months[1]]), efdMPlus1: number(window[demandWindow.months[2]]), bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferAllocationMode: allocationMode, currentStockQty: round(stock.onHandQty), availableStockQty: round(stock.availableQty), stockReservedQty: round(stock.reservedQty), stockQcQty: round(stock.qcQty), leadTimeDays: round(leadTimeDays), delivery, capacity: { status: rccp?.status === "OVERRIDDEN" && capacitySummary?.capacityStatus === "OVERLOAD" ? "OVERRIDDEN" : capacitySummary?.capacityStatus || doc.capacityStatus || "NOT_CHECKED", maxLoadPercentage: number(capacitySummary?.maxLoadPercentage), rccpRunId: rccp?.id || null }, bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "GENERAL_RULE", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase, components, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, planningLock: coverage ? { locked: true, lockIds: coverage.locks.map((row) => row.id), lockedAt: coverage.locks.map((row) => row.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(coverage.locks.map((row) => row.lockedBy).filter(Boolean))].join(", ") || null } : { locked: false, lockIds: [] }, planMetrics: { baselineMpsQty: round(baselineMpsQty), deltaMpsQty: round(deltaMpsQty), approvedCutQty: round(approvedCutQty), totalPlanQty: round(Math.max(baselineMpsQty + deltaMpsQty - approvedCutQty, 0)), additionalQty: number(coverage?.additionalQty), pendingDeltaQty: number(coverage?.pendingDeltaQty) }, planningDocuments: { baselineMpsNumbers: [doc.mpsNumber], deltaMpsNumbers: [...new Set(deltaDocumentsByPart.get(detail.partCode) || [])], cutNumbers: [...new Set(cutDocumentsByPart.get(detail.partCode) || [])] }, ...netting, phases: allocatedPhases, phasePurchaseSimulation };
+    return { id: detail.id, mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode: detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, efdM1, deliveredM1: delivery.deliveredPreviousQty, shortageM1: round(Math.max(efdM1 - delivery.deliveredPreviousQty, 0)), efdM: number(window[demandWindow.months[1]]), efdMPlus1: number(window[demandWindow.months[2]]), bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferAllocationMode: allocationMode, currentStockQty: round(stock.onHandQty), availableStockQty: round(stock.availableQty), stockReservedQty: round(stock.reservedQty), stockQcQty: round(stock.qcQty), leadTimeDays: round(leadTimeDays), delivery, capacity: { status: rccp?.status === "OVERRIDDEN" && capacitySummary?.capacityStatus === "OVERLOAD" ? "OVERRIDDEN" : capacitySummary?.capacityStatus || doc.capacityStatus || "NOT_CHECKED", maxLoadPercentage: number(capacitySummary?.maxLoadPercentage), rccpRunId: rccp?.id || null }, bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "GENERAL_RULE", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase, components, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, planningLock: coverage ? { locked: true, lockIds: coverage.locks.map((row) => row.id), lockedAt: coverage.locks.map((row) => row.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(coverage.locks.map((row) => row.lockedBy).filter(Boolean))].join(", ") || null } : { locked: false, lockIds: [] }, planMetrics: { baselineMpsQty: round(baselineMpsQty), deltaMpsQty: round(deltaMpsQty), approvedCutQty: round(approvedCutQty), totalPlanQty: round(Math.max(baselineMpsQty + deltaMpsQty - approvedCutQty, 0)), additionalQty: number(coverage?.additionalQty), pendingDeltaQty: number(coverage?.pendingDeltaQty), lockedPoQty: number(coverage?.poQtyLocked), currentPoQty: number(coverage?.currentSoQty), poDeltaQty: round(coverage?.poDeltaQty) }, planningDocuments: { baselineMpsNumbers: [doc.mpsNumber], deltaMpsNumbers: [...new Set(deltaDocumentsByPart.get(detail.partCode) || [])], cutNumbers: [...new Set(cutDocumentsByPart.get(detail.partCode) || [])] }, ...netting, phases: allocatedPhases, phasePurchaseSimulation };
   });
   const query = text(options.q).toLowerCase();
   const statusFilter = text(options.status).toUpperCase();
@@ -1151,8 +1178,11 @@ async function getMpsWorkbench(tx, options = {}) {
   const pages = Math.max(Math.ceil(filtered.length / pageSize), 1);
   const safePage = Math.min(page, pages);
   const rccpApprovalAllowed = rccp?.status === "FEASIBLE" || (rccp?.status === "WARNING" && Boolean(rccp.acknowledgedAt)) || (rccp?.status === "OVERRIDDEN" && (rccp.overrides || []).length > 0);
-  const planningLock = { locked: additionalCoverage.items.some((row) => row.month === month), lockIds, lockedAt: additionalCoverage.items.map((row) => row.lock?.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(additionalCoverage.items.map((row) => row.lock?.lockedBy).filter(Boolean))].join(", ") || null, fingerprint: [...new Set(additionalCoverage.items.map((row) => row.lock?.sourceFingerprint).filter(Boolean))].join(",") || null };
+  const monthCoverage = [...additionalCoverage.byPartMonth.values()].filter((row) => row.month === month);
+  const monthLockItems = additionalCoverage.items.filter((row) => row.month === month);
+  const poDeltaQty = round(monthCoverage.reduce((sum, row) => sum + number(row.poDeltaQty), 0));
+  const planningLock = { locked: monthLockItems.length > 0, lockIds, lockedAt: monthLockItems.map((row) => row.lock?.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(monthLockItems.map((row) => row.lock?.lockedBy).filter(Boolean))].join(", ") || null, fingerprint: [...new Set(monthLockItems.map((row) => row.lock?.sourceFingerprint).filter(Boolean))].join(",") || null, poDeltaQty, changedPartCount: monthCoverage.filter((row) => Math.abs(number(row.poDeltaQty)) > EPSILON).length, hasPoDelta: monthCoverage.some((row) => Math.abs(number(row.poDeltaQty)) > EPSILON) };
   return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, planningLock, mps: { mpsNumber: doc.mpsNumber, status: doc.status, lifecycleStatus: doc.lifecycleStatus, revision: doc.revision, planKind: doc.planKind, lockedAt: doc.lockedAt, lockedBy: doc.lockedBy, capacityStatus: doc.capacityStatus, capacityCheckedAt: doc.capacityCheckedAt, planningAnchorMonth: doc.planningAnchorMonth, periodStart: doc.periodStart, periodEnd: doc.periodEnd, updatedAt: doc.updatedAt, replanRequired: doc.replanRequired, replanReason: doc.replanReason, deliveryFeasibilityStatus: doc.deliveryFeasibilityStatus, deliveryDispositionStatus: doc.deliveryDispositionStatus, officialGateStatus: doc.officialGateStatus, deliveryFeasibilityCheckedAt: doc.deliveryFeasibilityCheckedAt, deliveryFeasibilityReason: doc.deliveryFeasibilityReason }, deliveryGate, rccp: rccp ? { id: rccp.id, status: rccp.status, overallLoadStatus: rccp.overallLoadStatus, mpsRevision: rccp.mpsRevision, mpsQtySnapshot: rccp.mpsQtySnapshot, warningThreshold: rccp.warningThreshold, overloadThreshold: rccp.overloadThreshold, partSummaries: rccp.partSummaries, exceptions: rccp.exceptions, acknowledgedAt: rccp.acknowledgedAt, acknowledgedBy: rccp.acknowledgedBy, approvalAllowed: rccpApprovalAllowed, maxLoadPercentage: Math.max(0, ...(rccp.loads || []).map((row) => number(row.loadPercentage))) } : null, mrp, items: filtered.slice((safePage - 1) * pageSize, safePage * pageSize), summary, pagination: { page: safePage, pageSize, filtered: filtered.length, pages }, statuses: [...new Set(rows.map((row) => row.delivery?.status).filter(Boolean))].sort(), nettingStatuses: [...new Set(rows.map((row) => row.status))].sort(), generatedAt: new Date().toISOString(), periodStart: utcMonthStart(month), periodEnd: utcMonthEnd(month) };
 }
 
-module.exports = { getMpsWorkbench, buildLedger, demandPhases, blockedForecastSources, buildPhasePurchaseSimulation, phaseSimulationKey, requirementPhaseContributions };
+module.exports = { getMpsWorkbench, buildLedger, demandPhases, isCustomerDeliveryPhase, blockedForecastSources, buildPhasePurchaseSimulation, phaseSimulationKey, requirementPhaseContributions };
