@@ -32,6 +32,8 @@ router.post("/exception-workbench/:exceptionId/resolve", authorize("mps", "updat
 router.post("/exception-workbench/:exceptionId/close", authorize("mps", "approve"), logger("demandException", "close"), exceptionCtrl.transition("close"));
 router.post("/exception-workbench/:exceptionId/reopen", authorize("mps", "update"), logger("demandException", "reopen"), exceptionCtrl.transition("reopen"));
 router.post("/feasibility", authorize("mps", "read"), ctrl.feasibility);
+router.get("/recovery-plans", authorize("mps", "read"), ctrl.listRecoveryPlans);
+router.patch("/recovery-plans/:planId/feedback-status", authorize("mps", "update"), logger("demandPlanning", "update-recovery-feedback-status"), ctrl.updateRecoveryFeedbackStatus);
 router.get("/:deliveryTargetId/recovery-plan", authorize("mps", "read"), ctrl.getRecoveryPlan);
 router.put("/:deliveryTargetId/recovery-plan", authorize("mps", "update"), logger("demandPlanning", "save-due-date-recovery"), ctrl.saveRecoveryPlan);
 router.post("/recovery-plans/:planId/submit", authorize("mps", "update"), logger("demandPlanning", "submit-due-date-recovery"), ctrl.submitRecoveryPlan);

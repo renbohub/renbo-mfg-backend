@@ -6,10 +6,16 @@ const { buildYearlyDemand } = require("./yearlyDemandService");
 const { buildDeliveryPerformance, phaseDeliveryStatus } = require("./deliveryPerformanceService");
 const { getMpsDeliveryGate } = require("./mpsDeliveryFeasibilityService");
 const { loadAdditionalDemandCoverage } = require("./additionalDemandCoverageService");
+const {
+  buildMpsFeasibilityAssessment,
+  aggregateMpsFeasibilityAssessments,
+  summarizeMpsAssessments,
+} = require("./mpsFeasibilityAssessmentService");
+const { buildMpsCalculationBreakdown } = require("./mpsCalculationService");
+const { calculateShiftMinutes } = require("./workingHourCalendarService");
+const FEASIBILITY_CONFIG = require("./scheduleFeasibilityConfig");
 
 const EPSILON = 0.000001;
-const WORKING_HOURS_PER_DAY = 14;
-const MINIMUM_WIP_LEAD_TIME_HOURS = 2;
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 6) => {
   const factor = 10 ** digits;
@@ -20,6 +26,7 @@ const isSalesReservation = (row) => ["SO", "SALES_ORDER", "SALES ORDER"].include
 const remainingReservation = (row) => Math.max(number(row?.qtyReserved) - number(row?.qtyReleased), 0);
 const remainingMo = (row) => Math.max(number(row?.qtyPlanned) - Math.max(number(row?.qtyGood), number(row?.qtyProduced)) - number(row?.qtyReject), 0);
 const dateValue = (value, fallback) => value ? new Date(value) : new Date(fallback);
+const dateKey = (value) => value ? new Date(value).toISOString().slice(0, 10) : null;
 const leadTimeInDays = (value, unit) => {
   const duration = number(value);
   switch (text(unit).toUpperCase()) {
@@ -29,6 +36,43 @@ const leadTimeInDays = (value, unit) => {
     default: return duration;
   }
 };
+const rccpWorkProfileForPart = (rccp, partCode) => {
+  const relevantLoads = (rccp?.loads || []).filter((load) => (Array.isArray(load.partBreakdown) ? load.partBreakdown : [])
+    .some((row) => text(row.partCode) === text(partCode)));
+  return {
+    shiftsPerDay: Math.max(0, ...relevantLoads.map((row) => number(row.shiftsPerDay))),
+    hoursPerShift: Math.max(0, ...relevantLoads.map((row) => number(row.effectiveHoursPerShift))),
+  };
+};
+const calendarEventLabel = (reason) => {
+  const match = String(reason || "").match(/^\[YEARLY-CALENDAR:[^:]+:([A-Z_]+):[^\]]+\]\s*(.*)$/);
+  return match ? { type: match[1], label: match[2] || match[1] } : null;
+};
+function capacityWindowForProfile(profile, startAt, endAt, calendarOverrides = [], machineEvents = []) {
+  const start = new Date(startAt); const end = new Date(endAt);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return null;
+  const overrides = new Map(calendarOverrides.filter((row) => row.machineId === profile.machineId).map((row) => [dateKey(row.scheduleDate), row]));
+  const events = machineEvents.filter((row) => row.machineId === profile.machineId && row.status !== "CANCELLED");
+  const days = [];
+  for (let cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate())); cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    const dayStart = new Date(cursor); const dayEnd = new Date(cursor); dayEnd.setUTCHours(23, 59, 59, 999);
+    const override = overrides.get(dateKey(cursor)); const marker = calendarEventLabel(override?.reason);
+    const availabilityEvent = events.find((event) => new Date(event.startedAt) <= dayEnd && new Date(event.endedAt || endAt) >= dayStart);
+    const defaultWorking = String(profile.calendarMode || "WEEKDAY").toUpperCase() === "ALL_DAYS" || ![0, 6].includes(cursor.getUTCDay());
+    const isHoliday = override && (String(override.dayStatus || "WORKING").toUpperCase() === "HOLIDAY" || number(override.shiftsPerDay) <= 0);
+    const shifts = Array.isArray(override?.shiftOverrides) ? override.shiftOverrides : [];
+    const workingHours = isHoliday ? 0 : shifts.length
+      ? shifts.reduce((sum, shift) => sum + (calculateShiftMinutes(shift.startTime, shift.endTime, shift.breakMinutes) + number(shift.overtimeMinutes)) / 60, 0)
+      : defaultWorking ? number(profile.shiftsPerDay) * number(profile.effectiveHoursPerShift) : 0;
+    const unavailableMachineCount = availabilityEvent || ["MAINTENANCE", "BREAKDOWN"].includes(text(marker?.type).toUpperCase())
+      || ["INACTIVE", "MAINTENANCE", "RETIRED"].includes(text(profile.machine?.status).toUpperCase()) ? 1 : 0;
+    const availableMachines = workingHours > 0 ? Math.max(number(profile.resourceCount) - unavailableMachineCount, 0) : 0;
+    const availableHours = round(workingHours * availableMachines * number(profile.efficiencyPercent) / 100);
+    days.push({ date: dateKey(cursor), workingHours: round(workingHours), availableMachines, availableHours, eventType: availabilityEvent?.eventType || marker?.type || null, eventName: availabilityEvent?.reason || marker?.label || null, calendarSource: override ? "WORKING_CALENDAR_EVENT" : "MASTER_WORKING_HOUR" });
+  }
+  const grossAvailableHours = round(days.reduce((sum, day) => sum + day.availableHours, 0));
+  return { windowStart: dateKey(start), windowEnd: dateKey(end), grossAvailableHours, plannedDowntimeHours: number(profile.plannedDowntimeHours), netAvailableHours: round(Math.max(grossAvailableHours - number(profile.plannedDowntimeHours), 0)), days };
+}
 const planningProcess = (row, category, fallbackVendorLeadTimeDays = 0) => {
   const routingMode = text(row?.routingMode || "INHOUSE").toUpperCase();
   const isVendor = routingMode === "VENDOR"
@@ -76,7 +120,7 @@ const buildComponentPhaseNetting = ({ component, phases, receipts, officialRequi
     }
     const openingStockQty = round(stockPool);
     const openingFirmReceiptQty = round(receiptPool);
-    const previewGrossQty = operationalRequirementQty(number(component.qtyPerFg) * number(phase.plannedProductionQty || phase.qty), component.uomCode);
+    const previewGrossQty = operationalRequirementQty(number(component.qtyPerFg) * number(phase.plannedProductionQty ?? phase.qty), component.uomCode);
     const stockUsedQty = Math.min(stockPool, previewGrossQty);
     stockPool -= stockUsedQty;
     const afterStockQty = Math.max(previewGrossQty - stockUsedQty, 0);
@@ -118,7 +162,7 @@ const buildCascadingComponentNetting = ({ components, rootPartCode, phases, rece
     states.set(component.partCode, { stockPool: number(component.availableStockQty), receiptPool: 0, receiptIndex: 0, receiptEvents });
   }
   for (const [phaseIndex, phase] of phases.entries()) {
-    const plannedByPart = new Map([[rootPartCode, number(phase.plannedProductionQty || phase.qty)]]);
+    const plannedByPart = new Map([[rootPartCode, number(phase.plannedProductionQty ?? phase.qty)]]);
     const phaseDate = dateValue(phase.fgRequiredDate || phase.targetDeliveryDate, new Date(8640000000000000));
     for (const component of ordered) {
       const state = states.get(component.partCode);
@@ -156,96 +200,6 @@ const buildCascadingComponentNetting = ({ components, rootPartCode, phases, rece
     }
   }
   return phaseNettingByPart;
-};
-const processLeadTimeForQty = (component, qty) => {
-  const plannedQty = Math.max(number(qty), 0);
-  const steps = (component.processes || []).map((process) => {
-    if (process.isVendor) {
-      const vendorLeadTimeDays = plannedQty > EPSILON ? Math.max(number(process.vendorLeadTimeDays), 0) : 0;
-      return {
-        partCode: component.partCode, processCode: process.processCode, processName: process.processName,
-        routingMode: "VENDOR", qty: plannedQty, cycleTimeSeconds: 0, cycleLoadHours: 0,
-        vendorCode: process.vendorCode || null, vendorLeadTimeDays,
-        elapsedHours: round(vendorLeadTimeDays * WORKING_HOURS_PER_DAY),
-      };
-    }
-    const cycleTimeSeconds = Math.max(number(process.cycleTimeSeconds), 0);
-    const cycleLoadHours = cycleTimeSeconds * plannedQty / 3600;
-    return {
-      partCode: component.partCode, processCode: process.processCode, processName: process.processName,
-      routingMode: "INHOUSE", qty: plannedQty, cycleTimeSeconds,
-      cycleLoadHours: round(cycleLoadHours), vendorLeadTimeDays: 0, elapsedHours: round(cycleLoadHours),
-    };
-  });
-  return {
-    cycleTimeSeconds: round(steps.reduce((sum, step) => sum + number(step.cycleTimeSeconds), 0)),
-    cycleLoadHours: round(steps.reduce((sum, step) => sum + number(step.cycleLoadHours), 0)),
-    vendorLeadTimeDays: round(steps.reduce((sum, step) => sum + number(step.vendorLeadTimeDays), 0)),
-    elapsedHours: round(steps.reduce((sum, step) => sum + number(step.elapsedHours), 0)),
-    steps,
-  };
-};
-const buildCumulativeComponentLeadTimes = ({ components, rootPartCode, phases }) => {
-  const byPart = new Map(components.map((component) => [component.partCode, component]));
-  const result = new Map(components.map((component) => [component.partCode, []]));
-  for (const [phaseIndex, phase] of phases.entries()) {
-    const plannedByPart = new Map([[rootPartCode, number(phase.plannedProductionQty || phase.qty)]]);
-    for (const component of components) {
-      const netting = component.phaseNetting?.find((row) => number(row.phaseIndex) === phaseIndex);
-      plannedByPart.set(component.partCode, number(netting?.plannedOrderQty));
-    }
-    const memo = new Map();
-    const calculate = (partCode, visiting = new Set()) => {
-      if (partCode === rootPartCode || !byPart.has(partCode) || visiting.has(partCode)) {
-        return { totalHours: 0, totalDays: 0, ownHours: 0, parentHours: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0, steps: [] };
-      }
-      if (memo.has(partCode)) return memo.get(partCode);
-      const component = byPart.get(partCode);
-      const plannedQty = number(plannedByPart.get(partCode));
-      if (plannedQty <= EPSILON) {
-        const zero = {
-          phaseId: phase.id || String(phaseIndex), phaseIndex, plannedQty: 0,
-          ownHours: 0, parentHours: 0, totalHours: 0, totalDays: 0,
-          cycleTimeSeconds: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0,
-          ownCycleLoadHours: 0, ownVendorLeadTimeDays: 0, minimumLeadTimeAdjustmentHours: 0,
-          steps: [], calculationMethod: "ZERO_WHEN_MPS_ZERO",
-        };
-        memo.set(partCode, zero);
-        return zero;
-      }
-      const own = processLeadTimeForQty(component, plannedQty);
-      const nextVisiting = new Set(visiting).add(partCode);
-      const parents = (component.dependencies || []).map((dependency) => calculate(dependency.parentPartCode, nextVisiting));
-      const criticalParent = parents.sort((left, right) => number(right.totalHours) - number(left.totalHours))[0]
-        || { totalHours: 0, cycleLoadHours: 0, vendorLeadTimeDays: 0, steps: [] };
-      const rawTotalHours = round(own.elapsedHours + criticalParent.totalHours);
-      const totalHours = round(Math.max(rawTotalHours, MINIMUM_WIP_LEAD_TIME_HOURS));
-      const minimumLeadTimeAdjustmentHours = round(totalHours - rawTotalHours);
-      const value = {
-        phaseId: phase.id || String(phaseIndex), phaseIndex, plannedQty: round(plannedQty),
-        ownHours: round(own.elapsedHours), parentHours: round(criticalParent.totalHours), totalHours,
-        totalDays: round(totalHours / WORKING_HOURS_PER_DAY, 3),
-        cycleTimeSeconds: own.cycleTimeSeconds,
-        cycleLoadHours: round(own.cycleLoadHours + criticalParent.cycleLoadHours),
-        vendorLeadTimeDays: round(own.vendorLeadTimeDays + criticalParent.vendorLeadTimeDays),
-        ownCycleLoadHours: own.cycleLoadHours, ownVendorLeadTimeDays: own.vendorLeadTimeDays,
-        minimumLeadTimeAdjustmentHours,
-        steps: [
-          ...own.steps,
-          ...criticalParent.steps,
-          ...(minimumLeadTimeAdjustmentHours > EPSILON ? [{
-            partCode, processCode: "MIN-LEAD-TIME", processName: "Minimum WIP lead time",
-            routingMode: "POLICY", qty: plannedQty, elapsedHours: minimumLeadTimeAdjustmentHours,
-          }] : []),
-        ],
-        calculationMethod: "CUMULATIVE_QTY_X_CYCLE_PLUS_VENDOR_MIN_2H_14H_DAY",
-      };
-      memo.set(partCode, value);
-      return value;
-    };
-    for (const component of components) result.get(component.partCode).push(calculate(component.partCode));
-  }
-  return result;
 };
 const shiftMonth = (month, offset) => {
   const [year, value] = String(month || "").split("-").map(Number);
@@ -303,11 +257,13 @@ function demandPhases(detail) {
   for (const source of detail.demandSources || []) {
     const peggingRows = Array.isArray(source.sourcePegging) ? source.sourcePegging : [];
     if (!peggingRows.length) {
+      const targetDeliveryDate = source.targetDeliveryDate || source.effectiveRequiredDate || source.requiredDate;
+      const requestedFgDate = source.fgRequiredDate || source.effectiveRequiredDate || source.requiredDate;
       phases.push({
         id: `${source.id}:1`, sourceType: source.sourceType, sourceNumber: source.sourceNumber,
         customerCode: source.customerCode, qty: number(source.qty), phaseNumber: 1,
-        targetDeliveryDate: source.targetDeliveryDate || source.effectiveRequiredDate || source.requiredDate,
-        fgRequiredDate: source.fgRequiredDate || source.effectiveRequiredDate || source.requiredDate,
+        targetDeliveryDate,
+        fgRequiredDate: fgFinishNotAfterDelivery(requestedFgDate, targetDeliveryDate),
       });
       continue;
     }
@@ -316,19 +272,24 @@ function demandPhases(detail) {
         ? pegging.fgFinishSplits
         : [{ phaseNumber: 1, targetFinishDate: source.fgRequiredDate || pegging.targetDeliveryDate, qty: pegging.qty }];
       for (const [index, split] of splits.entries()) {
+        const targetDeliveryDate = pegging.targetDeliveryDate || source.targetDeliveryDate;
+        const requestedFgDate = split.targetFinishDate || source.fgRequiredDate || targetDeliveryDate;
         phases.push({
           id: `${source.id}:${pegging.deliveryTargetId || index}:${split.phaseNumber || index + 1}`,
           deliveryTargetId: pegging.deliveryTargetId || source.deliveryTargetId,
           sourceType: source.sourceType, sourceNumber: source.sourceNumber,
           customerCode: pegging.customerCode || source.customerCode,
           qty: number(split.qty), phaseNumber: number(split.phaseNumber) || index + 1,
-          targetDeliveryDate: pegging.targetDeliveryDate || source.targetDeliveryDate,
-          fgRequiredDate: split.targetFinishDate || source.fgRequiredDate || pegging.targetDeliveryDate,
+          targetDeliveryDate,
+          // Persisted legacy splits can outlive a customer delivery revision.
+          // Workbench netting must never schedule FG after the customer due date.
+          fgRequiredDate: fgFinishNotAfterDelivery(requestedFgDate, targetDeliveryDate),
         });
       }
     }
   }
   return phases.filter((row) => row.qty > EPSILON).sort((left, right) => dateValue(left.fgRequiredDate, detail.endDate) - dateValue(right.fgRequiredDate, detail.endDate)
+    || dateValue(left.targetDeliveryDate, detail.endDate) - dateValue(right.targetDeliveryDate, detail.endDate)
     || (left.sourceType === "SALES_ORDER" ? -1 : 1)
     || text(left.sourceNumber).localeCompare(text(right.sourceNumber)));
 }
@@ -379,6 +340,7 @@ function requirementPhaseContributions(requirement) {
         qty: requirement.grossRequirement,
       }];
   const rows = sources.flatMap((source) => {
+    const targetDeliveryDate = source.targetDeliveryDate || requirement.targetDeliveryDate;
     const splits = Array.isArray(source.fgFinishSplits) && source.fgFinishSplits.length
       ? source.fgFinishSplits
       : [{ qty: source.qty, phaseNumber: source.fgFinishSplitNumber || 1, targetFinishDate: source.fgRequiredDate || source.targetDeliveryDate || requirement.targetDeliveryDate }];
@@ -387,8 +349,8 @@ function requirementPhaseContributions(requirement) {
         sourceType: source.sourceType,
         sourceNumber: source.sourceNumber,
         deliveryTargetId: source.deliveryTargetId || requirement.deliveryTargetId,
-        targetDeliveryDate: source.targetDeliveryDate || requirement.targetDeliveryDate,
-        fgRequiredDate: split.targetFinishDate || source.fgRequiredDate,
+        targetDeliveryDate,
+        fgRequiredDate: fgFinishNotAfterDelivery(split.targetFinishDate || source.fgRequiredDate, targetDeliveryDate),
         phaseNumber: split.phaseNumber || source.fgFinishSplitNumber || index + 1,
       }),
       weight: Math.max(number(split.qty ?? source.qty), 0),
@@ -712,12 +674,39 @@ function buildLedger({ detail, stockLines, reservations, receipts, comparePhysic
   };
 }
 
+function fgFinishNotAfterDelivery(fgFinishDate, targetDeliveryDate) {
+  if (!fgFinishDate) return targetDeliveryDate || fgFinishDate;
+  if (!targetDeliveryDate) return fgFinishDate;
+  return dateValue(fgFinishDate, targetDeliveryDate) > dateValue(targetDeliveryDate, fgFinishDate)
+    ? targetDeliveryDate
+    : fgFinishDate;
+}
+
+function attachPhaseNetting(phases = [], ledger = []) {
+  const demandEvents = ledger.filter((row) => row.eventType === "GROSS_DEMAND");
+  return phases.map((phase, index) => {
+    const event = demandEvents[index] || {};
+    const reservedStockUsedQty = number(event.reservedUsedQty);
+    const freeStockUsedQty = number(event.freeUsedQty);
+    return {
+      ...phase,
+      plannedProductionQty: number(event.plannedProductionQty),
+      stockUsedQty: round(reservedStockUsedQty + freeStockUsedQty),
+      reservedStockUsedQty: round(reservedStockUsedQty),
+      freeStockUsedQty: round(freeStockUsedQty),
+      projectedFreeQty: round(event.projectedFreeQty),
+      uncoveredQty: round(event.uncoveredQty),
+    };
+  });
+}
+
 async function getMpsWorkbench(tx, options = {}) {
   const month = planningMonthKey(options.month || new Date());
   const demandWindow = await efdWindow(tx, month);
   const page = Math.max(Math.trunc(number(options.page)) || 1, 1);
   const pageSize = Math.min(Math.max(Math.trunc(number(options.pageSize)) || 25, 10), 100);
   const includeSimulation = ["1", "true", "yes"].includes(text(options.includeSimulation).toLowerCase());
+  const includeFeasibilityDetail = ["1", "true", "yes"].includes(text(options.includeFeasibilityDetail).toLowerCase());
   const detailId = text(options.detailId);
   const doc = await tx.mPS.findFirst({
     where: { sourceKey: `MONTH:${month}`, isDeleted: false, status: { not: "Superseded" } },
@@ -769,7 +758,7 @@ async function getMpsWorkbench(tx, options = {}) {
       },
     },
   });
-  if (!doc) return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, mps: null, rccp: null, mrp: null, items: [], blockedForecasts: await blockedForecastSources(tx, month), summary: { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0 }, pagination: { page: 1, pageSize, filtered: 0, pages: 1 }, statuses: [] };
+  if (!doc) return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, mps: null, rccp: null, mrp: null, items: [], blockedForecasts: await blockedForecastSources(tx, month), summary: { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0, feasibleCount: 0, riskCount: 0, notEvaluatedCount: 0, notFeasibleCount: 0 }, feasibilitySummary: summarizeMpsAssessments([]), pagination: { page: 1, pageSize, filtered: 0, pages: 1 }, statuses: ["FEASIBLE", "FEASIBLE_WITH_RISK", "NOT_FEASIBLE", "NOT_EVALUATED", "NA"] };
   const additionalCoverage = await loadAdditionalDemandCoverage(tx, {
     year: Number(month.slice(0, 4)),
     partCodes: doc.details.map((row) => row.partCode),
@@ -825,9 +814,30 @@ async function getMpsWorkbench(tx, options = {}) {
   });
   const rccp = await tx.rccpRun.findFirst({
     where: { mpsId: doc.id, invalidatedAt: null },
-    include: { loads: { orderBy: { loadPercentage: "desc" } }, overrides: { orderBy: { approvedAt: "desc" } } },
+    include: {
+      loads: { orderBy: { loadPercentage: "desc" } },
+      overrides: { orderBy: { approvedAt: "desc" } },
+      timeBuckets: { orderBy: [{ bucketStart: "asc" }, { resourceCode: "asc" }] },
+      offsetDetails: { orderBy: [{ calculatedStartDate: "asc" }, { sequence: "asc" }] },
+    },
     orderBy: { createdAt: "desc" },
   });
+  const feasibilityProfiles = includeFeasibilityDetail ? await tx.rccpResourceProfile.findMany({
+    where: { partId: { in: doc.details.map((row) => row.partId).filter(Boolean) }, isActive: true, isCritical: true },
+    include: { machine: { select: { id: true, machineCode: true, machineName: true, status: true } } },
+    orderBy: [{ sequence: "asc" }, { resourceCode: "asc" }],
+  }) : [];
+  const feasibilityMachineIds = [...new Set(feasibilityProfiles.map((profile) => profile.machineId).filter(Boolean))];
+  const [feasibilityCalendarOverrides, feasibilityMachineEvents] = feasibilityMachineIds.length ? await Promise.all([
+    tx.capacityCalendarOverride.findMany({
+      where: { machineId: { in: feasibilityMachineIds }, scheduleDate: { gte: utcMonthStart(month), lte: utcMonthEnd(month) }, isDeleted: false },
+      orderBy: [{ scheduleDate: "asc" }],
+    }),
+    tx.machineAvailabilityEvent.findMany({
+      where: { machineId: { in: feasibilityMachineIds }, isDeleted: false, status: { not: "CANCELLED" }, startedAt: { lte: utcMonthEnd(month) }, OR: [{ endedAt: null }, { endedAt: { gte: utcMonthStart(month) } }] },
+      orderBy: [{ startedAt: "asc" }],
+    }),
+  ]) : [[], []];
   const selectedDetail = detailId ? doc.details.find((row) => row.id === detailId) : null;
   const traceSearch = selectedDetail?.partCode || text(options.q);
   const [mrpRequirements, traceability] = mrp && includeSimulation ? await Promise.all([
@@ -876,6 +886,7 @@ async function getMpsWorkbench(tx, options = {}) {
     orderBy: [{ requiredDate: "asc" }, { treePath: "asc" }],
     select: {
       mpsDetailId: true, partCode: true, requiredDate: true, orderType: true, levelMBOM: true, treePath: true,
+      materialRequiredDate: true, productionRequiredDate: true, orderDate: true, scheduleSource: true,
       grossRequirement: true, onHandQty: true, firmSupplyQty: true, netRequirement: true,
       plannedOrderQty: true, projectedAvailableQty: true, targetDeliveryDate: true,
       deliveryTargetId: true, rootDemandSourceNumber: true, sourceNumber: true,
@@ -931,12 +942,11 @@ async function getMpsWorkbench(tx, options = {}) {
   }
   const rows = doc.details.map((detail) => {
     const netting = buildLedger({ detail, stockLines: stockLines.filter((row) => row.partCode === detail.partCode), reservations: reservations.filter((row) => row.partCode === detail.partCode), receipts: receipts.filter((row) => row.part?.partCode === detail.partCode), comparePhysicalOpening: planningMonthKey(doc.planningAnchorMonth || doc.periodStart) === month });
-    const demandEvents = netting.ledger.filter((row) => row.eventType === "GROSS_DEMAND");
     const performance = deliveryPerformance.byPart.get(detail.partCode) || null;
     // Forecast dates are provisional while PO/SO is still zero. Once an SO
     // exists, only SO-backed phases remain visible as Batch Delivery.
-    const phasesWithProduction = netting.phases
-      .map((phase, index) => ({ ...phase, plannedProductionQty: number(demandEvents[index]?.plannedProductionQty), deliveryStatus: phaseDeliveryStatus(performance, phase) }))
+    const phasesWithProduction = attachPhaseNetting(netting.phases, netting.ledger)
+      .map((phase) => ({ ...phase, deliveryStatus: phaseDeliveryStatus(performance, phase) }))
       .filter((phase) => isCustomerDeliveryPhase(detail, phase));
     const bufferEvent = netting.ledger.find((row) => row.eventType === "BUFFER_TARGET");
     const allocationMode = bufferAllocationMode(detail.calculationTrace?.bufferAllocationMode);
@@ -1070,7 +1080,7 @@ async function getMpsWorkbench(tx, options = {}) {
       const targetIds = [...new Set(meaningful.map((row) => row.deliveryTargetId).filter(Boolean))];
       const rootQty = targetIds.reduce((sum, targetId) => {
         const phase = planningPhases.find((row) => row.deliveryTargetId === targetId);
-        return sum + number(phase?.plannedProductionQty || phase?.qty);
+        return sum + number(phase?.plannedProductionQty ?? phase?.qty);
       }, 0);
       const officialQtyPerFg = rootQty > EPSILON ? round(grossQty / rootQty) : 0;
       const structuralPaths = new Map();
@@ -1144,16 +1154,21 @@ async function getMpsWorkbench(tx, options = {}) {
       ...component,
       phaseNetting: phaseNettingByPart.get(component.partCode) || [],
     }));
-    const cumulativeLeadTimeByPart = buildCumulativeComponentLeadTimes({
-      components: nettedComponents,
-      rootPartCode: detail.partCode,
-      phases: planningPhases,
-    });
     const components = nettedComponents.map((component) => ({
       ...component,
       phaseNetting: component.phaseNetting.map((netting, index) => ({
         ...netting,
-        leadTime: cumulativeLeadTimeByPart.get(component.partCode)?.[index] || null,
+        leadTime: (() => {
+          const phase = planningPhases[index] || {};
+          const official = detailMrpRequirements.filter((requirement) => requirement.partCode === component.partCode && componentRequirementMatchesPhase(requirement, phase));
+          if (!official.length) return null;
+          const starts = official.map((row) => row.productionRequiredDate || row.materialRequiredDate || row.orderDate).filter(Boolean).map((value) => new Date(value));
+          const ends = official.map((row) => row.requiredDate).filter(Boolean).map((value) => new Date(value));
+          const startDate = starts.length ? new Date(Math.min(...starts)) : null;
+          const endDate = ends.length ? new Date(Math.max(...ends)) : null;
+          const totalHours = startDate && endDate ? Math.max((endDate - startDate) / 3600000, 0) : 0;
+          return { phaseId: phase.id || String(index), phaseIndex: index, startDate, endDate, totalHours: round(totalHours), totalDays: round(totalHours / 24, 3), steps: [], calculationMethod: "OFFICIAL_MRP_OR_TOOLS_WASM_CP_SAT", scheduleSources: [...new Set(official.map((row) => row.scheduleSource || "OR_TOOLS_WASM_CP_SAT"))] };
+        })(),
       })),
     }));
     const stock = stockTotalsByPart.get(detail.partCode) || {};
@@ -1164,17 +1179,259 @@ async function getMpsWorkbench(tx, options = {}) {
       ...(component.phaseNetting || []).map((row) => number(row.leadTime?.totalDays)),
     ), 0);
     const capacitySummary = (Array.isArray(rccp?.partSummaries) ? rccp.partSummaries : []).find((row) => row.partCode === detail.partCode);
+    const capacityStatus = rccp?.status === "OVERRIDDEN" && capacitySummary?.capacityStatus === "OVERLOAD"
+      ? "OVERRIDDEN"
+      : capacitySummary?.capacityStatus || doc.capacityStatus || "NOT_CHECKED";
+    const capacity = {
+      status: capacityStatus,
+      maxLoadPercentage: number(capacitySummary?.maxLoadPercentage),
+      rccpRunId: rccp?.id || null,
+      warningThreshold: number(rccp?.warningThreshold) || 90,
+      overloadThreshold: number(rccp?.overloadThreshold) || 100,
+      ...rccpWorkProfileForPart(rccp, detail.partCode),
+    };
     const coverage = coverageByPart.get(detail.partCode) || null;
     const baselineMpsQty = number(netting.metrics?.plannedProductionQty);
     const deltaMpsQty = number(deltaQtyByPart.get(detail.partCode));
     const approvedCutQty = number(cutQtyByPart.get(detail.partCode));
-    return { id: detail.id, mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode: detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, efdM1, deliveredM1: delivery.deliveredPreviousQty, shortageM1: round(Math.max(efdM1 - delivery.deliveredPreviousQty, 0)), efdM: number(window[demandWindow.months[1]]), efdMPlus1: number(window[demandWindow.months[2]]), bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferAllocationMode: allocationMode, currentStockQty: round(stock.onHandQty), availableStockQty: round(stock.availableQty), stockReservedQty: round(stock.reservedQty), stockQcQty: round(stock.qcQty), leadTimeDays: round(leadTimeDays), delivery, capacity: { status: rccp?.status === "OVERRIDDEN" && capacitySummary?.capacityStatus === "OVERLOAD" ? "OVERRIDDEN" : capacitySummary?.capacityStatus || doc.capacityStatus || "NOT_CHECKED", maxLoadPercentage: number(capacitySummary?.maxLoadPercentage), rccpRunId: rccp?.id || null }, bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "GENERAL_RULE", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase, components, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, planningLock: coverage ? { locked: true, lockIds: coverage.locks.map((row) => row.id), lockedAt: coverage.locks.map((row) => row.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(coverage.locks.map((row) => row.lockedBy).filter(Boolean))].join(", ") || null } : { locked: false, lockIds: [] }, planMetrics: { baselineMpsQty: round(baselineMpsQty), deltaMpsQty: round(deltaMpsQty), approvedCutQty: round(approvedCutQty), totalPlanQty: round(Math.max(baselineMpsQty + deltaMpsQty - approvedCutQty, 0)), additionalQty: number(coverage?.additionalQty), pendingDeltaQty: number(coverage?.pendingDeltaQty), lockedPoQty: number(coverage?.poQtyLocked), currentPoQty: number(coverage?.currentSoQty), poDeltaQty: round(coverage?.poDeltaQty) }, planningDocuments: { baselineMpsNumbers: [doc.mpsNumber], deltaMpsNumbers: [...new Set(deltaDocumentsByPart.get(detail.partCode) || [])], cutNumbers: [...new Set(cutDocumentsByPart.get(detail.partCode) || [])] }, ...netting, phases: allocatedPhases, phasePurchaseSimulation };
+    const planMetrics = { baselineMpsQty: round(baselineMpsQty), deltaMpsQty: round(deltaMpsQty), approvedCutQty: round(approvedCutQty), totalPlanQty: round(Math.max(baselineMpsQty + deltaMpsQty - approvedCutQty, 0)), additionalQty: number(coverage?.additionalQty), pendingDeltaQty: number(coverage?.pendingDeltaQty), lockedPoQty: number(coverage?.poQtyLocked), currentPoQty: number(coverage?.currentSoQty), poDeltaQty: round(coverage?.poDeltaQty) };
+    const uomCode = detail.uomCode || detail.part?.productionUomCode || detail.part?.baseUomCode;
+    const itemSnapshots = (deliveryGate.snapshots || []).filter((row) => row.partCode === detail.partCode);
+    const routeProcesses = mbomDetails.flatMap((row) => row.mbomProcesses || []);
+    const partOffsetRows = (rccp?.offsetDetails || []).filter((row) => row.mpsDetailId === detail.id);
+    const relevantLoads = (rccp?.loads || []).filter((load) => (load.partBreakdown || []).some((row) => row.mpsDetailId === detail.id || row.partCode === detail.partCode));
+    const bottleneck = relevantLoads.slice().sort((left, right) => number(right.loadPercentage) - number(left.loadPercentage))[0] || null;
+    const assessedCapacity = bottleneck ? {
+      ...capacity,
+      requiredCapacityHours: round(number(bottleneck.totalLoad)),
+      netAvailableCapacityHours: round(number(bottleneck.availableCapacity)),
+      bottleneckWorkCenterId: bottleneck.resourceProfileId || bottleneck.resourceCode,
+      bottleneckWorkCenterName: bottleneck.resourceName || bottleneck.resourceCode,
+      affectedTimeBucket: bottleneck.bucketStart || null,
+      evidence: relevantLoads.map((row) => ({ sourceType: "RCCP_LOAD", sourceDocumentNumber: rccp.id, workCenter: row.resourceCode, requiredHours: row.totalLoad, availableHours: row.availableCapacity, utilizationPct: row.loadPercentage })),
+    } : capacity;
+    const profilesForPart = feasibilityProfiles.filter((profile) => profile.partId === detail.partId);
+    const vendorProcessEntries = components.flatMap((component) => (component.processes || [])
+        .filter((process) => process.isVendor)
+        .map((process) => [
+          `${process.processCode || process.processName}|${process.vendorCode || process.vendorName}`,
+          {
+            componentPartCode: component.partCode,
+            processCode: process.processCode,
+            processName: process.processName,
+            vendorCode: process.vendorCode,
+            vendorName: process.vendorName,
+            vendorLeadTimeDays: number(process.vendorLeadTimeDays),
+          },
+        ]));
+    const vendorProcesses = [...new Map(vendorProcessEntries).values()];
+    const capacityDecisionSupport = (phase, requiredAt) => {
+      const windowStart = utcMonthStart(month); const windowEnd = requiredAt || phase.fgRequiredDate || utcMonthEnd(month);
+      const workCenters = profilesForPart.filter((profile) => {
+        const resourceIdentity = `${profile.resourceType || ""} ${profile.resourceCode || ""} ${profile.resourceName || ""}`.toUpperCase();
+        return !resourceIdentity.includes("VENDOR") && !resourceIdentity.includes("SUBCONTRACT");
+      }).map((profile) => {
+        const window = capacityWindowForProfile(profile, windowStart, windowEnd, feasibilityCalendarOverrides, feasibilityMachineEvents);
+        const load = relevantLoads.find((row) => row.resourceProfileId === profile.id || row.resourceCode === profile.resourceCode);
+        const requiredHours = load ? number(load.totalLoad) : round(number(phase.plannedProductionQty) * number(profile.standardTimeHours) + number(profile.setupTimeHours));
+        const availableHours = load && rccp ? number(load.availableCapacity) : number(window?.netAvailableHours);
+        return {
+          resourceCode: profile.resourceCode, resourceName: profile.resourceName || profile.resourceCode,
+          machineCode: profile.machine?.machineCode || null, machineName: profile.machine?.machineName || null,
+          machineStatus: profile.machine?.status || null, masterWorkingHoursPerDay: round(number(profile.shiftsPerDay) * number(profile.effectiveHoursPerShift)),
+          shiftsPerDay: profile.shiftsPerDay, hoursPerShift: profile.effectiveHoursPerShift, masterMachineCount: profile.resourceCount,
+          efficiencyPercent: profile.efficiencyPercent, requiredHours: round(requiredHours), availableHours: round(availableHours),
+          utilizationPct: availableHours > EPSILON ? round(requiredHours / availableHours * 100, 2) : null,
+          authoritative: Boolean(load && rccp), calendarWindow: window,
+        };
+      });
+      return { windowStart: dateKey(windowStart), windowEnd: dateKey(windowEnd), formula: "Master working hours x mesin tersedia x efficiency - maintenance/calendar downtime", authoritative: Boolean(rccp && workCenters.some((row) => row.authoritative)), workCenters };
+    };
+    const masterMissing = [];
+    if (!detail.customerTargetDate && !detail.fgRequiredDate && !itemSnapshots.some((row) => row.originalTargetDate)) masterMissing.push("requiredDeliveryAt");
+    if (window[demandWindow.months[1]] === null || window[demandWindow.months[1]] === undefined) masterMissing.push("demandQty");
+    if (!uomCode) masterMissing.push("uomCode");
+    if (planMetrics.totalPlanQty > EPSILON && !detail.mbom) masterMissing.push("effectiveBom");
+    if (planMetrics.totalPlanQty > EPSILON && !routeProcesses.length) masterMissing.push("effectiveRouting");
+    const mpsCalculation = buildMpsCalculationBreakdown({
+      previousEfdQty: efdM1, previousDeliveredQty: delivery.deliveredPreviousQty,
+      currentEfdQty: number(window[demandWindow.months[1]]), lookAheadEfdQty: number(window[demandWindow.months[2]]),
+      bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty),
+      calculationTrace: detail.calculationTrace, metrics: netting.metrics, planMetrics, mpsQty: planMetrics.totalPlanQty,
+      inventory: { onHandQty: number(stock.onHandQty), reservedQty: number(stock.reservedQty), allocatedQty: null, qcHoldQty: number(stock.qcQty), blockedQty: null, usableStockQty: number(stock.availableQty) },
+    });
+    const phaseInput = (phase, snapshot, rowType = "BATCH") => {
+      const phaseQty = number(phase.plannedProductionQty);
+      const dueQty = number(phase.qty);
+      const earliest = snapshot?.assessmentDetail?.earliestFeasibleDeliveryDate || null;
+      const requiredAt = snapshot?.effectiveCommitmentDate || snapshot?.originalTargetDate || phase.targetDeliveryDate || phase.fgRequiredDate || null;
+      const phaseOffsets = partOffsetRows.filter((row) => !row.mpsPhaseId || row.mpsPhaseId === phase.id);
+      const orderedOffsets = phaseOffsets.slice().sort((left, right) => number(left.sequence) - number(right.sequence));
+      let overlapCount = 0;
+      let minimumActualGapMinutes = null;
+      for (let index = 1; index < orderedOffsets.length; index += 1) {
+        const gap = (new Date(orderedOffsets[index].calculatedStartDate) - new Date(orderedOffsets[index - 1].calculatedFinishDate)) / 60000;
+        if (Number.isFinite(gap)) { minimumActualGapMinutes = minimumActualGapMinutes === null ? gap : Math.min(minimumActualGapMinutes, gap); if (gap < -EPSILON) overlapCount += 1; }
+      }
+      const materialCoverage = Array.isArray(snapshot?.assessmentDetail?.materialCoverage) ? snapshot.assessmentDetail.materialCoverage.map((row) => ({ ...row, causesDeliveryMiss: String(snapshot.feasibilityStatus || "").toUpperCase().includes("INFEASIBLE") || String(snapshot.feasibilityStatus || "").toUpperCase().includes("NOT_FEASIBLE") })) : [];
+      const externalRows = materialCoverage.filter((row) => number(row.shortageQty ?? row.expectedShortageQty) > EPSILON && (row.supplierCode || row.supplyCustomerCode));
+      const supplierRows = externalRows.map((row) => {
+        const latestRequestAt = row.latestPrDate ? new Date(row.latestPrDate) : null;
+        const evaluatedAt = snapshot?.evaluatedAt ? new Date(snapshot.evaluatedAt) : new Date();
+        const lateCalendarDays = latestRequestAt && Number.isFinite(latestRequestAt.getTime())
+          ? Math.max(Math.ceil((Date.UTC(evaluatedAt.getUTCFullYear(), evaluatedAt.getUTCMonth(), evaluatedAt.getUTCDate()) - Date.UTC(latestRequestAt.getUTCFullYear(), latestRequestAt.getUTCMonth(), latestRequestAt.getUTCDate())) / 86400000), 0)
+          : 0;
+        const supplierLeadTimeDays = number(row.supplierLeadTimeDays ?? row.procurementLeadTimeBreakdown?.supplierLeadTimeDays);
+        const totalLeadTimeDays = number(row.procurementLeadTimeDays);
+        const requestedLeadTimeDays = Math.max(supplierLeadTimeDays - lateCalendarDays, 0);
+        return {
+          partCode: row.partCode,
+          partName: row.partName || null,
+          shortageQty: round(number(row.shortageQty ?? row.expectedShortageQty)),
+          uomCode: row.uomCode || null,
+          supplierCode: row.supplierCode || row.supplyCustomerCode || null,
+          supplierName: row.supplierName || row.supplyCustomerName || null,
+          maxArrivalDate: dateKey(row.requiredDate),
+          latestRequestDate: dateKey(row.latestPrDate),
+          totalLeadTimeDays: round(totalLeadTimeDays),
+          internalProcessLeadTimeDays: round(Math.max(totalLeadTimeDays - supplierLeadTimeDays, 0)),
+          supplierLeadTimeDays: round(supplierLeadTimeDays),
+          requestedSupplierLeadTimeDays: round(requestedLeadTimeDays),
+          requiredAccelerationDays: round(Math.max(supplierLeadTimeDays - requestedLeadTimeDays, 0)),
+          leadTimeBreakdown: row.procurementLeadTimeBreakdown || null,
+          action: requestedLeadTimeDays > 0
+            ? `Request supplier lead time maksimal ${round(requestedLeadTimeDays)} hari`
+            : "Request immediate delivery; batas kedatangan sudah lewat",
+        };
+      });
+      const phaseCalculation = buildMpsCalculationBreakdown({
+        currentEfdQty: rowType === "BUFFER" ? 0 : dueQty,
+        bufferBaseQty: rowType === "BUFFER" ? number(phase.bufferBaseQty) : 0,
+        bufferPercent: rowType === "BUFFER" ? number(phase.bufferPercent) : 0,
+        bufferQty: rowType === "BUFFER" ? number(phase.bufferTargetQty) : number(phase.bufferAllocatedQty),
+        metrics: { grossDemandQty: dueQty, firmReceiptQty: 0, plannedProductionQty: phaseQty },
+        planMetrics: { baselineMpsQty: phaseQty, deltaMpsQty: 0, approvedCutQty: 0, totalPlanQty: phaseQty },
+        mpsQty: phaseQty,
+        inventory: { onHandQty: number(stock.onHandQty), reservedQty: number(stock.reservedQty), allocatedQty: null, qcHoldQty: number(stock.qcQty), blockedQty: null, usableStockQty: number(phase.stockUsedQty) },
+      });
+      return {
+        rowType, mpsQty: phaseQty, demandQty: dueQty, requiredDeliveryAt: requiredAt, uomCode, snapshots: snapshot ? [snapshot] : [],
+        identity: { lineId: `${detail.id}::${rowType.toLowerCase()}::${phase.id}`, parentLineId: detail.id, rowType, partId: detail.partId, partNumber: detail.part?.partNumber || detail.partCode, partName: detail.part?.partName || detail.partCode, period: month, batchId: phase.id, batchLabel: rowType === "BUFFER" ? "Buffer akhir bulan" : phase.sourceNumber || phase.id, mpsQty: phaseQty, requiredDeliveryAt: requiredAt },
+        masterData: { missingFields: rowType === "BUFFER" ? [] : masterMissing, evidence: [{ sourceType: "MPS_DETAIL", sourceDocumentNumber: doc.mpsNumber }, { sourceType: "MBOM", sourceDocumentNumber: detail.mbom?.mbomNumber || null }, { sourceType: "PLANNING_CONFIG", plantTimezone: FEASIBILITY_CONFIG.plantTimezone }] },
+        inventory: rowType === "BUFFER" ? {} : { onHandQty: number(stock.onHandQty), reservedQty: number(stock.reservedQty), allocatedQty: null, qcHoldQty: number(stock.qcQty), blockedQty: null, usableStockQty: number(phase.stockUsedQty), onTimeReceiptQty: 0, scheduledOutputByDue: phaseQty, demandAllocatedBefore: 0, dueDemandQty: dueQty },
+        materials: { applicable: rowType !== "BUFFER" && phaseQty > EPSILON, components: materialCoverage, materialReadyAt: earliest },
+        firmSupply: externalRows.length ? { externalDependent: true, firmReceiptQty: null, onTimeFirmReceiptQty: null, lateReceiptQty: null, unconfirmedReceiptQty: null, affectedPoNumbers: externalRows.flatMap((row) => row.affectedPoNumbers || []).filter(Boolean), evidence: externalRows } : { externalDependent: false },
+        capacity: assessedCapacity,
+        resources: rowType === "BUFFER" ? { applicable: false } : phaseOffsets.length && phaseOffsets.every((row) => row.resourceCode && row.calendarId) ? { evaluated: true, missingResourceCount: 0, conflictingResourceCount: phaseOffsets.filter((row) => row.status === "OVERLOAD").length, alternateResourceCount: 0, affectedResourceNames: phaseOffsets.filter((row) => row.status === "OVERLOAD").map((row) => row.resourceName || row.resourceCode) } : { evaluated: false, missingFields: ["rccp.offsetDetails.resourceCode", "rccp.offsetDetails.calendarId"] },
+        routing: rowType === "BUFFER" ? { applicable: false } : !routeProcesses.length ? { evaluated: false, missingFields: ["effectiveRouting"] } : phaseOffsets.length ? { evaluated: true, invalidSequenceCount: 0, overlapCount, minimumRequiredGapMinutes: FEASIBILITY_CONFIG.minPredecessorSuccessorGapMinutes, minimumActualGapMinutes, affectedOperationIds: overlapCount ? orderedOffsets.map((row) => row.id) : [] } : { evaluated: false, missingFields: ["rccp.offsetDetails.operationSchedule"] },
+        lot: { applicable: false },
+        schedule: { plannedStartAt: orderedOffsets[0]?.calculatedStartDate || capacitySummary?.earliestStartDate || null, plannedFinishAt: orderedOffsets.at(-1)?.calculatedFinishDate || null, projectedProductionFinishAt: orderedOffsets.at(-1)?.calculatedFinishDate || null, projectedCustomerArrivalAt: earliest, earliestFeasibleDeliveryAt: earliest, requiredDeliveryAt: requiredAt, warningSlackMinutes: FEASIBILITY_CONFIG.scheduleWarningSlackMinutes },
+        quality: rowType === "BUFFER" ? { applicable: false } : { evaluated: false, missingFields: ["inspectionPlan", "expectedInspectionDuration"] },
+        delivery: rowType === "BUFFER" ? { applicable: false } : { evaluated: false, missingFields: ["dispatchSlot", "transitDuration", "deliveryCalendar"] },
+        buffer: rowType === "BUFFER" ? { targetQty: number(phase.bufferTargetQty), projectedEndingQty: number(netting.metrics.projectedEndingQty) } : { targetQty: number(detail.bufferQty), projectedEndingQty: number(netting.metrics.projectedEndingQty) },
+        mpsCalculation: phaseCalculation,
+        decisionSupport: {
+          supplier: {
+            owner: "Purchasing",
+            actionLabel: "Request lead time supplier lebih cepat",
+            rows: supplierRows,
+            totalShortageQty: round(supplierRows.reduce((sum, row) => sum + number(row.shortageQty), 0)),
+          },
+          capacity: rowType === "BUFFER" ? { applicable: false, workCenters: [] } : capacityDecisionSupport(phase, requiredAt),
+          vendor: {
+            owner: "Purchasing",
+            actionLabel: "Request percepatan proses vendor",
+            processes: vendorProcesses,
+            totalLeadTimeDays: round(vendorProcesses.reduce((sum, row) => sum + number(row.vendorLeadTimeDays), 0)),
+          },
+          delivery: {
+            owner: "Sales",
+            actionLabel: "Change Delivery Target",
+            lastResort: true,
+            requestedDeliveryDate: dateKey(requiredAt),
+            earliestFeasibleDeliveryDate: dateKey(earliest),
+          },
+        },
+      };
+    };
+    const phaseAssessments = [];
+    const assessedPhases = allocatedPhases.map((phase) => {
+      const snapshot = itemSnapshots.find((row) => row.deliveryTargetId === phase.deliveryTargetId) || itemSnapshots.find((row) => row.sourceNumber === phase.sourceNumber && String(row.originalTargetDate || "").slice(0, 10) === String(phase.targetDeliveryDate || phase.fgRequiredDate || "").slice(0, 10));
+      const assessmentInput = phaseInput(phase, snapshot, "BATCH");
+      const detailAssessment = buildMpsFeasibilityAssessment(assessmentInput);
+      detailAssessment.decisionSupport = assessmentInput.decisionSupport;
+      phaseAssessments.push(detailAssessment);
+      const checklistSummary = { ...detailAssessment.summary, lineId: detailAssessment.identity.lineId };
+      return { ...phase, lineId: detailAssessment.identity.lineId, rowType: "BATCH", mpsQty: number(phase.plannedProductionQty), feasibilityLineId: detailAssessment.identity.lineId, checklistSummary, feasibilityAssessment: includeFeasibilityDetail ? detailAssessment : checklistSummary, ...(includeFeasibilityDetail ? { scheduleFeasibility: detailAssessment } : {}) };
+    });
+    let assessedBufferPhase = bufferPhase;
+    let bufferAssessment = null;
+    if (bufferPhase) {
+      const assessmentInput = phaseInput(bufferPhase, null, "BUFFER");
+      bufferAssessment = buildMpsFeasibilityAssessment(assessmentInput);
+      bufferAssessment.decisionSupport = assessmentInput.decisionSupport;
+      const checklistSummary = { ...bufferAssessment.summary, lineId: bufferAssessment.identity.lineId };
+      assessedBufferPhase = { ...bufferPhase, lineId: bufferAssessment.identity.lineId, rowType: "BUFFER", mpsQty: number(bufferPhase.plannedProductionQty), feasibilityLineId: bufferAssessment.identity.lineId, checklistSummary, feasibilityAssessment: includeFeasibilityDetail ? bufferAssessment : checklistSummary, ...(includeFeasibilityDetail ? { scheduleFeasibility: bufferAssessment } : {}) };
+    }
+    const childAssessments = [...phaseAssessments, ...(bufferAssessment ? [bufferAssessment] : [])];
+    const feasibilityDetail = aggregateMpsFeasibilityAssessments(childAssessments, { asOf: new Date(), identity: { lineId: detail.id, parentLineId: null, rowType: "FG", partId: detail.partId, partNumber: detail.part?.partNumber || detail.partCode, partName: detail.part?.partName || detail.partCode, period: month, batchId: null, mpsQty: planMetrics.totalPlanQty, requiredDeliveryAt: detail.customerTargetDate || detail.fgRequiredDate }, mpsCalculation });
+    const rootRequiredAt = detail.customerTargetDate || detail.fgRequiredDate || null;
+    const supplierSupportMap = new Map();
+    phaseAssessments.flatMap((assessment) => assessment.decisionSupport?.supplier?.rows || []).forEach((row) => {
+      const key = `${row.partCode}|${row.supplierCode}`;
+      const current = supplierSupportMap.get(key);
+      if (!current) { supplierSupportMap.set(key, { ...row }); return; }
+      current.shortageQty = round(number(current.shortageQty) + number(row.shortageQty));
+      if (row.maxArrivalDate && (!current.maxArrivalDate || row.maxArrivalDate < current.maxArrivalDate)) current.maxArrivalDate = row.maxArrivalDate;
+      if (row.latestRequestDate && (!current.latestRequestDate || row.latestRequestDate < current.latestRequestDate)) current.latestRequestDate = row.latestRequestDate;
+      current.totalLeadTimeDays = Math.max(number(current.totalLeadTimeDays), number(row.totalLeadTimeDays));
+      current.internalProcessLeadTimeDays = Math.max(number(current.internalProcessLeadTimeDays), number(row.internalProcessLeadTimeDays));
+      current.supplierLeadTimeDays = Math.max(number(current.supplierLeadTimeDays), number(row.supplierLeadTimeDays));
+      current.requestedSupplierLeadTimeDays = Math.min(number(current.requestedSupplierLeadTimeDays), number(row.requestedSupplierLeadTimeDays));
+      current.requiredAccelerationDays = Math.max(number(current.requiredAccelerationDays), number(row.requiredAccelerationDays));
+      current.action = current.requestedSupplierLeadTimeDays > 0
+        ? `Request supplier lead time maksimal ${round(current.requestedSupplierLeadTimeDays)} hari`
+        : "Request immediate delivery; batas kedatangan sudah lewat";
+    });
+    const supplierSupportRows = [...supplierSupportMap.values()];
+    feasibilityDetail.decisionSupport = {
+      supplier: {
+        owner: "Purchasing",
+        actionLabel: "Request lead time supplier lebih cepat",
+        rows: supplierSupportRows,
+        totalShortageQty: round(supplierSupportRows.reduce((sum, row) => sum + number(row.shortageQty), 0)),
+      },
+      capacity: capacityDecisionSupport({ plannedProductionQty: planMetrics.totalPlanQty, fgRequiredDate: rootRequiredAt }, rootRequiredAt),
+      vendor: {
+        owner: "Purchasing",
+        actionLabel: "Request percepatan proses vendor",
+        processes: vendorProcesses,
+        totalLeadTimeDays: round(vendorProcesses.reduce((sum, row) => sum + number(row.vendorLeadTimeDays), 0)),
+      },
+      delivery: {
+        owner: "Sales",
+        actionLabel: "Change Delivery Target",
+        lastResort: true,
+        requestedDeliveryDate: dateKey(rootRequiredAt),
+        earliestFeasibleDeliveryDate: dateKey(feasibilityDetail.summary.earliestFeasibleDeliveryAt),
+      },
+    };
+    feasibilityDetail.summary.lineId = detail.id;
+    const checklistSummary = { ...feasibilityDetail.summary, lineId: detail.id };
+    const feasibilityAssessment = includeFeasibilityDetail ? feasibilityDetail : checklistSummary;
+    netting.mpsQty = planMetrics.totalPlanQty;
+    return { id: detail.id, lineId: detail.id, rowType: "FG", mpsNumber: doc.mpsNumber, mpsStatus: doc.status, lifecycleStatus: doc.lifecycleStatus, lineNumber: detail.lineNumber, partCode: detail.partCode, partNumber: detail.part?.partNumber, partName: detail.part?.partName, uomCode, customerCode: detail.customerCode, demandPolicy: detail.demandPolicy, productionPercent: detail.productionPercent, efdM1, deliveredM1: delivery.deliveredPreviousQty, shortageM1: round(Math.max(efdM1 - delivery.deliveredPreviousQty, 0)), efdM: number(window[demandWindow.months[1]]), efdMPlus1: number(window[demandWindow.months[2]]), bufferBaseQty: number(detail.bufferBaseQty), bufferPercent: number(detail.bufferPercent), bufferQty: number(detail.bufferQty), bufferAllocationMode: allocationMode, currentStockQty: round(stock.onHandQty), availableStockQty: round(stock.availableQty), stockReservedQty: round(stock.reservedQty), stockQcQty: round(stock.qcQty), allocatedStockQty: null, blockedStockQty: null, leadTimeDays: round(leadTimeDays), delivery, capacity: assessedCapacity, checklistSummary: feasibilityDetail.summary, feasibilityAssessment, ...(includeFeasibilityDetail ? { scheduleFeasibility: feasibilityDetail } : {}), bufferTargetDate: detail.endDate, nextForecastMonth: nextPlanningMonthKey(month), bufferSource: detail.bufferOverridden ? "OVERRIDE" : "GENERAL_RULE", masterBufferPercent: number(detail.part?.bufferStock), bufferPhase: assessedBufferPhase, components, earliestFgRequiredDate: detail.fgRequiredDate, earliestCustomerTargetDate: detail.customerTargetDate, calculationTrace: detail.calculationTrace, mpsCalculation, planningLock: coverage ? { locked: true, lockIds: coverage.locks.map((row) => row.id), lockedAt: coverage.locks.map((row) => row.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(coverage.locks.map((row) => row.lockedBy).filter(Boolean))].join(", ") || null } : { locked: false, lockIds: [] }, planMetrics, planningDocuments: { baselineMpsNumbers: [doc.mpsNumber], deltaMpsNumbers: [...new Set(deltaDocumentsByPart.get(detail.partCode) || [])], cutNumbers: [...new Set(cutDocumentsByPart.get(detail.partCode) || [])] }, ...netting, phases: assessedPhases, phasePurchaseSimulation };
   });
   const query = text(options.q).toLowerCase();
   const statusFilter = text(options.status).toUpperCase();
-  const filtered = rows.filter((row) => (!detailId || row.id === detailId) && (!query || [row.partCode, row.partNumber, row.partName, row.customerCode, row.mpsNumber, row.delivery?.statusLabel, row.delivery?.lastScheduleNumber].some((value) => text(value).toLowerCase().includes(query))) && (!statusFilter || row.status === statusFilter || row.delivery?.status === statusFilter));
+  const filtered = rows.filter((row) => (!detailId || row.id === detailId) && (!query || [row.partCode, row.partNumber, row.partName, row.customerCode, row.mpsNumber, row.delivery?.statusLabel, row.delivery?.lastScheduleNumber].some((value) => text(value).toLowerCase().includes(query))) && (!statusFilter || row.feasibilityAssessment?.status === statusFilter));
   const summary = rows.reduce((acc, row) => { acc.partCount += 1; ["grossDemandQty", "freeOpeningQty", "peggedReservationQty", "firmReceiptQty", "plannedProductionQty", "uncoveredQty"].forEach((key) => { acc[key] += number(row.metrics[key]); }); acc.bufferBaseQty += number(row.bufferBaseQty); acc.bufferQty += number(row.bufferQty); if (row.status === "REVIEW_VARIANCE") acc.varianceCount += 1; if (row.status === "SHORTAGE") acc.shortageCount += 1; return acc; }, { partCount: 0, grossDemandQty: 0, bufferBaseQty: 0, bufferQty: 0, freeOpeningQty: 0, peggedReservationQty: 0, firmReceiptQty: 0, plannedProductionQty: 0, uncoveredQty: 0, varianceCount: 0, shortageCount: 0 });
   Object.keys(summary).forEach((key) => { if (key !== "partCount" && key !== "varianceCount" && key !== "shortageCount") summary[key] = round(summary[key]); });
+  const feasibilitySummary = summarizeMpsAssessments(rows.map((row) => row.feasibilityAssessment));
+  summary.feasibleCount = number(feasibilitySummary.counts.FEASIBLE);
+  summary.riskCount = number(feasibilitySummary.counts.FEASIBLE_WITH_RISK);
+  summary.notEvaluatedCount = number(feasibilitySummary.counts.NOT_EVALUATED);
+  summary.notFeasibleCount = number(feasibilitySummary.counts.NOT_FEASIBLE);
   const pages = Math.max(Math.ceil(filtered.length / pageSize), 1);
   const safePage = Math.min(page, pages);
   const rccpApprovalAllowed = rccp?.status === "FEASIBLE" || (rccp?.status === "WARNING" && Boolean(rccp.acknowledgedAt)) || (rccp?.status === "OVERRIDDEN" && (rccp.overrides || []).length > 0);
@@ -1182,7 +1439,7 @@ async function getMpsWorkbench(tx, options = {}) {
   const monthLockItems = additionalCoverage.items.filter((row) => row.month === month);
   const poDeltaQty = round(monthCoverage.reduce((sum, row) => sum + number(row.poDeltaQty), 0));
   const planningLock = { locked: monthLockItems.length > 0, lockIds, lockedAt: monthLockItems.map((row) => row.lock?.lockedAt).filter(Boolean).sort()[0] || null, lockedBy: [...new Set(monthLockItems.map((row) => row.lock?.lockedBy).filter(Boolean))].join(", ") || null, fingerprint: [...new Set(monthLockItems.map((row) => row.lock?.sourceFingerprint).filter(Boolean))].join(",") || null, poDeltaQty, changedPartCount: monthCoverage.filter((row) => Math.abs(number(row.poDeltaQty)) > EPSILON).length, hasPoDelta: monthCoverage.some((row) => Math.abs(number(row.poDeltaQty)) > EPSILON) };
-  return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, planningLock, mps: { mpsNumber: doc.mpsNumber, status: doc.status, lifecycleStatus: doc.lifecycleStatus, revision: doc.revision, planKind: doc.planKind, lockedAt: doc.lockedAt, lockedBy: doc.lockedBy, capacityStatus: doc.capacityStatus, capacityCheckedAt: doc.capacityCheckedAt, planningAnchorMonth: doc.planningAnchorMonth, periodStart: doc.periodStart, periodEnd: doc.periodEnd, updatedAt: doc.updatedAt, replanRequired: doc.replanRequired, replanReason: doc.replanReason, deliveryFeasibilityStatus: doc.deliveryFeasibilityStatus, deliveryDispositionStatus: doc.deliveryDispositionStatus, officialGateStatus: doc.officialGateStatus, deliveryFeasibilityCheckedAt: doc.deliveryFeasibilityCheckedAt, deliveryFeasibilityReason: doc.deliveryFeasibilityReason }, deliveryGate, rccp: rccp ? { id: rccp.id, status: rccp.status, overallLoadStatus: rccp.overallLoadStatus, mpsRevision: rccp.mpsRevision, mpsQtySnapshot: rccp.mpsQtySnapshot, warningThreshold: rccp.warningThreshold, overloadThreshold: rccp.overloadThreshold, partSummaries: rccp.partSummaries, exceptions: rccp.exceptions, acknowledgedAt: rccp.acknowledgedAt, acknowledgedBy: rccp.acknowledgedBy, approvalAllowed: rccpApprovalAllowed, maxLoadPercentage: Math.max(0, ...(rccp.loads || []).map((row) => number(row.loadPercentage))) } : null, mrp, items: filtered.slice((safePage - 1) * pageSize, safePage * pageSize), summary, pagination: { page: safePage, pageSize, filtered: filtered.length, pages }, statuses: [...new Set(rows.map((row) => row.delivery?.status).filter(Boolean))].sort(), nettingStatuses: [...new Set(rows.map((row) => row.status))].sort(), generatedAt: new Date().toISOString(), periodStart: utcMonthStart(month), periodEnd: utcMonthEnd(month) };
+  return { period: month, efdWindow: { months: demandWindow.months, totals: demandWindow.totals, total: demandWindow.total, rule: demandWindow.rule }, planningLock, mps: { mpsNumber: doc.mpsNumber, status: doc.status, lifecycleStatus: doc.lifecycleStatus, revision: doc.revision, planKind: doc.planKind, lockedAt: doc.lockedAt, lockedBy: doc.lockedBy, capacityStatus: doc.capacityStatus, capacityCheckedAt: doc.capacityCheckedAt, planningAnchorMonth: doc.planningAnchorMonth, periodStart: doc.periodStart, periodEnd: doc.periodEnd, updatedAt: doc.updatedAt, replanRequired: doc.replanRequired, replanReason: doc.replanReason, deliveryFeasibilityStatus: doc.deliveryFeasibilityStatus, deliveryDispositionStatus: doc.deliveryDispositionStatus, officialGateStatus: doc.officialGateStatus, deliveryFeasibilityCheckedAt: doc.deliveryFeasibilityCheckedAt, deliveryFeasibilityReason: doc.deliveryFeasibilityReason }, deliveryGate, feasibilitySummary, rccp: rccp ? { id: rccp.id, status: rccp.status, overallLoadStatus: rccp.overallLoadStatus, mpsRevision: rccp.mpsRevision, mpsQtySnapshot: rccp.mpsQtySnapshot, warningThreshold: rccp.warningThreshold, overloadThreshold: rccp.overloadThreshold, partSummaries: rccp.partSummaries, exceptions: rccp.exceptions, acknowledgedAt: rccp.acknowledgedAt, acknowledgedBy: rccp.acknowledgedBy, approvalAllowed: rccpApprovalAllowed, maxLoadPercentage: Math.max(0, ...(rccp.loads || []).map((row) => number(row.loadPercentage))) } : null, mrp, items: filtered.slice((safePage - 1) * pageSize, safePage * pageSize), summary, pagination: { page: safePage, pageSize, filtered: filtered.length, pages }, statuses: ["FEASIBLE", "FEASIBLE_WITH_RISK", "NOT_FEASIBLE", "NOT_EVALUATED", "NA"], nettingStatuses: [...new Set(rows.map((row) => row.status))].sort(), generatedAt: new Date().toISOString(), periodStart: utcMonthStart(month), periodEnd: utcMonthEnd(month) };
 }
 
-module.exports = { getMpsWorkbench, buildLedger, demandPhases, isCustomerDeliveryPhase, blockedForecastSources, buildPhasePurchaseSimulation, phaseSimulationKey, requirementPhaseContributions };
+module.exports = { getMpsWorkbench, buildLedger, attachPhaseNetting, demandPhases, fgFinishNotAfterDelivery, isCustomerDeliveryPhase, blockedForecastSources, buildPhasePurchaseSimulation, phaseSimulationKey, requirementPhaseContributions };

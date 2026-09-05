@@ -221,16 +221,18 @@ function buildDueDateRecoveryChecklist(feasibility = {}, options = {}) {
     required: false,
     verification: "Alasan khusus, risiko, pemilik risiko, dan bukti approval wajib lengkap.",
   }));
-  actions.push(action({
-    id: "ACCEPT_LATE",
-    category: "GOVERNANCE",
-    title: "Accept Late",
-    reason: "Keterlambatan diterima dengan tanggal komitmen baru dan persetujuan formal.",
-    ownerRole: "PPIC Approver",
-    targetDate: earliestDeliveryDate || requestedDeliveryDate,
-    required: false,
-    verification: "Alasan, tanggal baru, dampak delivery phase, dan approval wajib tersimpan.",
-  }));
+  if (feasibility.status === "NOT_FEASIBLE" && gapDays > 0) {
+    actions.push(action({
+      id: "ACCEPT_LATE",
+      category: "GOVERNANCE",
+      title: "Accept Late",
+      reason: "Keterlambatan diterima dengan tanggal komitmen baru dan persetujuan formal.",
+      ownerRole: "PPIC Approver",
+      targetDate: earliestDeliveryDate,
+      required: false,
+      verification: "Alasan, tanggal baru, dampak delivery phase, dan approval wajib tersimpan.",
+    }));
+  }
 
   actions.push(action({
     id: "DAILY_CONTROL",
@@ -272,4 +274,29 @@ function validateRecoveryChecklist(checklist = [], requestedDeliveryDate = null)
   return errors;
 }
 
-module.exports = { buildDueDateRecoveryChecklist, validateRecoveryChecklist, calendarGapDays };
+function buildTrialRecoveryChecklist(recommendation = {}, options = {}) {
+  const owner = String(options.owner || "PPIC Trial").trim();
+  const notes = String(options.notes || "Trial recovery otomatis dari MPS Workbench.").trim();
+  const evidenceReference = String(options.evidenceReference || "MPS one-click trial recovery").trim();
+  return (recommendation.actions || []).map((item) => {
+    const selected = Boolean(item.required || item.id === "RUN_TRIAL_RECOVERY");
+    return {
+      ...item,
+      selected,
+      owner: selected ? owner || item.ownerRole || "PPIC Trial" : null,
+      targetDate: item.targetDate || recommendation.requestedDeliveryDate || null,
+      notes: selected ? notes : null,
+      evidenceReference: selected ? evidenceReference : null,
+    };
+  });
+}
+
+function resolveAcceptedLateDate(requestedDeliveryDate, earliestFeasibleDeliveryDate) {
+  const requested = asDate(requestedDeliveryDate);
+  const feasible = asDate(earliestFeasibleDeliveryDate);
+  if (!requested || !feasible) return null;
+  if (feasible > requested) return feasible;
+  return null;
+}
+
+module.exports = { buildDueDateRecoveryChecklist, buildTrialRecoveryChecklist, resolveAcceptedLateDate, validateRecoveryChecklist, calendarGapDays };

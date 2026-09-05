@@ -341,6 +341,33 @@ exports.workbench = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+async function resolveWorkbenchFeasibility(lineId, month) {
+  const normalizedLineId = String(lineId || "").trim();
+  const parentDetailId = normalizedLineId.split("::")[0];
+  const data = await getMpsWorkbench(prisma, {
+    month,
+    page: 1,
+    pageSize: 10,
+    detailId: parentDetailId,
+    includeSimulation: false,
+    includeFeasibilityDetail: true,
+  });
+  const item = data.items?.[0];
+  if (!item) return null;
+  if (normalizedLineId === item.lineId || normalizedLineId === item.id) return item.scheduleFeasibility;
+  const phase = [...(item.phases || []), item.bufferPhase].filter(Boolean)
+    .find((row) => row.feasibilityLineId === normalizedLineId);
+  return phase?.scheduleFeasibility || null;
+}
+
+exports.workbenchFeasibility = async (req, res, next) => {
+  try {
+    const result = await resolveWorkbenchFeasibility(req.params.lineId, req.query.month);
+    if (!result) return res.status(404).json({ message: "Baris MPS atau evaluasi feasibility tidak ditemukan." });
+    return res.json(result);
+  } catch (error) { return next(error); }
+};
+
 // Read model for both newly generated monthly MPS and legacy MPS documents
 // whose header covers more than one month.  It deliberately derives the month
 // from each detail's startDate, so no historical document needs rewriting.

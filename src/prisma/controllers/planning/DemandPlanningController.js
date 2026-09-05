@@ -4,7 +4,8 @@ const { prisma } = require("../../index");
 const { buildDemandRows, buildCapacityOverview, reviewDemand, planningAnchorMonth } = require("../../services/planning/demandPlanningService");
 const { assessDemandFeasibility } = require("../../services/planning/demandFeasibilityService");
 const { simulateDisplacement } = require("../../services/planning/dppDisplacementService");
-const { buildDueDateRecoveryChecklist, validateRecoveryChecklist } = require("../../services/planning/dueDateRecoveryService");
+const { buildDueDateRecoveryChecklist, buildTrialRecoveryChecklist, resolveAcceptedLateDate, validateRecoveryChecklist } = require("../../services/planning/dueDateRecoveryService");
+const { deliveryTargetIdsFromMps, refreshMpsDeliveryFeasibility, isAcceptLateApplicable } = require("../../services/planning/mpsDeliveryFeasibilityService");
 
 const text = (value) => String(value ?? "").trim() || null;
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -88,6 +89,100 @@ function deliveryTargetIdsFromRequirements(requirements = []) {
   }).map(String))];
 }
 
+function effectiveRecoveryPlan(plan, feasibility = {}, requestedDeliveryDate = null) {
+  if (!plan || String(plan.decisionType || "").toUpperCase() !== "ACCEPT_LATE") return plan;
+  const originalTargetDate = requestedDeliveryDate || feasibility.requestedDeliveryDate || plan.requestedDeliveryDate;
+  const applicable = isAcceptLateApplicable({
+    feasibilityStatus: feasibility.status || feasibility.feasibilityStatus,
+    originalTargetDate,
+    earliestFeasibleDeliveryDate: feasibility.earliestFeasibleDeliveryDate,
+    acceptLateNewDate: plan.acceptedDeliveryDate,
+  });
+  if (applicable) return { ...plan, isApplicableToCurrentCalculation: true };
+  return {
+    ...plan,
+    historicalStatus: plan.status,
+    status: "REPLAN_REQUIRED",
+    isApplicableToCurrentCalculation: false,
+  };
+}
+
+const RECOVERY_FEEDBACK_STATUSES = new Set(["OPEN", "IN_PROGRESS", "WAITING", "DONE"]);
+function recoveryFeedbackStatus(plan = {}, checklist = []) {
+  const explicit = (Array.isArray(checklist) ? checklist : []).map((item) => String(item.feedbackStatus || "").toUpperCase()).find((value) => RECOVERY_FEEDBACK_STATUSES.has(value));
+  if (explicit) return explicit;
+  if (plan.status === "APPROVED") return "DONE";
+  if (plan.status === "PENDING_APPROVAL") return "WAITING";
+  if (["DRAFT", "REJECTED", "REPLAN_REQUIRED"].includes(plan.status)) return "IN_PROGRESS";
+  return "OPEN";
+}
+function recoveryDepartment(action = {}, decisionType = "RECOVERY") {
+  if (decisionType === "ACCEPT_LATE" || action.id === "ACCEPT_LATE") return "Sales";
+  const key = `${action.id || ""} ${action.title || ""} ${action.ownerRole || ""}`.toUpperCase();
+  if (/SUPPLIER|MATERIAL|PURCHAS|VENDOR|PO|PR/.test(key)) return "Purchasing";
+  if (/CAPACITY|OVERTIME|LINE|PRODUCTION|ROUT/.test(key)) return "Production";
+  if (/WAREHOUSE|STOCK|INVENTORY/.test(key)) return "Warehouse";
+  if (/ENGINEER|MASTER DATA|BOM/.test(key)) return "Engineering";
+  return "PPIC";
+}
+
+exports.listRecoveryPlans = async (req, res, next) => {
+  try {
+    const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(String(req.query.month || "")) ? String(req.query.month) : null;
+    const start = month ? new Date(`${month}-01T00:00:00.000Z`) : null;
+    const end = start ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1)) : null;
+    const plans = await prisma.dueDateRecoveryPlan.findMany({
+      where: { isCurrentPlan: true, isDeleted: false, ...(start ? { requestedDeliveryDate: { gte: start, lt: end } } : {}) },
+      orderBy: [{ updatedAt: "desc" }],
+    });
+    const targetIds = [...new Set(plans.map((plan) => plan.deliveryTargetId))];
+    const [targets, sources] = targetIds.length ? await Promise.all([
+      prisma.demandDeliveryTarget.findMany({ where: { id: { in: targetIds }, isDeleted: false } }),
+      prisma.mPSDemandSource.findMany({
+        where: { deliveryTargetId: { in: targetIds } },
+        select: { deliveryTargetId: true, mpsDetail: { select: { mpsNumber: true } } },
+        orderBy: { updatedAt: "desc" },
+      }),
+    ]) : [[], []];
+    const targetById = new Map(targets.map((target) => [target.id, target]));
+    const mpsByTarget = new Map();
+    for (const source of sources) if (!mpsByTarget.has(source.deliveryTargetId)) mpsByTarget.set(source.deliveryTargetId, source.mpsDetail?.mpsNumber || null);
+    const query = String(req.query.q || "").trim().toLowerCase();
+    const requestedFeedback = String(req.query.feedbackStatus || "").toUpperCase();
+    const items = plans.map((plan) => {
+      const target = targetById.get(plan.deliveryTargetId) || {};
+      const checklist = Array.isArray(plan.checklist) ? plan.checklist : [];
+      const selectedActions = checklist.filter((item) => item.selected);
+      const primaryAction = selectedActions.find((item) => !item.required && item.id !== "ACCEPT_LATE") || selectedActions.find((item) => item.id === "ACCEPT_LATE") || selectedActions[0] || {};
+      const feedbackStatus = recoveryFeedbackStatus(plan, selectedActions);
+      return {
+        id: plan.id, deliveryTargetId: plan.deliveryTargetId, revision: plan.revision, planStatus: plan.status,
+        feedbackStatus, decisionType: plan.decisionType, recovery: plan.decisionType === "ACCEPT_LATE" ? "Change Delivery Target" : primaryAction.title || "Recovery Action",
+        dept: recoveryDepartment(primaryAction, plan.decisionType), owner: primaryAction.owner || primaryAction.ownerRole || null, targetDate: primaryAction.targetDate || plan.acceptedDeliveryDate || plan.earliestFeasibleDelivery,
+        notes: primaryAction.notes || plan.notes, evidenceReference: primaryAction.evidenceReference || null,
+        requestedDeliveryDate: plan.requestedDeliveryDate, earliestFeasibleDelivery: plan.earliestFeasibleDelivery, recoveryGapDays: plan.recoveryGapDays,
+        criticalConstraint: plan.criticalConstraint, sourceType: target.sourceType || null, sourceNumber: target.sourceNumber || null,
+        customerCode: target.customerCode || null, partCode: target.partCode || null, qty: target.qty ?? null, uomCode: target.uomCode || null,
+        mpsNumber: mpsByTarget.get(plan.deliveryTargetId) || null, updatedAt: plan.updatedAt,
+      };
+    }).filter((item) => (!requestedFeedback || item.feedbackStatus === requestedFeedback) && (!query || [item.mpsNumber, item.sourceNumber, item.partCode, item.customerCode, item.recovery, item.dept].some((value) => String(value || "").toLowerCase().includes(query))));
+    const counts = Object.fromEntries([...RECOVERY_FEEDBACK_STATUSES].map((status) => [status, items.filter((item) => item.feedbackStatus === status).length]));
+    res.json({ items, total: items.length, month, counts });
+  } catch (error) { next(error); }
+};
+
+exports.updateRecoveryFeedbackStatus = async (req, res, next) => {
+  try {
+    const feedbackStatus = String(req.body.feedbackStatus || "").toUpperCase();
+    if (!RECOVERY_FEEDBACK_STATUSES.has(feedbackStatus)) return res.status(400).json({ message: "Feedback Status harus Open, In Progress, Waiting, atau Done." });
+    const plan = await prisma.dueDateRecoveryPlan.findFirst({ where: { id: req.params.planId, isCurrentPlan: true, isDeleted: false } });
+    if (!plan) return res.status(404).json({ message: "Recovery Plan tidak ditemukan." });
+    const checklist = (Array.isArray(plan.checklist) ? plan.checklist : []).map((item) => item.selected ? { ...item, feedbackStatus } : item);
+    const updated = await prisma.dueDateRecoveryPlan.update({ where: { id: plan.id }, data: { checklist: json(checklist), updatedBy: actor(req) } });
+    res.json({ id: updated.id, feedbackStatus, updatedAt: updated.updatedAt });
+  } catch (error) { next(error); }
+};
+
 async function displacementSimulation(deliveryTargetId, proposedCompletion = null) {
   const target = await prisma.demandDeliveryTarget.findFirst({ where: { id: deliveryTargetId, isDeleted: false } });
   if (!target) throw Object.assign(new Error("Delivery target tidak ditemukan."), { statusCode: 404 });
@@ -102,8 +197,8 @@ async function displacementSimulation(deliveryTargetId, proposedCompletion = nul
 exports.list = async (req, res, next) => {
   try {
     const demandRows = await buildDemandRows(prisma, { startDate: text(req.query.startDate), endDate: text(req.query.endDate), customerCode: text(req.query.customerCode), partCode: text(req.query.partCode), status: text(req.query.status) });
-    const targetIds=demandRows.map((row)=>row.id);const [proposals,recoveryPlans]=demandRows.length?await Promise.all([prisma.dPPDisplacementProposal.findMany({where:{deliveryTargetId:{in:targetIds},isDeleted:false},orderBy:{requestedAt:"desc"}}),prisma.dueDateRecoveryPlan.findMany({where:{deliveryTargetId:{in:targetIds},isCurrentPlan:true,isDeleted:false},select:{id:true,deliveryTargetId:true,revision:true,status:true,recoveryGapDays:true,approvedBy:true,approvedAt:true}})]):[[],[]];const proposalByTarget=new Map();for(const proposal of proposals)if(!proposalByTarget.has(proposal.deliveryTargetId))proposalByTarget.set(proposal.deliveryTargetId,proposal);const recoveryByTarget=new Map(recoveryPlans.map((plan)=>[plan.deliveryTargetId,plan]));
-    const items=demandRows.map((row)=>{const proposal=proposalByTarget.get(row.id),recovery=recoveryByTarget.get(row.id);return{...row,displacementProposalId:proposal?.id||null,displacementProposalStatus:proposal?.status||null,dueDateRecoveryPlanId:recovery?.id||null,dueDateRecoveryRevision:recovery?.revision||null,dueDateRecoveryStatus:recovery?.status||null,dueDateRecoveryGapDays:recovery?.recoveryGapDays||0,dueDateRecoveryApprovedBy:recovery?.approvedBy||null,dueDateRecoveryApprovedAt:recovery?.approvedAt||null}});
+    const targetIds=demandRows.map((row)=>row.id);const [proposals,recoveryPlans]=demandRows.length?await Promise.all([prisma.dPPDisplacementProposal.findMany({where:{deliveryTargetId:{in:targetIds},isDeleted:false},orderBy:{requestedAt:"desc"}}),prisma.dueDateRecoveryPlan.findMany({where:{deliveryTargetId:{in:targetIds},isCurrentPlan:true,isDeleted:false},select:{id:true,deliveryTargetId:true,revision:true,status:true,decisionType:true,requestedDeliveryDate:true,acceptedDeliveryDate:true,recoveryGapDays:true,approvedBy:true,approvedAt:true}})]):[[],[]];const proposalByTarget=new Map();for(const proposal of proposals)if(!proposalByTarget.has(proposal.deliveryTargetId))proposalByTarget.set(proposal.deliveryTargetId,proposal);const recoveryByTarget=new Map(recoveryPlans.map((plan)=>[plan.deliveryTargetId,plan]));
+    const items=demandRows.map((row)=>{const proposal=proposalByTarget.get(row.id),storedRecovery=recoveryByTarget.get(row.id),recovery=effectiveRecoveryPlan(storedRecovery,{status:row.feasibilityStatus,earliestFeasibleDeliveryDate:row.earliestFeasibleDeliveryDate},row.effectiveTargetDate||row.targetDate);return{...row,displacementProposalId:proposal?.id||null,displacementProposalStatus:proposal?.status||null,dueDateRecoveryPlanId:recovery?.id||null,dueDateRecoveryRevision:recovery?.revision||null,dueDateRecoveryStatus:recovery?.status||null,dueDateRecoveryHistoricalStatus:recovery?.historicalStatus||null,dueDateRecoveryApplicable:recovery?.isApplicableToCurrentCalculation??null,dueDateRecoveryGapDays:recovery?.recoveryGapDays||0,dueDateRecoveryApprovedBy:recovery?.approvedBy||null,dueDateRecoveryApprovedAt:recovery?.approvedAt||null}});
     const priorityClass = text(req.query.priorityClass);
     const feasibilityStatus = text(req.query.feasibilityStatus);
     const filtered = items.filter((row) => (!priorityClass || row.priorityClass === priorityClass) && (!feasibilityStatus || row.feasibilityStatus === feasibilityStatus));
@@ -135,7 +230,8 @@ exports.review = async (req, res, next) => {
 exports.getRecoveryPlan = async (req, res, next) => {
   try {
     const context = await targetFeasibility(req.params.deliveryTargetId, text(req.query.planNumber));
-    const plan = await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId: context.target.id, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } });
+    const storedPlan = await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId: context.target.id, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } });
+    const plan = effectiveRecoveryPlan(storedPlan, context.feasibility, context.target.targetDate);
     res.json({ target: { id: context.target.id, sourceType: context.target.sourceType, sourceNumber: context.target.sourceNumber, customerCode: context.target.customerCode, partCode: context.target.partCode, targetDeliveryDate: context.target.targetDate }, feasibility: context.feasibility, recommendation: context.recommendation, plan });
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };
@@ -198,6 +294,99 @@ exports.approveRecoveryPlan = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+exports.bulkTrialRecovery = async (req, res, next) => {
+  try {
+    const mpsNumber = text(req.body.mpsNumber);
+    const requestedIds = [...new Set((Array.isArray(req.body.deliveryTargetIds) ? req.body.deliveryTargetIds : [])
+      .map((value) => String(value || "").trim()).filter(Boolean))];
+    if (!mpsNumber) return res.status(400).json({ message: "Nomor MPS wajib diisi." });
+    if (!requestedIds.length) return res.status(400).json({ message: "Tidak ada delivery infeasible yang dapat direcovery." });
+    if (requestedIds.length > 100) return res.status(400).json({ message: "Maksimal 100 delivery target per recovery trial." });
+
+    const mps = await prisma.mPS.findFirst({
+      where: { mpsNumber, isDeleted: false },
+      include: { details: { where: { isDeleted: false }, include: { demandSources: true } } },
+    });
+    if (!mps) return res.status(404).json({ message: "MPS tidak ditemukan." });
+    const allowedIds = new Set(deliveryTargetIdsFromMps(mps));
+    const actorName = actor(req);
+    const now = new Date();
+    const processed = [];
+    const skipped = [];
+    const failed = [];
+
+    for (const deliveryTargetId of requestedIds) {
+      if (!allowedIds.has(deliveryTargetId)) {
+        skipped.push({ deliveryTargetId, reason: "TARGET_NOT_LINKED_TO_MPS" });
+        continue;
+      }
+      try {
+        const context = await targetFeasibility(deliveryTargetId);
+        if (!["NOT_FEASIBLE", "MASTER_DATA_INCOMPLETE"].includes(String(context.feasibility.status || "").toUpperCase())) {
+          skipped.push({ deliveryTargetId, reason: "DELIVERY_NOT_INFEASIBLE" });
+          continue;
+        }
+        const current = await prisma.dueDateRecoveryPlan.findFirst({
+          where: { deliveryTargetId, isCurrentPlan: true, isDeleted: false },
+          orderBy: { revision: "desc" },
+        });
+        if (["PENDING_APPROVAL", "APPROVED"].includes(current?.status)) {
+          skipped.push({ deliveryTargetId, reason: `RECOVERY_${current.status}`, planId: current.id });
+          continue;
+        }
+        const checklist = buildTrialRecoveryChecklist(context.recommendation, {
+          owner: actorName,
+          notes: `Trial recovery satu tombol untuk ${mpsNumber}.`,
+          evidenceReference: `MPS Workbench ${mpsNumber}`,
+        });
+        const requestedDeliveryDate = new Date(context.recommendation.requestedDeliveryDate);
+        const errors = validateRecoveryChecklist(checklist, requestedDeliveryDate);
+        if (errors.length) {
+          failed.push({ deliveryTargetId, reason: "VALIDATION_FAILED", errors });
+          continue;
+        }
+        const data = {
+          requestedDeliveryDate,
+          fgRequiredDate: context.recommendation.fgRequiredDate ? new Date(context.recommendation.fgRequiredDate) : null,
+          earliestFeasibleFgDate: context.recommendation.earliestFeasibleFgDate ? new Date(context.recommendation.earliestFeasibleFgDate) : null,
+          earliestFeasibleDelivery: context.recommendation.earliestFeasibleDeliveryDate ? new Date(context.recommendation.earliestFeasibleDeliveryDate) : null,
+          recoveryGapDays: context.recommendation.recoveryGapDays,
+          criticalConstraint: context.recommendation.criticalConstraint,
+          feasibilitySnapshot: json(context.feasibility),
+          checklist: json(checklist),
+          notes: `Trial recovery satu tombol untuk ${mpsNumber}.`,
+          status: "PENDING_APPROVAL",
+          submittedBy: actorName,
+          submittedAt: now,
+          approvedBy: null,
+          approvedAt: null,
+          approvalReason: null,
+          decisionType: "RECOVERY",
+          originalDeliveryDate: requestedDeliveryDate,
+          acceptedDeliveryDate: null,
+          acceptLateReason: null,
+          rejectedBy: null,
+          rejectedAt: null,
+          rejectionReason: null,
+          updatedBy: actorName,
+        };
+        const plan = await prisma.$transaction(async (tx) => {
+          if (current && ["DRAFT", "REJECTED", "REPLAN_REQUIRED"].includes(current.status)) {
+            return tx.dueDateRecoveryPlan.update({ where: { id: current.id }, data });
+          }
+          if (current) await tx.dueDateRecoveryPlan.update({ where: { id: current.id }, data: { isCurrentPlan: false, updatedBy: actorName } });
+          return tx.dueDateRecoveryPlan.create({ data: { ...data, deliveryTargetId, revision: number(current?.revision) + 1 || 1, isCurrentPlan: true, createdBy: actorName } });
+        });
+        processed.push({ deliveryTargetId, planId: plan.id, status: plan.status });
+      } catch (error) {
+        failed.push({ deliveryTargetId, reason: "PROCESSING_FAILED", message: error.message });
+      }
+    }
+    if (processed.length) await refreshMpsDeliveryFeasibility(prisma, mpsNumber);
+    return res.json({ mpsNumber, requested: requestedIds.length, processed, skipped, failed });
+  } catch (error) { return next(error); }
+};
+
 exports.bulkAcceptLate = async (req, res, next) => {
   try {
     const runNumber = text(req.body.runNumber);
@@ -233,9 +422,14 @@ exports.bulkAcceptLate = async (req, res, next) => {
           continue;
         }
         const requestedDeliveryDate = new Date(context.recommendation.requestedDeliveryDate);
-        const acceptedDeliveryDate = new Date(context.recommendation.earliestFeasibleDeliveryDate);
-        if (Number.isNaN(requestedDeliveryDate.getTime()) || Number.isNaN(acceptedDeliveryDate.getTime()) || acceptedDeliveryDate <= requestedDeliveryDate) {
-          skipped.push({ deliveryTargetId, reason: "NO_LATE_CUSTOMER_COMMITMENT" });
+        const calculatedFeasibleDate = new Date(context.recommendation.earliestFeasibleDeliveryDate);
+        if (String(context.feasibility.status || "").toUpperCase() !== "NOT_FEASIBLE") {
+          skipped.push({ deliveryTargetId, reason: String(context.feasibility.status || "DELIVERY_NOT_INFEASIBLE").toUpperCase() });
+          continue;
+        }
+        const acceptedDeliveryDate = resolveAcceptedLateDate(requestedDeliveryDate, calculatedFeasibleDate);
+        if (!acceptedDeliveryDate) {
+          skipped.push({ deliveryTargetId, reason: "DELIVERY_NOT_LATE" });
           continue;
         }
         const current = await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } });
@@ -244,11 +438,7 @@ exports.bulkAcceptLate = async (req, res, next) => {
           continue;
         }
         const now = new Date();
-        if (current?.status === "PENDING_APPROVAL") {
-          if (current.decisionType !== "ACCEPT_LATE") {
-            skipped.push({ deliveryTargetId, reason: "PENDING_NON_ACCEPT_LATE", planId: current.id });
-            continue;
-          }
+        if (current?.status === "PENDING_APPROVAL" && current.decisionType === "ACCEPT_LATE") {
           const targetChanged = context.target.updatedAt > current.updatedAt
             || context.target.targetDate.getTime() !== current.requestedDeliveryDate.getTime();
           const currentErrors = [
@@ -267,7 +457,8 @@ exports.bulkAcceptLate = async (req, res, next) => {
           continue;
         }
         const evidenceReference = `Auto Accept Late ${runNumber}`;
-        const checklist = autoAcceptLateChecklist(context.recommendation, reason, evidenceReference);
+        const acceptLateRecommendation = { ...context.recommendation, earliestFeasibleDeliveryDate: acceptedDeliveryDate.toISOString() };
+        const checklist = autoAcceptLateChecklist(acceptLateRecommendation, reason, evidenceReference);
         const validationErrors = [
           ...validateRecoveryChecklist(checklist, requestedDeliveryDate),
           ...validateAcceptLate({ decisionType: "ACCEPT_LATE", acceptedDeliveryDate, requestedDeliveryDate, acceptLateReason: reason }),
