@@ -60,8 +60,13 @@ const controller = fs.readFileSync(path.resolve(__dirname, "../src/prisma/contro
 const routes = fs.readFileSync(path.resolve(__dirname, "../src/prisma/routes/planning/mps.js"), "utf8");
 const monthly = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
 const rccp = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/rccpService.js"), "utf8");
-assert(routes.includes('/:mpsNumber/rccp/run'), "Route run RCCP harus tersedia");
+const automatic = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/mpsAutomaticEvaluationService.js"), "utf8");
+assert(!routes.includes('/:mpsNumber/rccp/run'), "RCCP tidak boleh memiliki route run manual");
 assert(routes.includes('/:mpsNumber/approve'), "Route approval MPS harus tersedia");
+assert(controller.includes("runAutomaticMpsEvaluation(prisma, result.docs"), "Create dan recalculate MPS wajib menjalankan evaluasi otomatis");
+assert(automatic.includes("await executeRccp"), "Pipeline otomatis wajib menjalankan RCCP");
+assert(automatic.includes("refreshDelivery"), "Pipeline otomatis wajib merefresh delivery gate");
+assert(automatic.includes("readWorkbench"), "Pipeline otomatis wajib menghitung checklist workbench");
 assert(controller.includes("assertMpsApprovalAllowed"), "Approval MPS wajib melewati RCCP gate");
 assert(controller.includes("invalidateRccp"), "Perubahan adjustment MPS wajib meng-invalidasi RCCP");
 assert(monthly.includes("MPS Qty/periode berubah saat monthly sync"), "Perubahan demand sumber wajib meng-invalidasi RCCP");
@@ -69,4 +74,4 @@ assert(rccp.includes('lifecycleStatus: "CAPACITY_CHECKED"'), "RCCP yang diterima
 assert(rccp.includes('code: "CAPACITY_CHANGED_AFTER_RCCP"'), "Perubahan master capacity setelah snapshot wajib memblokir approval");
 assert(!rccp.includes("productionOrder.create"), "RCCP tidak boleh membuat Production Order");
 
-console.log("RCCP MPS capacity-gate contracts passed: 21/21 cases");
+console.log("RCCP MPS automatic capacity-gate contracts passed.");

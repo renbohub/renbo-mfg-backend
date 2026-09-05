@@ -1,35 +1,8 @@
 "use strict";
 
+const { solveBackwardMilestones } = require("./solver/planningSolverService");
+
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
-const dateKey = (value) => new Date(value).toISOString().slice(0, 10);
-
-function isWorkingDay(value, holidayKeys = new Set()) {
-  const date = new Date(value);
-  const day = date.getUTCDay();
-  return day !== 0 && day !== 6 && !holidayKeys.has(dateKey(date));
-}
-
-function subtractWorkingDays(value, days, holidays = []) {
-  const result = new Date(value);
-  const holidayKeys = new Set(holidays.map(dateKey));
-  let remaining = Math.max(Math.ceil(number(days)), 0);
-  while (remaining > 0) {
-    result.setUTCDate(result.getUTCDate() - 1);
-    if (isWorkingDay(result, holidayKeys)) remaining -= 1;
-  }
-  return result;
-}
-
-function addWorkingDays(value, days, holidays = []) {
-  const result = new Date(value);
-  const holidayKeys = new Set(holidays.map(dateKey));
-  let remaining = Math.max(Math.ceil(number(days)), 0);
-  while (remaining > 0) {
-    result.setUTCDate(result.getUTCDate() + 1);
-    if (isWorkingDay(result, holidayKeys)) remaining -= 1;
-  }
-  return result;
-}
 
 function monthOffset(from, to) {
   const left = new Date(from);
@@ -50,7 +23,7 @@ function classifyProcurementWindow({ materialRequiredDate, latestPrDate, asOf = 
   return "FUTURE";
 }
 
-function procurementSchedule({
+async function procurementSchedule({
   materialRequiredDate,
   supplierLeadTimeDays = 0,
   prApprovalDays = 1,
@@ -70,23 +43,22 @@ function procurementSchedule({
     safetyLeadTimeDays: Math.max(number(safetyLeadTimeDays), 0),
   };
   const totalLeadTimeDays = Object.values(leadTimeBreakdown).reduce((sum, value) => sum + value, 0);
-  // Keep every backward-scheduling milestone explicit so PPIC can distinguish
-  // customer delivery, production start, supplier arrival, PO release and PR.
-  const supplierRequiredArrivalDate = subtractWorkingDays(
-    materialRequiredDate,
-    leadTimeBreakdown.receivingQcDays + leadTimeBreakdown.safetyLeadTimeDays,
+  const solver = await solveBackwardMilestones({
+    targetDate: materialRequiredDate,
     holidays,
-  );
-  const latestPoDate = subtractWorkingDays(
-    supplierRequiredArrivalDate,
-    leadTimeBreakdown.supplierLeadTimeDays + leadTimeBreakdown.transitDays,
-    holidays,
-  );
-  const latestPrDate = subtractWorkingDays(
-    latestPoDate,
-    leadTimeBreakdown.prApprovalDays + leadTimeBreakdown.poProcessingDays,
-    holidays,
-  );
+    tasks: [
+      { id: "PR_APPROVAL", duration: leadTimeBreakdown.prApprovalDays, unit: "DAY" },
+      { id: "PO_PROCESSING", duration: leadTimeBreakdown.poProcessingDays, unit: "DAY" },
+      { id: "SUPPLIER", duration: leadTimeBreakdown.supplierLeadTimeDays, unit: "DAY" },
+      { id: "TRANSIT", duration: leadTimeBreakdown.transitDays, unit: "DAY" },
+      { id: "RECEIVING_QC", duration: leadTimeBreakdown.receivingQcDays, unit: "DAY" },
+      { id: "SAFETY", duration: leadTimeBreakdown.safetyLeadTimeDays, unit: "DAY" },
+    ],
+  });
+  const milestone = Object.fromEntries(solver.tasks.map((task) => [task.id, task]));
+  const latestPrDate = milestone.PR_APPROVAL?.startDate || new Date(materialRequiredDate);
+  const latestPoDate = milestone.SUPPLIER?.startDate || milestone.PO_PROCESSING?.endDate || latestPrDate;
+  const supplierRequiredArrivalDate = milestone.RECEIVING_QC?.startDate || milestone.TRANSIT?.endDate || latestPoDate;
   return {
     materialRequiredDate: new Date(materialRequiredDate),
     supplierRequiredArrivalDate,
@@ -95,7 +67,15 @@ function procurementSchedule({
     totalLeadTimeDays,
     leadTimeBreakdown,
     procurementWindow: classifyProcurementWindow({ materialRequiredDate: supplierRequiredArrivalDate, latestPrDate, asOf }),
+    solver: {
+      engine: solver.engine,
+      engineVersion: solver.engineVersion,
+      status: solver.status,
+      objectiveValue: solver.objectiveValue,
+      wallTimeSeconds: solver.wallTimeSeconds,
+      milestones: solver.tasks,
+    },
   };
 }
 
-module.exports = { isWorkingDay, subtractWorkingDays, addWorkingDays, classifyProcurementWindow, procurementSchedule };
+module.exports = { classifyProcurementWindow, procurementSchedule };

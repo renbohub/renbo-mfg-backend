@@ -358,13 +358,15 @@ const normalizedInput = {
     planNumber: "MPP-202609-001",
     actor: "ppic",
   });
-  assert.strictEqual(scenario.status, "READY_WITH_OVERLOAD");
+  assert.strictEqual(scenario.status, "READY");
+  assert.strictEqual(scenario.generationSource, "OR_TOOLS_CP_SAT");
+  assert.strictEqual(scenario.aiValidationSummary.solver.engine, "OR_TOOLS_WASM_CP_SAT");
   assert.strictEqual(scenario.ruleVersion, RULE_VERSION);
   assert.deepStrictEqual(scenario.inputSnapshot, normalizedInput.auditSnapshot);
   assert.strictEqual(
     scenario.items.length,
-    3,
-    "two allocations and their overload trace must be persisted",
+    2,
+    "two CP-SAT allocations must be persisted without legacy overload trace",
   );
   assert.strictEqual(
     prisma.productionPlanAllocation.create.calls.length,
@@ -411,8 +413,8 @@ const normalizedInput = {
   });
   assert.strictEqual(disabledAiCalls, 0,
     "Auto Allocation tidak boleh menyalakan Qwen ketika AI_ASSISTANT_ENABLED=false");
-  assert.strictEqual(disabledAiScenario.generationSource, "RULE_BASED_FALLBACK");
-  assert.strictEqual(disabledAiScenario.aiValidationSummary.fallbackReason, "FEATURE_DISABLED");
+  assert.strictEqual(disabledAiScenario.generationSource, "OR_TOOLS_CP_SAT");
+  assert.strictEqual(disabledAiScenario.aiValidationSummary.solver.engine, "OR_TOOLS_WASM_CP_SAT");
 
   const changeItems = scenario.items.filter((item) => item.changeType);
   assert.deepStrictEqual(

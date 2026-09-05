@@ -8,6 +8,24 @@ const {
   effectiveVendorLeadTime,
 } = require("../src/prisma/services/planning/demandPlanningConstraintService");
 const { procurementSchedule } = require("../src/prisma/services/planning/procurementSchedulingService");
+const demandPlanningSource = require("fs").readFileSync(require("path").resolve(__dirname, "../src/prisma/services/planning/demandPlanningService.js"), "utf8");
+const monthlyPlanningSource = require("fs").readFileSync(require("path").resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
+
+assert.match(
+  demandPlanningSource,
+  /input\.forceSolverDates\s*\?\s*target\.qty\s*:/,
+  "MPS solver refresh must schedule the persisted delivery-target quantity, not the merged sibling total",
+);
+assert.match(
+  demandPlanningSource,
+  /savedSplitsMatchDemand[\s\S]*savedSplitsStillProtectDueDate\s*=\s*savedSplitsMatchDemand/,
+  "stale finish splits with a quantity different from effective demand must be rebuilt",
+);
+assert.match(
+  monthlyPlanningSource,
+  /decisionByTarget\.get\(target\.id\)[\s\S]*\|\|\s*decisionByTarget\.get\(target\.matchedForecastTargetId\)/,
+  "MPS delivery batches must prefer each active target's OR-Tools decision over its matched Forecast fallback",
+);
 
 (async () => {
   const forecastTargetId = "forecast-phase";
@@ -58,9 +76,9 @@ const { procurementSchedule } = require("../src/prisma/services/planning/procure
   const policy = procurementPolicyFromDecision(inherited);
   assert.strictEqual(policy.receivingQcDays, 0);
   assert.strictEqual(policy.safetyLeadTimeDays, 0);
-  const schedule = procurementSchedule({ materialRequiredDate: new Date("2026-08-11T07:00:00.000Z"), supplierLeadTimeDays: 5, ...policy });
-  assert.strictEqual(schedule.latestPoDate.toISOString().slice(0, 10), "2026-08-04");
-  assert.strictEqual(schedule.latestPrDate.toISOString().slice(0, 10), "2026-07-31");
+  const schedule = await procurementSchedule({ materialRequiredDate: new Date("2026-08-11T07:00:00.000Z"), supplierLeadTimeDays: 5, ...policy });
+  assert.strictEqual(schedule.solver.engine, "OR_TOOLS_WASM_CP_SAT");
+  assert(schedule.latestPrDate < schedule.latestPoDate && schedule.latestPoDate < schedule.supplierRequiredArrivalDate);
 
   const vendorPlanning = effectiveVendorLeadTime({
     sequence: 10,

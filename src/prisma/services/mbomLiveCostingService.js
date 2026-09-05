@@ -2,9 +2,10 @@ const {
   legacyPriceValue,
   resolveEffectiveRecord,
 } = require("./pricing/effectivePriceService");
+const { resolveVendorProcessPrice } = require("./pricing/vendorProcessPricingService");
+const { isCustomerSupplied } = require("../utils/materialSupply");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
-
 const priceValue = (record, costingDate) => legacyPriceValue(record, costingDate);
 
 const emptyEstimate = () => ({
@@ -41,6 +42,9 @@ const COSTING_HEADER_SELECT = {
       id: true,
       parentDetailId: true,
       partId: true,
+      supplierId: true,
+      materialSupplyType: true,
+      vendorId: true,
       category: true,
       qty: true,
       grossWeight: true,
@@ -69,7 +73,10 @@ const COSTING_HEADER_SELECT = {
         where: { isDeleted: false },
         select: {
           id: true,
+          routingMode: true,
+          vendorId: true,
           cycleTime: true,
+          process: { select: { processCode: true, processName: true } },
           machine: {
             select: {
               id: true,
@@ -103,7 +110,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       prisma.materialPriceList.findMany({ where: { isDeleted: false } }),
       prisma.vendorPriceList.findMany({
         where: { isDeleted: false },
-        include: { details: { where: { isDeleted: false } } },
+        include: { details: { where: { isDeleted: false }, include: { vendorProcess: true } } },
       }),
       prisma.machineCostRate.findMany({ where: { isDeleted: false } }),
       prisma.currency.findMany({
@@ -143,26 +150,11 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       : row.materialForm?.symbol;
 
   const directPrice = (row) => {
-    if (row.category === "Vendor") {
-      const list = resolveEffectiveRecord(
-        vendorPrices.filter((item) => item.partId === row.partId),
-        costingDate,
-      );
-      const values = (list?.details || [])
-        .map((detail) => priceValue(detail, costingDate))
-        .filter((value) => value > 0);
-      return {
-        value: toIdr(
-          values.reduce((sum, value) => sum + value, 0),
-          list?.currencyCode,
-        ),
-        found: values.length > 0,
-        kind: "vendor",
-      };
+    if (isCustomerSupplied(row.materialSupplyType)) {
+      return { value: 0, found: true, kind: "material", customerSupplied: true };
     }
-
     const partPrice = resolveEffectiveRecord(
-      partPrices.filter((item) => item.partId === row.partId),
+      partPrices.filter((item) => item.partId === row.partId && (!row.supplierId || item.supplierId === row.supplierId)),
       costingDate,
     );
     const partValue = priceValue(partPrice, costingDate);
@@ -177,6 +169,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
     const material = row.part?.material || {};
     const formSymbol = selectedMaterialSymbol(row);
     const candidates = materialPrices.filter((item) => {
+      if (row.supplierId && item.supplierId !== row.supplierId) return false;
       if (item.materialId) return item.materialId === row.part?.materialId;
       return (
         item.materialGradeId === material.materialGradeId &&
@@ -201,6 +194,22 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
   const processEstimate = (row) =>
     (row.mbomProcesses || []).reduce(
       (result, process) => {
+        if (String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
+          const resolved = resolveVendorProcessPrice({
+            vendorPrices,
+            vendorId: process.vendorId,
+            partId: row.partId,
+            process: process.process,
+            costingDate,
+            currencyRates,
+          });
+          const value = number(resolved?.unitPrice);
+          result.value += value;
+          result.vendor += value;
+          result.lines += 1;
+          if (resolved?.found) result.covered += 1;
+          return result;
+        }
         const seconds = number(process.cycleTime);
         const machine = process.machine || {};
         const effectiveRate = resolveEffectiveRecord(
@@ -225,7 +234,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
         if (found) result.covered += 1;
         return result;
       },
-      { value: 0, lines: 0, covered: 0 },
+      { value: 0, vendor: 0, lines: 0, covered: 0 },
     );
 
   const memo = new Map();
@@ -251,6 +260,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       const qty = Math.max(0, number(row.qty));
       const routing = processEstimate(row);
       result.process += routing.value * qty;
+      result.vendor += routing.vendor * qty;
       result.total += routing.value * qty;
       result.lines += routing.lines;
       result.covered += routing.covered;
@@ -259,7 +269,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       if (childHeader) {
         addScaled(result, estimateHeader(childHeader, nextStack), qty);
       } else if (
-        ["Purchase", "Vendor"].includes(row.category) ||
+        row.category === "Purchase" ||
         row.part?.itemType === "RAW"
       ) {
         const price = directPrice(row);
@@ -269,12 +279,9 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
             : qty;
         const amount = price.value * pricedQty;
         result.total += amount;
-        if (price.kind === "vendor") result.vendor += amount;
-        else {
-          result.material += amount;
-          if (price.kind === "material") result.rawMaterial += amount;
-          else result.purchase += amount;
-        }
+        result.material += amount;
+        if (price.kind === "material") result.rawMaterial += amount;
+        else result.purchase += amount;
         result.lines += 1;
         if (price.found) result.covered += 1;
       }
@@ -304,7 +311,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
           rawMaterialCost: estimate.rawMaterial,
           purchasePartCost: estimate.purchase,
           vendorCost: estimate.vendor,
-          processCost: estimate.process + estimate.vendor,
+          processCost: estimate.process,
           overheadCost: 0,
           totalCost: estimate.total,
           costPerUnit: estimate.total,

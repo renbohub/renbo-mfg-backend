@@ -76,15 +76,17 @@ function sameOperation(left, right) {
   return left.partCode === right.partCode && left.processId === right.processId;
 }
 
-async function createProductionShortfallCarryover(tx, { log, schedule, actor = "system" }) {
+async function createProductionShortfallCarryover(tx, { log, schedule, actor = "system", targetDate: requestedTargetDate, shortfallQty: requestedShortfallQty } = {}) {
   if (!log?.id || !schedule?.id) return null;
   const existing = await tx.productionLogCarryover.findUnique({ where: { sourceLogId: log.id } });
-  if (existing) return existing;
+  if (existing && existing.status !== "REVERSED") return existing;
 
-  const shortfallQty = round(Math.max(number(log.qtyPlanned) - number(log.qtyGood), 0));
+  const shortfallQty = requestedShortfallQty == null
+    ? round(Math.max(number(log.qtyPlanned) - number(log.qtyGood), 0))
+    : round(Math.max(number(requestedShortfallQty), 0));
   if (shortfallQty <= EPSILON) return null;
 
-  const targetDate = addDays(schedule.scheduleDate || log.logDate, 1);
+  const targetDate = requestedTargetDate ? dateOnly(requestedTargetDate) : addDays(schedule.scheduleDate || log.logDate, 1);
   const { start, end } = dayRange(targetDate);
   const [workOrder, route, targetSchedules] = await Promise.all([
     schedule.woId ? tx.workOrder.findFirst({ where: { id: schedule.woId, isDeleted: false } }) : null,
@@ -254,18 +256,19 @@ async function createProductionShortfallCarryover(tx, { log, schedule, actor = "
     remainingQty = 0;
   }
 
-  return tx.productionLogCarryover.create({
-    data: {
-      sourceLogId: log.id,
-      sourceDpsId: schedule.id,
-      targetDate,
-      shortfallQty,
-      allocatedQty: round(allocations.reduce((sum, row) => sum + number(row.qty), 0)),
-      targetAllocations: allocations,
-      status: allocations.some((row) => row.mode === "CREATE_OVERFLOW") ? "OVER_CAPACITY" : "ALLOCATED",
-      createdBy: actor,
-    },
-  });
+  const data = {
+    sourceDpsId: schedule.id,
+    targetDate,
+    shortfallQty,
+    allocatedQty: round(allocations.reduce((sum, row) => sum + number(row.qty), 0)),
+    targetAllocations: allocations,
+    status: allocations.some((row) => row.mode === "CREATE_OVERFLOW") ? "OVER_CAPACITY" : "ALLOCATED",
+    createdBy: actor,
+    reversedAt: null,
+  };
+  return existing
+    ? tx.productionLogCarryover.update({ where: { id: existing.id }, data })
+    : tx.productionLogCarryover.create({ data: { sourceLogId: log.id, ...data } });
 }
 
 async function rollbackProductionShortfallCarryover(tx, sourceLogId) {

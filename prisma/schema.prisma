@@ -658,10 +658,11 @@ model Customer {
   updatedAt              DateTime @updatedAt @map("updated_at")
 
   // Relations
-  currency          Currency?          @relation(fields: [currencyCode], references: [currencyCode])
-  salesOrderHeaders SalesOrderHeader[]
-  quotationHeaders  QuotationHeader[]
-  vendorPriceLists  VendorPriceList[]
+  currency            Currency?          @relation(fields: [currencyCode], references: [currencyCode])
+  salesOrderHeaders   SalesOrderHeader[]
+  quotationHeaders    QuotationHeader[]
+  vendorPriceLists    VendorPriceList[]
+  suppliedMbomDetails MBOMDetail[]       @relation("MBOMSupplyCustomer")
 
   @@index([customerCode])
   @@index([customerName])
@@ -705,6 +706,7 @@ model Supplier {
   purchaseInvoices   PurchaseInvoice[]
   parts              Part[]
   supplierItems      SupplierItem[]
+  mbomDetails        MBOMDetail[]
 
   @@index([supplierCode])
   @@index([supplierName])
@@ -744,6 +746,7 @@ model Vendor {
   purchaseOrders            PurchaseOrder[]
   purchaseInvoices          PurchaseInvoice[]
   mbomProcesses             MBOMProcess[]
+  mbomDetails               MBOMDetail[]
   capacityMachineOverrides  CapacityMachineOverride[]
   productionPlanAllocations ProductionPlanAllocation[]
   workOrders                WorkOrder[]
@@ -2543,6 +2546,10 @@ model MBOMDetail {
   parentDetailId          String?  @map("parent_detail_id")
   levelComponent          Int      @default(0) @map("level_component")
   partId                  String?  @map("part_id")
+  supplierId              String?  @map("supplier_id")
+  materialSupplyType      String   @default("SUPPLIER_PURCHASE") @map("material_supply_type") // SUPPLIER_PURCHASE, CUSTOMER_SUPPLIED
+  supplyCustomerId        String?  @map("supply_customer_id")
+  vendorId                String?  @map("vendor_id")
   qty                     Float    @default(0)
   uomCode                 String?  @map("uom_code")
   category                Category @default(Purchase) // inHouse, Purchase, Vendor
@@ -2576,6 +2583,9 @@ model MBOMDetail {
   mbomProcesses         MBOMProcess[]
   workOrders            WorkOrder[]
   part                  Part?            @relation(fields: [partId], references: [id], onDelete: SetNull)
+  supplier              Supplier?        @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  supplyCustomer        Customer?        @relation("MBOMSupplyCustomer", fields: [supplyCustomerId], references: [id], onDelete: SetNull)
+  vendor                Vendor?          @relation(fields: [vendorId], references: [id], onDelete: SetNull)
   uom                   Uom?             @relation(fields: [uomCode], references: [uomCode], onDelete: SetNull)
   mbomcostDetails       MBOMCostDetail[]
   mrpRequirements       MRPRequirement[]
@@ -2585,6 +2595,10 @@ model MBOMDetail {
   @@index([noReg])
   @@index([parentDetailId])
   @@index([partId])
+  @@index([supplierId])
+  @@index([materialSupplyType])
+  @@index([supplyCustomerId])
+  @@index([vendorId])
   @@index([uomCode])
   @@index([category])
   @@index([assemblyPolicyOverride])
@@ -3706,7 +3720,7 @@ model PlanningBaselineLock {
   createdAt         DateTime @default(now()) @map("created_at")
   updatedAt         DateTime @updatedAt @map("updated_at")
 
-  coverages  AdditionalDemandCoverage[]
+  coverages   AdditionalDemandCoverage[]
   adjustments PlanningAdjustment[]
 
   @@unique([periodMonth, customerCode, partCode])
@@ -3764,7 +3778,7 @@ model PlanningAdjustment {
   createdAt         DateTime  @default(now()) @map("created_at")
   updatedAt         DateTime  @updatedAt @map("updated_at")
 
-  baselineLock PlanningBaselineLock      @relation(fields: [baselineLockId], references: [id], onDelete: Restrict)
+  baselineLock PlanningBaselineLock     @relation(fields: [baselineLockId], references: [id], onDelete: Restrict)
   lines        PlanningAdjustmentLine[]
 
   @@index([baselineLockId, status])
@@ -3773,20 +3787,20 @@ model PlanningAdjustment {
 }
 
 model PlanningAdjustmentLine {
-  id             String   @id @default(uuid())
-  adjustmentId   String   @map("adjustment_id")
-  mpsNumber      String?  @map("mps_number")
-  mpsDetailId    String?  @map("mps_detail_id")
-  moNumber       String?  @map("mo_number")
-  partCode       String   @map("part_code")
-  requestedCutQty Float   @default(0) @map("requested_cut_qty")
-  approvedCutQty  Float   @default(0) @map("approved_cut_qty")
-  appliedCutQty   Float   @default(0) @map("applied_cut_qty")
-  plannedQty      Float   @default(0) @map("planned_qty")
-  producedQty     Float   @default(0) @map("produced_qty")
-  wipQty          Float   @default(0) @map("wip_qty")
-  supplierPoQty   Float   @default(0) @map("supplier_po_qty")
-  status          String  @default("PENDING")
+  id              String   @id @default(uuid())
+  adjustmentId    String   @map("adjustment_id")
+  mpsNumber       String?  @map("mps_number")
+  mpsDetailId     String?  @map("mps_detail_id")
+  moNumber        String?  @map("mo_number")
+  partCode        String   @map("part_code")
+  requestedCutQty Float    @default(0) @map("requested_cut_qty")
+  approvedCutQty  Float    @default(0) @map("approved_cut_qty")
+  appliedCutQty   Float    @default(0) @map("applied_cut_qty")
+  plannedQty      Float    @default(0) @map("planned_qty")
+  producedQty     Float    @default(0) @map("produced_qty")
+  wipQty          Float    @default(0) @map("wip_qty")
+  supplierPoQty   Float    @default(0) @map("supplier_po_qty")
+  status          String   @default("PENDING")
   metadata        Json?
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
@@ -4704,6 +4718,8 @@ model MRPRequirement {
   orderPercent                Float     @default(100) @map("order_percent") // Override PPIC atas forecast; SO tetap minimum
   adjustedOrderQty            Float     @default(0) @map("adjusted_order_qty") // Qty setelah Order % dan netting stock
   orderType                   String?   @map("order_type") // Purchase, Production
+  materialSupplyType          String    @default("SUPPLIER_PURCHASE") @map("material_supply_type")
+  supplyCustomerCode          String?   @map("supply_customer_code")
   leadTime                    Int       @default(0) @map("lead_time") // Lead time in days
   orderDate                   DateTime? @map("order_date") // Calculated order date
   latestPrDate                DateTime? @map("latest_pr_date")
@@ -4739,6 +4755,8 @@ model MRPRequirement {
   @@index([mpsDetailId])
   @@index([requiredDate])
   @@index([orderType])
+  @@index([materialSupplyType])
+  @@index([supplyCustomerCode])
   @@index([latestPrDate])
   @@index([procurementWindow])
   @@index([isDeleted])
@@ -7272,4 +7290,36 @@ model Notification {
   @@index([isRead])
   @@index([createdAt])
   @@map("tbl_notifications")
+}
+
+model PlanningSolverRun {
+  id                 String    @id @default(uuid())
+  runNumber          String    @unique @map("run_number")
+  scope              String
+  referenceType      String?   @map("reference_type")
+  referenceNumber    String?   @map("reference_number")
+  status             String    @default("QUEUED")
+  engine             String    @default("OR_TOOLS_WASM_CP_SAT")
+  engineVersion      String    @default("0.9.1") @map("engine_version")
+  modelVersion       String?   @map("model_version")
+  inputHash          String    @map("input_hash")
+  inputSnapshot      Json      @map("input_snapshot")
+  resultSnapshot     Json?     @map("result_snapshot")
+  blockers           Json?     @default("[]")
+  objectiveValue     Float?    @map("objective_value")
+  bestObjectiveBound Float?    @map("best_objective_bound")
+  wallTimeSeconds    Float?    @map("wall_time_seconds")
+  errorCode          String?   @map("error_code")
+  errorMessage       String?   @map("error_message")
+  requestedBy        String?   @map("requested_by")
+  requestedAt        DateTime  @default(now()) @map("requested_at")
+  startedAt          DateTime? @map("started_at")
+  finishedAt         DateTime? @map("finished_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  @@index([status, requestedAt])
+  @@index([scope, referenceNumber])
+  @@index([inputHash])
+  @@map("tbl_planning_solver_run")
 }

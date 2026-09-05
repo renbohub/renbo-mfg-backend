@@ -3085,7 +3085,7 @@ exports.convertToDailyPlans = async (req, res, next) => {
         && !(override.shiftsPerDay != null && number(override.shiftsPerDay) <= 0);
     };
 
-    const dailyReleaseSchedule = scheduleDailyReleaseAllocations(desired.map((item) => {
+    const dailyReleaseSchedule = await scheduleDailyReleaseAllocations(desired.map((item) => {
       const workCenterMachines = item.allocation.mbomProcess?.routingOperation?.workCenter?.machines || [];
       const eligibleMachineIds = workCenterMachines.length ? workCenterMachines
         .filter((row) => !row.machine?.isDeleted && String(row.machine?.status || "Active").toUpperCase() === "ACTIVE")
@@ -3110,9 +3110,13 @@ exports.convertToDailyPlans = async (req, res, next) => {
         plannedQty: item.assignedQty,
       };
     }), {
+      prisma,
       dayStart: "07:00",
       dependencyGapMinutes: 120,
       defaultDurationMinutes: 60,
+      referenceType: "MONTHLY_PLAN_DAILY_RELEASE",
+      referenceNumber: plan.planNumber,
+      actor: req.user?.username || req.user?.email || "system",
     });
 
     const published = await prisma.$transaction(async (tx) => {

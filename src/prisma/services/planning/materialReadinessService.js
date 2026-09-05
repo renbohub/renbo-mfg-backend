@@ -1,4 +1,3 @@
-const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_PO_STATUSES = new Set([
   "Approved",
   "Sent",
@@ -13,8 +12,8 @@ const CONFIRMED_SUGGESTION_STATUSES = new Set([
   "Alternative Delivery Date",
   "Confirmed",
 ]);
-const { subtractWorkingDays } = require("./procurementSchedulingService");
 const { loadDemandPlanningConstraintMap, applyDecisionToRoutingMetric } = require("./demandPlanningConstraintService");
+const { solveBackwardMilestones } = require("./solver/planningSolverService");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 3) => Number(number(value).toFixed(digits));
@@ -27,7 +26,6 @@ const day = (value) => {
     parsed.getUTCDate(),
   ));
 };
-const addDays = (value, days) => new Date(day(value).getTime() + number(days) * DAY_MS);
 
 function sourceNumbers(detail) {
   const values = [
@@ -301,7 +299,7 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
   );
   const today = day(new Date());
   const issues = [];
-  const items = orders.map((order) => {
+  const items = await Promise.all(orders.map(async (order) => {
     const linkedDetails = prDetails.filter((detail) => sourceNumbers(detail).has(order.orderNumber));
     const masterSupplier = supplierContext(order);
     const procurementSupplierCode = linkedDetails.flatMap((detail) => [
@@ -322,9 +320,14 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
         }
         : masterSupplier;
     const requiredDate = day(order.requiredDate);
-    const calculatedOrderDate = supplier.leadTimeDays > 0
-      ? addDays(requiredDate, -supplier.leadTimeDays)
-      : day(order.orderDate);
+    const supplierSchedule = supplier.leadTimeDays > 0
+      ? await solveBackwardMilestones({
+        targetDate: requiredDate,
+        hoursPerDay: 8,
+        tasks: [{ id: `SUPPLIER:${order.orderNumber}`, duration: supplier.leadTimeDays, unit: "DAY" }],
+      })
+      : null;
+    const calculatedOrderDate = supplierSchedule?.tasks?.[0]?.startDate || day(order.orderDate);
     let prQty = 0;
     let poQty = 0;
     let receivedQty = 0;
@@ -419,6 +422,12 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
       leadTimeDays: supplier.leadTimeDays,
       leadTimeSource: supplier.source,
       orderDate: calculatedOrderDate,
+      orderDateSolver: supplierSchedule ? {
+        engine: supplierSchedule.engine,
+        engineVersion: supplierSchedule.engineVersion,
+        status: supplierSchedule.status,
+        taskId: supplierSchedule.tasks[0]?.id,
+      } : null,
       requiredDate,
       latestDeliveryDate,
       prNumbers: [...prNumbers].filter(Boolean),
@@ -426,7 +435,7 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
       ready: !lineIssues.some((issue) => issue.severity === "BLOCKING"),
       issues: lineIssues,
     };
-  });
+  }));
 
   const blocking = issues.filter((issue) => issue.severity === "BLOCKING").length;
   const warning = issues.filter((issue) => issue.severity === "WARNING").length;
@@ -469,7 +478,7 @@ function confirmedSuggestionAllocation(allocation) {
  * system-generated material due date as an explicit fallback instead of
  * silently pretending that the whole quantity was confirmed.
  */
-function suggestionSystemMaterialDate(item, planningConstraintByTarget = new Map(), routingMetric = null) {
+async function suggestionSystemMaterialDate(item, planningConstraintByTarget = new Map(), routingMetric = null) {
   const stored = item?.materialRequiredDate || item?.plannedProductionStart;
   const delivery = item?.customerDeliveryDate;
   const breakdown = routingMetric || item?.productionLeadTimeBreakdown;
@@ -480,7 +489,12 @@ function suggestionSystemMaterialDate(item, planningConstraintByTarget = new Map
   const queueDays = Math.ceil(number(adjusted.queueBufferHours ?? breakdown.queueBufferHours) / 8);
   const scheduledDays = Math.max(number(adjusted.productionLeadTimeDays) + queueDays, 0);
   if (scheduledDays <= 0) return stored ? new Date(stored) : new Date(delivery);
-  return subtractWorkingDays(delivery, scheduledDays);
+  const schedule = await solveBackwardMilestones({
+    targetDate: delivery,
+    hoursPerDay: 8,
+    tasks: [{ id: "PRODUCTION_MATERIAL_GATE", duration: scheduledDays, unit: "DAY" }],
+  });
+  return schedule.tasks[0]?.startDate || (stored ? new Date(stored) : new Date(delivery));
 }
 
 function resolveSuggestionMaterialGate(item, systemDateOverride = null) {
@@ -681,26 +695,26 @@ async function buildProductionMaterialGate(prisma, planOrNumber) {
     routingMetrics = await purchaseSuggestionController.routingMetricsForRequests(prisma, [...routingRequestByItemId.values()]);
   }
 
-  const items = suggestion.items.flatMap((item) => {
+  const items = (await Promise.all(suggestion.items.map(async (item) => {
     const sources = suggestionSources(item).filter((source) => !source.mpsNumber || source.mpsNumber === mpsNumber);
     if (!sources.length && suggestionSources(item).length) return [];
     const routingRequest = routingRequestByItemId.get(item.id) || {};
     const authoritativeRoutingMetric = routingRequest.headerId
       ? routingMetrics.get(routingMetricKey(routingRequest.headerId, routingRequest.scheduleQty))
       : null;
-    const calculatedSystemDate = suggestionSystemMaterialDate(item, planningConstraintByTarget, authoritativeRoutingMetric);
+    const calculatedSystemDate = await suggestionSystemMaterialDate(item, planningConstraintByTarget, authoritativeRoutingMetric);
     const gate = resolveSuggestionMaterialGate(item, calculatedSystemDate);
-    return [{
+    return {
       suggestionItemId: item.id,
       partCode: item.partCode,
       materialCode: item.materialCode,
       deliveryTargetIds: [...new Set(sources.map((source) => source.deliveryTargetId).filter(Boolean))],
       fgPartCodes: [...new Set(sources.map((source) => source.fgPartCode).filter(Boolean))],
       storedSystemDueDate: day(item.materialRequiredDate || item.plannedProductionStart),
-      calculationSource: calculatedSystemDate ? "PURCHASE_SUGGESTION_BACKWARD_DUE" : "PURCHASE_SUGGESTION_STORED_DUE",
+      calculationSource: calculatedSystemDate ? "OR_TOOLS_WASM_CP_SAT" : "PURCHASE_SUGGESTION_STORED_DUE",
       ...gate,
-    }];
-  });
+    };
+  }))).filter(Boolean).flat();
   const identity = {
     planNumber: plan.planNumber,
     mpsNumber,

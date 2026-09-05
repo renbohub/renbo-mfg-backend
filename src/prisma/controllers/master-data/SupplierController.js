@@ -218,8 +218,15 @@ exports.list = async (req, res, next) => {
 
 exports.get = async (req, res, next) => {
   try {
+    const reference = String(req.params.supplierCode || "").trim();
     const doc = await prisma.supplier.findFirst({
-      where: { supplierCode: req.params.supplierCode, isDeleted: false },
+      where: {
+        isDeleted: false,
+        OR: [
+          { supplierCode: reference },
+          { id: reference },
+        ],
+      },
       include: includeSupplierMainBusinesses,
     });
     if (!doc) return res.status(404).json({ message: "Supplier not found" });

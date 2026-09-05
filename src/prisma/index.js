@@ -1,7 +1,9 @@
 const path = require("path");
 require("dotenv").config({
   path: path.resolve(__dirname, "../../.env"),
-  override: true,
+  // PM2/deployment environment is authoritative; .env only supplies values
+  // that were not injected by the process manager.
+  override: false,
 });
 const { PrismaClient } = require("@prisma/client");
 const { PrismaPg } = require("@prisma/adapter-pg");
@@ -68,7 +70,7 @@ async function assertDatabaseSchemaReady() {
 }
 
 // Connection test
-async function connectDatabase() {
+async function connectDatabase(options = {}) {
   try {
     await prisma.$connect();
     // PrismaPg membuka koneksi secara lazy. Query ringan ini memastikan
@@ -77,9 +79,10 @@ async function connectDatabase() {
     console.log("✅ PostgreSQL Connected successfully");
     await assertDatabaseSchemaReady();
 
-    // Run seeder after connection
-    const runSeeders = require("./utils/seeder");
-    await runSeeders();
+    if (options.seed !== false) {
+      const runSeeders = require("./utils/seeder");
+      await runSeeders();
+    }
   } catch (error) {
     console.error("❌ PostgreSQL Connection Failed:", error.message);
     console.error(

@@ -39,6 +39,7 @@ const machinesRouter = require("./master-data/machines");
 const machineCostRatesRouter = require("./master-data/machine-cost-rates");
 const shiftsRouter = require("./master-data/shifts");
 const workingHourProfilesRouter = require("./master-data/working-hour-profiles");
+const yearlyWorkingCalendarsRouter = require("./master-data/yearly-working-calendars");
 const subProcessesRouter = require("./master-data/sub-processes");
 const departmentsRouter = require("./master-data/departments");
 const divisionsRouter = require("./master-data/divisions");
@@ -91,6 +92,7 @@ const reportingRouter = require("./reporting");
 const capacityPlanningRouter = require("./planning/capacity-planning");
 const demandPlanningRouter = require("./planning/demand-planning");
 const planningExecutionCockpitRouter = require("./planning/execution-cockpit");
+const planningSolverRunsRouter = require("./planning/solver-runs");
 
 const manufacturingOrdersRouter = require("./production/manufacturing-orders");
 const workOrdersRouter = require("./production/work-orders");
@@ -192,6 +194,7 @@ function registerRoutes(app) {
   api.use("/master-data/machine-cost-rates", auth, machineCostRatesRouter);
   api.use("/master-data/shifts", auth, shiftsRouter);
   api.use("/master-data/working-hour-profiles", auth, workingHourProfilesRouter);
+  api.use("/master-data/yearly-working-calendars", auth, yearlyWorkingCalendarsRouter);
   api.use("/master-data/sub-processes", auth, subProcessesRouter);
   api.use("/master-data/departments", auth, departmentsRouter);
   api.use("/master-data/divisions", auth, divisionsRouter);
@@ -233,6 +236,7 @@ function registerRoutes(app) {
   api.use("/reports", auth, reportingRouter);
   api.use("/planning/capacity-planning", auth, capacityPlanningRouter);
   api.use("/planning/demand-planning", auth, demandPlanningRouter);
+  api.use("/planning/solver-runs", auth, planningSolverRunsRouter);
   api.use("/planning/execution-cockpit", auth, planningExecutionCockpitRouter);
 
   // Purchasing routes

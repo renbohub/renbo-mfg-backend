@@ -8,6 +8,8 @@ const { normalizeDurationUnit } = require("../../utils/duration");
 const { generateConfiguredNumber } = require("../../services/numberingService");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { buildMbomReport } = require("../../services/mbomReportService");
+const { validateBomGraphStructure, assertBomGraphStructure } = require("../../services/planning/solver/bomGraphValidationService");
+const { normalizeMaterialSupplyType, isCustomerSupplied } = require("../../utils/materialSupply");
 
 // ============================================
 // REUSABLE INCLUDES & QUERIES
@@ -46,6 +48,9 @@ const MBOM_DETAIL_INCLUDE = {
       },
     },
     uom: true,
+    supplier: true,
+    supplyCustomer: true,
+    vendor: true,
     materialForm: true,
     alternateMaterialForm: true,
     mbomProcesses: {
@@ -53,6 +58,7 @@ const MBOM_DETAIL_INCLUDE = {
       include: {
         process: true,
         machine: true,
+        vendor: true,
       },
       orderBy: { sequence: "asc" },
     },
@@ -89,6 +95,9 @@ const MBOM_HEADER_INCLUDE_NO_FILTER = {
         },
       },
       uom: true,
+      supplier: true,
+      supplyCustomer: true,
+      vendor: true,
       materialForm: true,
       alternateMaterialForm: true,
       parentDetail: true,
@@ -97,6 +106,7 @@ const MBOM_HEADER_INCLUDE_NO_FILTER = {
         include: {
           process: true,
           machine: true,
+          vendor: true,
         },
       },
     },
@@ -299,6 +309,40 @@ function getDetailProcesses(detail) {
       : undefined;
 }
 
+function normalizeVendorRoutingDetails(details) {
+  if (!Array.isArray(details)) return details;
+  details.forEach((detail) => {
+    if (detail?.isDeleted === true || detail?.category !== "Vendor") return;
+    const processes = (getDetailProcesses(detail) || []).filter((process) => process?.isDeleted !== true);
+    if (!processes.length) {
+      throw badRequest("Komponen Proses outsource wajib memiliki minimal satu Routing Process.");
+    }
+
+    // Compatibility for old BOM payloads where the vendor was stored on the
+    // component row instead of the actual routing operation.
+    if (detail.vendorId) {
+      const hasExplicitVendorRoute = processes.some((process) => String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR");
+      processes.forEach((process) => {
+        const isVendorRoute = String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR";
+        if (!hasExplicitVendorRoute || isVendorRoute) {
+          process.routingMode = "VENDOR";
+          process.vendorId = process.vendorId || detail.vendorId;
+          process.machineId = null;
+          process.machineSpecificationCode = null;
+          process.alternativeMachineIds = [];
+          process.cycleTime = 0;
+        }
+      });
+    }
+
+    if (!processes.some((process) => String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR")) {
+      throw badRequest("Komponen Proses outsource belum memiliki routing mode Vendor. Buka Routing, pilih mode Vendor, lalu pilih vendor code.");
+    }
+    detail.vendorId = null;
+  });
+  return details;
+}
+
 function assignProcessRoutingNumbers(details) {
   if (!Array.isArray(details)) return details;
 
@@ -391,18 +435,23 @@ function prepareMBOMProcessData(process, noReg, mbomDetailId) {
     throw badRequest("processId wajib diisi untuk MBOM process.");
   }
 
+  const routingMode = String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR" ? "VENDOR" : "INHOUSE";
+  if (routingMode === "VENDOR" && !process.vendorId) {
+    throw badRequest("Vendor wajib dipilih untuk routing process VENDOR.");
+  }
+
   return convertNumericFields({
     noReg,
     mbomDetailId,
     processId: process.processId,
     occurrenceCode: process.occurrenceCode || null,
     routingNumber: process.routingNumber || null,
-    machineId: process.machineId || null,
-    machineSpecificationCode: process.machineSpecificationCode || process.machine?.machineSpecificationCode || null,
+    machineId: routingMode === "VENDOR" ? null : process.machineId || null,
+    machineSpecificationCode: routingMode === "VENDOR" ? null : process.machineSpecificationCode || process.machine?.machineSpecificationCode || null,
     alternativeMachineIds: [],
     diesId: process.diesId || null,
-    routingMode: String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR" ? "VENDOR" : "INHOUSE",
-    vendorId: process.vendorId || null,
+    routingMode,
+    vendorId: routingMode === "VENDOR" ? process.vendorId : null,
     sequence: process.sequence || 0,
     cycleTime: process.cycleTime || 0,
     notes: process.occurrenceCode || process.notes || null,
@@ -430,6 +479,32 @@ async function syncMBOMDetailProcesses(tx, detailId, noReg, processes) {
   }
 
   for (const process of processes) {
+    if (String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
+      const routingProcess = await tx.process.findFirst({
+        where: { id: process.processId, isDeleted: false },
+        select: { processCode: true, processName: true },
+      });
+      if (!routingProcess) throw badRequest("Master proses routing vendor tidak ditemukan atau sudah nonaktif.");
+      const vendorProcess = await tx.vendorProcess.findFirst({
+        where: { vendorProcessCode: routingProcess.processCode, isDeleted: false },
+        select: { id: true, vendorProcessCode: true },
+      });
+      if (!vendorProcess) {
+        throw badRequest(`Proses ${routingProcess.processCode} belum tersedia di Master Kode Proses Vendor. Lengkapi master tersebut sebelum memilih vendor di BOM.`);
+      }
+      const assignment = await tx.entityVendorProcess.findFirst({
+        where: {
+          entityType: "vendor",
+          vendorProcessId: vendorProcess.id,
+          vendorId: process.vendorId,
+          vendor: { is: { isDeleted: false, status: "Active" } },
+        },
+        select: { id: true },
+      });
+      if (!assignment) {
+        throw badRequest(`Vendor yang dipilih tidak terdaftar sebagai pelaksana proses ${routingProcess.processCode}. Periksa Master Kode Proses Vendor.`);
+      }
+    }
     if (String(process.routingMode || "INHOUSE").toUpperCase() !== "VENDOR" && process.machineSpecificationCode) {
       const representative = await tx.machine.findFirst({
         where: { machineSpecificationCode: process.machineSpecificationCode, isDeleted: false },
@@ -514,6 +589,11 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
     ? Math.max(1, Math.round(Number(detail.alternateMaterialCavity)))
     : null;
   let alternateGrossWeight = Math.max(Number(detail.alternateGrossWeight || 0), 0);
+  const materialSupplyType = normalizeMaterialSupplyType(detail.materialSupplyType);
+  const supplyCustomerId = isCustomerSupplied(materialSupplyType)
+    ? normalizeOptionalCode(detail.supplyCustomerId)
+    : null;
+  let rawMaterialPart = false;
 
   // Auto-calculate scrapFactor dari PartBase (baseOn='Actual').
   // Field ini sengaja diturunkan dari master part agar konsisten di create/update MBOM.
@@ -528,6 +608,7 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
       },
     });
     if (rawPart?.itemType === "RAW" && rawPart.rawType === "MATERIAL" && rawPart.materialId) {
+      rawMaterialPart = true;
       materialThickness = rawPart.material?.thickness ?? materialThickness;
       materialWidth = rawPart.material?.width ?? materialWidth;
       materialDensity = rawPart.material?.density ?? materialDensity;
@@ -555,6 +636,23 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
     scrapFactor = calculateScrapFactorFromPartBase(partBase);
   }
 
+  if (isCustomerSupplied(materialSupplyType)) {
+    if (!rawMaterialPart) {
+      throw badRequest("Opsi Disuplai Customer hanya dapat dipakai untuk Part RAW bertipe MATERIAL.");
+    }
+    if ((detail.category || "Purchase") !== "Purchase") {
+      throw badRequest("Material yang disuplai customer wajib memakai kategori Purchase agar tetap masuk netting material.");
+    }
+    if (!supplyCustomerId) {
+      throw badRequest("Customer pemasok material wajib dipilih.");
+    }
+    const customer = await db.customer.findFirst({
+      where: { id: supplyCustomerId, isDeleted: false, status: { not: "Inactive" } },
+      select: { id: true },
+    });
+    if (!customer) throw badRequest("Customer pemasok material tidak aktif atau tidak ditemukan.");
+  }
+
   if (materialScheme === "ALTERNATIVE" && !(alternateGrossWeight > 0)) {
     throw badRequest("Skema material alternatif belum lengkap. Isi form, pitch, dan cavity sebelum dipakai untuk MRP.");
   }
@@ -566,6 +664,10 @@ async function prepareMBOMDetailData(detail, createdBy, options = {}) {
   const data = convertNumericFields({
     levelComponent: detail.levelComponent || 0,
     partId: detail.partId || null,
+    supplierId: detail.category === "Purchase" && !isCustomerSupplied(materialSupplyType) ? detail.supplierId || null : null,
+    materialSupplyType: rawMaterialPart ? materialSupplyType : "SUPPLIER_PURCHASE",
+    supplyCustomerId: rawMaterialPart ? supplyCustomerId : null,
+    vendorId: null,
     qty: detail.qty || 0,
     uomCode: detail.uomCode || null,
     category: detail.category || "Purchase",
@@ -958,6 +1060,7 @@ exports.get = async (req, res, next) => {
     await assignProcessOccurrenceCodes(doc.details);
     const transformed = mapDoc(doc);
     transformed.sequenceInsertionPolicy = await getSequenceInsertionPolicy(doc);
+    transformed.graphValidation = validateBomGraphStructure(doc);
     res.json(transformed);
   } catch (e) {
     next(e);
@@ -992,7 +1095,7 @@ exports.create = async (req, res, next) => {
 
     const normalizedPayload = await normalizeMBOMUomCodes(headerData, details);
     headerData = normalizedPayload.headerData;
-    const normalizedDetails = normalizedPayload.details;
+    const normalizedDetails = normalizeVendorRoutingDetails(normalizedPayload.details);
     assignProcessRoutingNumbers(normalizedDetails);
     await assignProcessOccurrenceCodes(normalizedDetails);
 
@@ -1066,6 +1169,7 @@ exports.create = async (req, res, next) => {
         where: { id: createdHeader.id },
         include: MBOM_HEADER_INCLUDE,
       });
+      assertBomGraphStructure(created);
       await queueDirtyPartCodes(tx, [
         created.part?.partCode,
         ...(created.details || []).map((detail) => detail.part?.partCode),
@@ -1126,7 +1230,7 @@ exports.update = async (req, res, next) => {
     );
     const normalizedPayload = await normalizeMBOMUomCodes(headerData, details);
     headerData = normalizedPayload.headerData;
-    const normalizedDetails = normalizedPayload.details;
+    const normalizedDetails = normalizeVendorRoutingDetails(normalizedPayload.details);
     assignProcessRoutingNumbers(normalizedDetails);
     await assignProcessOccurrenceCodes(normalizedDetails);
 
@@ -1142,6 +1246,7 @@ exports.update = async (req, res, next) => {
         }
 
         const revision = await createMBOMRevision(tx, sourceHeader, headerData, normalizedDetails, req);
+        assertBomGraphStructure(revision);
         await queueDirtyPartCodes(tx, [
           revision.part?.partCode,
           ...(revision.details || []).map((detail) => detail.part?.partCode),
@@ -1317,6 +1422,7 @@ exports.update = async (req, res, next) => {
         where: { id: updatedHeader.id },
         include: MBOM_HEADER_INCLUDE,
       });
+      assertBomGraphStructure(updated);
       await queueDirtyPartCodes(tx, [
         updated.part?.partCode,
         ...(updated.details || []).map((detail) => detail.part?.partCode),

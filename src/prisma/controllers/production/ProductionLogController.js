@@ -3756,11 +3756,13 @@ exports.approve = async (req, res, next) => {
         },
       });
 
-      const carryover = await createProductionShortfallCarryover(tx, {
-        log: updated,
-        schedule: relatedSchedule,
-        actor: req.user?.username || req.user?.email || "system",
-      });
+      const carryover = toNumber(updated.qtyReject) > QUANTITY_TOLERANCE
+        ? null
+        : await createProductionShortfallCarryover(tx, {
+            log: updated,
+            schedule: relatedSchedule,
+            actor: req.user?.username || req.user?.email || "system",
+          });
 
       let automation = null;
       const subAssemblyMovementNumbers = await consumeReservedSubAssembliesForProductionLog(

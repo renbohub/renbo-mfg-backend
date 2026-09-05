@@ -2,7 +2,8 @@ const { prisma } = require("../../index");
 const { createAiDraftService } = require("../../services/ai/aiDraftService");
 const aiDraftService = createAiDraftService({ prisma });
 const { assertApprovedCurrentMrp } = require("../../services/planning/mrpLifecycleService");
-const { procurementSchedule, subtractWorkingDays } = require("../../services/planning/procurementSchedulingService");
+const { procurementSchedule } = require("../../services/planning/procurementSchedulingService");
+const { resolveProductionRequirementDates } = require("../../services/planning/mrpDueDateService");
 const {
   loadDemandPlanningConstraintMap,
   leadTimeControls,
@@ -67,10 +68,6 @@ function resolvePrCategory(item = {}) {
 // use the exact same MBOM critical-path and per-process rounding logic.
 exports.routingMetrics = routingMetrics;
 exports.routingMetricsForRequests = routingMetricsForRequests;
-
-function subtractDays(value, days) {
-  return new Date(new Date(value).getTime() - Math.max(number(days), 0) * 24 * 60 * 60 * 1000);
-}
 
 function leadTimeHours(detail) {
   const value = number(detail?.leadTime);
@@ -555,7 +552,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
   const suggestionNumber = existing && options.force === true
     ? existing.suggestionNumber
     : await nextSuggestionNumber(tx);
-  const rawItems = orders.map((order) => {
+  const rawItems = await Promise.all(orders.map(async (order) => {
     const matched = requirementsByPartDay.get(`${order.partCode}|${day(order.requiredDate)}`) || [];
     const bomPurchaseDefault = matched
       .map(resolveBomPurchaseDefaults)
@@ -600,12 +597,17 @@ async function generateForRun(tx, runNumber, user, options = {}) {
     // Purchase Suggestion protects the latest permissible production start.
     // Existing finite-capacity allocations are evidence, not the source of this
     // deadline; otherwise an early allocation turns into an unnecessarily early PR.
-    const calculatedProductionStart = subtractWorkingDays(fgRequiredDate, scheduledProductionLeadTimeDays);
+    const productionSchedule = await resolveProductionRequirementDates({
+      fgRequiredDate,
+      customerTargetDate: customerDeliveryDate,
+      routingMetric: { ...routing, productionLeadTimeDays: scheduledProductionLeadTimeDays },
+    });
+    const calculatedProductionStart = productionSchedule.productionLatestStartDate;
     const plannedProductionStart = calculatedProductionStart;
     const materialRequiredDate = plannedProductionStart;
-    const scheduleSource = "MRP_BACKWARD_SCHEDULE";
+    const scheduleSource = "OR_TOOLS_WASM_CP_SAT";
     const procurementPolicy = procurementPolicyFromDecision(planningDecision, options.procurementPolicy || {});
-    const schedule = procurementSchedule({
+    const schedule = await procurementSchedule({
       materialRequiredDate,
       supplierLeadTimeDays: purchasingLeadTimeDays,
       ...procurementPolicy,
@@ -745,7 +747,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
       priceEffectiveUntil: effectivePurchasePrice?.effectiveUntil || null,
       status: "Draft",
     };
-  });
+  }));
   const groupedItems = new Map();
   for (const item of rawItems) {
     const identity = item.materialCode || item.partCode;
@@ -782,7 +784,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
     current.materialRequiredDate = new Date(Math.min(new Date(current.materialRequiredDate), new Date(item.materialRequiredDate)));
     current.recommendedOrderDate = new Date(Math.min(new Date(current.recommendedOrderDate), new Date(item.recommendedOrderDate)));
     current.latestPrDate = new Date(Math.min(new Date(current.latestPrDate || current.recommendedOrderDate), new Date(item.latestPrDate || item.recommendedOrderDate)));
-    if (item.scheduleSource === "FINITE_CAPACITY") current.scheduleSource = "FINITE_CAPACITY";
+    if (item.scheduleSource) current.scheduleSource = item.scheduleSource;
     const windowPriority = ["EXPEDITE", "CURRENT_MONTH", "DELIVERY_1_15", "DELIVERY_16_EOM", "EARLY_FOLLOWING_MONTH", "FUTURE"];
     if (windowPriority.indexOf(item.procurementWindow) < windowPriority.indexOf(current.procurementWindow)) current.procurementWindow = item.procurementWindow;
     current.atRiskSupplyQty = round(number(current.atRiskSupplyQty) + number(item.atRiskSupplyQty));
@@ -886,7 +888,7 @@ async function autoConfirmSupplierItem(tx, item, actor, asOf) {
   }
 
   const effectiveLeadTimeDays = 2;
-  const recalculatedSchedule = procurementSchedule({
+  const recalculatedSchedule = await procurementSchedule({
     materialRequiredDate: item.materialRequiredDate,
     supplierLeadTimeDays: effectiveLeadTimeDays,
     ...(item.productionLeadTimeBreakdown?.procurementPolicy || {}),
@@ -1125,133 +1127,135 @@ exports.get = async (req, res, next) => {
         sourceRequirements: (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : []).map(enrichSource),
       };
     });
+    const responseItems = await Promise.all(presentationItems.map(async (row) => {
+      const routingRequest = itemRoutingRequestById.get(row.id) || {};
+      const headerId = routingRequest.headerId || schedulingRequirementById.get(row.mrpRequirementId)?.mpsDetail?.mbomHeaderId;
+      const baseMetric = schedulingMetrics.get(routingMetricKey(headerId, routingRequest.scheduleQty));
+      const planningDecision = (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : [])
+        .map((source) => planningConstraintByTarget.get(source.deliveryTargetId || requirementById.get(source.id)?.deliveryTargetId))
+        .find(Boolean)
+        || planningConstraintByTarget.get(requirementById.get(row.mrpRequirementId)?.deliveryTargetId)
+        || null;
+      const routingDecision = applyDecisionToRoutingMetric(baseMetric, planningDecision);
+      const metric = routingDecision.metric || baseMetric;
+      const legacyQty = number(legacyQtyByHeader.get(headerId));
+      const legacyCycleLoadHours = metric ? round(metric.cycleTimeSeconds * legacyQty / 3600) : 0;
+      const legacyTotalHours = metric
+        ? round(metric.summedComponentLeadHours + metric.routingRunHours + metric.setupHours + legacyCycleLoadHours + number(row.queueBufferHours))
+        : number(row.productionLeadTimeHours);
+      const currentTotalHours = metric ? round(metric.productionLeadTimeHours + number(row.queueBufferHours)) : number(row.productionLeadTimeHours);
+      const currentTotalDays = metric
+        ? round(metric.productionLeadTimeDays + Math.ceil(number(row.queueBufferHours) / WORKING_HOURS_PER_DAY))
+        : round(number(row.productionLeadTimeHours) / WORKING_HOURS_PER_DAY);
+      const scheduledProductionLeadTimeDays = Math.ceil(currentTotalDays);
+      const calculatedLeadTimeBreakdown = metric ? {
+        ...metric,
+        queueBufferHours: number(row.queueBufferHours),
+        totalProductionLeadTimeHours: currentTotalHours,
+        totalProductionLeadTimeDays: currentTotalDays,
+        exactProductionLeadTimeDays: round(metric.exactProductionLeadTimeDays + number(row.queueBufferHours) / WORKING_HOURS_PER_DAY),
+        scheduledProductionLeadTimeDays,
+        storedProductionLeadTimeHours: number(row.productionLeadTimeHours),
+        legacyDetected: Math.abs(number(row.productionLeadTimeHours) - legacyTotalHours) <= 0.001 && Math.abs(legacyQty - metric.scheduleQty) > 0.001,
+        legacyRequirementCount: number(requirementCountByHeader.get(headerId)),
+        legacyAccumulatedQty: legacyQty,
+        legacyCycleLoadHours,
+        legacyTotalHours,
+        planningEvidence: routingDecision.planningEvidence || row.productionLeadTimeBreakdown?.planningEvidence || null,
+        ...(row.productionLeadTimeBreakdown?.moqAllocation ? { moqAllocation: row.productionLeadTimeBreakdown.moqAllocation } : {}),
+      } : row.productionLeadTimeBreakdown;
+      const fgRequiredDate = row.productionLeadTimeBreakdown?.fgRequiredDate || row.customerDeliveryDate;
+      const productionDates = metric && fgRequiredDate
+        ? await resolveProductionRequirementDates({ fgRequiredDate, customerTargetDate: row.customerDeliveryDate, routingMetric: { ...metric, productionLeadTimeDays: scheduledProductionLeadTimeDays } })
+        : null;
+      const calculatedProductionDueDate = productionDates?.productionLatestStartDate || row.materialRequiredDate;
+      const controls = leadTimeControls(planningDecision);
+      const masterSupplierLeadTimeDays = number(row.confirmedLeadTimeDays ?? row.purchasingLeadTimeDays);
+      const effectiveSupplierLeadTimeDays = controls.supplierLeadTime ? masterSupplierLeadTimeDays : 0;
+      const procurementPolicy = procurementPolicyFromDecision(planningDecision, row.productionLeadTimeBreakdown?.procurementPolicy || {});
+      const calculatedProcurementSchedule = calculatedProductionDueDate
+        ? await procurementSchedule({ materialRequiredDate: calculatedProductionDueDate, supplierLeadTimeDays: effectiveSupplierLeadTimeDays, ...procurementPolicy })
+        : null;
+      const calculatedPurchaseDueDate = calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate;
+      const allocatedRequirementIds = new Set(presentationItems.flatMap((candidate) => (Array.isArray(candidate.sourceRequirements) ? candidate.sourceRequirements : []).map((source) => String(source.id))));
+      const externalCandidates = externalRequirements.filter((requirement) => {
+        const relatedPart = relatedPartByCode.get(requirement.partCode);
+        const sameIdentity = row.materialCode
+          ? relatedPart?.material?.materialCode === row.materialCode
+          : requirement.partCode === row.partCode;
+        return sameIdentity
+          && !allocatedRequirementIds.has(String(requirement.id))
+          && new Date(requirement.targetDeliveryDate || requirement.requiredDate) > new Date(row.customerDeliveryDate || row.materialRequiredDate);
+      }).map((requirement) => {
+        const relatedPart = relatedPartByCode.get(requirement.partCode);
+        return {
+          sourceItemId: `MRP:${requirement.id}`,
+          sourceRequirementId: requirement.id,
+          sourceKind: "MRP_REQUIREMENT",
+          availableQty: number(requirement.adjustedOrderQty || requirement.plannedOrderQty || requirement.netRequirement),
+          partCode: requirement.partCode,
+          partNumber: relatedPart?.partNumber || null,
+          customerCode: requirement.customerCode || null,
+          sourceType: requirement.sourceType || "MRP",
+          sourceNumber: requirement.sourceNumber || null,
+          deliveryTargetId: requirement.deliveryTargetId || null,
+          targetDeliveryDate: requirement.targetDeliveryDate || requirement.requiredDate,
+          requiredDate: requirement.requiredDate,
+          materialRequiredDate: requirement.materialRequiredDate || requirement.requiredDate,
+          uomCode: row.uomCode || null,
+        };
+      }).filter((candidate) => candidate.availableQty > 0);
+      const candidateRows = buildMoqAllocationCandidates(presentationItems, row.id, externalCandidates);
+      const planningHorizonDate = latestReviewedDemand?.targetDeliveryDate || row.customerDeliveryDate;
+      const bomPurchaseDefault = unique([
+        row.mrpRequirementId,
+        ...(Array.isArray(row.sourceRequirements) ? row.sourceRequirements.map((source) => source.id) : []),
+      ])
+        .map((id) => resolveBomPurchaseDefaults(requirementById.get(id)))
+        .find((value) => value.form)
+        || { form: null, width: null, source: "NOT_FOUND", materialScheme: null };
+      return {
+        ...row,
+        scheduleSource: "OR_TOOLS_WASM_CP_SAT",
+        calculatedProductionDueDate,
+        calculatedPurchaseDueDate,
+        supplierRequiredArrivalDate: calculatedProcurementSchedule?.supplierRequiredArrivalDate || row.productionLeadTimeBreakdown?.procurementSchedule?.supplierRequiredArrivalDate || null,
+        latestPoDate: calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate,
+        calculatedLatestPrDate: calculatedProcurementSchedule?.latestPrDate || row.latestPrDate,
+        productionLeadTimeBreakdown: calculatedLeadTimeBreakdown ? {
+          ...calculatedLeadTimeBreakdown,
+          procurementSchedule: calculatedProcurementSchedule || calculatedLeadTimeBreakdown.procurementSchedule || null,
+          procurementPolicy,
+          masterPurchasingLeadTimeDays: masterSupplierLeadTimeDays,
+          effectivePurchasingLeadTimeDays: effectiveSupplierLeadTimeDays,
+        } : calculatedLeadTimeBreakdown,
+        masterMaterialWidth: materialById.get(row.materialId)?.width ?? null,
+        masterMaterialThickness: materialById.get(row.materialId)?.thickness ?? null,
+        masterMaterialForm: materialById.get(row.materialId)?.materialForm ?? null,
+        bomDefaultPurchaseForm: bomPurchaseDefault.form,
+        bomDefaultMaterialWidth: bomPurchaseDefault.width,
+        bomMaterialScheme: bomPurchaseDefault.materialScheme,
+        bomPurchaseFormSource: bomPurchaseDefault.source,
+        recommendedPurchaseForms: unique([
+          requirementById.get(row.mrpRequirementId)?.mbomDetail?.materialForm,
+          requirementById.get(row.mrpRequirementId)?.mbomDetail?.alternateMaterialForm,
+        ]),
+        moqAllocationCandidates: candidateRows,
+        moqAllocationSearch: {
+          searchedAfterDate: row.customerDeliveryDate || row.materialRequiredDate,
+          planningHorizonDate,
+          candidateCount: candidateRows.length,
+          reason: candidateRows.length
+            ? "CANDIDATES_AVAILABLE"
+            : new Date(planningHorizonDate) <= new Date(row.customerDeliveryDate || row.materialRequiredDate)
+              ? "NO_LATER_DELIVERY_REQUEST"
+              : "NO_MATCHING_MATERIAL_IN_LATER_DELIVERY",
+        },
+      };
+    }));
     res.json({
       ...item,
-      items: presentationItems.map((row) => {
-        const routingRequest = itemRoutingRequestById.get(row.id) || {};
-        const headerId = routingRequest.headerId || schedulingRequirementById.get(row.mrpRequirementId)?.mpsDetail?.mbomHeaderId;
-        const baseMetric = schedulingMetrics.get(routingMetricKey(headerId, routingRequest.scheduleQty));
-        const planningDecision = (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : [])
-          .map((source) => planningConstraintByTarget.get(source.deliveryTargetId || requirementById.get(source.id)?.deliveryTargetId))
-          .find(Boolean)
-          || planningConstraintByTarget.get(requirementById.get(row.mrpRequirementId)?.deliveryTargetId)
-          || null;
-        const routingDecision = applyDecisionToRoutingMetric(baseMetric, planningDecision);
-        const metric = routingDecision.metric || baseMetric;
-        const legacyQty = number(legacyQtyByHeader.get(headerId));
-        const legacyCycleLoadHours = metric ? round(metric.cycleTimeSeconds * legacyQty / 3600) : 0;
-        const legacyTotalHours = metric
-          ? round(metric.summedComponentLeadHours + metric.routingRunHours + metric.setupHours + legacyCycleLoadHours + number(row.queueBufferHours))
-          : number(row.productionLeadTimeHours);
-        const currentTotalHours = metric ? round(metric.productionLeadTimeHours + number(row.queueBufferHours)) : number(row.productionLeadTimeHours);
-        const currentTotalDays = metric
-          ? round(metric.productionLeadTimeDays + Math.ceil(number(row.queueBufferHours) / WORKING_HOURS_PER_DAY))
-          : round(number(row.productionLeadTimeHours) / WORKING_HOURS_PER_DAY);
-        const scheduledProductionLeadTimeDays = Math.ceil(currentTotalDays);
-        const calculatedLeadTimeBreakdown = metric ? {
-          ...metric,
-          queueBufferHours: number(row.queueBufferHours),
-          totalProductionLeadTimeHours: currentTotalHours,
-          totalProductionLeadTimeDays: currentTotalDays,
-          exactProductionLeadTimeDays: round(metric.exactProductionLeadTimeDays + number(row.queueBufferHours) / WORKING_HOURS_PER_DAY),
-          scheduledProductionLeadTimeDays,
-          storedProductionLeadTimeHours: number(row.productionLeadTimeHours),
-          legacyDetected: Math.abs(number(row.productionLeadTimeHours) - legacyTotalHours) <= 0.001 && Math.abs(legacyQty - metric.scheduleQty) > 0.001,
-          legacyRequirementCount: number(requirementCountByHeader.get(headerId)),
-          legacyAccumulatedQty: legacyQty,
-          legacyCycleLoadHours,
-          legacyTotalHours,
-          planningEvidence: routingDecision.planningEvidence || row.productionLeadTimeBreakdown?.planningEvidence || null,
-          ...(row.productionLeadTimeBreakdown?.moqAllocation ? { moqAllocation: row.productionLeadTimeBreakdown.moqAllocation } : {}),
-        } : row.productionLeadTimeBreakdown;
-        const fgRequiredDate = row.productionLeadTimeBreakdown?.fgRequiredDate || row.customerDeliveryDate;
-        const calculatedProductionDueDate = metric && fgRequiredDate
-          ? subtractWorkingDays(fgRequiredDate, scheduledProductionLeadTimeDays)
-          : row.materialRequiredDate;
-        const controls = leadTimeControls(planningDecision);
-        const masterSupplierLeadTimeDays = number(row.confirmedLeadTimeDays ?? row.purchasingLeadTimeDays);
-        const effectiveSupplierLeadTimeDays = controls.supplierLeadTime ? masterSupplierLeadTimeDays : 0;
-        const procurementPolicy = procurementPolicyFromDecision(planningDecision, row.productionLeadTimeBreakdown?.procurementPolicy || {});
-        const calculatedProcurementSchedule = calculatedProductionDueDate
-          ? procurementSchedule({ materialRequiredDate: calculatedProductionDueDate, supplierLeadTimeDays: effectiveSupplierLeadTimeDays, ...procurementPolicy })
-          : null;
-        const calculatedPurchaseDueDate = calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate;
-        const allocatedRequirementIds = new Set(presentationItems.flatMap((candidate) => (Array.isArray(candidate.sourceRequirements) ? candidate.sourceRequirements : []).map((source) => String(source.id))));
-        const externalCandidates = externalRequirements.filter((requirement) => {
-          const relatedPart = relatedPartByCode.get(requirement.partCode);
-          const sameIdentity = row.materialCode
-            ? relatedPart?.material?.materialCode === row.materialCode
-            : requirement.partCode === row.partCode;
-          return sameIdentity
-            && !allocatedRequirementIds.has(String(requirement.id))
-            && new Date(requirement.targetDeliveryDate || requirement.requiredDate) > new Date(row.customerDeliveryDate || row.materialRequiredDate);
-        }).map((requirement) => {
-          const relatedPart = relatedPartByCode.get(requirement.partCode);
-          return {
-            sourceItemId: `MRP:${requirement.id}`,
-            sourceRequirementId: requirement.id,
-            sourceKind: "MRP_REQUIREMENT",
-            availableQty: number(requirement.adjustedOrderQty || requirement.plannedOrderQty || requirement.netRequirement),
-            partCode: requirement.partCode,
-            partNumber: relatedPart?.partNumber || null,
-            customerCode: requirement.customerCode || null,
-            sourceType: requirement.sourceType || "MRP",
-            sourceNumber: requirement.sourceNumber || null,
-            deliveryTargetId: requirement.deliveryTargetId || null,
-            targetDeliveryDate: requirement.targetDeliveryDate || requirement.requiredDate,
-            requiredDate: requirement.requiredDate,
-            materialRequiredDate: requirement.materialRequiredDate || requirement.requiredDate,
-            uomCode: row.uomCode || null,
-          };
-        }).filter((candidate) => candidate.availableQty > 0);
-        const candidateRows = buildMoqAllocationCandidates(presentationItems, row.id, externalCandidates);
-        const planningHorizonDate = latestReviewedDemand?.targetDeliveryDate || row.customerDeliveryDate;
-        const bomPurchaseDefault = unique([
-          row.mrpRequirementId,
-          ...(Array.isArray(row.sourceRequirements) ? row.sourceRequirements.map((source) => source.id) : []),
-        ])
-          .map((id) => resolveBomPurchaseDefaults(requirementById.get(id)))
-          .find((value) => value.form)
-          || { form: null, width: null, source: "NOT_FOUND", materialScheme: null };
-        return {
-          ...row,
-          scheduleSource: "MRP_BACKWARD_SCHEDULE",
-          calculatedProductionDueDate,
-          calculatedPurchaseDueDate,
-          supplierRequiredArrivalDate: calculatedProcurementSchedule?.supplierRequiredArrivalDate || row.productionLeadTimeBreakdown?.procurementSchedule?.supplierRequiredArrivalDate || null,
-          latestPoDate: calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate,
-          calculatedLatestPrDate: calculatedProcurementSchedule?.latestPrDate || row.latestPrDate,
-          productionLeadTimeBreakdown: calculatedLeadTimeBreakdown ? {
-            ...calculatedLeadTimeBreakdown,
-            procurementSchedule: calculatedProcurementSchedule || calculatedLeadTimeBreakdown.procurementSchedule || null,
-            procurementPolicy,
-            masterPurchasingLeadTimeDays: masterSupplierLeadTimeDays,
-            effectivePurchasingLeadTimeDays: effectiveSupplierLeadTimeDays,
-          } : calculatedLeadTimeBreakdown,
-          masterMaterialWidth: materialById.get(row.materialId)?.width ?? null,
-          masterMaterialThickness: materialById.get(row.materialId)?.thickness ?? null,
-          masterMaterialForm: materialById.get(row.materialId)?.materialForm ?? null,
-          bomDefaultPurchaseForm: bomPurchaseDefault.form,
-          bomDefaultMaterialWidth: bomPurchaseDefault.width,
-          bomMaterialScheme: bomPurchaseDefault.materialScheme,
-          bomPurchaseFormSource: bomPurchaseDefault.source,
-          recommendedPurchaseForms: unique([
-            requirementById.get(row.mrpRequirementId)?.mbomDetail?.materialForm,
-            requirementById.get(row.mrpRequirementId)?.mbomDetail?.alternateMaterialForm,
-          ]),
-          moqAllocationCandidates: candidateRows,
-          moqAllocationSearch: {
-            searchedAfterDate: row.customerDeliveryDate || row.materialRequiredDate,
-            planningHorizonDate,
-            candidateCount: candidateRows.length,
-            reason: candidateRows.length
-              ? "CANDIDATES_AVAILABLE"
-              : new Date(planningHorizonDate) <= new Date(row.customerDeliveryDate || row.materialRequiredDate)
-                ? "NO_LATER_DELIVERY_REQUEST"
-                : "NO_MATCHING_MATERIAL_IN_LATER_DELIVERY",
-          },
-        };
-      }),
+      items: responseItems,
     });
   } catch (error) { next(error); }
 };
@@ -1476,7 +1480,7 @@ exports.updateItem = async (req, res, next) => {
           ?? (supplierChanged ? supplierMaster?.leadTimeDays : optionalNumber(item.confirmedLeadTimeDays))
           ?? supplierMaster?.leadTimeDays
           ?? number(item.purchasingLeadTimeDays);
-      const recalculatedSchedule = procurementSchedule({
+      const recalculatedSchedule = await procurementSchedule({
         materialRequiredDate: item.materialRequiredDate,
         supplierLeadTimeDays: effectiveLeadTimeDays,
         ...(item.productionLeadTimeBreakdown?.procurementPolicy || {}),

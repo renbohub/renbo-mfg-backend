@@ -20,7 +20,11 @@ exports.deliveryBoard = async (req, res, next) => {
       where: {
         isDeleted: false,
         status: { notIn: ["Cancelled", "Failed"] },
-        plannedDate: { gte: from, lte: to },
+        OR: [
+          { plannedDate: { gte: from, lte: to } },
+          { actualDate: { gte: from, lte: to } },
+          { deliveredAt: { gte: from, lte: to } },
+        ],
       },
       include: {
         soHeader: { select: { customerCode: true, customerName: true } },
@@ -44,7 +48,7 @@ exports.deliveryBoard = async (req, res, next) => {
       partNumber: detail.soDetail?.partNumber,
       partName: detail.soDetail?.partName,
       plannedAt: schedule.plannedDate,
-      actualAt: schedule.actualDate || schedule.deliveredAt,
+      actualAt: schedule.deliveredAt || schedule.actualDate,
       plannedQty: numberValue(detail.qty),
       deliveredQty: numberValue(detail.qtyDelivered),
       outstandingQty: Math.max(numberValue(detail.qty) - numberValue(detail.qtyDelivered), 0),

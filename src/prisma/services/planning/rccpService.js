@@ -2,6 +2,7 @@
 
 const { planningMonthKey } = require("../../utils/planningMonth");
 const { getMpsWorkbench, demandPhases } = require("./mpsWorkbenchService");
+const { calculateShiftMinutes } = require("./workingHourCalendarService");
 const {
   utcDate,
   dateKey,
@@ -75,6 +76,31 @@ function availableCapacityHours(profile, workingDays) {
   ));
 }
 
+function availableCapacityHoursForPeriod(profile, periodStart, periodEnd, calendarOverrides = []) {
+  const start = utcDate(periodStart);
+  const end = utcDate(periodEnd);
+  const overrides = new Map(calendarOverrides.map((row) => [dateKey(row.scheduleDate), row]));
+  let grossHours = 0;
+  for (let cursor = new Date(start); cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    const override = overrides.get(dateKey(cursor));
+    const weekday = cursor.getUTCDay();
+    const defaultWorking = String(profile.calendarMode || "WEEKDAY").toUpperCase() === "ALL_DAYS" || (weekday !== 0 && weekday !== 6);
+    if (override) {
+      if (String(override.dayStatus || "WORKING").toUpperCase() === "HOLIDAY" || number(override.shiftsPerDay ?? profile.shiftsPerDay) <= 0) continue;
+      const specialShifts = Array.isArray(override.shiftOverrides) ? override.shiftOverrides : [];
+      grossHours += specialShifts.length
+        ? specialShifts.reduce((sum, shift) => sum + (calculateShiftMinutes(shift.startTime, shift.endTime, shift.breakMinutes) + number(shift.overtimeMinutes)) / 60, 0)
+        : number(override.shiftsPerDay ?? profile.shiftsPerDay) * number(profile.effectiveHoursPerShift);
+    } else if (defaultWorking) {
+      grossHours += number(profile.shiftsPerDay) * number(profile.effectiveHoursPerShift);
+    }
+  }
+  return round(Math.max(
+    grossHours * number(profile.resourceCount) * number(profile.efficiencyPercent) / 100 - number(profile.plannedDowntimeHours),
+    0,
+  ));
+}
+
 function capacityForProfilesAcrossBuckets(profiles = [], horizonStart, horizonEnd, calendarOverrides = []) {
   const uniqueProfiles = [...new Map(profiles.filter(Boolean).map((profile) => [
     profile.id || `${profile.partId || "PART"}|${profile.resourceCode || "RESOURCE"}|${profile.machineId || "MACHINE"}`,
@@ -85,12 +111,7 @@ function capacityForProfilesAcrossBuckets(profiles = [], horizonStart, horizonEn
     const profileCapacities = uniqueProfiles.map((profile) => {
       if (!profile.isCapacityConstrained) return Number.POSITIVE_INFINITY;
       const overrides = calendarOverrides.filter((row) => row.machineId === profile.machineId);
-      const workingDays = workingDaysInPeriod(bucket.start, bucket.end, {
-        calendarMode: profile.calendarMode,
-        shiftsPerDay: profile.shiftsPerDay,
-        overrides,
-      });
-      return availableCapacityHours(profile, workingDays);
+      return availableCapacityHoursForPeriod(profile, bucket.start, bucket.end, overrides);
     });
     const finiteCapacities = profileCapacities.filter(Number.isFinite);
     return total + (finiteCapacities.length ? Math.min(...finiteCapacities) : 0);
@@ -416,14 +437,14 @@ async function runRccpMonthlyLegacy(prisma, mpsNumber, options = {}) {
     const machineIds = [...new Set(allProfiles.map(({ profile }) => profile.machineId).filter(Boolean))];
     const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
       where: { machineId: { in: machineIds }, scheduleDate: { gte: doc.periodStart, lte: doc.periodEnd }, isDeleted: false },
-      select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true },
+      select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
     }) : [];
     const existingLoads = await existingLoadByResource(tx, doc.id, doc.periodStart);
     const resources = new Map();
     for (const { detail, profile } of allProfiles) {
       const overrides = calendarOverrides.filter((row) => row.machineId === profile.machineId);
       const workingDays = workingDaysInPeriod(doc.periodStart, doc.periodEnd, { calendarMode: profile.calendarMode, shiftsPerDay: profile.shiftsPerDay, overrides });
-      const capacity = availableCapacityHours(profile, workingDays);
+      const capacity = availableCapacityHoursForPeriod(profile, doc.periodStart, doc.periodEnd, overrides);
       if (capacity <= EPSILON) exceptions.push({ code: "NO_AVAILABLE_CAPACITY", partCode: detail.partCode, resourceCode: profile.resourceCode, message: `${profile.resourceCode}: available capacity periode ini 0 jam.` });
       const current = resources.get(profile.resourceCode) || {
         resourceCode: profile.resourceCode,
@@ -648,7 +669,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
     const machineIds = [...new Set(positiveDetails.flatMap((detail) => detail.part.rccpResourceProfiles.map((profile) => profile.machineId)).filter(Boolean))];
     const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
       where: { machineId: { in: machineIds }, scheduleDate: { gte: calendarScanStart, lte: latestRequiredDate }, isDeleted: false },
-      select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true },
+      select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
     }) : [];
     const overridesByMachine = new Map();
     for (const override of calendarOverrides) {
@@ -660,7 +681,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
     const offsetRows = [];
     for (const { detail, phase, resourceRequirements } of phaseRows) {
       const activeRequirements = resourceRequirements.filter((requirement) => number(requirement.qty) > EPSILON);
-      const timeline = backwardOffsetPhase({
+      const timeline = await backwardOffsetPhase({
         requiredDate: phase.fgRequiredDate,
         profiles: activeRequirements.map((requirement) => ({
           ...requirement.profile,
@@ -738,8 +759,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
         const profileCapacities = resource.profiles.map((profile) => {
           if (!profile.isCapacityConstrained) return Number.POSITIVE_INFINITY;
           const overrides = overridesByMachine.get(profile.machineId) || [];
-          const days = workingDaysInPeriod(range.start, range.end, { calendarMode: profile.calendarMode, shiftsPerDay: profile.shiftsPerDay, overrides });
-          return availableCapacityHours(profile, days);
+          return availableCapacityHoursForPeriod(profile, range.start, range.end, overrides);
         });
         const finiteCapacities = profileCapacities.filter(Number.isFinite);
         const availableCapacity = finiteCapacities.length ? Math.min(...finiteCapacities) : 0;
@@ -866,7 +886,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
       for (const row of offsetRows.filter((item) => item.status === "OVERLOAD" && item.bucketAllocations.length === 1)) {
         const originalBucketKey = dateKey(weekStart(row.calculatedStartDate));
         const resource = resources.get(row.resourceCode);
-        const recommendation = findEarlierFeasibleStart({
+        const recommendation = await findEarlierFeasibleStart({
           originalStartDate: row.calculatedStartDate,
           currentRequirement: row.requiredCapacityHours,
           searchWindowDays: configuration.previousSearchWindowDays,
@@ -877,9 +897,8 @@ async function runRccp(prisma, mpsNumber, options = {}) {
             const candidateKey = dateKey(candidateStart);
             if (candidateKey === originalBucketKey) return { availableCapacity: 0, existingLoad: 0 };
             const rangeEnd = new Date(candidateStart); rangeEnd.setUTCDate(rangeEnd.getUTCDate() + 6);
-            const days = workingDaysInPeriod(candidateStart, rangeEnd, { calendarMode: resource.profile.calendarMode, shiftsPerDay: resource.profile.shiftsPerDay, overrides: overridesByMachine.get(resource.profile.machineId) || [] });
             return {
-              availableCapacity: availableCapacityHours(resource.profile, days),
+              availableCapacity: availableCapacityHoursForPeriod(resource.profile, candidateStart, rangeEnd, overridesByMachine.get(resource.profile.machineId) || []),
               existingLoad: number(existingBucketLoads.get(`${row.resourceCode}|${candidateKey}`)) + number(currentByBucket.get(`${row.resourceCode}|${candidateKey}`)),
             };
           },
@@ -1006,10 +1025,9 @@ async function applyRecommendation(prisma, runId, recommendationId, input = {}) 
       const newBucketEnd = new Date(newBucketStart); newBucketEnd.setUTCDate(newBucketEnd.getUTCDate() + 6);
       const calendarOverrides = profile.machineId ? await tx.capacityCalendarOverride.findMany({
         where: { machineId: profile.machineId, scheduleDate: { gte: newBucketStart, lte: newBucketEnd }, isDeleted: false },
-        select: { scheduleDate: true, dayStatus: true, shiftsPerDay: true },
+        select: { scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
       }) : [];
-      const days = workingDaysInPeriod(newBucketStart, newBucketEnd, { calendarMode: profile.calendarMode, shiftsPerDay: profile.shiftsPerDay, overrides: calendarOverrides });
-      const availableCapacity = availableCapacityHours(profile, days);
+      const availableCapacity = availableCapacityHoursForPeriod(profile, newBucketStart, newBucketEnd, calendarOverrides);
       const otherRuns = await tx.rccpRun.findMany({
         where: { id: { not: runId }, mpsId: { not: recommendation.run.mpsId }, invalidatedAt: null, status: { in: VALID_RESULT_STATUSES } },
         include: { timeBuckets: { where: { resourceCode: detail.resourceCode, bucketStart: newBucketStart } } },
@@ -1105,7 +1123,7 @@ async function assertMpsApprovalAllowed(tx, doc) {
   const freshnessEnd = latest.capacityHorizonEnd || doc.periodEnd;
   const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
     where: { machineId: { in: machineIds }, scheduleDate: { gte: freshnessStart, lte: freshnessEnd }, isDeleted: false },
-    select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true },
+    select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
   }) : [];
   let capacityChanged = false;
   for (const load of latest.loads) {
@@ -1176,11 +1194,34 @@ async function invalidateRccpByMachineCalendar(tx, machineId, scheduleDate) {
   return mpsIds.length;
 }
 
+async function invalidateRccpByMachineCalendarRange(tx, machineIds, scheduleStart, scheduleEnd) {
+  const ids = [...new Set((machineIds || []).filter(Boolean))];
+  if (!ids.length || !scheduleStart || !scheduleEnd) return 0;
+  const profiles = await tx.rccpResourceProfile.findMany({
+    where: { machineId: { in: ids }, isActive: true },
+    select: { id: true },
+  });
+  if (!profiles.length) return 0;
+  const runs = await tx.rccpRun.findMany({
+    where: {
+      invalidatedAt: null,
+      capacityHorizonStart: { lte: scheduleEnd },
+      capacityHorizonEnd: { gte: scheduleStart },
+      loads: { some: { resourceProfileId: { in: profiles.map((row) => row.id) } } },
+    },
+    select: { mpsId: true },
+  });
+  const mpsIds = [...new Set(runs.map((row) => row.mpsId))];
+  for (const mpsId of mpsIds) await invalidateRccp(tx, mpsId, "RCCP_INVALID_CAPACITY_CHANGED", { incrementRevision: false });
+  return mpsIds.length;
+}
+
 module.exports = {
   capacityStatusForLoad,
   worstCapacityStatus,
   workingDaysInPeriod,
   availableCapacityHours,
+  availableCapacityHoursForPeriod,
   capacityForProfilesAcrossBuckets,
   calculateRccpLoad,
   profileMatchesProcess,
@@ -1193,4 +1234,5 @@ module.exports = {
   assertMpsApprovalAllowed,
   invalidateRccp,
   invalidateRccpByMachineCalendar,
+  invalidateRccpByMachineCalendarRange,
 };

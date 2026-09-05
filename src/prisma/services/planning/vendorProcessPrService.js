@@ -1,4 +1,5 @@
 const { generateDocNumber } = require("../../controllers/purchasing/utils/purchasingHelpers");
+const { legacyPriceValue } = require("../pricing/effectivePriceService");
 
 const EPSILON = 0.000001;
 const MONTH_PRICE_FIELDS = [
@@ -13,11 +14,12 @@ const dayKey = (value) => {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
 };
 const processMatches = (vendorProcess, process) => {
-  const values = [vendorProcess?.vendorProcessCode, vendorProcess?.vendorProcessName]
-    .map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
-  const targets = [process?.processCode, process?.processName]
-    .map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
-  return targets.some((target) => values.includes(target));
+  const vendorCode = String(vendorProcess?.vendorProcessCode || "").trim().toLowerCase();
+  const processCode = String(process?.processCode || "").trim().toLowerCase();
+  if (vendorCode && processCode) return vendorCode === processCode;
+  const vendorName = String(vendorProcess?.vendorProcessName || "").trim().toLowerCase();
+  const processName = String(process?.processName || "").trim().toLowerCase();
+  return Boolean(vendorName && processName && vendorName === processName);
 };
 
 function capacityVendorPrMarker(planNumber, vendorCode) {
@@ -47,19 +49,18 @@ function groupVendorAllocations(allocations = []) {
 
 function effectiveVendorRate(priceList, process, date) {
   if (!priceList) return null;
-  const matchingDetail = (priceList.details || []).find((row) => processMatches(row.vendorProcess, process))
-    || (priceList.details || [])[0]
-    || null;
+  const matchingDetail = (priceList.details || []).find((row) => processMatches(row.vendorProcess, process)) || null;
   if (!matchingDetail) return null;
   const monthRate = optionalNumber(matchingDetail[MONTH_PRICE_FIELDS[(date || new Date()).getUTCMonth()]]);
-  const unitPrice = monthRate != null && monthRate > 0 ? monthRate : optionalNumber(matchingDetail.unitPrice);
+  const directRate = optionalNumber(matchingDetail.unitPrice);
+  const unitPrice = legacyPriceValue(matchingDetail, date || new Date());
   if (unitPrice == null || unitPrice < 0) return null;
   return {
     unitPrice,
     currencyCode: priceList.currencyCode || "IDR",
     priceListId: priceList.id,
     vendorProcessId: matchingDetail.vendorProcessId,
-    priceSource: monthRate > 0 ? `MONTH_${MONTH_PRICE_FIELDS[(date || new Date()).getUTCMonth()].toUpperCase()}` : "UNIT_PRICE",
+    priceSource: directRate != null ? "UNIT_PRICE" : monthRate > 0 ? `MONTH_${MONTH_PRICE_FIELDS[(date || new Date()).getUTCMonth()].toUpperCase()}` : "PRICE_NOT_FOUND",
   };
 }
 
@@ -85,9 +86,7 @@ async function resolveVendorPrices(client, allocations) {
       && (!row.effectiveUntil || row.effectiveUntil >= priceDate));
     const exact = eligible.find((row) => row.partId && row.partId === partId && (row.details || []).some((detail) => processMatches(detail.vendorProcess, allocation.mbomProcess?.process)));
     const matched = exact
-      || eligible.find((row) => (row.details || []).some((detail) => processMatches(detail.vendorProcess, allocation.mbomProcess?.process)))
-      || eligible.find((row) => row.partId === partId)
-      || eligible[0];
+      || eligible.find((row) => (row.details || []).some((detail) => processMatches(detail.vendorProcess, allocation.mbomProcess?.process)));
     prices.set(allocation.id, effectiveVendorRate(matched, allocation.mbomProcess?.process, priceDate));
   }
   return prices;

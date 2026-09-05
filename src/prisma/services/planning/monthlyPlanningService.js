@@ -22,6 +22,8 @@ const { refreshMpsDeliveryFeasibility, invalidateMpsDeliveryGate } = require("./
 const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
 const { buildDeliveryPerformance } = require("./deliveryPerformanceService");
 const { buildYearlyDemand } = require("./yearlyDemandService");
+const { reviewDemand } = require("./demandPlanningService");
+const { enqueueSolverRun, completeSolverRun, failSolverRun } = require("./solver/planningSolverRunService");
 
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const MONTHLY_SOURCE_PREFIX = "MONTH:";
@@ -137,6 +139,7 @@ function resolveBufferBaseQty({ nextEfd, yearlyEfdLookahead, forecastLookaheadQt
 
 function fgFinishSplitsForTarget(target, decision, uomCode) {
   const targetQty = normalizeQuantity(target?.qty, uomCode);
+  const customerTargetDate = target?.targetDate;
   const raw = Array.isArray(decision?.fgFinishSplits)
     ? decision.fgFinishSplits
         .map((row, index) => ({
@@ -162,7 +165,9 @@ function fgFinishSplitsForTarget(target, decision, uomCode) {
     allocated = normalizeQuantity(allocated + qty, uomCode);
     return {
       phaseNumber: index + 1,
-      targetFinishDate: row.targetFinishDate,
+      targetFinishDate: customerTargetDate && new Date(row.targetFinishDate) > new Date(customerTargetDate)
+        ? customerTargetDate
+        : row.targetFinishDate,
       qty,
     };
   }).filter((row) => row.qty > 0);
@@ -550,6 +555,69 @@ async function previewMonthlyMbomSelections(tx, options = {}) {
   });
 }
 
+async function refreshMonthlyDemandSolver(prisma, options = {}) {
+  const selection = normalizeMpsRunSelection(options);
+  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || new Date());
+  const requestedMonths = selection.months.length ? new Set(selection.months) : null;
+  const selectedDemand = await collectMonthlyDemand(prisma, requestedMonths, anchorMonth, selection.selectedDeliveryTargetIds);
+  const deliveryTargetIds = uniq([...selectedDemand.buckets.values()]
+    .flatMap((bucket) => [...bucket.forecastTargets, ...bucket.soTargets].map((target) => target.id)));
+  const audit = await enqueueSolverRun(prisma, {
+    scope: "MPS_RECALCULATION",
+    referenceType: "MPS_MONTHS",
+    referenceNumber: selection.months.join(",") || anchorMonth,
+    modelVersion: "OR-TOOLS-WASM-CP-SAT-V1",
+    inputSnapshot: { months: selection.months, planningAnchorMonth: anchorMonth, deliveryTargetIds },
+    requestedBy: options.runBy || "system",
+    status: "RUNNING",
+  });
+  try {
+    const existingRows = deliveryTargetIds.length ? await prisma.demandPlanningDecision.findMany({
+      where: { deliveryTargetId: { in: deliveryTargetIds }, isDeleted: false },
+    }) : [];
+    const existingByTarget = new Map(existingRows.map((row) => [row.deliveryTargetId, row]));
+    const decisions = [];
+    for (const deliveryTargetId of deliveryTargetIds) {
+      const existing = existingByTarget.get(deliveryTargetId);
+      const constraintDetails = existing?.constraintDetails && typeof existing.constraintDetails === "object" ? existing.constraintDetails : {};
+      const decision = await reviewDemand(prisma, deliveryTargetId, {
+        forceSolverDates: true,
+        planNumber: options.planNumber,
+        manualPriorityAdjustment: number(existing?.manualPriorityAdjustment),
+        manualAdjustmentReason: existing?.manualAdjustmentReason,
+        urgentFlag: Boolean(existing?.urgentFlag),
+        bufferPercent: existing?.bufferPercent,
+        bufferQty: existing?.bufferQty,
+        displacementPolicy: existing?.displacementPolicy || "SIMULATE_FIRST",
+        displacementReason: existing?.displacementReason,
+        status: existing?.status || "REVIEWED",
+        leadTimeControls: constraintDetails.leadTimeControls,
+        supplierStrategy: constraintDetails.supplierStrategy,
+        supplierSelections: constraintDetails.supplierSelections,
+        vendorProcessAdjustments: constraintDetails.vendorProcessAdjustments,
+      }, options.runBy || "system");
+      decisions.push({
+        deliveryTargetId,
+        fgRequiredDate: decision.fgRequiredDate,
+        feasibilityStatus: decision.feasibilityStatus,
+        solver: decision.constraintDetails?.solver || null,
+      });
+    }
+    const result = {
+      engine: "OR_TOOLS_WASM_CP_SAT",
+      engineVersion: "0.9.1",
+      status: "COMPLETED",
+      targetCount: deliveryTargetIds.length,
+      decisions,
+    };
+    await completeSolverRun(prisma, audit.id, result);
+    return { ...result, runId: audit.id, runNumber: audit.runNumber };
+  } catch (error) {
+    await failSolverRun(prisma, audit.id, error);
+    throw error;
+  }
+}
+
 async function syncMonthlyMps(tx, options = {}) {
   const selection = normalizeMpsRunSelection(options);
   const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || new Date());
@@ -820,7 +888,12 @@ async function syncMonthlyMps(tx, options = {}) {
       const customerCodes = uniq(bucket.customerCodes);
       const forecastDetailIds = uniq(bucket.forecastDetailIds);
       const offsets = uniq(bucket.forecastOffsets);
-      const decisionForTarget = (target) => decisionByTarget.get(target.matchedForecastTargetId || target.id) || decisionByTarget.get(target.id);
+      // The active SO delivery target owns its own OR-Tools result. A matched
+      // Forecast decision is only a fallback for an SO target that has not yet
+      // been reviewed; preferring it collapsed every SO batch onto the single
+      // Forecast FG date.
+      const decisionForTarget = (target) => decisionByTarget.get(target.id)
+        || decisionByTarget.get(target.matchedForecastTargetId);
       const targetDecisions = deliveryTargets.map((target) => ({ target, decision: decisionForTarget(target) })).filter((row) => row.decision);
       const leadingDecision = [...targetDecisions].sort((left, right) => number(right.decision.finalPriorityScore) - number(left.decision.finalPriorityScore))[0]?.decision || null;
       const earliestTarget = [...deliveryTargets].sort((left, right) => new Date(left.targetDate) - new Date(right.targetDate))[0] || null;
@@ -866,6 +939,12 @@ async function syncMonthlyMps(tx, options = {}) {
           bufferAllocationMode: existing?.calculationTrace?.bufferAllocationMode === "DISTRIBUTE_TO_PHASES"
             ? "DISTRIBUTE_TO_PHASES"
             : "SEPARATE_END_MONTH",
+          dueDateEngine: options.solverRefresh ? {
+            engine: options.solverRefresh.engine,
+            engineVersion: options.solverRefresh.engineVersion,
+            solverRunNumber: options.solverRefresh.runNumber,
+            targetCount: options.solverRefresh.targetCount,
+          } : existing?.calculationTrace?.dueDateEngine || null,
         },
         qtyPlanned,
         startDate: utcMonthStart(month),
@@ -909,7 +988,10 @@ async function syncMonthlyMps(tx, options = {}) {
         || String(existing?.mbomHeaderId || "") !== String(selectedMbom?.id || "")
         || String(existing?.mbomSelectionMode || "") !== String(data.mbomSelectionMode || "")
         || number(existing?.mbomRevisionSnapshot) !== number(data.mbomRevisionSnapshot)
-        || String(existing?.mbomNoRegSnapshot || "") !== String(data.mbomNoRegSnapshot || "");
+        || String(existing?.mbomNoRegSnapshot || "") !== String(data.mbomNoRegSnapshot || "")
+        || String(existing?.fgRequiredDate || "") !== String(data.fgRequiredDate || "")
+        || String(existing?.customerTargetDate || "") !== String(data.customerTargetDate || "")
+        || String(existing?.calculationTrace?.dueDateEngine?.engine || "") !== String(data.calculationTrace?.dueDateEngine?.engine || "");
       if (lineChanged) {
         demandChanged = true;
       }
@@ -1098,6 +1180,7 @@ module.exports = {
   targetIncludedInMpsSelection,
   resolveBufferBaseQty,
   customerDeliveryTargets,
+  refreshMonthlyDemandSolver,
   syncMonthlyMps,
   previewMonthlyMbomSelections,
 };

@@ -5,6 +5,9 @@ const { DEFAULT_FORMULAS, evaluateFormula } = require("../src/prisma/services/ma
 const { procurementSchedule } = require("../src/prisma/services/planning/procurementSchedulingService");
 const { resolveBufferBaseQty, customerDeliveryTargets } = require("../src/prisma/services/planning/monthlyPlanningService");
 const { buildLedger, isCustomerDeliveryPhase } = require("../src/prisma/services/planning/mpsWorkbenchService");
+const mrpControllerSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MRPController.js"), "utf8");
+
+(async () => {
 
 const checks = [];
 function check(name, condition) {
@@ -36,11 +39,21 @@ const bufferedDetail = { ...detail, forecastQty: 300, bufferBaseQty: 400, buffer
 const bufferedExpanded = controller.__test.expandMpsDetailsByDeliveryPhases([bufferedDetail], phases);
 check("MRP keeps exact customer phases and creates one internal buffer bucket", bufferedExpanded.length === 3 && bufferedExpanded[0].qtyPlanned === 100 && bufferedExpanded[1].qtyPlanned === 200 && bufferedExpanded[2].qtyPlanned === 120 && bufferedExpanded[2]._isBufferPhase === true);
 check("MRP buffer no longer inflates forecast delivery phases", bufferedExpanded[0].forecastQty === 100 && bufferedExpanded[1].forecastQty === 200 && bufferedExpanded[2].forecastQty === 0 && bufferedExpanded.reduce((sum, row) => sum + row.qtyPlanned, 0) === bufferedDetail.qtyPlanned);
+const stockNettedDetail = { ...bufferedDetail, qtyPlanned: 320 };
+const stockNettedPhases = phases.map((phase, index) => ({ ...phase, sourceDeliveryTargetId: `target-${index + 1}` }));
+const stockNettedExpanded = controller.__test.expandMpsDetailsByDeliveryPhases(stockNettedDetail ? [stockNettedDetail] : [], stockNettedPhases, new Map([
+  ["target-1", { demandQty: 100, stockUsedQty: 100, plannedProductionQty: 0, uncoveredQty: 0 }],
+  ["target-2", { demandQty: 200, stockUsedQty: 0, plannedProductionQty: 200, uncoveredQty: 0 }],
+]));
+check("MRP phase expansion uses official FIFO stock netting", stockNettedExpanded.length === 3 && stockNettedExpanded[0].qtyPlanned === 0 && stockNettedExpanded[0]._deliveryDemandQty === 100 && stockNettedExpanded[1].qtyPlanned === 200 && stockNettedExpanded[2].qtyPlanned === 120);
 const multiPhaseSoDemand = { "FG-TEST": [{ dueDate: new Date("2026-08-31T00:00:00.000Z"), remainingQty: 300, sourceNumber: "SO-TEST#1" }] };
 const soPhaseDetail = { ...detail, partCode: "FG-TEST", _deliveryPhaseId: "so-phase-1", _deliveryPhaseSourceType: "SALES_ORDER", qtyPlanned: 100, demandSources: [{ sourceType: "SALES_ORDER", sourceNumber: "SO-TEST" }] };
 const firstSoPhase = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(multiPhaseSoDemand, soPhaseDetail, null);
 const secondSoPhase = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(multiPhaseSoDemand, { ...soPhaseDetail, _deliveryPhaseId: "so-phase-2", qtyPlanned: 200 }, null);
 check("MRP consumes multi-phase SO quantity per phase instead of all at phase one", firstSoPhase.consumedQty === 100 && secondSoPhase.consumedQty === 200 && multiPhaseSoDemand["FG-TEST"][0].remainingQty === 0);
+const stockCoveredSoDemand = { "FG-TEST": [{ dueDate: new Date("2026-08-31T00:00:00.000Z"), remainingQty: 100, sourceNumber: "SO-TEST#1" }] };
+const stockCoveredSo = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(stockCoveredSoDemand, { ...soPhaseDetail, qtyPlanned: 0, _deliveryDemandQty: 100 }, null);
+check("stock-covered MPS phase still consumes represented SO demand", stockCoveredSo.consumedQty === 100 && stockCoveredSoDemand["FG-TEST"][0].remainingQty === 0);
 const pegging = controller.__test.demandPeggingForPhase({
   qtyPlanned: "25.50",
   partCode: "FG-TEST",
@@ -52,8 +65,9 @@ const pegging = controller.__test.demandPeggingForPhase({
   }],
 });
 check("MRP delivery-phase pegging safely converts numeric quantities", pegging.length === 1 && pegging[0].qty === 25.5);
-const phasedPurchaseDates = procurementSchedule({ materialRequiredDate: "2026-09-15T00:00:00.000Z", supplierLeadTimeDays: 7, asOf: "2026-08-11T00:00:00.000Z" });
-check("Procurement schedule separates supplier arrival, PO and PR dates", phasedPurchaseDates.supplierRequiredArrivalDate.toISOString().slice(0, 10) === "2026-09-11" && phasedPurchaseDates.latestPoDate.toISOString().slice(0, 10) === "2026-09-02" && phasedPurchaseDates.latestPrDate.toISOString().slice(0, 10) === "2026-08-31");
+const phasedPurchaseDates = await procurementSchedule({ materialRequiredDate: "2026-09-15T00:00:00.000Z", supplierLeadTimeDays: 7, asOf: "2026-08-11T00:00:00.000Z" });
+check("Procurement schedule is solved by CP-SAT with ordered milestones", phasedPurchaseDates.solver?.engine === "OR_TOOLS_WASM_CP_SAT" && phasedPurchaseDates.solver?.milestones?.length === 6 && phasedPurchaseDates.latestPrDate < phasedPurchaseDates.latestPoDate && phasedPurchaseDates.latestPoDate < phasedPurchaseDates.supplierRequiredArrivalDate);
+check("dependent production schedule uses the OR-Tools backward calendar", /productionSchedule\s*=\s*orderType\s*===\s*"Production"[\s\S]*resolveProductionRequirementDates[\s\S]*scheduleSource:\s*orderType\s*===\s*"Production"/.test(mrpControllerSource));
 const materialAliasA = { itemType: "RAW", rawType: "MATERIAL", materialId: "material-1", material: { materialCode: "SPHC" } };
 const materialAliasB = { ...materialAliasA };
 check("Raw part aliases share one planning stock key", controller.__test.planningStockKey("RAW-A", materialAliasA) === controller.__test.planningStockKey("RAW-B", materialAliasB));
@@ -140,7 +154,7 @@ const explodeSource = mrpSource.slice(explodeStart, explodeStart + 30000);
 const hybridSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/hybridMrpService.js"), "utf8");
 const monthlySource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
 const mpsSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MPSController.js"), "utf8");
-const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/ppic-detail.js"), "utf8");
+const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/ppic-detail.js"), "utf8");
 const suggestionSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/purchasing/PurchaseSuggestionController.js"), "utf8");
 check("MBOM explosion no longer references out-of-scope MPS precheck", !explodeSource.includes("mpsPrecheck"));
 check("Raw material follows the parent net production driver", explodeSource.includes("const parentOutputMap = netOutputQtyByMbomDetailId") && !explodeSource.includes("relatedSourceCodes.has(sourceCode)"));
@@ -165,3 +179,4 @@ check(
 
 for (const result of checks) console.log(`${result.ok ? "PASS" : "FAIL"} ${result.name}`);
 if (checks.some((result) => !result.ok)) process.exitCode = 1;
+})().catch((error) => { console.error(error); process.exitCode = 1; });

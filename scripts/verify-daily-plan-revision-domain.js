@@ -67,10 +67,22 @@ const executionExceptions = buildExecutionExceptions([{
   processCode: "WELD",
   plannedQty: 100,
   uomCode: "PCS",
-  productionLogs: [{ id: "log-a", qtyGood: 80, qtyReject: 5, qtyRework: 5, downtime: 20 }],
+  productionLogs: [{
+    id: "log-a", qtyProduced: 100, qtyGood: 96, qtyReject: 4, qtyRework: 2, downtime: 20,
+    ngReasons: [{ status: "MIXED", qtyNg: 4, qtyRework: 2, qtyReject: 2 }],
+    carryover: null,
+  }],
 }]);
-assert.deepStrictEqual(executionExceptions.map((row) => row.exceptionType), ["PRODUCTION_SHORTFALL", "NG_PENDING_REVIEW", "MACHINE_DOWNTIME"]);
-assert.strictEqual(executionExceptions[0].qty, 20);
-assert.strictEqual(executionExceptions[1].qty, 10);
+assert.deepStrictEqual(executionExceptions.map((row) => row.exceptionType), ["PRODUCTION_SHORTFALL", "MACHINE_DOWNTIME"]);
+assert.strictEqual(executionExceptions[0].qty, 2, "hanya scrap final yang menjadi shortfall; rework tidak boleh dihitung ganda");
+assert.strictEqual(executionExceptions[0].sourceLogId, "log-a");
+assert.strictEqual(executionExceptions[0].action, "ALLOCATE_NEXT_DRAFT");
+
+const pendingNg = buildExecutionExceptions([{
+  ...base, id: "schedule-pending", status: "Completed", partCode: "PART-A", scheduleDate: new Date("2026-08-24"),
+  productionLogs: [{ id: "log-pending", qtyProduced: 40, qtyGood: 36, qtyReject: 4, qtyRework: 0, ngReasons: [{ status: "PENDING_QC", qtyNg: 4, qtyRework: 0, qtyReject: 0 }] }],
+}]);
+assert.deepStrictEqual(pendingNg.map((row) => row.exceptionType), ["NG_PENDING_REVIEW"]);
+assert.strictEqual(pendingNg[0].qty, 4, "NG pending memakai qtyNg, bukan qtyReject + qtyRework");
 
 console.log("Daily plan revision domain contracts passed.");

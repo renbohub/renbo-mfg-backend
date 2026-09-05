@@ -121,8 +121,6 @@ function buildExecutionExceptions(schedules = []) {
   const rows = [];
   schedules.forEach((schedule) => {
     const logs = Array.isArray(schedule.productionLogs) ? schedule.productionLogs : [];
-    const good = logs.reduce((sum, log) => sum + Number(log.qtyGood || 0), 0);
-    const ng = logs.reduce((sum, log) => sum + Number(log.qtyReject || 0) + Number(log.qtyRework || 0), 0);
     const downtime = logs.reduce((sum, log) => sum + Number(log.downtime || 0), 0);
     const common = {
       id: `derived:${schedule.id}`,
@@ -136,21 +134,27 @@ function buildExecutionExceptions(schedules = []) {
       state: "OPEN",
       derived: true,
     };
-    const shortfall = Math.max(0, Number(schedule.plannedQty || 0) - good);
+    const produced = logs.reduce((sum, log) => sum + Number(log.qtyProduced || 0), 0);
+    const pendingNg = logs.reduce((sum, log) => sum + (log.ngReasons || []).filter((row) => row.status === "PENDING_QC").reduce((value, row) => value + Number(row.qtyNg || 0), 0), 0);
+    const scrap = logs.reduce((sum, log) => sum + (log.ngReasons || []).filter((row) => row.status !== "PENDING_QC").reduce((value, row) => value + Number(row.qtyReject || 0), 0), 0);
+    const allocated = logs.reduce((sum, log) => sum + (log.carryover && log.carryover.status !== "REVERSED" ? Number(log.carryover.allocatedQty || 0) : 0), 0);
+    const shortfall = Math.max(0, Number(schedule.plannedQty || 0) - produced + scrap - allocated);
     if (["Completed", "In Progress"].includes(schedule.status) && shortfall > 0) rows.push({
       ...common,
       id: `${common.id}:shortfall`,
       exceptionType: "PRODUCTION_SHORTFALL",
       severity: schedule.status === "Completed" ? "BLOCKER" : "WARNING",
       qty: shortfall,
+      sourceLogId: logs.find((log) => log.id)?.id || null,
+      action: "ALLOCATE_NEXT_DRAFT",
       suggestions: [{ action: "ALLOCATE_NEXT_DRAFT", label: "Alokasikan sisa ke Draft berikutnya" }],
     });
-    if (ng > 0) rows.push({
+    if (pendingNg > 0) rows.push({
       ...common,
       id: `${common.id}:ng`,
       exceptionType: "NG_PENDING_REVIEW",
       severity: "WARNING",
-      qty: ng,
+      qty: pendingNg,
       suggestions: [{ action: "WAIT_QC", label: "Tunggu disposition QC" }, { action: "PREPARE_REWORK", label: "Siapkan slot rework" }],
     });
     if (downtime > 0) rows.push({

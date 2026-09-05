@@ -2,8 +2,12 @@
 
 const { recommendMonthlyCapacity } = require("./capacityRecommendationService");
 const { netTimePhasedDemand } = require("./timePhasedNettingService");
-const { procurementSchedule, addWorkingDays } = require("./procurementSchedulingService");
+const { procurementSchedule } = require("./procurementSchedulingService");
 const { buildDueDateRecoveryChecklist } = require("./dueDateRecoveryService");
+const { solveBackwardMilestones, solveFiniteSchedule } = require("./solver/planningSolverService");
+const { assertBomGraphStructure, selectAuthoritativeMbom } = require("./solver/bomGraphValidationService");
+const { durationToWorkingDays } = require("../../utils/duration");
+const { normalizeMaterialSupplyType, isCustomerSupplied } = require("../../utils/materialSupply");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const asDate = (value) => {
@@ -65,73 +69,6 @@ function supplierOption(item) {
     orderMultiple: number(item?.orderMultiple),
     purchaseUomCode: item?.purchaseUomCode || null,
   };
-}
-
-function subtractWorkingDays(value, days, calendar = {}) {
-  let cursor = startOfDay(value);
-  let remaining = Math.max(Math.ceil(number(days)), 0);
-  while (cursor && remaining > 0) {
-    cursor = addDays(cursor, -1);
-    const override = calendar[dateKey(cursor)];
-    const weekend = [0, 6].includes(cursor.getUTCDay());
-    if (override === "WORKING" || (!weekend && override !== "HOLIDAY")) remaining -= 1;
-  }
-  return cursor;
-}
-
-function isPlanningWorkingDay(value, calendar = {}) {
-  const cursor = asDate(value);
-  if (!cursor) return false;
-  const override = calendar[dateKey(cursor)];
-  const weekend = [0, 6].includes(cursor.getUTCDay());
-  return override === "WORKING" || (!weekend && override !== "HOLIDAY");
-}
-
-function addWorkingHours(value, hours, { calendar = {}, hoursPerDay = 8 } = {}) {
-  let cursor = asDate(value);
-  if (!cursor) return null;
-  let remaining = Math.max(number(hours), 0);
-  const dailyHours = Math.max(number(hoursPerDay), 1);
-  while (remaining > 0.000001) {
-    if (!isPlanningWorkingDay(cursor, calendar)) {
-      cursor = addDays(startOfDay(cursor), 1);
-      continue;
-    }
-    const dayStart = startOfDay(cursor);
-    const elapsed = Math.max((cursor - dayStart) / 3600000, 0);
-    if (elapsed >= dailyHours - 0.000001) {
-      cursor = addDays(dayStart, 1);
-      continue;
-    }
-    const consumed = Math.min(remaining, dailyHours - elapsed);
-    cursor = new Date(cursor.getTime() + consumed * 3600000);
-    remaining -= consumed;
-    if (remaining > 0.000001 && (cursor - dayStart) / 3600000 >= dailyHours - 0.000001) cursor = addDays(dayStart, 1);
-  }
-  return cursor;
-}
-
-function subtractWorkingHours(value, hours, { calendar = {}, hoursPerDay = 8 } = {}) {
-  let cursor = asDate(value);
-  if (!cursor) return null;
-  let remaining = Math.max(number(hours), 0);
-  const dailyHours = Math.max(number(hoursPerDay), 1);
-  while (remaining > 0.000001) {
-    const dayStart = startOfDay(cursor);
-    if (!isPlanningWorkingDay(cursor, calendar) || cursor <= dayStart) {
-      cursor = addDays(dayStart, -1);
-      while (!isPlanningWorkingDay(cursor, calendar)) cursor = addDays(cursor, -1);
-      cursor = new Date(startOfDay(cursor).getTime() + dailyHours * 3600000);
-      continue;
-    }
-    const rawElapsed = Math.max((cursor - dayStart) / 3600000, 0);
-    if (rawElapsed > dailyHours) cursor = new Date(dayStart.getTime() + dailyHours * 3600000);
-    const elapsed = Math.min(rawElapsed, dailyHours);
-    const consumed = Math.min(remaining, elapsed);
-    cursor = new Date(cursor.getTime() - consumed * 3600000);
-    remaining -= consumed;
-  }
-  return cursor;
 }
 
 function processDurationDays(step, quantity) {
@@ -314,52 +251,84 @@ function applyVendorAdjustmentsToProcessSteps(processSteps, vendorProcesses, pol
   });
 }
 
-function calculateLeadTimeFeasibility(input = {}) {
+async function calculateLeadTimeFeasibility(input = {}) {
   const requestedDeliveryDate = startOfDay(input.requestedDeliveryDate || input.targetDeliveryDate);
   if (!requestedDeliveryDate) throw Object.assign(new Error("Requested delivery date wajib valid."), { statusCode: 400 });
   const today = startOfDay(input.today || new Date());
   const calendar = input.productionCalendar || {};
+  const holidays = Object.entries(calendar).filter(([, status]) => String(status).toUpperCase() === "HOLIDAY").map(([key]) => key);
   const dispatchDays = Math.max(number(input.dispatchDays ?? 1), 0);
-  const fgRequiredDate = subtractWorkingDays(requestedDeliveryDate, dispatchDays, calendar);
+  const materialStagingDays = Math.max(number(input.materialStagingDays), 0);
   const capacityPolicy = feasibilityCapacityPolicy(input);
   const productionHoursPerDay = capacityPolicy.hoursPerShift * capacityPolicy.shiftsPerDay;
   const productionLeadTimeBreakdown = applyShiftCapacityToProductionLeadTime(input.productionLeadTimeBreakdown, capacityPolicy);
-  const orderedSteps = [...(input.processSteps || [])].sort((a, b) => number(b.sequence) - number(a.sequence));
-  let processDue = fgRequiredDate;
-  let vendorSendDate = null;
-  let vendorReturnDate = null;
-  const processTimeline = [];
-  for (const step of orderedSteps) {
-    const finishDate = processDue;
+  const orderedSteps = [...(input.processSteps || [])].sort((a, b) => number(a.sequence) - number(b.sequence));
+  const processTasks = orderedSteps.map((step, index) => {
     const routingMode = String(step.routingMode || "INHOUSE").toUpperCase();
     const baselineDurationDays = processDurationDays(step, input.quantity);
     const durationDays = routingMode === "VENDOR" ? baselineDurationDays : baselineDurationDays / capacityPolicy.shiftsPerDay;
-    const durationHours = durationDays * productionHoursPerDay;
-    const startDate = subtractWorkingHours(finishDate, durationHours, { calendar, hoursPerDay: productionHoursPerDay });
-    if (routingMode === "VENDOR") {
-      vendorReturnDate = vendorReturnDate || finishDate;
-      vendorSendDate = startDate;
-    }
-    processTimeline.unshift({
-      sequence: number(step.sequence),
-      processCode: step.processCode || null,
+    return {
+      id: `PROCESS_${index + 1}`,
+      duration: Math.max(durationDays * productionHoursPerDay, 0),
+      unit: "HOUR",
+      source: step,
       routingMode,
-      vendorCode: step.vendorCode || null,
-      durationDays, durationHours, baselineDurationDays,
-      capacityShiftsPerDay: routingMode === "VENDOR" ? null : capacityPolicy.shiftsPerDay,
-      latestStartDate: startDate,
-      latestFinishDate: finishDate,
+      baselineDurationDays,
+      durationDays,
+    };
+  });
+  const explicitProductionDays = number(productionLeadTimeBreakdown?.exactProductionLeadTimeDays ?? productionLeadTimeBreakdown?.productionLeadTimeDays);
+  const derivedProductionDays = processTasks.reduce((sum, task) => sum + task.durationDays, 0);
+  if (!processTasks.length && explicitProductionDays > 0) {
+    processTasks.push({
+      id: "PRODUCTION_CRITICAL_PATH",
+      duration: explicitProductionDays * productionHoursPerDay,
+      unit: "HOUR",
+      source: { sequence: 1, processCode: "PRODUCTION_CRITICAL_PATH", routingMode: "INHOUSE" },
+      routingMode: "INHOUSE",
+      baselineDurationDays: explicitProductionDays,
+      durationDays: explicitProductionDays,
     });
-    processDue = startDate;
   }
-  const scheduledProductionLeadTimeDays = number(productionLeadTimeBreakdown?.productionLeadTimeDays ?? input.scheduledProductionLeadTimeDays);
-  const exactProductionLeadTimeDays = number(productionLeadTimeBreakdown?.exactProductionLeadTimeDays ?? scheduledProductionLeadTimeDays);
-  const scheduledProductionLeadTimeHours = exactProductionLeadTimeDays * productionHoursPerDay;
-  if (scheduledProductionLeadTimeHours > 0) processDue = subtractWorkingHours(fgRequiredDate, scheduledProductionLeadTimeHours, { calendar, hoursPerDay: productionHoursPerDay });
-  const productionLatestStartDate = processDue;
-  const materialRequiredDate = subtractWorkingDays(productionLatestStartDate, number(input.materialStagingDays), calendar);
-  const holidays = Object.entries(calendar).filter(([, status]) => status === "HOLIDAY").map(([key]) => key);
-  const purchasingSchedule = procurementSchedule({
+  const backwardTasks = [
+    ...(materialStagingDays > 0 ? [{ id: "MATERIAL_STAGING", duration: materialStagingDays, unit: "DAY" }] : []),
+    ...processTasks,
+    ...(dispatchDays > 0 ? [{ id: "DISPATCH", duration: dispatchDays, unit: "DAY" }] : []),
+  ];
+  if (!backwardTasks.length) backwardTasks.push({ id: "ZERO_LEAD_TIME", duration: 0, unit: "MINUTE" });
+  const backward = await solveBackwardMilestones({
+    targetDate: requestedDeliveryDate,
+    calendar,
+    holidays,
+    hoursPerDay: productionHoursPerDay,
+    dailyWindows: [{ startMinute: 0, endMinute: productionHoursPerDay * 60 }],
+    tasks: backwardTasks,
+  });
+  const byId = new Map(backward.tasks.map((task) => [task.id, task]));
+  const dispatchTask = byId.get("DISPATCH");
+  const fgRequiredDate = dispatchTask?.startDate || requestedDeliveryDate;
+  const productionRows = processTasks.map((definition) => {
+    const solved = byId.get(definition.id);
+    return {
+      sequence: number(definition.source.sequence),
+      processCode: definition.source.processCode || null,
+      routingMode: definition.routingMode,
+      vendorCode: definition.source.vendorCode || null,
+      durationDays: definition.durationDays,
+      durationHours: definition.duration,
+      baselineDurationDays: definition.baselineDurationDays,
+      capacityShiftsPerDay: definition.routingMode === "VENDOR" ? null : capacityPolicy.shiftsPerDay,
+      latestStartDate: solved?.startDate || fgRequiredDate,
+      latestFinishDate: solved?.endDate || fgRequiredDate,
+      solverTaskId: definition.id,
+    };
+  });
+  const productionLatestStartDate = productionRows[0]?.latestStartDate || fgRequiredDate;
+  const materialRequiredDate = byId.get("MATERIAL_STAGING")?.startDate || productionLatestStartDate;
+  const vendorRows = productionRows.filter((row) => row.routingMode === "VENDOR");
+  const vendorSendDate = vendorRows[0]?.latestStartDate || null;
+  const vendorReturnDate = vendorRows[vendorRows.length - 1]?.latestFinishDate || null;
+  const purchasingSchedule = await procurementSchedule({
     materialRequiredDate,
     supplierLeadTimeDays: input.supplierLeadTimeDays,
     prApprovalDays: input.prApprovalDays,
@@ -370,14 +339,44 @@ function calculateLeadTimeFeasibility(input = {}) {
     holidays,
     asOf: today,
   });
-  const supplierRequiredArrivalDate = purchasingSchedule.supplierRequiredArrivalDate;
-  const latestPoDate = purchasingSchedule.latestPoDate;
-  const latestPrDate = purchasingSchedule.latestPrDate;
-  const earliestMaterialDate = addWorkingDays(today, purchasingSchedule.totalLeadTimeDays, holidays);
-  const productionDays = exactProductionLeadTimeDays || processTimeline.reduce((sum, row) => sum + row.durationDays, 0);
-  const earliestProductionStartDate = addWorkingDays(earliestMaterialDate, number(input.materialStagingDays), holidays);
-  const earliestFeasibleFgDate = addWorkingHours(earliestProductionStartDate, productionDays * productionHoursPerDay, { calendar, hoursPerDay: productionHoursPerDay });
-  const earliestFeasibleDeliveryDate = addDays(earliestFeasibleFgDate, dispatchDays);
+  const earliestTaskDefinitions = [
+    ...(purchasingSchedule.totalLeadTimeDays > 0 ? [{ id: "PROCUREMENT", duration: purchasingSchedule.totalLeadTimeDays, durationUnit: "DAY" }] : []),
+    ...(materialStagingDays > 0 ? [{ id: "MATERIAL_STAGING", duration: materialStagingDays, durationUnit: "DAY" }] : []),
+    ...processTasks.map((task) => ({ id: task.id, duration: task.duration, durationUnit: "HOUR" })),
+    ...(dispatchDays > 0 ? [{ id: "DISPATCH", duration: dispatchDays, durationUnit: "DAY" }] : []),
+  ];
+  let predecessorId = null;
+  const earliestTasks = earliestTaskDefinitions.map((task, index) => {
+    const result = {
+      ...task,
+      eligibleResourceIds: ["PLANNING_TIMELINE"],
+      predecessorIds: predecessorId ? [predecessorId] : [],
+      releaseDate: today,
+      dueDate: requestedDeliveryDate,
+      required: true,
+      minimizeCompletion: index === earliestTaskDefinitions.length - 1,
+      tardinessWeight: 100000,
+      completionWeight: 1,
+    };
+    predecessorId = task.id;
+    return result;
+  });
+  const forwardHorizonDays = Math.max(
+    Math.ceil(purchasingSchedule.totalLeadTimeDays + materialStagingDays + Math.max(explicitProductionDays, derivedProductionDays) + dispatchDays) * 3 + 30,
+    180,
+  );
+  const forward = earliestTasks.length ? await solveFiniteSchedule({
+    horizonStart: today,
+    horizonEnd: addDays(today, forwardHorizonDays),
+    calendar,
+    hoursPerDay: productionHoursPerDay,
+    dailyWindows: [{ startMinute: 0, endMinute: productionHoursPerDay * 60 }],
+    tasks: earliestTasks,
+  }) : { status: "OPTIMAL", feasible: true, tasks: [] };
+  const forwardById = new Map((forward.tasks || []).map((task) => [task.id, task]));
+  const finalForwardTask = forward.tasks?.[forward.tasks.length - 1] || null;
+  const earliestFeasibleDeliveryDate = finalForwardTask?.endDate || today;
+  const earliestFeasibleFgDate = forwardById.get("DISPATCH")?.startDate || earliestFeasibleDeliveryDate;
   const result = {
     requestedDeliveryDate,
     fgDispatchDate: requestedDeliveryDate,
@@ -385,23 +384,33 @@ function calculateLeadTimeFeasibility(input = {}) {
     finalProcessDueDate: fgRequiredDate,
     productionLatestStartDate,
     materialRequiredDate,
-    supplierRequiredArrivalDate,
-    latestPoDate,
-    latestPrDate,
+    supplierRequiredArrivalDate: purchasingSchedule.supplierRequiredArrivalDate,
+    latestPoDate: purchasingSchedule.latestPoDate,
+    latestPrDate: purchasingSchedule.latestPrDate,
     vendorSendDate,
     vendorReturnDate,
     earliestFeasibleFgDate,
     earliestFeasibleDeliveryDate,
-    processTimeline,
+    processTimeline: productionRows,
     productionLeadTimeBreakdown,
-    scheduledProductionLeadTimeHours,
+    scheduledProductionLeadTimeHours: Math.max(explicitProductionDays, derivedProductionDays) * productionHoursPerDay,
     purchasingSchedule,
     capacityAssumption: capacityPolicy,
     today,
+    solver: {
+      engine: "OR_TOOLS_WASM_CP_SAT",
+      engineVersion: "0.9.1",
+      backward,
+      forward,
+    },
   };
-  return result;
+  return {
+    ...result,
+    leadTimeDays: Math.max(Math.ceil((earliestFeasibleDeliveryDate - today) / 86400000), 0),
+    latenessDays: Math.max(Math.ceil((earliestFeasibleDeliveryDate - requestedDeliveryDate) / 86400000), 0),
+    slackDays: Math.floor((requestedDeliveryDate - earliestFeasibleDeliveryDate) / 86400000),
+  };
 }
-
 async function purchaseSuggestionRoutingMetric(prisma, mbomHeaderId, quantity) {
   if (!mbomHeaderId) return null;
   // Lazy import avoids controller initialization cycles while retaining one
@@ -443,23 +452,17 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
   async function headerFor(childPartId) {
     if (!childPartId) return null;
     if (headers.has(childPartId)) return headers.get(childPartId);
-    const header = await prisma.mBOMHeader.findFirst({
-      where: {
-        partId: childPartId,
-        isDeleted: false,
-        ...(effectiveAt ? { AND: [
-          { OR: [{ effectiveDate: null }, { effectiveDate: { lte: new Date(effectiveAt) } }] },
-          { OR: [{ expiryDate: null }, { expiryDate: { gte: new Date(effectiveAt) } }] },
-        ] } : {}),
-      },
-      orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
+    const header = await selectAuthoritativeMbom(prisma, {
+      partId: childPartId,
+      effectiveAt: effectiveAt || new Date(),
       select: {
         id: true, noReg: true, partId: true,
         details: {
           where: { isDeleted: false },
           orderBy: [{ levelComponent: "asc" }, { createdAt: "asc" }],
           select: {
-            id: true, parentDetailId: true, levelComponent: true, partId: true, category: true, qty: true, grossWeight: true, uomCode: true, leadTime: true, leadTimeUnit: true,
+            id: true, parentDetailId: true, levelComponent: true, partId: true, category: true, qty: true, grossWeight: true, uomCode: true, leadTime: true, leadTimeUnit: true, materialSupplyType: true,
+            supplyCustomer: { select: { customerCode: true, customerName: true } },
             part: {
               select: {
                 id: true, partCode: true, partName: true,
@@ -469,36 +472,48 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
                 },
               },
             },
-            mbomProcesses: { where: { isDeleted: false }, orderBy: { sequence: "asc" }, select: { sequence: true, cycleTime: true, routingMode: true, process: { select: { processCode: true } }, vendor: { select: { vendorCode: true, leadTimeDays: true } }, routingOperation: { select: { isSubcontract: true } } } },
+            mbomProcesses: { where: { isDeleted: false }, orderBy: { sequence: "asc" }, select: { id: true, sequence: true, cycleTime: true, routingMode: true, machineId: true, machineSpecificationCode: true, vendorId: true, process: { select: { processCode: true } }, vendor: { select: { id: true, vendorCode: true, leadTimeDays: true } }, routingOperation: { select: { isSubcontract: true } } } },
           },
         },
       },
     });
+    if (header) header.graphValidation = assertBomGraphStructure(header);
     headers.set(childPartId, header);
     return header;
   }
 
   async function walk(currentPartId, currentPartCode, driverQty, depth, path, accumulatedLeadTimeDays = 0, activeHeaders = new Set()) {
-    if (!currentPartId || depth > maxDepth) return null;
+    if (!currentPartId) return null;
+    if (depth > maxDepth) throw Object.assign(new Error(`MBOM melebihi batas kedalaman ${maxDepth}; periksa cycle atau struktur sub-assembly.`), { statusCode: 409, code: "MBOM_MAX_DEPTH_EXCEEDED" });
     const header = await headerFor(currentPartId);
-    if (!header || activeHeaders.has(header.id)) return header;
+    if (!header) return null;
+    if (activeHeaders.has(header.id)) throw Object.assign(new Error(`Cycle antar-revision MBOM terdeteksi pada ${header.noReg}.`), { statusCode: 409, code: "MBOM_CROSS_HEADER_CYCLE" });
     const nextActive = new Set(activeHeaders); nextActive.add(header.id);
     const requiredByDetail = new Map();
     const pathByDetail = new Map();
     const cumulativeLeadTimeByDetail = new Map();
     for (const detail of header.details || []) {
       if (!detail.part?.partCode) continue;
-      const parentDriver = detail.parentDetailId && requiredByDetail.has(detail.parentDetailId) ? requiredByDetail.get(detail.parentDetailId) : driverQty;
+      if (detail.parentDetailId && !requiredByDetail.has(detail.parentDetailId)) {
+        throw Object.assign(new Error(`Parent ${detail.parentDetailId} belum ter-resolve sebelum child ${detail.part.partCode}; urutan/struktur MBOM ambigu.`), { statusCode: 409, code: "MBOM_PARENT_ORDER_AMBIGUOUS" });
+      }
+      const parentDriver = detail.parentDetailId ? requiredByDetail.get(detail.parentDetailId) : driverQty;
       const category = categoryKey(detail.category);
       const usagePerParent = category === "PURCHASE" && number(detail.grossWeight) > 0 ? number(detail.grossWeight) : number(detail.qty);
       const requiredQty = Math.max(usagePerParent, 0) * Math.max(number(parentDriver), 0);
       requiredByDetail.set(detail.id, requiredQty);
-      const supplierResolution = resolveSupplierItem(detail.part.supplierItems, detail.part.partCode, { supplierSelections, supplierStrategy });
+      const materialSupplyType = normalizeMaterialSupplyType(detail.materialSupplyType);
+      const customerSupplied = category === "PURCHASE" && isCustomerSupplied(materialSupplyType);
+      const supplierResolution = customerSupplied
+        ? { item: null, selectionSource: "CUSTOMER_SUPPLIED" }
+        : resolveSupplierItem(detail.part.supplierItems, detail.part.partCode, { supplierSelections, supplierStrategy });
       const supplierItem = supplierResolution.item;
-      const supplierLeadTimeDays = supplierLeadTime(supplierItem);
+      const supplierLeadTimeDays = customerSupplied
+        ? durationToWorkingDays(detail.leadTime, detail.leadTimeUnit)
+        : supplierLeadTime(supplierItem);
       const supplierOptions = (detail.part.supplierItems || []).map(supplierOption);
       const leadTimeSteps = category === "PURCHASE"
-        ? [{ sequence: null, processCode: "SUPPLIER", routingMode: "SUPPLIER", resourceCode: supplierItem?.supplier?.supplierCode || null, durationDays: supplierLeadTimeDays }]
+        ? [{ sequence: null, processCode: customerSupplied ? "CUSTOMER SUPPLY" : "SUPPLIER", routingMode: customerSupplied ? "CUSTOMER_SUPPLIED" : "SUPPLIER", resourceCode: customerSupplied ? detail.supplyCustomer?.customerCode || null : supplierItem?.supplier?.supplierCode || null, durationDays: supplierLeadTimeDays }]
         : (detail.mbomProcesses || []).map((process) => {
             const routingMode = String(process.routingMode || "INHOUSE").toUpperCase();
             return {
@@ -516,16 +531,18 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
       trace.push({
         level: depth + Math.max(number(detail.levelComponent), 0), mbomNumber: header.noReg, parentPartCode: currentPartCode, partCode: detail.part.partCode,
         partName: detail.part.partName || null, category, usagePerParent, requiredQty, uomCode: detail.uomCode || supplierItem?.purchaseUomCode || null,
+        materialSupplyType, supplyCustomerCode: detail.supplyCustomer?.customerCode || null, supplyCustomerName: detail.supplyCustomer?.customerName || null,
         path: rowPath, supplierItemId: supplierItem?.id || null, supplierCode: supplierItem?.supplier?.supplierCode || null, supplierName: supplierItem?.supplier?.supplierName || null,
         supplierSelectionSource: supplierResolution.selectionSource, supplierOptions,
         supplierLeadTimeDays, processLeadTimeDays, cumulativeLeadTimeDays, leadTimeSteps, moq: number(supplierItem?.moq), orderMultiple: number(supplierItem?.orderMultiple),
       });
       if (category === "PURCHASE") {
-        const existing = purchased.get(detail.part.partCode) || { partCode: detail.part.partCode, partName: detail.part.partName || null, qty: 0, uomCode: detail.uomCode || supplierItem?.purchaseUomCode || null, supplierItemId: supplierItem?.id || null, supplierCode: supplierItem?.supplier?.supplierCode || null, supplierName: supplierItem?.supplier?.supplierName || null, supplierSelectionSource: supplierResolution.selectionSource, supplierOptions, supplierLeadTimeDays, moq: number(supplierItem?.moq), orderMultiple: number(supplierItem?.orderMultiple), paths: [] };
+        const purchaseKey = `${detail.part.partCode}|${materialSupplyType}|${detail.supplyCustomer?.customerCode || ""}`;
+        const existing = purchased.get(purchaseKey) || { partCode: detail.part.partCode, partName: detail.part.partName || null, qty: 0, uomCode: detail.uomCode || supplierItem?.purchaseUomCode || null, materialSupplyType, supplyCustomerCode: detail.supplyCustomer?.customerCode || null, supplyCustomerName: detail.supplyCustomer?.customerName || null, supplierItemId: supplierItem?.id || null, supplierCode: supplierItem?.supplier?.supplierCode || null, supplierName: supplierItem?.supplier?.supplierName || null, supplierSelectionSource: supplierResolution.selectionSource, supplierOptions: customerSupplied ? [] : supplierOptions, supplierLeadTimeDays, moq: number(supplierItem?.moq), orderMultiple: number(supplierItem?.orderMultiple), paths: [] };
         existing.qty += requiredQty;
         existing.supplierLeadTimeDays = Math.max(existing.supplierLeadTimeDays, supplierLeadTimeDays);
         existing.paths.push(rowPath);
-        purchased.set(detail.part.partCode, existing);
+        purchased.set(purchaseKey, existing);
       } else {
         const edge = `${header.id}:${detail.id}:${detail.part.id}`;
         if (!visitedEdges.has(edge)) {
@@ -563,7 +580,7 @@ async function loadDemandContext(prisma, { partCode, quantity, requestedDelivery
     };
   }));
   const componentRequirements = explosion.componentRequirements;
-  const supplierRows = componentRequirements.filter((row) => row.supplierCode);
+  const supplierRows = componentRequirements.filter((row) => !isCustomerSupplied(row.materialSupplyType) && row.supplierCode);
   const supplierLeadTimeDays = componentRequirements.reduce((max, row) => Math.max(max, number(row.supplierLeadTimeDays)), 0);
   const result = {
     part,
@@ -575,7 +592,7 @@ async function loadDemandContext(prisma, { partCode, quantity, requestedDelivery
     quantity,
     requestedDeliveryDate,
     supplierLeadTimeDays,
-    masterDataComplete: Boolean(part && header && processSteps.length && componentRequirements.every((row) => row.supplierCode)),
+    masterDataComplete: Boolean(part && header && processSteps.length && componentRequirements.every((row) => isCustomerSupplied(row.materialSupplyType) ? row.supplyCustomerCode : row.supplierCode)),
   };
   return result;
 }
@@ -597,7 +614,7 @@ async function loadMaterialCoverage(prisma, componentRequirements, requiredDate,
   const [balances, openPo, openPr] = await supplyPromise;
   const components = componentRequirements.map((component) => {
     const openingQty = balances.filter((row) => [row.partCode,row.materialCode,row.partNumber].includes(component.partCode)).reduce((sum,row) => sum + number(row.qtyAvailable), 0);
-    const supplyEvents = [
+    const supplyEvents = isCustomerSupplied(component.materialSupplyType) ? [] : [
       ...openPo.filter((row) => row.partCode === component.partCode && number(row.qty) > number(row.qtyReceived)).map((row) => ({ sourceType: "PO", sourceNumber: row.poNumber, qty: number(row.qty) - number(row.qtyReceived), availableDate: row.deliveryDate || row.po.deliveryDate, confidence: ["Confirmed","Partial Receipt","Sent","Approved"].includes(row.po.status) ? "FIRM" : "PLANNED" })),
       ...openPr.filter((row) => row.partCode === component.partCode && number(row.qty) > number(row.orderedQty)).map((row) => ({ sourceType: "PR", sourceNumber: row.prNumber, qty: number(row.qty) - number(row.orderedQty), availableDate: row.pr.requiredDate, confidence: "PLANNED" })),
     ];
@@ -658,12 +675,23 @@ async function assessDemandFeasibility(prisma, input = {}) {
   const vendorAdjustment = applyVendorProcessAdjustments(shiftedProductionLeadTimeBreakdown, input.vendorProcessAdjustments, capacityPolicy);
   const productionLeadTimeBreakdown = vendorAdjustment.breakdown;
   const processSteps = applyVendorAdjustmentsToProcessSteps(context.processSteps, vendorAdjustment.vendorProcesses, capacityPolicy);
-  const timeline = calculateLeadTimeFeasibility({ ...controlledInput, ...context, processSteps, supplierLeadTimeDays: controlledInput.supplierLeadTimeDays, capacityShiftsPerDay: capacityPolicy.shiftsPerDay, capacityHoursPerShift: capacityPolicy.hoursPerShift, productionLeadTimeBreakdown });
+  const timeline = await calculateLeadTimeFeasibility({ ...controlledInput, ...context, processSteps, supplierLeadTimeDays: controlledInput.supplierLeadTimeDays, capacityShiftsPerDay: capacityPolicy.shiftsPerDay, capacityHoursPerShift: capacityPolicy.hoursPerShift, productionLeadTimeBreakdown });
   const coverage = input.materialCovered == null ? await loadMaterialCoverage(prisma, context.componentRequirements, timeline.materialRequiredDate, { supplyCache: input.materialSupplyCache }) : { covered: Boolean(input.materialCovered), shortages: [], components: [] };
   const capacity = await simulateCapacity(prisma, input);
   const holidays = Object.entries(input.productionCalendar || {}).filter(([, status]) => status === "HOLIDAY").map(([key]) => key);
-  const materialCoverage = coverage.components.map((row) => {
-    const schedule = procurementSchedule({
+  const materialCoverage = await Promise.all(coverage.components.map(async (row) => {
+    if (isCustomerSupplied(row.materialSupplyType)) {
+      return {
+        ...row,
+        latestPrDate: null,
+        procurementWindow: "CUSTOMER_SUPPLIED",
+        procurementLeadTimeDays: leadTimeControls.supplierLeadTime ? number(row.supplierLeadTimeDays) : 0,
+        procurementLeadTimeBreakdown: {
+          customerSupplyDays: leadTimeControls.supplierLeadTime ? number(row.supplierLeadTimeDays) : 0,
+        },
+      };
+    }
+    const schedule = await procurementSchedule({
       materialRequiredDate: timeline.materialRequiredDate,
       supplierLeadTimeDays: leadTimeControls.supplierLeadTime ? row.supplierLeadTimeDays : 0,
       prApprovalDays: input.prApprovalDays,
@@ -675,7 +703,7 @@ async function assessDemandFeasibility(prisma, input = {}) {
       asOf: timeline.today,
     });
     return { ...row, latestPrDate: schedule.latestPrDate, procurementWindow: schedule.procurementWindow, procurementLeadTimeDays: schedule.totalLeadTimeDays, procurementLeadTimeBreakdown: schedule.leadTimeBreakdown };
-  });
+  }));
   let cumulativeProductionDays = 0;
   const productionLeadTimeTrace = (productionLeadTimeBreakdown?.processPath || []).map((step) => {
     const scheduledDays = number(step.elapsedDays);
@@ -689,12 +717,14 @@ async function assessDemandFeasibility(prisma, input = {}) {
   });
   const purchasingLeadTimeTrace = materialCoverage.map((row) => {
     const breakdown = row.procurementLeadTimeBreakdown || {};
-    const steps = [
+    const steps = isCustomerSupplied(row.materialSupplyType)
+      ? [{ processCode: "CUSTOMER SUPPLY", routingMode: "CUSTOMER_SUPPLIED", resourceCode: row.supplyCustomerCode || null, durationDays: number(breakdown.customerSupplyDays) }].filter((step) => step.durationDays > 0)
+      : [
       ["PR APPROVAL", breakdown.prApprovalDays], ["PO PROCESSING", breakdown.poProcessingDays], ["SUPPLIER", breakdown.supplierLeadTimeDays],
       ["TRANSIT", breakdown.transitDays], ["RECEIVING QC", breakdown.receivingQcDays], ["SAFETY", breakdown.safetyLeadTimeDays],
     ].filter(([, days]) => number(days) > 0).map(([processCode, days]) => ({ processCode, routingMode: "PURCHASING", resourceCode: processCode === "SUPPLIER" ? row.supplierCode : null, durationDays: number(days) }));
     return {
-      level: 99, partCode: row.partCode, partName: row.partName || null, path: [context.part?.partCode || input.partCode, row.partCode].filter(Boolean), category: "PURCHASE",
+      level: 99, partCode: row.partCode, partName: row.partName || null, path: [context.part?.partCode || input.partCode, row.partCode].filter(Boolean), category: isCustomerSupplied(row.materialSupplyType) ? "CUSTOMER_SUPPLIED" : "PURCHASE",
       processLeadTimeDays: row.procurementLeadTimeDays, cumulativeLeadTimeDays: cumulativeProductionDays + number(row.procurementLeadTimeDays), leadTimeSteps: steps,
       latestPrDate: row.latestPrDate, procurementWindow: row.procurementWindow,
     };
@@ -709,9 +739,12 @@ async function assessDemandFeasibility(prisma, input = {}) {
   const exactProductionLeadTimeDays = Math.max(number(productionLeadTimeBreakdown?.exactProductionLeadTimeDays), timeline.processTimeline.reduce((sum, row) => sum + number(row.durationDays), 0));
   const productionHoursPerDay = capacityPolicy.hoursPerShift * capacityPolicy.shiftsPerDay;
   const exactProductionLeadTimeHours = exactProductionLeadTimeDays * productionHoursPerDay;
-  const earliestMaterialAvailableDate = addWorkingDays(timeline.today, procurementLeadTimeDaysApplied, holidays);
-  const earliestProductionStartDate = addWorkingDays(earliestMaterialAvailableDate, materialStagingDays, holidays);
-  const leadTimeEarliestFgDate = addWorkingHours(earliestProductionStartDate, exactProductionLeadTimeHours, { calendar: input.productionCalendar || {}, hoursPerDay: productionHoursPerDay });
+  const forwardSolverTasks = new Map((timeline.solver?.forward?.tasks || []).map((task) => [task.id, task]));
+  const earliestMaterialAvailableDate = forwardSolverTasks.get("PROCUREMENT")?.endDate || timeline.today;
+  const earliestProductionStartDate = forwardSolverTasks.get("MATERIAL_STAGING")?.endDate
+    || forwardSolverTasks.get("PROCESS_1")?.startDate
+    || earliestMaterialAvailableDate;
+  const leadTimeEarliestFgDate = timeline.earliestFeasibleFgDate;
   const capacityEarliestFgDate = asDate(capacity?.earliestFeasibleCompletion);
   const earliestFeasibleFgDate = capacityEarliestFgDate && capacityEarliestFgDate > leadTimeEarliestFgDate ? capacityEarliestFgDate : leadTimeEarliestFgDate;
   const dispatchDays = Math.max(number(input.dispatchDays ?? 1), 0);
@@ -730,7 +763,7 @@ async function assessDemandFeasibility(prisma, input = {}) {
     ? { ...baseClassification, status: "AT_RISK", criticalConstraint: "RISK_WAIVER" }
     : baseClassification;
   const earliestFgCalculation = {
-    method: String(input.sourceType || "").toUpperCase() === "FORECAST" ? "FORECAST_TWO_SHIFT_HOURLY_EARLIEST_FG_V2" : "PURCHASE_SUGGESTION_HOURLY_DUE_DATE_V5",
+    method: "OR_TOOLS_WASM_CP_SAT_FORWARD_BACKWARD_NETTING_V1",
     calculationAnchorDate: timeline.today,
     materialCoverageBasis: materialCoveredByRequiredDate ? "STOCK_OR_OPEN_SUPPLY_COVERED" : hasPurchaseMaterial ? "PURCHASING_LEAD_TIME_REQUIRED" : "NO_PURCHASE_MATERIAL",
     procurementLeadTimeDaysApplied,
@@ -774,12 +807,13 @@ async function assessDemandFeasibility(prisma, input = {}) {
     criticalConstraint: classification.criticalConstraint,
     requiresRiskApproval: waivedRisks.length > 0,
     waivedRisks,
+    solver: timeline.solver,
     procurementWindow: timeline.purchasingSchedule?.procurementWindow || null,
-    constraintDetails: { rootPartCode: context.part?.partCode || input.partCode, bomNumber: context.mbomHeader?.noReg || null, bomTrace: context.bomTrace, leadTimeTrace: [...productionLeadTimeTrace, ...purchasingLeadTimeTrace], productionLeadTimeBreakdown, procurementLeadTimeBreakdown: timeline.purchasingSchedule?.leadTimeBreakdown || null, earliestFgCalculation, capacityAssumption: { ...capacityPolicy, finiteCapacitySimulated: Boolean(input.planNumber), loadAware: Boolean(input.planNumber) }, processTimeline: timeline.processTimeline, capacityBlockers: capacity?.blockers || [], supplierLeadTimeDays: leadTimeControls.supplierLeadTime ? context.supplierLeadTimeDays : 0, leadTimeControls, supplierStrategy, supplierSelections, supplierAlternatives: context.componentRequirements.map((row) => ({ partCode: row.partCode, partName: row.partName, selectedSupplierItemId: row.supplierItemId, selectedSupplierCode: row.supplierCode, selectedSupplierName: row.supplierName, selectionSource: row.supplierSelectionSource, options: row.supplierOptions || [] })), vendorProcesses: vendorAdjustment.vendorProcesses, vendorProcessAdjustments: vendorAdjustment.adjustments, vendorAdjustmentApplied: vendorAdjustment.adjustments.length > 0, waivedRisks, requiresRiskApproval: waivedRisks.length > 0, materialCoverage, materialShortages: coverage.shortages.map((shortage) => materialCoverage.find((row) => row.partCode === shortage.partCode) || shortage) },
+    constraintDetails: { rootPartCode: context.part?.partCode || input.partCode, bomNumber: context.mbomHeader?.noReg || null, bomGraphValidation: context.mbomHeader?.graphValidation || null, bomTrace: context.bomTrace, leadTimeTrace: [...productionLeadTimeTrace, ...purchasingLeadTimeTrace], productionLeadTimeBreakdown, procurementLeadTimeBreakdown: timeline.purchasingSchedule?.leadTimeBreakdown || null, earliestFgCalculation, solver: timeline.solver, capacityAssumption: { ...capacityPolicy, finiteCapacitySimulated: Boolean(input.planNumber), loadAware: Boolean(input.planNumber) }, processTimeline: timeline.processTimeline, capacityBlockers: capacity?.blockers || [], supplierLeadTimeDays: leadTimeControls.supplierLeadTime ? context.supplierLeadTimeDays : 0, leadTimeControls, supplierStrategy, supplierSelections, supplierAlternatives: context.componentRequirements.map((row) => ({ partCode: row.partCode, partName: row.partName, selectedSupplierItemId: row.supplierItemId, selectedSupplierCode: row.supplierCode, selectedSupplierName: row.supplierName, selectionSource: row.supplierSelectionSource, options: row.supplierOptions || [] })), vendorProcesses: vendorAdjustment.vendorProcesses, vendorProcessAdjustments: vendorAdjustment.adjustments, vendorAdjustmentApplied: vendorAdjustment.adjustments.length > 0, waivedRisks, requiresRiskApproval: waivedRisks.length > 0, materialCoverage, materialShortages: coverage.shortages.map((shortage) => materialCoverage.find((row) => row.partCode === shortage.partCode) || shortage) },
     simulatedAt: new Date(),
   };
   result.constraintDetails.recoveryRecommendation = buildDueDateRecoveryChecklist(result);
   return result;
 }
 
-module.exports = { calculateLeadTimeFeasibility, classifyFeasibility, assessDemandFeasibility, subtractWorkingDays, addWorkingHours, subtractWorkingHours, processDurationDays, feasibilityCapacityPolicy, applyShiftCapacityToProductionLeadTime, applyVendorProcessAdjustments, applyVendorAdjustmentsToProcessSteps, vendorProcessKey, normalizeVendorProcessAdjustments, loadMaterialCoverage, explodeDemandBom, purchaseSuggestionRoutingMetric, normalizeLeadTimeControls, resolveSupplierItem, supplierLeadTime };
+module.exports = { calculateLeadTimeFeasibility, classifyFeasibility, assessDemandFeasibility, processDurationDays, feasibilityCapacityPolicy, applyShiftCapacityToProductionLeadTime, applyVendorProcessAdjustments, applyVendorAdjustmentsToProcessSteps, vendorProcessKey, normalizeVendorProcessAdjustments, loadMaterialCoverage, explodeDemandBom, purchaseSuggestionRoutingMetric, normalizeLeadTimeControls, resolveSupplierItem, supplierLeadTime };

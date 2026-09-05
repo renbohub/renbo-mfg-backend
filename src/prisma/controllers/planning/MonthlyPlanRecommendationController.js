@@ -49,12 +49,9 @@ function createHandlers(service, prismaClient = prisma) {
   return {
     generate: async (req, res, next) => {
       try {
-        const supportsAi = typeof service.generateAiRecommendationScenario === "function";
-        const generate = supportsAi ? service.generateAiRecommendationScenario : service.generateRecommendationScenario;
         const options = { planNumber: req.params.planNumber, actor: actor(req) };
-        if (supportsAi) Object.assign(options, { user: req.user, pageContext: { moduleCode: "planning-ppic", pageCode: "monthly-production-plans", recordKey: req.params.planNumber } });
         return res.status(201).json(
-          await generate(prismaClient, options),
+          await service.generateRecommendationScenario(prismaClient, options),
         );
       } catch (error) {
         return next(error);

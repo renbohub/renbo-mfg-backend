@@ -4,12 +4,50 @@ const assert = require("assert");
 const {
   reviewMpsDeliveryFeasibility,
 } = require("../src/prisma/services/planning/mpsDeliveryFeasibilityService");
+const {
+  buildDueDateRecoveryChecklist,
+  buildTrialRecoveryChecklist,
+  resolveAcceptedLateDate,
+  validateRecoveryChecklist,
+} = require("../src/prisma/services/planning/dueDateRecoveryService");
 
 assert.strictEqual(
   typeof reviewMpsDeliveryFeasibility,
   "function",
   "MPS must expose an in-page delivery feasibility review workflow",
 );
+
+const trialRecommendation = buildDueDateRecoveryChecklist({
+  status: "MASTER_DATA_INCOMPLETE",
+  criticalConstraint: "MASTER_DATA",
+  requestedDeliveryDate: "2026-09-10",
+  fgRequiredDate: "2026-09-09",
+  earliestFeasibleDeliveryDate: "2026-09-10",
+  simulatedAt: "2026-08-28",
+  constraintDetails: {},
+});
+assert.ok(!trialRecommendation.actions.some((item) => item.id === "ACCEPT_LATE"), "incomplete master data must be corrected, not accepted as late");
+const trialChecklist = buildTrialRecoveryChecklist(trialRecommendation, {
+  owner: "ppic.trial",
+  notes: "Trial recovery satu tombol untuk pengujian.",
+  evidenceReference: "MPS-TEST",
+});
+assert.ok(trialChecklist.find((item) => item.id === "RUN_TRIAL_RECOVERY")?.selected, "one-click recovery must select RUN_TRIAL_RECOVERY");
+assert.ok(trialChecklist.filter((item) => item.required).every((item) => item.selected && item.owner && item.targetDate));
+assert.deepStrictEqual(validateRecoveryChecklist(trialChecklist, "2026-09-10"), []);
+assert.strictEqual(resolveAcceptedLateDate("2026-09-10", "2026-09-15").toISOString().slice(0, 10), "2026-09-15");
+assert.strictEqual(resolveAcceptedLateDate("2026-09-10", "2026-09-05"), null, "on-time estimates must not manufacture an Accept Late date");
+assert.strictEqual(resolveAcceptedLateDate("2026-09-10", "2026-09-10"), null, "same-day delivery is not late");
+assert.strictEqual(resolveAcceptedLateDate("invalid", "2026-09-05"), null);
+
+const lateRecommendation = buildDueDateRecoveryChecklist({
+  status: "NOT_FEASIBLE",
+  criticalConstraint: "CAPACITY",
+  requestedDeliveryDate: "2026-09-10",
+  earliestFeasibleDeliveryDate: "2026-09-12",
+  constraintDetails: {},
+});
+assert.ok(lateRecommendation.actions.some((item) => item.id === "ACCEPT_LATE"), "a verified date miss may offer Accept Late");
 
 function fixtureDocument() {
   return {

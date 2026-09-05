@@ -23,12 +23,10 @@ router.post("/delta/generate", authorize("mps", "create"), logger("mps", "genera
 router.post("/production-cut/preview", authorize("mps", "read"), ctrl.previewProductionCut);
 router.post("/production-cut", authorize("mps", "update"), logger("mps", "create-production-cut"), ctrl.createProductionCut);
 router.patch("/production-cut/:adjustmentNumber/approve", authorize("mps", "approve"), logger("mps", "approve-production-cut"), ctrl.approveProductionCut);
-router.post("/:mpsNumber/delivery-feasibility/review", authorize("mps", "update"), guardMps, logger("mps", "review-delivery-feasibility", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.reviewDeliveryFeasibility);
 router.get("/:mpsNumber/readiness", authorize("mps", "read"), ctrl.readiness);
 router.post("/:mpsNumber/delivery-phases", authorize("mps", "update"), guardMps, logger("mps", "create-delivery-phase", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.createDeliveryPhase);
 router.patch("/:mpsNumber/delivery-phases/:phaseId/remove", authorize("mps", "update"), guardMps, logger("mps", "remove-delivery-phase", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.removeDeliveryPhase);
 router.patch("/:mpsNumber/adjustments", authorize("mps", "update"), guardMps, logger("mps", "update-adjustments", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.updateAdjustments);
-router.post("/:mpsNumber/rccp/run", authorize("mps", "update"), guardMps, logger("mps", "run-rccp", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), rccp.run);
 router.get("/:mpsNumber/rccp/latest", authorize("mps", "read"), rccp.latest);
 router.get("/rccp/:runId", authorize("mps", "read"), rccp.get);
 router.get("/rccp/:runId/timeline", authorize("mps", "read"), rccp.timeline);

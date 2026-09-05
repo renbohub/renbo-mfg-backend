@@ -9,6 +9,8 @@ const {
   shouldRetireOfficialMrp,
   isPromotableCustomerDeliverySource,
   deliveryTargetIdsFromMps,
+  isCoveredWithoutMpsProduction,
+  isAcceptLateApplicable,
 } = require("../src/prisma/services/planning/mpsDeliveryFeasibilityService");
 
 const root = path.resolve(__dirname, "..");
@@ -30,6 +32,7 @@ function snapshot(overrides = {}) {
 
 assert.strictEqual(normalizeDeliveryFeasibility("NOT_FEASIBLE"), "INFEASIBLE");
 assert.strictEqual(normalizeDeliveryFeasibility("LATE"), "INFEASIBLE");
+assert.strictEqual(normalizeDeliveryFeasibility("MASTER_DATA_INCOMPLETE"), "MASTER_DATA_INCOMPLETE");
 assert.strictEqual(normalizeDeliveryFeasibility("FEASIBLE"), "FEASIBLE");
 assert.strictEqual(normalizeDeliveryFeasibility("AT_RISK"), "AT_RISK");
 assert.strictEqual(normalizeDeliveryFeasibility("NOT_SIMULATED"), "UNKNOWN");
@@ -53,6 +56,38 @@ assert.deepStrictEqual(deriveMpsDeliveryGate([snapshot({ feasibilityStatus: "AT_
   reason: "1 delivery phase berisiko tetapi masih memenuhi tanggal delivery.",
 });
 assert.strictEqual(deriveMpsDeliveryGate([snapshot({ feasibilityStatus: "INFEASIBLE" })]).officialGateStatus, "BLOCKED");
+assert.deepStrictEqual(deriveMpsDeliveryGate([snapshot({ feasibilityStatus: "MASTER_DATA_INCOMPLETE" })]), {
+  feasibilityStatus: "MASTER_DATA_INCOMPLETE",
+  dispositionStatus: "NONE",
+  officialGateStatus: "BLOCKED",
+  blockerCount: 1,
+  exceptionCount: 0,
+  reason: "1 delivery phase belum dapat dinilai karena master data belum lengkap.",
+});
+assert.strictEqual(isAcceptLateApplicable({
+  feasibilityStatus: "MASTER_DATA_INCOMPLETE",
+  originalTargetDate: "2026-09-09",
+  earliestFeasibleDeliveryDate: "2026-09-10",
+  acceptLateNewDate: "2026-09-10",
+}), false, "Accept Late must never hide incomplete master data");
+assert.strictEqual(isAcceptLateApplicable({
+  feasibilityStatus: "NOT_FEASIBLE",
+  originalTargetDate: "2026-09-09",
+  earliestFeasibleDeliveryDate: "2026-09-08",
+  acceptLateNewDate: "2026-09-10",
+}), false, "an on-time latest estimate must retire historical Accept Late");
+assert.strictEqual(isAcceptLateApplicable({
+  feasibilityStatus: "NOT_FEASIBLE",
+  originalTargetDate: "2026-09-09",
+  earliestFeasibleDeliveryDate: "2026-09-11",
+  acceptLateNewDate: "2026-09-11",
+}), true, "Accept Late is active only when it covers the latest late estimate");
+assert.strictEqual(isAcceptLateApplicable({
+  feasibilityStatus: "NOT_FEASIBLE",
+  originalTargetDate: "2026-09-09",
+  earliestFeasibleDeliveryDate: "2026-09-12",
+  acceptLateNewDate: "2026-09-11",
+}), false, "an obsolete accepted date must not cover a newer estimate");
 assert.strictEqual(deriveMpsDeliveryGate([snapshot({
   feasibilityStatus: "INFEASIBLE",
   dispositionStatus: "RECOVERY_APPROVED",
@@ -70,6 +105,9 @@ assert.strictEqual(deriveMpsDeliveryGate([snapshot({ sourceCurrent: false })]).o
 assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "BLOCKED" }), true);
 assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "OFFICIAL" }), false);
 assert.strictEqual(shouldRetireOfficialMrp({ officialGateStatus: "APPROVED_WITH_EXCEPTION" }), false);
+assert.strictEqual(isCoveredWithoutMpsProduction({ demandQty: 20, stockUsedQty: 20, plannedProductionQty: 0, uncoveredQty: 0 }), true);
+assert.strictEqual(isCoveredWithoutMpsProduction({ demandQty: 20, stockUsedQty: 19, plannedProductionQty: 1, uncoveredQty: 0 }), false);
+assert.strictEqual(isCoveredWithoutMpsProduction({ demandQty: 20, stockUsedQty: 20, plannedProductionQty: 0, uncoveredQty: 1 }), false);
 
 const mixedDetail = {
   actualSalesOrderQty: 2500,
@@ -91,7 +129,7 @@ assert.deepStrictEqual(deliveryTargetIdsFromMps({ details: [forecastFallbackDeta
 const mpsController = source("src/prisma/controllers/planning/MPSController.js");
 const mrpController = source("src/prisma/controllers/planning/MRPController.js");
 const workbenchService = source("src/prisma/services/planning/mpsWorkbenchService.js");
-const workbenchUi = source("../renbo-mfg-frontend/public/js/ppic-mps-workbench.js");
+const workbenchUi = source("../frontend/public/js/ppic-mps-workbench.js");
 
 assert.match(mpsController, /assertMpsDeliveryApprovalAllowed/);
 assert.match(mrpController, /assertOfficialMpsDeliveryGate/);

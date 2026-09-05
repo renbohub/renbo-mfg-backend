@@ -1,5 +1,6 @@
 const { prisma } = require("../../index");
 const { validateScheduleItems, summarizeRevision, buildExecutionExceptions } = require("./dailyPlanRevisionDomain");
+const { createProductionShortfallCarryover } = require("./productionShortfallCarryoverService");
 const { autoCorrectWorkPlacements } = require("./dailyReleaseSchedulingService");
 const { ensureMaterialIssueDraft } = require("../../controllers/production/DailyProductionScheduleController");
 
@@ -210,7 +211,7 @@ async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
         include: {
           productionLogs: {
             where: { isDeleted: false },
-            select: { id: true, logNumber: true, status: true, qtyProduced: true, qtyGood: true, qtyReject: true, qtyRework: true, startTime: true, endTime: true, downtime: true },
+            select: { id: true, logNumber: true, status: true, qtyPlanned: true, qtyProduced: true, qtyGood: true, qtyReject: true, qtyRework: true, startTime: true, endTime: true, downtime: true, ngReasons: { where: { isDeleted: false }, select: { status: true, qtyNg: true, qtyRework: true, qtyReject: true } }, carryover: true },
           },
         },
         orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }],
@@ -222,7 +223,7 @@ async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
     : revisions.find((row) => ["Draft", "Ready", "Partially Released"].includes(row.status)) || revisions.find((row) => row.status === "Released") || revisions[0];
   const legacy = revision ? [] : await client.dailyProductionSchedule.findMany({
     where: { scheduleDate: { gte: range.start, lte: range.end }, isDeleted: false, productionPlanId: { not: null }, shift: { not: "VENDOR" }, ...(productionMode ? { status: { in: executionStatuses } } : {}) },
-    include: { productionLogs: { where: { isDeleted: false }, select: { id: true, logNumber: true, status: true, qtyProduced: true, qtyGood: true, qtyReject: true, qtyRework: true, startTime: true, endTime: true, downtime: true } } },
+    include: { productionLogs: { where: { isDeleted: false }, select: { id: true, logNumber: true, status: true, qtyPlanned: true, qtyProduced: true, qtyGood: true, qtyReject: true, qtyRework: true, startTime: true, endTime: true, downtime: true, ngReasons: { where: { isDeleted: false }, select: { status: true, qtyNg: true, qtyRework: true, qtyReject: true } }, carryover: true } } },
     orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }],
   });
   let sourceSchedules = revision?.schedules || legacy;
@@ -356,7 +357,7 @@ async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId 
     // working day. Limiting work windows to the selected date leaves valid
     // successors in their old (and dependency-invalid) positions.
     const windowsByMachine = await placementWindowsByMachine(prisma, placementHorizon(range.start), revision.schedules);
-    const result = autoCorrectWorkPlacements(revision.schedules.map((item) => ({ ...item, movable: item.status === "Draft" })), { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+    const result = await autoCorrectWorkPlacements(revision.schedules.map((item) => ({ ...item, movable: item.status === "Draft" })), { prisma, windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120, referenceType: "DAILY_PLAN_REVISION", referenceNumber: revision.revisionNumber || revision.id, actor: userId });
     if (!result.changes.length) return { scope: "DAILY_REVISION", changedCount: 0, warnings: result.warnings, revisionId: revision.id };
     const correctedById = new Map(result.items.map((item) => [item.id, item]));
     const updated = await prisma.$transaction(async (tx) => {
@@ -382,7 +383,7 @@ async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId 
   const currentLegacySchedules = legacySchedules.filter((item) => dateKey(item.scheduleDate) === range.key);
   if (currentLegacySchedules.length) {
     const windowsByMachine = await placementWindowsByMachine(prisma, horizon, legacySchedules);
-    const result = autoCorrectWorkPlacements(legacySchedules.map((item) => ({ ...item, movable: dateKey(item.scheduleDate) === range.key && item.status === "Draft" })), { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+    const result = await autoCorrectWorkPlacements(legacySchedules.map((item) => ({ ...item, movable: dateKey(item.scheduleDate) === range.key && item.status === "Draft" })), { prisma, windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120, referenceType: "LEGACY_DAILY_PLAN", referenceNumber: range.key, actor: userId });
     if (!result.changes.length) return { scope: "LEGACY_DAILY_PLAN", changedCount: 0, warnings: result.warnings };
     const correctedById = new Map(result.items.map((item) => [item.id, item]));
     await prisma.$transaction(async (tx) => {
@@ -412,7 +413,7 @@ async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId 
     movable: true,
   }));
   const windowsByMachine = await placementWindowsByMachine(prisma, range, prepared);
-  const result = autoCorrectWorkPlacements(prepared, { windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120 });
+  const result = await autoCorrectWorkPlacements(prepared, { prisma, windowsByMachine, dayStart: "07:00", dependencyGapMinutes: 120, referenceType: "MONTHLY_PLAN_ALLOCATION", referenceNumber: [...new Set(allocations.map((item) => item.plan.planNumber))].join(","), actor: userId });
   if (!result.changes.length) return { scope: "ALLOCATION_PREVIEW", changedCount: 0, warnings: result.warnings, planNumbers: [...new Set(allocations.map((item) => item.plan.planNumber))] };
   const correctedById = new Map(result.items.map((item) => [item.id, item]));
   await prisma.$transaction(async (tx) => {
@@ -579,4 +580,29 @@ async function releaseRevision({ revisionId, expectedVersion, warningReason, use
   });
 }
 
-module.exports = { buildRevisionNumber, copyScheduleData, productionHandoffView, placementWindowsForMachine, placementWindowsByMachine, getWorkspace, createDraft, autoCorrectPlacement, updateItem, validateRevision, validationForSchedule, releaseSchedule, releaseRevision };
+async function allocateExecutionShortfall({ sourceLogId, targetDate, userId } = {}) {
+  if (!sourceLogId || !targetDate) throw Object.assign(new Error("Source Production Log dan tanggal tujuan wajib diisi."), { statusCode: 400 });
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "tbl_production_log" WHERE "id" = ${sourceLogId} FOR UPDATE`;
+    const log = await tx.productionLog.findFirst({
+      where: { id: sourceLogId, isDeleted: false, status: "Approved" },
+      include: {
+        dailyProductionSchedule: true,
+        ngReasons: { where: { isDeleted: false }, select: { status: true, qtyNg: true, qtyReject: true, qtyRework: true } },
+        carryover: true,
+      },
+    });
+    if (!log || !log.dailyProductionSchedule) throw Object.assign(new Error("Production Log atau Daily Schedule sumber tidak ditemukan."), { statusCode: 404 });
+    if (log.ngReasons.some((row) => row.status === "PENDING_QC")) throw Object.assign(new Error("Disposition QC belum selesai."), { statusCode: 409 });
+    if (log.carryover && log.carryover.status !== "REVERSED") throw Object.assign(new Error("Shortfall Production Log ini sudah dialokasikan."), { statusCode: 409 });
+    const destination = new Date(`${String(targetDate).slice(0, 10)}T00:00:00.000Z`);
+    if (Number.isNaN(destination.getTime())) throw Object.assign(new Error("Tanggal tujuan tidak valid."), { statusCode: 400 });
+    if (destination <= new Date(log.dailyProductionSchedule.scheduleDate)) throw Object.assign(new Error("Tanggal tujuan harus setelah tanggal produksi sumber."), { statusCode: 400 });
+    const scrapQty = log.ngReasons.reduce((sum, row) => sum + Number(row.qtyReject || 0), 0);
+    const shortfallQty = Math.max(Number(log.qtyPlanned || 0) - Number(log.qtyProduced || 0) + scrapQty, 0);
+    if (shortfallQty <= 0.000001) throw Object.assign(new Error("Tidak ada shortfall yang perlu dialokasikan."), { statusCode: 409 });
+    return createProductionShortfallCarryover(tx, { log, schedule: log.dailyProductionSchedule, actor: userId || "system", targetDate: destination, shortfallQty });
+  });
+}
+
+module.exports = { buildRevisionNumber, copyScheduleData, productionHandoffView, placementWindowsForMachine, placementWindowsByMachine, getWorkspace, createDraft, autoCorrectPlacement, updateItem, validateRevision, validationForSchedule, releaseSchedule, releaseRevision, allocateExecutionShortfall };

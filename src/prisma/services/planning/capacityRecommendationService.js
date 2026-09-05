@@ -4,6 +4,8 @@ const { findPreset, findActivePreset, shiftDurationMinutes } = require("./capaci
 const { isDiesCapacityBlockingEnabled, isDiesTonnageCompatible, isPressResource, maintenanceInterval } = require("./diesCapacityService");
 const { buildProductionMaterialGate, materialGateForJob } = require("./materialReadinessService");
 const { loadDemandPlanningConstraintMap, effectiveVendorLeadTime } = require("./demandPlanningConstraintService");
+const { solveFiniteSchedule } = require("./solver/planningSolverService");
+const { enqueueSolverRun, completeSolverRun, failSolverRun } = require("./solver/planningSolverRunService");
 
 const DAY_MINUTES = 1440;
 const EPSILON = 0.000001;
@@ -11,7 +13,7 @@ const DEFAULT_CANDIDATE_BUDGET = 50000;
 const MAX_CANDIDATE_BUDGET = 500000;
 const RETAINED_PLACEMENT_CANDIDATES = 4;
 const AUTO_CAPACITY_OVERRIDE_PREFIX = "[AUTO-CAPACITY-RECOMMENDATION]";
-const VERSION = "FINITE-CAPACITY-PIPELINE-V11-FG-REQUIRED-LATE-VISIBILITY";
+const VERSION = "OR-TOOLS-WASM-CP-SAT-V1";
 const SCORING_MODEL = "CAPACITY_ALLOCATION_SCORE_V2";
 const EARLY_START_TOLERANCE_DAYS = 2;
 const MINIMUM_RUNTIME_ALLOWANCE_FACTOR = 1.2;
@@ -1892,6 +1894,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     occupy(usage, row.machineId, { ...reservation, partCode: null, processCode: null });
     occupyDies(diesUsage, row.diesId, reservation);
   }
+  const solverFixedMachineUsage = new Map([...usage].map(([key, rows]) => [key, rows.map((row) => ({ ...row }))]));
+  const solverFixedDiesUsage = new Map([...diesUsage].map(([key, rows]) => [key, rows.map((row) => ({ ...row }))]));
   let manualByRoute = new Map();
   manual.forEach((row) => manualByRoute.set(row.mbomProcessId, number(manualByRoute.get(row.mbomProcessId)) + number(row.plannedQty)));
   const manualCompletionByRoute = new Map();
@@ -2418,6 +2422,120 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     cumulativeQty.set(groupKey, runningCumulativeQty);
   }
 
+  let monthlySolverAudit = null;
+  if (generated.length) {
+    const machineById = new Map(machines.map((machine) => [machine.id, machine]));
+    const calendar = {};
+    const resourceAvailability = {};
+    const horizonDays = Math.max(dayIndex(plan.periodStart, schedulingHorizonEnd), 0);
+    for (let day = 0; day <= horizonDays; day += 1) calendar[dateKey(addDays(plan.periodStart, day))] = "WORKING";
+    const maximumMode = preset?.algorithm?.allowOvertime !== false
+      ? "OVERTIME"
+      : preset?.algorithm?.allowExtraShift !== false ? "THREE_SHIFT" : "NORMAL";
+    for (const machine of machines) {
+      resourceAvailability[machine.id] = [];
+      for (let day = 0; day <= horizonDays; day += 1) {
+        const windows = shiftWindows(machine, day, maximumMode, preset, plan.periodStart)
+          .map((window) => ({ startMinute: window.start - day * DAY_MINUTES, endMinute: window.end - day * DAY_MINUTES }));
+        if (windows.length) resourceAvailability[machine.id].push({ date: dateKey(addDays(plan.periodStart, day)), windows });
+      }
+    }
+    const resourceBlockedIntervals = [
+      ...[...solverFixedMachineUsage.entries()].flatMap(([resourceId, rows]) => rows.map((row) => ({ resourceId, startMinute: row.start, durationMinutes: row.end - row.start }))),
+      ...[...solverFixedDiesUsage.entries()].flatMap(([diesId, rows]) => rows.map((row) => ({ resourceId: `DIES:${diesId}`, startMinute: row.start, durationMinutes: row.end - row.start }))),
+    ];
+    const solverTasks = generated.map((item, index) => {
+      const route = item.task.route;
+      const routeSpecification = specificationCode(route);
+      const machineCandidates = routeMode(route) === "VENDOR"
+        ? [`VENDOR:${route.vendorId || item.vendor?.id || "UNASSIGNED"}`]
+        : [...new Set([
+            ...(routeSpecification ? (machineBySpecification.get(routeSpecification) || []).map((machine) => machine.id) : []),
+            item.machine?.id,
+          ].filter(Boolean))];
+      return {
+        id: `ALLOC-${index}`,
+        durationMinutes: Math.max(Math.ceil(item.end - item.start), 1),
+        eligibleResourceIds: machineCandidates,
+        requiredResourceIds: item.dies?.id ? [`DIES:${item.dies.id}`] : [],
+        predecessorIds: (item.predecessorToken || []).map((token) => `ALLOC-${token}`),
+        predecessorGapMinutes: MINIMUM_SUCCESSOR_GAP_MINUTES,
+        releaseDate: item.phase.materialGate?.readyDate || item.phase.preferredStartDate || plan.periodStart,
+        dueDate: item.phase.targetFgDue || item.phase.due || schedulingHorizonEnd,
+        baselineStartDate: dateFromAbsolute(plan.periodStart, item.start),
+        required: true,
+        tardinessWeight: 100000,
+        movementWeight: 1,
+      };
+    });
+    const solverInput = {
+      horizonStart: plan.periodStart,
+      horizonEnd: schedulingHorizonEnd,
+      calendar,
+      dailyWindows: [{ startMinute: 0, endMinute: DAY_MINUTES }],
+      resourceAvailability,
+      resourceBlockedIntervals,
+      tasks: solverTasks,
+      options: {
+        maxTimeInSeconds: number(options.solverMaxTimeInSeconds) || 60,
+        numSearchWorkers: number(options.solverWorkers) || 2,
+        randomSeed: 1,
+      },
+    };
+    const solverRun = await enqueueSolverRun(prisma, {
+      scope: "MONTHLY_CAPACITY",
+      referenceType: "MONTHLY_PRODUCTION_PLAN",
+      referenceNumber: plan.planNumber,
+      modelVersion: VERSION,
+      inputSnapshot: solverInput,
+      requestedBy: options.actor || "system",
+      status: "RUNNING",
+    });
+    let solved;
+    try {
+      solved = await solveFiniteSchedule(solverInput);
+      if (!solved.feasible) {
+        const infeasible = new Error(`Monthly planning solver tidak menemukan schedule feasible (${solved.status}).`);
+        infeasible.statusCode = 409;
+        infeasible.code = "MONTHLY_SOLVER_INFEASIBLE";
+        infeasible.solver = solved;
+        throw infeasible;
+      }
+      await completeSolverRun(prisma, solverRun.id, solved);
+    } catch (error) {
+      await failSolverRun(prisma, solverRun.id, error);
+      throw error;
+    }
+    const solvedById = new Map(solved.tasks.map((task) => [task.id, task]));
+    for (let index = 0; index < generated.length; index += 1) {
+      const item = generated[index];
+      const task = solvedById.get(`ALLOC-${index}`);
+      if (!task?.scheduled) continue;
+      item.start = timestampMinute(plan.periodStart, task.startDate);
+      item.end = timestampMinute(plan.periodStart, task.endDate);
+      if (routeMode(item.task.route) !== "VENDOR") item.machine = machineById.get(task.resourceId) || item.machine;
+      const day = Math.floor(item.start / DAY_MINUTES);
+      const matchingWindow = item.machine
+        ? shiftWindows(item.machine, day, maximumMode, preset, plan.periodStart).find((window) => item.start >= window.start && item.start < window.end)
+        : null;
+      item.shift = matchingWindow?.shift || item.shift;
+      item.solverEngine = solved.engine;
+      item.solverStatus = solved.status;
+      item.solverTardinessMinutes = task.tardinessMinutes;
+    }
+    monthlySolverAudit = {
+      engine: solved.engine,
+      engineVersion: solved.engineVersion,
+      status: solved.status,
+      objectiveValue: solved.objectiveValue,
+      bestObjectiveBound: solved.bestObjectiveBound,
+      wallTimeSeconds: solved.wallTimeSeconds,
+      taskCount: generated.length,
+      maxTimeInSeconds: number(options.solverMaxTimeInSeconds) || 60,
+      workers: number(options.solverWorkers) || 2,
+      runNumber: solverRun.runNumber,
+    };
+  }
   const scoringSummary = summarizeAllocationScoring(generated);
   const persisted = [];
   if (options.persist !== false) {
@@ -2533,7 +2651,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const capacityFlowRule = options.flowRule
         ? { ...previousCapacityFlowRule, active: options.flowRule }
         : (Object.keys(previousCapacityFlowRule).length ? previousCapacityFlowRule : null);
-      const summary = { ...previousSummary, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS, scoringSummary, capacityConstraints, materialGate, averageAllocationScore: scoringSummary.averageScore, minimumAllocationScore: scoringSummary.minimumScore, allocationCount: persisted.length, phaseCount: phaseResults.length, coveredPhaseCount: phaseResults.filter((row) => row.status === "COVERED").length, blockerCount: blockers.length, phaseResults, blockers, ...(capacityFlowRule ? { capacityFlowRule } : {}) };
+      const summary = { ...previousSummary, version: VERSION, solver: monthlySolverAudit, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS, scoringSummary, capacityConstraints, materialGate, averageAllocationScore: scoringSummary.averageScore, minimumAllocationScore: scoringSummary.minimumScore, allocationCount: persisted.length, phaseCount: phaseResults.length, coveredPhaseCount: phaseResults.filter((row) => row.status === "COVERED").length, blockerCount: blockers.length, phaseResults, blockers, ...(capacityFlowRule ? { capacityFlowRule } : {}) };
       if (planningMode === "PRODUCTION") await tx.monthlyProductionPlan.update({ where: { id: plan.id }, data: { recommendationGeneratedAt: new Date(), recommendationVersion: VERSION, recommendationSummary: summary } });
     });
   }
@@ -2541,7 +2659,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const validationRequest = buildRecommendationValidationScope({ planNumber, planningMode, scenarioKey, presetId, persisted: options.persist !== false });
   return {
     planNumber, planningMode, scenarioKey, presetId, presetName: preset?.name || null, version: VERSION, scoringModel: SCORING_MODEL, scoringWeights: SCORING_WEIGHTS,
-    schedulePolicy, schedulingHorizonEnd: dateKey(schedulingHorizonEnd), jitSafetyDays,
+    schedulePolicy, schedulingHorizonEnd: dateKey(schedulingHorizonEnd), jitSafetyDays, solver: monthlySolverAudit,
     scoringSummary,
     capacityConstraints,
     materialGate,

@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const backendRoot = path.resolve(__dirname, "..");
-const frontendRoot = path.resolve(backendRoot, "..", "renbo-mfg-frontend");
+const frontendRoot = path.resolve(backendRoot, "..", "frontend");
 const readBackend = (...segments) => fs.readFileSync(path.join(backendRoot, ...segments), "utf8");
 const readFrontend = (...segments) => fs.readFileSync(path.join(frontendRoot, ...segments), "utf8");
 const checks = [];

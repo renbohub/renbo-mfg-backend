@@ -1,6 +1,8 @@
 const { calculateLiveMbomCosts } = require("./mbomLiveCostingService");
 const { legacyPriceValue, resolveEffectiveRecord } = require("./pricing/effectivePriceService");
+const { resolveVendorProcessPrice } = require("./pricing/vendorProcessPricingService");
 const { resolveMbomRevision } = require("./planning/mbomRevisionService");
+const { isCustomerSupplied } = require("../utils/materialSupply");
 
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const text = (value) => String(value ?? "").trim();
@@ -29,7 +31,7 @@ async function buildMbomReport(prisma, noReg, options = {}) {
       details: {
         where: { isDeleted: false }, orderBy: [{ levelComponent: "asc" }, { createdAt: "asc" }],
         include: {
-          parentDetail: { include: { part: true } }, uom: true, materialForm: true, alternateMaterialForm: true,
+          parentDetail: { include: { part: true } }, uom: true, materialForm: true, alternateMaterialForm: true, supplier: true, supplyCustomer: true, vendor: true,
           part: { include: { material: true } },
           mbomProcesses: { where: { isDeleted: false }, orderBy: { sequence: "asc" }, include: { process: true, machine: true, vendor: true, dies: true } },
         },
@@ -43,7 +45,7 @@ async function buildMbomReport(prisma, noReg, options = {}) {
   const [partPrices, materialPrices, vendorPrices, machineRates, currencies, liveCostMap] = await Promise.all([
     prisma.partPriceList.findMany({ where: { isDeleted: false }, include: { supplier: true } }),
     prisma.materialPriceList.findMany({ where: { isDeleted: false }, include: { supplier: true, material: true, materialSubstance: true, materialGrade: true } }),
-    prisma.vendorPriceList.findMany({ where: { isDeleted: false }, include: { vendor: true, details: { where: { isDeleted: false } } } }),
+    prisma.vendorPriceList.findMany({ where: { isDeleted: false }, include: { vendor: true, details: { where: { isDeleted: false }, include: { vendorProcess: true } } } }),
     prisma.machineCostRate.findMany({ where: { isDeleted: false } }),
     prisma.currency.findMany({ where: { isDeleted: false }, select: { currencyCode: true, exchangeRate: true } }),
     calculateLiveMbomCosts(prisma, { costingDate: date }),
@@ -60,25 +62,35 @@ async function buildMbomReport(prisma, noReg, options = {}) {
   const buildRow = (detail, context) => {
     const part = detail.part || {};
     const material = part.material || {};
-    const partPrice = resolveEffectiveRecord(partPrices.filter((row) => row.partId === part.id), date);
+    const customerSupplied = isCustomerSupplied(detail.materialSupplyType);
+    const partPrice = resolveEffectiveRecord(partPrices.filter((row) => row.partId === part.id && (!detail.supplierId || row.supplierId === detail.supplierId)), date);
     const form = detail.materialScheme === "ALTERNATIVE" ? detail.alternateMaterialForm?.symbol : detail.materialForm?.symbol;
-    const materialCandidates = materialPrices.filter((row) => row.materialId ? row.materialId === part.materialId : (
+    const materialCandidates = materialPrices.filter((row) => (!detail.supplierId || row.supplierId === detail.supplierId) && (row.materialId ? row.materialId === part.materialId : (
       row.materialGradeId === material.materialGradeId && row.materialSubstanceId === material.materialSubstanceId
       && number(row.thickness) === number(material.thickness) && (!row.CSP || row.CSP === form)
-    ));
+    )));
     const materialPrice = resolveEffectiveRecord(materialCandidates, date);
-    const vendorPrice = detail.category === "Vendor" ? resolveEffectiveRecord(vendorPrices.filter((row) => row.partId === part.id), date) : null;
-    const selectedPrice = vendorPrice || partPrice || materialPrice;
-    const unitPriceOriginal = vendorPrice
-      ? (vendorPrice.details || []).reduce((sum, row) => sum + legacyPriceValue(row, date), 0)
-      : legacyPriceValue(selectedPrice, date);
+    const selectedPrice = customerSupplied ? null : partPrice || materialPrice;
+    const unitPriceOriginal = legacyPriceValue(selectedPrice, date);
     const priceCurrency = selectedPrice?.currencyCode || "IDR";
     const priceExchangeRate = priceCurrency === "IDR" ? 1 : number(currencyRates.get(priceCurrency)) || 1;
     const unitPrice = unitPriceOriginal * priceExchangeRate;
-    const priceSource = vendorPrice ? "Vendor Price List" : partPrice ? "Purchase Part Price List" : materialPrice ? "Material Price List" : "Not Found";
+    const priceSource = customerSupplied ? "Customer Supplied (Zero Value)" : partPrice ? "Purchase Part Price List" : materialPrice ? "Material Price List" : "Not Found";
     const priceQty = materialPrice && number(detail.grossWeight) > 0 ? number(detail.qty) * number(detail.grossWeight) : number(detail.qty);
     const purchaseAmount = unitPrice * priceQty;
     const processes = (detail.mbomProcesses || []).map((process) => {
+      if (String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
+        const resolved = resolveVendorProcessPrice({ vendorPrices, vendorId: process.vendorId, partId: part.id, process: process.process, costingDate: date, currencyRates });
+        const originalRate = number(resolved?.originalUnitPrice); const currencyCode = resolved?.currencyCode || "IDR"; const exchangeRate = number(resolved?.exchangeRate) || 1;
+        return {
+          routingNumber: process.routingNumber || process.occurrenceCode || `OP-${String(process.sequence || 0).padStart(3, "0")}`,
+          sequence: process.sequence, processCode: process.process?.processCode, processName: process.process?.processName,
+          routingMode: "VENDOR", machineCode: null, machineName: null, machineSpecificationCode: null, diesCode: process.dies?.diesCode,
+          vendorCode: process.vendor?.vendorCode, vendorName: process.vendor?.vendorName, cycleTimeSeconds: 0,
+          rate: originalRate * exchangeRate, originalRate, rateCurrency: currencyCode, exchangeRate, rateType: "PER_PCS",
+          processCostPerUnit: number(resolved?.unitPrice), priceSource: resolved?.priceList ? "Vendor Price List" : "Not Found", effectiveFrom: resolved?.priceList?.effectiveFrom || null,
+        };
+      }
       const costing = machineCost(process, machineRates, date, currencyRates);
       return {
         routingNumber: process.routingNumber || process.occurrenceCode || `OP-${String(process.sequence || 0).padStart(3, "0")}`,
@@ -92,7 +104,7 @@ async function buildMbomReport(prisma, noReg, options = {}) {
       };
     });
     const processCostPerUnit = processes.reduce((sum, process) => sum + number(process.processCostPerUnit), 0);
-    const priceRequired = Boolean(part.materialId) || ["Purchase", "Vendor"].includes(detail.category);
+    const priceRequired = !customerSupplied && (Boolean(part.materialId) || detail.category === "Purchase");
     return {
       line: context.line, nodeKey: context.nodeKey, parentNodeKey: context.parentNodeKey,
       level: context.level, localLevel: detail.levelComponent, parentPartCode: context.parentPartCode, parentPartNumber: context.parentPartNumber,
@@ -101,12 +113,13 @@ async function buildMbomReport(prisma, noReg, options = {}) {
       linkedBomNoReg: context.linkedHeader?.noReg || null, linkedBomRevision: context.linkedHeader?.revision || null,
       partCode: part.partCode, partNumber: part.partNumber, partName: part.partName, itemType: part.itemType,
       rawType: part.rawType, category: detail.category, qty: number(detail.qty), cumulativeQty: context.cumulativeQty, uomCode: detail.uomCode,
+      materialSupplyType: detail.materialSupplyType || "SUPPLIER_PURCHASE", supplyCustomerCode: detail.supplyCustomer?.customerCode || null, supplyCustomerName: detail.supplyCustomer?.customerName || null,
       scrapPercent: number(detail.scrapFactor), grossWeightKg: number(detail.grossWeight),
       materialCode: material.materialCode, materialName: material.materialName, materialType: material.materialType,
       materialSpec: material.spec, thickness: material.thickness, width: material.width, materialForm: form,
       leadTime: number(detail.leadTime), leadTimeUnit: detail.leadTimeUnit,
-      unitPrice, unitPriceOriginal, priceExchangeRate, priceUom: selectedPrice?.uomCode || vendorPrice?.details?.[0]?.uomCode, priceCurrency,
-      priceSource, supplierCode: selectedPrice?.supplier?.supplierCode || vendorPrice?.vendor?.vendorCode, supplierName: selectedPrice?.supplier?.supplierName || vendorPrice?.vendor?.vendorName,
+      unitPrice, unitPriceOriginal, priceExchangeRate, priceUom: selectedPrice?.uomCode, priceCurrency,
+      priceSource, supplierCode: selectedPrice?.supplier?.supplierCode, supplierName: selectedPrice?.supplier?.supplierName,
       priceEffectiveFrom: selectedPrice?.effectiveFrom, priceEffectiveUntil: selectedPrice?.effectiveUntil, priceRequired,
       purchaseAmount, processCostPerUnit, estimatedLineCost: purchaseAmount + processCostPerUnit * number(detail.qty),
       estimatedExtendedCost: unitPrice * (materialPrice && number(detail.grossWeight) > 0 ? context.cumulativeQty * number(detail.grossWeight) : context.cumulativeQty) + processCostPerUnit * context.cumulativeQty,

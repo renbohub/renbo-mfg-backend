@@ -11,10 +11,11 @@ const {
   openPersistentSession,
   stageRecommendationChanges,
 } = require("./capacityEditSessionService");
+const { solveFiniteSchedule } = require("./solver/planningSolverService");
 const { aiRuntimeSupervisor } = require("../ai/aiRuntimeSupervisor");
 const { resolveModelFile, validateRuntimeConfig } = require("../ai/aiModelProfileService");
 
-const RULE_VERSION = "MPP-BACKWARD-FG-DUE-V6-TWO-SHIFT-BATCH";
+const RULE_VERSION = "MPP-OR-TOOLS-WASM-CP-SAT-V1";
 const ACTIVE_SCENARIO_STATUSES = [
   "READY",
   "READY_WITH_OVERLOAD",
@@ -425,6 +426,137 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
   };
 }
 
+function routeIdentity(lineNumber, mbomProcessId) {
+  return `${Number(lineNumber || 0)}|${String(mbomProcessId || "")}`;
+}
+
+async function optimizeRecommendationWithCpSat(input, recommendation) {
+  const proposalRows = (recommendation.items || []).filter((item) => item.changeType && item.proposedValue?.targetDate);
+  if (!proposalRows.length) {
+    return { ...recommendation, solver: { engine: "OR_TOOLS_WASM_CP_SAT", engineVersion: "0.9.1", status: "OPTIMAL", taskCount: 0 } };
+  }
+  const routes = (input.jobs || []).flatMap((job) => (job.routes || []).map((route) => ({ ...route, job })));
+  const routeByIdentity = new Map(routes.map((route) => [routeIdentity(route.lineNumber ?? route.job.lineNumber, route.mbomProcessId), route]));
+  const resourceById = new Map();
+  for (const route of routes) {
+    for (const resource of route.resources || []) {
+      resourceById.set(String(resource.machineId || resource.vendorId || resource.id), resource);
+    }
+  }
+  const tasks = proposalRows.map((item, recommendationIndex) => {
+    const route = routeByIdentity.get(routeIdentity(item.lineNumber, item.mbomProcessId));
+    if (!route) throw new Error(`Routing recommendation ${item.lineNumber}/${item.mbomProcessId} tidak ditemukan.`);
+    const vendor = String(route.routingMode || "INHOUSE").toUpperCase() === "VENDOR";
+    const calculatedDuration = vendor
+      ? Math.max(number(route.leadDays), 1) * 14 * 60
+      : number(route.minutesPerUnit) * number(item.proposedValue.qty);
+    return {
+      id: `REC-${recommendationIndex + 1}`,
+      recommendationIndex,
+      lineNumber: item.lineNumber,
+      routeSequence: number(route.sequence),
+      durationMinutes: Math.max(Math.ceil(number(item.proposedValue.batchDurationMinutes) || calculatedDuration), 1),
+      eligibleResourceIds: (route.resources || []).map((resource) => String(resource.machineId || resource.vendorId || resource.id)).filter(Boolean),
+      releaseDate: item.proposedValue.materialAvailableDate || item.trace?.materialAvailableDate || input.periodStart,
+      dueDate: item.trace?.fgRequiredDate || route.fgRequiredDate || input.periodEnd,
+      baselineStartDate: item.proposedValue.targetDate,
+      tardinessWeight: 1000000,
+      movementWeight: 1,
+      backwardWeight: 10,
+      required: true,
+    };
+  });
+  const tasksByLine = new Map();
+  for (const task of tasks) {
+    const rows = tasksByLine.get(String(task.lineNumber)) || [];
+    rows.push(task);
+    tasksByLine.set(String(task.lineNumber), rows);
+  }
+  for (const rows of tasksByLine.values()) {
+    rows.sort((left, right) => left.routeSequence - right.routeSequence || left.recommendationIndex - right.recommendationIndex);
+    for (const task of rows) {
+      task.predecessorIds = rows.filter((candidate) => candidate.routeSequence < task.routeSequence).map((candidate) => candidate.id);
+    }
+  }
+  const resourceAvailability = {};
+  for (const [resourceId, resource] of resourceById) {
+    const dated = resource.availableMinutesByDate || {};
+    if (Object.keys(dated).length) {
+      resourceAvailability[resourceId] = Object.entries(dated)
+        .filter(([, minutes]) => number(minutes) > 0)
+        .map(([date, minutes]) => ({ date, startMinute: 0, endMinute: Math.min(Math.ceil(number(minutes)), 14 * 60) }));
+    }
+  }
+  const solver = await solveFiniteSchedule({
+    horizonStart: input.periodStart,
+    horizonEnd: input.periodEnd,
+    dailyWindows: [{ startMinute: 0, endMinute: 14 * 60 }],
+    tasks,
+    resourceAvailability,
+    scheduleDirection: "BACKWARD",
+    options: { maxTimeInSeconds: 60, numSearchWorkers: 2, randomSeed: 1 },
+  });
+  if (!solver.feasible) throw Object.assign(new Error(`OR-Tools tidak menemukan Monthly Plan yang feasible (${solver.status}).`), { solver });
+  const solvedByIndex = new Map(solver.tasks.map((task) => [task.recommendationIndex, task]));
+  const optimizedItems = (recommendation.items || [])
+    .filter((item) => item.itemType !== "OVERLOAD_EXCEPTION")
+    .map((item) => {
+      const recommendationIndex = proposalRows.indexOf(item);
+      if (recommendationIndex < 0) return item;
+      const solved = solvedByIndex.get(recommendationIndex);
+      const resource = solved?.resourceId ? resourceById.get(String(solved.resourceId)) : null;
+      return {
+        ...item,
+        workCenterId: resource?.workCenterId || item.workCenterId,
+        proposedValue: {
+          ...item.proposedValue,
+          targetDate: solved.startDate.toISOString().slice(0, 10),
+          targetMachineId: resource?.machineId || null,
+          vendorId: resource?.vendorId || null,
+          vendorReturnDate: resource?.vendorId ? solved.endDate.toISOString().slice(0, 10) : null,
+          targetRowKey: resource?.matrixRowKey || item.proposedValue.targetRowKey,
+          targetChildKey: resource?.matrixChildKey || item.proposedValue.targetChildKey,
+          overload: false,
+        },
+        trace: {
+          ...item.trace,
+          solverTaskId: solved.id,
+          solverStartAt: solved.startDate,
+          solverEndAt: solved.endDate,
+          solverResourceId: solved.resourceId,
+          solverTardinessMinutes: solved.tardinessMinutes,
+        },
+      };
+    });
+  const fgSolverStatus = new Map();
+  for (const item of optimizedItems) {
+    if (!item.trace?.solverTaskId) continue;
+    const key = String(item.lineNumber ?? item.trace?.fgId ?? item.partCode ?? item.trace.solverTaskId);
+    const current = fgSolverStatus.get(key) || { late: false };
+    current.late ||= number(item.trace.solverTardinessMinutes) > 0;
+    fgSolverStatus.set(key, current);
+  }
+  const solvedSummary = { ...(recommendation.summary || {}), overloadCellCount: 0 };
+  if (fgSolverStatus.size) {
+    solvedSummary.fgLateCount = [...fgSolverStatus.values()].filter((row) => row.late).length;
+    solvedSummary.fgOnTimeCount = fgSolverStatus.size - solvedSummary.fgLateCount;
+  }
+  return {
+    ...recommendation,
+    items: optimizedItems,
+    summary: solvedSummary,
+    solver: {
+      engine: solver.engine,
+      engineVersion: solver.engineVersion,
+      status: solver.status,
+      objectiveValue: solver.objectiveValue,
+      bestObjectiveBound: solver.bestObjectiveBound,
+      wallTimeSeconds: solver.wallTimeSeconds,
+      taskCount: solver.tasks.length,
+    },
+  };
+}
+
 function createRecommendationService(dependencies = {}) {
   const env = dependencies.env || process.env;
   const buildSnapshot = dependencies.buildSnapshot || buildCapacitySnapshot;
@@ -520,7 +652,7 @@ function createRecommendationService(dependencies = {}) {
       },
     });
     try {
-      const result = buildRecommendation(input);
+      const result = await optimizeRecommendationWithCpSat(input, buildRecommendation(input));
       const data = result.items.map((item) =>
         jsonSafe({ ...item, scenarioId: scenario.id }),
       );
@@ -536,6 +668,8 @@ function createRecommendationService(dependencies = {}) {
           data: {
             status: scenarioStatus(result.summary),
             summary: jsonSafe(result.summary),
+            generationSource: "OR_TOOLS_CP_SAT",
+            aiValidationSummary: jsonSafe({ solver: result.solver }),
             errorMessage: null,
           },
         }),
@@ -713,6 +847,7 @@ function createRecommendationService(dependencies = {}) {
 
   return {
     adaptCapacitySnapshot,
+    optimizeRecommendationWithCpSat,
     applyRecommendationScenario,
     discardRecommendationScenario,
     generateRecommendationScenario,
@@ -734,6 +869,7 @@ module.exports = {
   ACTIVE_SCENARIO_STATUSES,
   RULE_VERSION,
   adaptCapacitySnapshot,
+  optimizeRecommendationWithCpSat,
   createRecommendationService,
   httpError,
   recommendationItemToEditorChange,

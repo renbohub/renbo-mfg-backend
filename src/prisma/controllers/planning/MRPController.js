@@ -23,6 +23,10 @@ const {
 } = require("./services/planningRealtimeService");
 const { isSubAssemblyDetail } = require("../../utils/assemblyPolicy");
 const { durationToWorkingDays } = require("../../utils/duration");
+const {
+  normalizeMaterialSupplyType,
+  isCustomerSupplied,
+} = require("../../utils/materialSupply");
 const { effectiveDemandQty: resolvePolicyDemandQty } = require("../../services/planning/demandConsumptionService");
 const { netTimePhasedDemand } = require("../../services/planning/timePhasedNettingService");
 const { procurementSchedule } = require("../../services/planning/procurementSchedulingService");
@@ -40,7 +44,7 @@ const {
   routingMetricsForRequests,
 } = require("../purchasing/PurchaseSuggestionController");
 const { procurementView, customerPeggingView } = require("../../services/planning/mrpPresentationService");
-const { getMpsDeliveryGate, assertOfficialMpsDeliveryGate } = require("../../services/planning/mpsDeliveryFeasibilityService");
+const { getMpsDeliveryGate, assertOfficialMpsDeliveryGate, buildMpsPhaseNettingCoverage } = require("../../services/planning/mpsDeliveryFeasibilityService");
 const {
   canonicalMrpLifecycleStatus,
   mrpCalculationLifecycle,
@@ -1539,7 +1543,7 @@ function normalizeReferencePcs(value) {
     : Math.ceil(qty);
 }
 
-function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
+function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = [], phaseCoverageByTarget = new Map()) {
   const plansByDetail = new Map();
   for (const plan of deliveryPlans) {
     if (!plan?.mpsDetailId || !plan.plannedDate || Number(plan.qtyPlanned || 0) <= 0) continue;
@@ -1564,14 +1568,26 @@ function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
     // internal ending-stock target and must not inflate every customer phase.
     // If PPIC intentionally lowers production below customer demand, reduce
     // the customer phases proportionally; otherwise preserve their exact qty.
-    const customerPlannedTotal = Math.min(phaseTotal, plannedTotal);
-    const customerScale = phaseTotal > 0 ? customerPlannedTotal / phaseTotal : 0;
+    const requestedPhaseProduction = phases.map((phase) => {
+      const coverage = phase.sourceDeliveryTargetId
+        ? phaseCoverageByTarget.get(phase.sourceDeliveryTargetId)
+        : null;
+      if (!coverage) return Number(phase.qtyPlanned || 0);
+      const siblingPhases = phases.filter((row) => row.sourceDeliveryTargetId === phase.sourceDeliveryTargetId);
+      const siblingTotal = siblingPhases.reduce((sum, row) => sum + Number(row.qtyPlanned || 0), 0);
+      return siblingTotal > 0
+        ? Number(coverage.plannedProductionQty || 0) * Number(phase.qtyPlanned || 0) / siblingTotal
+        : 0;
+    });
+    const requestedCustomerTotal = requestedPhaseProduction.reduce((sum, qty) => sum + qty, 0);
+    const customerPlannedTotal = Math.min(requestedCustomerTotal, plannedTotal);
+    const customerScale = requestedCustomerTotal > 0 ? customerPlannedTotal / requestedCustomerTotal : 0;
     let allocatedCustomerQty = 0;
     const customerRows = phases.map((phase, index) => {
       const isLast = index === phases.length - 1;
       const phaseQty = isLast
         ? roundPlanningQty(customerPlannedTotal - allocatedCustomerQty)
-        : roundPlanningQty(Number(phase.qtyPlanned || 0) * customerScale);
+        : roundPlanningQty(Number(requestedPhaseProduction[index] || 0) * customerScale);
       allocatedCustomerQty = roundPlanningQty(allocatedCustomerQty + phaseQty);
       const dueDate = new Date(phase.fgRequiredDate || phase.plannedDate);
       const phaseStart = new Date(dueDate.getTime() - leadTimeMs);
@@ -1597,6 +1613,7 @@ function expandMpsDetailsByDeliveryPhases(details = [], deliveryPlans = []) {
         _customerTargetDate: phase.plannedDate || null,
         _fgRequiredDate: phase.fgRequiredDate || phase.plannedDate || null,
         _fgFinishSplitNumber: phase.fgFinishSplitNumber || null,
+        _deliveryDemandQty: Number(phase.qtyPlanned || 0),
         _isBufferPhase: false,
       };
     });
@@ -1682,7 +1699,7 @@ function demandPeggingForPhase(detail) {
     }));
   });
   if (rows.length) {
-    const targetQty = number(detail.qtyPlanned);
+    const targetQty = number(detail._deliveryDemandQty ?? detail.qtyPlanned);
     const sourceTotal = rows.reduce((sum, row) => sum + number(row.qty), 0);
     let allocated = 0;
     return rows.map((row, index) => {
@@ -1706,7 +1723,7 @@ function demandPeggingForPhase(detail) {
     deliveryPhaseNumber: detail._deliveryPhaseNumber || null,
     phaseLabel: detail._deliveryPhaseNumber ? `Phase ${detail._deliveryPhaseNumber}` : "Delivery phase belum dipetakan",
     fgPartCode: detail.partCode,
-    qty: number(detail.qtyPlanned),
+    qty: number(detail._deliveryDemandQty ?? detail.qtyPlanned),
     referenceSources,
   }];
 }
@@ -2228,9 +2245,15 @@ function applyNextMonthPurchaseBuffer(requirements = [], options = {}) {
         grossRequirement: Number(row.grossRequirement || 0),
         projectedAvailable,
       }));
-      row.plannedOrderQty = row.netRequirement;
+      const customerSupplied = isCustomerSupplied(row.materialSupplyType);
+      row.plannedOrderQty = customerSupplied ? 0 : row.netRequirement;
       row.orderPercent = Number(row.orderPercent ?? 100);
-      row.adjustedOrderQty = row.netRequirement;
+      row.adjustedOrderQty = customerSupplied ? 0 : row.netRequirement;
+      if (customerSupplied) {
+        row.scheduleSource = "CUSTOMER_SUPPLIED_BOM";
+        row.procurementWindow = "CUSTOMER_SUPPLIED";
+        row.notes = `Material disuplai customer ${row.supplyCustomerCode || row.customerCode || "terpilih"}; kebutuhan net ${row.netRequirement} tidak dibuat menjadi Purchase Suggestion / PR / PO.`;
+      }
       projectedAvailable = Math.max(projectedAvailable - Number(row.grossRequirement || 0), 0);
       projectedActual = Math.max(projectedActual - Number(row.grossRequirement || 0), 0);
     }
@@ -2239,7 +2262,7 @@ function applyNextMonthPurchaseBuffer(requirements = [], options = {}) {
   return purchaseRequirements;
 }
 
-function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = [], options = {}) {
+async function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = [], options = {}) {
   const rowsBySupply = new Map();
   for (const row of requirements) {
     const supplyKey = row._planningStockKey || normalizePartCode(row.partCode);
@@ -2273,22 +2296,32 @@ function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = [], op
         availableDate: event.availableDate,
         qty: roundPlanningQty(event.qty),
       }));
-      row.plannedOrderQty = row.netRequirement;
-      row.adjustedOrderQty = row.netRequirement;
+      const customerSupplied = isCustomerSupplied(row.materialSupplyType);
+      row.plannedOrderQty = customerSupplied ? 0 : row.netRequirement;
+      row.adjustedOrderQty = customerSupplied ? 0 : row.netRequirement;
+      row.materialRequiredDate = new Date(row.requiredDate);
+      if (customerSupplied) {
+        row.supplierRequiredArrivalDate = null;
+        row.orderDate = null;
+        row.latestPrDate = null;
+        row.procurementWindow = "CUSTOMER_SUPPLIED";
+        row.scheduleSource = "CUSTOMER_SUPPLIED_BOM";
+        row.notes = `Material disuplai customer ${row.supplyCustomerCode || row.customerCode || "terpilih"}; kebutuhan net ${row.netRequirement} tidak dibuat menjadi Purchase Suggestion / PR / PO.`;
+        continue;
+      }
       const leadTime = Number(options.partnerMap?.[row.partCode]?.leadTimeDays || row.leadTime || 0);
       const planningDecision = options.planningConstraintByTarget?.get(row.deliveryTargetId) || null;
-      const schedule = procurementSchedule({
+      const schedule = await procurementSchedule({
         materialRequiredDate: row.requiredDate,
         supplierLeadTimeDays: leadTime,
         ...procurementPolicyFromDecision(planningDecision, options.procurementPolicy || {}),
         asOf: options.asOf || new Date(),
       });
-      row.materialRequiredDate = new Date(row.requiredDate);
       row.supplierRequiredArrivalDate = schedule.supplierRequiredArrivalDate;
       row.orderDate = schedule.latestPoDate;
       row.latestPrDate = schedule.latestPrDate;
       row.procurementWindow = schedule.procurementWindow;
-      row.scheduleSource = row.scheduleSource || "MRP_BACKWARD_SCHEDULE";
+      row.scheduleSource = row.scheduleSource || "OR_TOOLS_WASM_CP_SAT";
     }
   }
   return requirements;
@@ -2774,9 +2807,9 @@ function consumeSalesOrdersAlreadyRepresentedByMps(demandByPart, mpsDetail, soDe
   if (mpsDetail._isBufferPhase) return { consumedQty: 0, sources: [] };
   const explicitSoNumbers = explicitSalesOrderNumbersForMpsDetail(mpsDetail);
   const phaseTargetQty = mpsDetail._deliveryPhaseId
-    ? (mpsDetail.qtyPlanned == null
+    ? (mpsDetail._deliveryDemandQty == null && mpsDetail.qtyPlanned == null
       ? Number.MAX_SAFE_INTEGER
-      : Math.max(Number(mpsDetail.qtyPlanned || 0), 0))
+      : Math.max(Number(mpsDetail._deliveryDemandQty ?? mpsDetail.qtyPlanned ?? 0), 0))
     : Number.MAX_SAFE_INTEGER;
   return consumeSoDemandForPart(
     demandByPart,
@@ -4762,12 +4795,16 @@ exports.runMRP = async (req, res, next) => {
         // Child production rows hasil MRP ditampilkan di MPS, tetapi bukan demand
         // baru. Hanya row sumber forecast/SO yang boleh diexplode pada run berikutnya.
         const rawSourceMpsDetailsByNumber = new Map();
+        const phaseCoverageByMpsNumber = new Map();
+        for (const document of mpsDocuments) {
+          phaseCoverageByMpsNumber.set(document.mpsNumber, await buildMpsPhaseNettingCoverage(tx, document));
+        }
         const sourceMpsDetails = mpsDocuments.flatMap((document) => {
           const rawDetails = document.details.filter(
             (row) => !String(row.notes || "").startsWith(GENERATED_MPS_CHILD_NOTE_PREFIX),
           );
           rawSourceMpsDetailsByNumber.set(document.mpsNumber, rawDetails);
-          return expandMpsDetailsByDeliveryPhases(rawDetails, document.deliveryPlans || [])
+          return expandMpsDetailsByDeliveryPhases(rawDetails, document.deliveryPlans || [], phaseCoverageByMpsNumber.get(document.mpsNumber))
             .map((row) => ({ ...row, _sourceMpsNumber: document.mpsNumber }));
         })
           .filter((row) => !isMPlusOnePreview || includeMPlusTwoBuffer || !row._isBufferPhase)
@@ -5039,7 +5076,7 @@ exports.runMRP = async (req, res, next) => {
           const routingDecision = applyDecisionToRoutingMetric(baseRoutingMetric, planningDecision);
           const customerTargetDate = mpsDetail._customerTargetDate || mpsDetail.customerTargetDate || mpsDetail.endDate;
           const fgRequiredDate = mpsDetail._fgRequiredDate || mpsDetail.fgRequiredDate || mpsDetail.endDate;
-          const productionDates = resolveProductionRequirementDates({
+          const productionDates = await resolveProductionRequirementDates({
             fgRequiredDate,
             customerTargetDate,
             routingMetric: routingDecision.metric || baseRoutingMetric,
@@ -5096,6 +5133,7 @@ exports.runMRP = async (req, res, next) => {
             orderType: "Production",
             leadTime: leadTimeDays,
             orderDate,
+            scheduleSource: productionDates.solver?.engine || "OR_TOOLS_WASM_CP_SAT",
             notes: mpsDetail._isBufferPhase
               ? "MPS internal buffer stock"
               : mpsDetail._deliveryPhaseId
@@ -5469,7 +5507,7 @@ exports.runMRP = async (req, res, next) => {
                 poDelayDays: isSimulation ? Number(scenarioAssumptions?.poDelayDays || 0) : 0,
               },
             );
-        applyTimePhasedPurchaseNetting(purchaseRequirements, purchasingSupplyTimeline, {
+        await applyTimePhasedPurchaseNetting(purchaseRequirements, purchasingSupplyTimeline, {
           initialStockAvailableMap: purchaseInitialStockAvailableMap,
           partnerMap,
           planningConstraintByTarget,
@@ -5477,6 +5515,7 @@ exports.runMRP = async (req, res, next) => {
           procurementPolicy: scenarioAssumptions?.procurementPolicy || {},
         });
         for (const requirement of purchaseRequirements) {
+          if (isCustomerSupplied(requirement.materialSupplyType)) continue;
           const supplierLeadTime = Number(partnerMap[requirement.partCode]?.leadTimeDays || 0);
           if (supplierLeadTime <= 0) continue;
           requirement.leadTime = supplierLeadTime;
@@ -5995,6 +6034,9 @@ async function explodeMBOM(
             where: { isDeleted: false },
             select: { routingMode: true, sequence: true, vendor: { select: { vendorCode: true, leadTimeDays: true } } },
           },
+          supplyCustomer: {
+            select: { customerCode: true, customerName: true },
+          },
         },
         orderBy: [{ levelComponent: "asc" }, { createdAt: "asc" }],
       },
@@ -6220,7 +6262,12 @@ async function explodeMBOM(
     const orderType = ["inHouse", "Vendor"].includes(detail.category)
       ? "Production"
       : "Purchase";
-    const plannedOrderQty = orderType === "Production" && !isSubAssembly
+    const materialSupplyType = normalizeMaterialSupplyType(detail.materialSupplyType);
+    const customerSuppliedMaterial = orderType === "Purchase"
+      && isCustomerSupplied(materialSupplyType);
+    const plannedOrderQty = customerSuppliedMaterial
+      ? 0
+      : orderType === "Production" && !isSubAssembly
       ? 0
       : netRequirement;
     // Firm MPP/MO menutup planned supply parent, tetapi produksi tersebut tetap
@@ -6255,10 +6302,19 @@ async function explodeMBOM(
     projectedMppSupplyMap[partCode] = Math.max(mppAvailableBefore - mppDrivenQty, 0);
     projectedMoSupplyMap[partCode] = Math.max(moAvailableBefore - moDrivenQty, 0);
 
-    // Calculate lead time and order date
+    // Calculate lead time and order date. Production dependencies use the
+    // same CP-SAT backward calendar as the root FG instead of subtracting
+    // calendar days locally; Purchase rows are finalized by procurementSchedule.
     const leadTime = durationToWorkingDays(detail.leadTime, detail.leadTimeUnit);
-    const orderDate = new Date(requiredDate);
-    orderDate.setDate(orderDate.getDate() - leadTime);
+    const productionSchedule = orderType === "Production"
+      ? await resolveProductionRequirementDates({
+          fgRequiredDate: requiredDate,
+          customerTargetDate: options.targetDeliveryDate || requiredDate,
+          routingMetric: { productionLeadTimeDays: leadTime, workingHoursPerDay: 8 },
+        })
+      : null;
+    const orderDate = productionSchedule?.productionLatestStartDate || new Date(requiredDate);
+    if (!productionSchedule) orderDate.setDate(orderDate.getDate() - leadTime);
     const vendorLeadTimeDays = (detail.mbomProcesses || [])
       .filter((route) => String(route.routingMode || "").toUpperCase() === "VENDOR"
         || (String(detail.category || "").toUpperCase() === "VENDOR" && Boolean(route.vendorId || route.vendor)))
@@ -6306,6 +6362,10 @@ async function explodeMBOM(
       mbomDetailId: detail.id,
       partCode: detail.part.partCode,
       partId: detail.part.id,
+      materialSupplyType,
+      supplyCustomerCode: customerSuppliedMaterial
+        ? detail.supplyCustomer?.customerCode || options.customerCode || null
+        : null,
       requirementType: "Dependent",
       sourceType: "MBOM",
       sourceNumber: mbomHeader.noReg,
@@ -6316,9 +6376,9 @@ async function explodeMBOM(
       fgPartCode: options.fgPartCode || null,
       targetDeliveryDate: options.targetDeliveryDate || null,
       parentRequiredDate: options.parentRequiredDate || requiredDate,
-      materialRequiredDate: orderType === "Purchase" ? requiredDate : orderDate,
-      productionRequiredDate: orderType === "Production" ? requiredDate : null,
-      supplierRequiredArrivalDate: orderType === "Purchase" ? requiredDate : null,
+      materialRequiredDate: orderType === "Purchase" ? requiredDate : productionSchedule?.materialRequiredDate || orderDate,
+      productionRequiredDate: orderType === "Production" ? productionSchedule?.productionLatestStartDate || orderDate : null,
+      supplierRequiredArrivalDate: orderType === "Purchase" && !customerSuppliedMaterial ? requiredDate : null,
       vendorSendDate,
       vendorReturnDate,
       priorityScore: options.priorityScore ?? null,
@@ -6347,7 +6407,14 @@ async function explodeMBOM(
       mpsDetailId: options.mpsDetailId || null,
       leadTime,
       orderDate,
-      notes: targetedReservedUsed > 0
+      scheduleSource: customerSuppliedMaterial
+        ? "CUSTOMER_SUPPLIED_BOM"
+        : orderType === "Production"
+        ? productionSchedule?.solver?.engine || "OR_TOOLS_WASM_CP_SAT"
+        : null,
+      notes: customerSuppliedMaterial
+        ? `Material disuplai customer ${detail.supplyCustomer?.customerCode || options.customerCode || "terpilih"}; kebutuhan tetap dinetting dan tidak dibuat menjadi Purchase Suggestion / PR / PO.`
+        : targetedReservedUsed > 0
         ? `Manual stock reservation ${targetedReservedUsed} untuk ${targetedReservationKey?.split("|").pop() || options.fgPartCode || "part"}`
         : null,
       // Seluruh turunan BOM mewarisi buffer master parent/FG. Buffer child
@@ -6629,7 +6696,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
           isDeleted: false,
           orderType: "Purchase",
         },
-        select: { id: true, rootRequirementId: true, partCode: true, bufferBaseQty: true, effectiveDemandQty: true, forecastQty: true, soConsumedQty: true, bufferQty: true },
+        select: { id: true, rootRequirementId: true, partCode: true, materialSupplyType: true, bufferBaseQty: true, effectiveDemandQty: true, forecastQty: true, soConsumedQty: true, bufferQty: true },
       });
       if (selected.length !== requirementIds.length) {
         throw Object.assign(new Error("Sebagian requirement purchase tidak ditemukan"), { status: 404 });
@@ -6639,7 +6706,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
       const targets = !isOrderPercentUpdate && bufferScope === "PARENT_FG" && rootRequirementIds.length
         ? await tx.mRPRequirement.findMany({
           where: { runNumber, isDeleted: false, orderType: "Purchase", rootRequirementId: { in: rootRequirementIds } },
-          select: { id: true, partCode: true, bufferBaseQty: true, effectiveDemandQty: true, forecastQty: true, soConsumedQty: true, bufferQty: true },
+          select: { id: true, partCode: true, materialSupplyType: true, bufferBaseQty: true, effectiveDemandQty: true, forecastQty: true, soConsumedQty: true, bufferQty: true },
         })
         : selected;
 
@@ -6688,7 +6755,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
           part: {
             include: { partBases: { select: { baseOn: true, grossWeight: true } } },
           },
-          mbomDetail: { select: { uomCode: true, grossWeight: true, category: true } },
+          mbomDetail: { select: { uomCode: true, grossWeight: true, category: true, materialSupplyType: true } },
         },
         orderBy: [{ requiredDate: "asc" }, { treePath: "asc" }],
       });
@@ -6726,20 +6793,26 @@ exports.updateRequirementBuffer = async (req, res, next) => {
         for (const row of requirements.filter((item) => normalizePartCode(item.partCode) === partCode)) {
           const grossRequirement = Number(row.grossRequirement || 0);
           const netRequirement = roundPlanningQty(Math.max(grossRequirement - projectedAvailable, 0));
+          const customerSupplied = isCustomerSupplied(row.materialSupplyType || row.mbomDetail?.materialSupplyType);
+          const purchaseOrderQty = customerSupplied ? 0 : netRequirement;
           await tx.mRPRequirement.update({
             where: { id: row.id },
             data: {
               onHandQty: projectedActual,
               allocatedQty,
               netRequirement,
-              plannedOrderQty: netRequirement,
-              adjustedOrderQty: netRequirement,
+              plannedOrderQty: purchaseOrderQty,
+              adjustedOrderQty: purchaseOrderQty,
+              ...(customerSupplied ? {
+                procurementWindow: "CUSTOMER_SUPPLIED",
+                scheduleSource: "CUSTOMER_SUPPLIED_BOM",
+              } : {}),
             },
           });
           projectedAvailable = Math.max(projectedAvailable - grossRequirement, 0);
           projectedActual = Math.max(projectedActual - grossRequirement, 0);
           row.netRequirement = netRequirement;
-          row.plannedOrderQty = netRequirement;
+          row.plannedOrderQty = purchaseOrderQty;
         }
       }
 

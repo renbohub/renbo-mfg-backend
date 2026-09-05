@@ -10,8 +10,6 @@ const {
   purchaseSuggestionRoutingMetric,
   normalizeLeadTimeControls,
   resolveSupplierItem,
-  addWorkingHours,
-  subtractWorkingHours,
   applyVendorProcessAdjustments,
   applyVendorAdjustmentsToProcessSteps,
   vendorProcessKey,
@@ -26,6 +24,7 @@ const {
   attachDraftSalesOrders,
   capacityHorizonMonths,
   normalizeFgFinishSplits,
+  resolveReviewFgFinishInput,
   procurementWindow,
   planningAnchorMonth,
   mpsWindowMonths,
@@ -93,17 +92,16 @@ test("supplier master lead-time update cascades only inherited Supplier Item val
   assert.equal(itemUpdate.data.leadTimeDays, 5);
 });
 
-test("FG risk preserves production precision in working hours across weekends", () => {
-  assert.equal(addWorkingHours(day("2026-08-14"), 20, { hoursPerDay: 16 }).toISOString(), "2026-08-17T04:00:00.000Z");
-  assert.equal(subtractWorkingHours(day("2026-08-17"), 6, { hoursPerDay: 16 }).toISOString(), "2026-08-14T10:00:00.000Z");
-  const result = calculateLeadTimeFeasibility({
+test("FG risk is solved on the central working-time axis", async () => {
+  const result = await calculateLeadTimeFeasibility({
     requestedDeliveryDate: day("2026-08-28"), today: day("2026-08-11"), dispatchDays: 0,
     sourceType: "FORECAST", capacityShiftsPerDay: 2, capacityHoursPerShift: 8,
     productionLeadTimeBreakdown: { productionLeadTimeDays: 1, exactProductionLeadTimeDays: 0.5, capacityAdjusted: true, capacityShiftsPerDay: 2 },
     supplierLeadTimeDays: 0, prApprovalDays: 0, poProcessingDays: 0, receivingQcDays: 0, safetyLeadTimeDays: 0,
   });
   assert.equal(result.scheduledProductionLeadTimeHours, 8);
-  assert.equal(result.productionLatestStartDate.toISOString(), "2026-08-27T08:00:00.000Z");
+  assert.equal(result.solver.engine, "OR_TOOLS_WASM_CP_SAT");
+  assert(result.productionLatestStartDate < result.fgRequiredDate);
 });
 
 test("forecast 10,000 keeps three delivery phases", () => {
@@ -227,6 +225,49 @@ test("FG finish split total must equal effective demand", () => {
   assert.throws(() => normalizeFgFinishSplits([{ targetFinishDate: "2026-08-20", qty: 90 }], { demandQty: 100, fallbackDate: day("2026-08-20"), deliveryDate: day("2026-08-31") }), /harus sama/);
 });
 
+test("FG finish split 2 uses its own customer delivery target", () => {
+  const splits = normalizeFgFinishSplits([
+    { targetFinishDate: "2026-08-25", qty: 40 },
+    { targetFinishDate: "2026-08-31", qty: 60 },
+  ], { demandQty: 100, deliveryDate: day("2026-08-25"), deliveryDates: [day("2026-08-25"), day("2026-08-31")] });
+  assert.equal(splits[1].targetFinishDate.toISOString(), day("2026-08-31").toISOString());
+  assert.throws(() => normalizeFgFinishSplits([
+    { targetFinishDate: "2026-08-25", qty: 40 },
+    { targetFinishDate: "2026-09-01", qty: 60 },
+  ], { demandQty: 100, deliveryDate: day("2026-08-25"), deliveryDates: [day("2026-08-25"), day("2026-08-31")] }), /split 2 tidak boleh melewati/);
+});
+
+test("Periksa Delivery preserves configured FG splits and caps a late feasibility fallback", () => {
+  const configured = [{ phaseNumber: 1, targetFinishDate: "2026-08-29", qty: 40 }, { phaseNumber: 2, targetFinishDate: "2026-08-31", qty: 60 }];
+  const preserved = resolveReviewFgFinishInput({}, { fgRequiredDate: "2026-08-29", fgFinishSplits: configured }, "2026-09-03", "2026-08-31");
+  assert.equal(preserved.splits, configured);
+  assert.equal(preserved.fallbackDate.toISOString(), day("2026-08-29").toISOString());
+
+  const fallback = resolveReviewFgFinishInput({}, {}, "2026-09-03", "2026-08-31");
+  assert.equal(fallback.fallbackDate.toISOString(), day("2026-08-31").toISOString());
+});
+
+test("MPS workbench caps legacy FG finish split 2 at customer delivery", () => {
+  const { demandPhases, fgFinishNotAfterDelivery } = require("../src/prisma/services/planning/mpsWorkbenchService");
+  const phases = demandPhases({
+    id: "MPS-DETAIL-1",
+    demandSources: [{
+      id: "SOURCE-1", sourceType: "SALES_ORDER", sourceNumber: "SO-1", qty: 100,
+      sourcePegging: [{
+        deliveryTargetId: "TARGET-1", targetDeliveryDate: "2026-08-31", qty: 100,
+        fgFinishSplits: [
+          { phaseNumber: 1, targetFinishDate: "2026-08-25", qty: 40 },
+          { phaseNumber: 2, targetFinishDate: "2026-09-02", qty: 60 },
+        ],
+      }],
+    }],
+  });
+  assert.equal(phases[1].fgRequiredDate, "2026-08-31");
+  assert.equal(phases[1].targetDeliveryDate, "2026-08-31");
+
+  assert.equal(fgFinishNotAfterDelivery("2026-09-02", "2026-08-31"), "2026-08-31");
+});
+
 test("FG finish splits propagate through MPS, MRP, and capacity", () => {
   const monthly = fs.readFileSync(path.join(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
   const mrp = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/planning/MRPController.js"), "utf8");
@@ -258,8 +299,8 @@ test("overdue SO preserves due date and becomes P0/P1", () => {
   assert.equal(result.targetDeliveryDate.toISOString(), day("2026-08-01").toISOString());
 });
 
-test("supplier lead time can make delivery not feasible", () => {
-  const timeline = calculateLeadTimeFeasibility({
+test("supplier lead time can make delivery not feasible", async () => {
+  const timeline = await calculateLeadTimeFeasibility({
     requestedDeliveryDate: day("2026-08-12"),
     today: day("2026-08-09"),
     dispatchDays: 1,
@@ -270,7 +311,7 @@ test("supplier lead time can make delivery not feasible", () => {
   assert.equal(classifyFeasibility({ timeline }).status, "NOT_FEASIBLE");
 });
 
-test("Forecast feasibility calculates an earlier delivery using two-shift capacity", () => {
+test("Forecast feasibility calculates an earlier delivery using two-shift capacity", async () => {
   const common = {
     requestedDeliveryDate: day("2026-08-31"), today: day("2026-08-10"), dispatchDays: 1,
     supplierLeadTimeDays: 0, prApprovalDays: 0, poProcessingDays: 0, transitDays: 0, receivingQcDays: 0, safetyLeadTimeDays: 0,
@@ -279,8 +320,8 @@ test("Forecast feasibility calculates an earlier delivery using two-shift capaci
       processPath: [{ mode: "INHOUSE", elapsedDays: 4, rawElapsedDays: 4 }],
     },
   };
-  const oneShift = calculateLeadTimeFeasibility({ ...common, sourceType: "SALES_ORDER", capacityShiftsPerDay: 1 });
-  const twoShift = calculateLeadTimeFeasibility({ ...common, sourceType: "FORECAST" });
+  const oneShift = await calculateLeadTimeFeasibility({ ...common, sourceType: "SALES_ORDER", capacityShiftsPerDay: 1 });
+  const twoShift = await calculateLeadTimeFeasibility({ ...common, sourceType: "FORECAST" });
   assert.equal(twoShift.capacityAssumption.shiftsPerDay, 2);
   assert.equal(twoShift.productionLeadTimeBreakdown.baselineProductionLeadTimeDays, 4);
   assert.equal(twoShift.productionLeadTimeBreakdown.productionLeadTimeDays, 2);
@@ -326,13 +367,13 @@ test("Forecast warning traces multi-level exploded BOM without losing quantities
   const headers = {
     FG: { id: "BOM-FG", noReg: "MBOM-FG", details: [
       { id: "D-WIP", parentDetailId: null, levelComponent: 0, partId: "WIP", category: "inHouse", qty: 2, grossWeight: 0, uomCode: "PCS", part: { id: "WIP", partCode: "WIP-1", partName: "WIP", supplierItems: [] }, mbomProcesses: [{ sequence: 10, cycleTime: 2880, routingMode: "INHOUSE", process: { processCode: "PRESS" }, vendor: null }] },
-      { id: "D-MAT1", parentDetailId: null, levelComponent: 0, partId: "MAT1", category: "Purchase", qty: 0, grossWeight: 3, uomCode: "KG", part: { id: "MAT1", partCode: "MAT-1", partName: "Material 1", supplierItems: [supplierItem] }, mbomProcesses: [] },
+      { id: "D-MAT1", parentDetailId: null, levelComponent: 0, partId: "MAT1", category: "Purchase", qty: 3, grossWeight: 0, uomCode: "KG", part: { id: "MAT1", partCode: "MAT-1", partName: "Material 1", supplierItems: [supplierItem] }, mbomProcesses: [] },
     ] },
     WIP: { id: "BOM-WIP", noReg: "MBOM-WIP", details: [
       { id: "D-MAT2", parentDetailId: null, levelComponent: 0, partId: "MAT2", category: "Purchase", qty: 4, grossWeight: 0, uomCode: "PCS", part: { id: "MAT2", partCode: "MAT-2", partName: "Material 2", supplierItems: [supplierItem] }, mbomProcesses: [] },
     ] },
   };
-  const prisma = { mBOMHeader: { findFirst: async ({ where }) => headers[where.partId] || null } };
+  const prisma = { mBOMHeader: { findMany: async ({ where }) => headers[where.partId] ? [headers[where.partId]] : [] } };
   const result = await explodeDemandBom(prisma, { partId: "FG", partCode: "FG-1", quantity: 5 });
   assert.equal(result.trace.length, 3);
   assert.equal(result.componentRequirements.find((row) => row.partCode === "MAT-1").qty, 15);
@@ -352,15 +393,15 @@ test("Forecast feasibility reuses Purchase Suggestion critical path and procurem
   assert.equal(metric.calculationMethod, "BOM_CRITICAL_PATH_ROUND_EACH_PROCESS_V4");
   assert.equal(metric.exactProductionLeadTimeDays, 0.125);
   assert.equal(metric.productionLeadTimeDays, 1, "each process must round upward like Purchase Suggestion");
-  const timeline = calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-28"), today: day("2026-08-10"), supplierLeadTimeDays: 7, productionLeadTimeBreakdown: metric });
-  const purchaseDue = procurementSchedule({ materialRequiredDate: timeline.materialRequiredDate, supplierLeadTimeDays: 7, asOf: day("2026-08-10") });
+  const timeline = await calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-28"), today: day("2026-08-10"), supplierLeadTimeDays: 7, productionLeadTimeBreakdown: metric });
+  const purchaseDue = await procurementSchedule({ materialRequiredDate: timeline.materialRequiredDate, supplierLeadTimeDays: 7, asOf: day("2026-08-10") });
   assert.equal(timeline.latestPrDate.toISOString(), purchaseDue.latestPrDate.toISOString());
   assert.equal(timeline.purchasingSchedule.totalLeadTimeDays, 11, "PR + PO + Supplier + QC + Safety must match Purchase Suggestion");
 });
 
-test("vendor process moves production latest start backward", () => {
-  const withoutVendor = calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-30"), today: day("2026-08-01"), processSteps: [{ sequence: 1, durationDays: 2 }] });
-  const withVendor = calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-30"), today: day("2026-08-01"), processSteps: [{ sequence: 1, durationDays: 2 }, { sequence: 2, durationDays: 4, routingMode: "VENDOR" }] });
+test("vendor process moves production latest start backward", async () => {
+  const withoutVendor = await calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-30"), today: day("2026-08-01"), processSteps: [{ sequence: 1, durationDays: 2 }] });
+  const withVendor = await calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-30"), today: day("2026-08-01"), processSteps: [{ sequence: 1, durationDays: 2 }, { sequence: 2, durationDays: 4, routingMode: "VENDOR" }] });
   assert(withVendor.productionLatestStartDate < withoutVendor.productionLatestStartDate);
   assert(withVendor.vendorSendDate && withVendor.vendorReturnDate);
 });
@@ -387,12 +428,12 @@ test("vendor process overlay cannot remove dependency and needs adjustment reaso
   assert.throws(() => applyVendorProcessAdjustments(breakdown, [{ key, adjustedDurationHours: 16, reason: "" }], { hoursPerShift: 8, shiftsPerDay: 1 }), /Alasan adjustment vendor/);
 });
 
-test("vendor timeline send and return use the reviewed planning duration", () => {
+test("vendor timeline send and return use the reviewed planning duration", async () => {
   const vendorProcesses = [{ key: "K1", processCode: "PAINT", vendorCode: "V001", sequence: 10, masterDurationHours: 40, adjustedDurationHours: 16, reason: "Express slot" }];
   const processSteps = applyVendorAdjustmentsToProcessSteps([{ sequence: 10, processCode: "PAINT", routingMode: "VENDOR", vendorCode: "V001", durationDays: 5 }], vendorProcesses, { hoursPerShift: 8, shiftsPerDay: 1 });
   assert.equal(processSteps[0].durationDays, 2);
-  const timeline = calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-31"), today: day("2026-08-01"), dispatchDays: 1, processSteps });
-  const baseline = calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-31"), today: day("2026-08-01"), dispatchDays: 1, processSteps: [{ ...processSteps[0], durationDays: 5 }] });
+  const timeline = await calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-31"), today: day("2026-08-01"), dispatchDays: 1, processSteps });
+  const baseline = await calculateLeadTimeFeasibility({ requestedDeliveryDate: day("2026-08-31"), today: day("2026-08-01"), dispatchDays: 1, processSteps: [{ ...processSteps[0], durationDays: 5 }] });
   assert(timeline.vendorSendDate > baseline.vendorSendDate, "shorter reviewed duration must move vendor send date closer to return");
   assert.equal(timeline.processTimeline[0].durationHours, 16);
 });

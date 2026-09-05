@@ -1,5 +1,7 @@
 "use strict";
 
+const { solveBackwardMilestones, solveFiniteSchedule } = require("./solver/planningSolverService");
+
 const EPSILON = 0.000001;
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 6) => {
@@ -35,15 +37,6 @@ function isWorkingDay(value, options = {}) {
   return mode === "ALL_DAYS" || (date.getUTCDay() !== 0 && date.getUTCDay() !== 6);
 }
 
-function moveToWorkingDay(value, direction, options = {}, includeCurrent = true) {
-  const cursor = utcDate(value);
-  if (!cursor) return null;
-  if (includeCurrent && isWorkingDay(cursor, options)) return cursor;
-  do cursor.setUTCDate(cursor.getUTCDate() + (direction >= 0 ? 1 : -1));
-  while (!isWorkingDay(cursor, options));
-  return cursor;
-}
-
 function addWorkingDays(value, amount, options = {}) {
   let cursor = utcDate(value);
   if (!cursor) return null;
@@ -69,45 +62,48 @@ function resolvedCalendarId(profile = {}) {
     || (String(profile.resourceType || "INTERNAL").toUpperCase() === "OUTSOURCE" ? "VENDOR" : "FACTORY");
 }
 
-function backwardOffsetPhase(input = {}) {
+async function backwardOffsetPhase(input = {}) {
   const requiredDate = utcDate(input.requiredDate);
   if (!requiredDate) throw new Error("Required Date RCCP tidak valid.");
   const profiles = [...(input.profiles || [])]
     .filter((profile) => input.includeVendorLeadTime !== false || String(profile.resourceType || "INTERNAL").toUpperCase() !== "OUTSOURCE")
-    .sort((left, right) => number(right.sequence) - number(left.sequence));
-  const details = [];
-  let cursor = requiredDate;
-  let upstreamMayFinishOnCursor = false;
+    .sort((left, right) => number(left.sequence) - number(right.sequence));
+  if (!profiles.length) return { requiredDate, earliestStartDate: requiredDate, details: [], solver: { engine: "OR_TOOLS_WASM_CP_SAT", status: "OPTIMAL" } };
+  const hoursPerDay = 14;
+  const calendar = {};
   for (const profile of profiles) {
-    const calendar = {
-      calendarMode: profile.calendarMode,
-      shiftsPerDay: profile.shiftsPerDay,
-      useWorkingCalendar: input.useWorkingCalendar !== false,
-      overrides: input.overridesByMachine?.get(profile.machineId) || [],
-    };
-    // A short downstream internal operation (for example the 2-hour final
-    // packing phase) can start after its upstream operation finishes on the
-    // same working day. Keep the default one-day handoff for full-day and
-    // outsourced operations.
-    const finish = moveToWorkingDay(cursor, -1, calendar, upstreamMayFinishOnCursor);
-    const leadDays = Math.max(leadTimeWorkingDays(profile), 1);
-    const start = addWorkingDays(finish, -(leadDays - 1), calendar);
-    details.unshift({
+    for (const override of input.overridesByMachine?.get(profile.machineId) || []) {
+      if (String(override.dayStatus || "WORKING").toUpperCase() === "HOLIDAY" || number(override.shiftsPerDay) <= 0) calendar[dateKey(override.scheduleDate)] = "HOLIDAY";
+    }
+  }
+  const solved = await solveBackwardMilestones({
+    targetDate: requiredDate,
+    hoursPerDay,
+    calendar: input.useWorkingCalendar === false ? {} : calendar,
+    dailyWindows: [{ startMinute: 0, endMinute: hoursPerDay * 60 }],
+    tasks: profiles.map((profile) => {
+      const rawUnit = String(profile.leadTimeUnit || "WORKING_DAY").toUpperCase();
+      const unit = rawUnit.startsWith("MINUTE") ? "MINUTE" : rawUnit.startsWith("HOUR") ? "HOUR" : "DAY";
+      return { id: `RCCP:${profile.id || profile.resourceCode}:${profile.sequence}`, duration: Math.max(number(profile.leadTimeValue), 1), unit };
+    }),
+  });
+  const details = profiles.map((profile, index) => {
+    const timing = solved.tasks[index];
+    return {
       profile,
       sequence: number(profile.sequence),
       resourceCode: profile.resourceCode,
       resourceName: profile.resourceName || profile.resourceCode,
       resourceType: String(profile.resourceType || "INTERNAL").toUpperCase(),
       requiredDate,
-      calculatedStartDate: start,
-      calculatedFinishDate: finish,
-      leadTimeDays: leadDays,
+      calculatedStartDate: timing.startDate,
+      calculatedFinishDate: timing.endDate,
+      leadTimeDays: leadTimeWorkingDays(profile),
       calendarId: resolvedCalendarId(profile),
-    });
-    cursor = start;
-    upstreamMayFinishOnCursor = profile.allowUpstreamSameDay === true;
-  }
-  return { requiredDate, earliestStartDate: details[0]?.calculatedStartDate || requiredDate, details };
+      solverTaskId: timing.id,
+    };
+  });
+  return { requiredDate, earliestStartDate: details[0]?.calculatedStartDate || requiredDate, details, solver: solved };
 }
 
 function weekStart(value) {
@@ -176,10 +172,11 @@ function capacityOffsetStatus(hasPreviousMonthLoad, previousStatuses = []) {
   return "PREVIOUS_MONTH_REQUIRED";
 }
 
-function findEarlierFeasibleStart(input = {}) {
+async function findEarlierFeasibleStart(input = {}) {
   const originalStart = utcDate(input.originalStartDate);
   const searchWindow = Math.max(Math.trunc(number(input.searchWindowDays)), 0);
   const requirement = number(input.currentRequirement);
+  const candidates = [];
   for (let offset = 1; offset <= searchWindow; offset += 1) {
     const candidate = addWorkingDays(originalStart, -offset, input.calendar || {});
     const capacity = input.capacityAt(candidate) || {};
@@ -187,10 +184,28 @@ function findEarlierFeasibleStart(input = {}) {
     const total = number(capacity.existingLoad) + requirement;
     const loadPercentage = available > EPSILON ? round(total / available * 100, 4) : 0;
     if (available > EPSILON && loadPercentage <= number(input.overloadThreshold ?? 100)) {
-      return { recommendedStartDate: candidate, recommendedLoadPercentage: loadPercentage, existingLoad: number(capacity.existingLoad), availableCapacity: available };
+      candidates.push({ candidate, loadPercentage, existingLoad: number(capacity.existingLoad), availableCapacity: available });
     }
   }
-  return null;
+  if (!candidates.length) return null;
+  const earliest = candidates.reduce((min, row) => row.candidate < min ? row.candidate : min, candidates[0].candidate);
+  const calendar = {};
+  for (let cursor = new Date(earliest); cursor <= originalStart; cursor.setUTCDate(cursor.getUTCDate() + 1)) calendar[dateKey(cursor)] = "WORKING";
+  const resources = Object.fromEntries(candidates.map((row, index) => [`RCCP-CANDIDATE-${index}`, [{ date: dateKey(row.candidate), startMinute: 0, endMinute: 1 }]]));
+  const solved = await solveFiniteSchedule({
+    horizonStart: earliest,
+    horizonEnd: originalStart,
+    calendar,
+    dailyWindows: [{ startMinute: 0, endMinute: 1 }],
+    resourceAvailability: resources,
+    scheduleDirection: "BACKWARD",
+    tasks: [{ id: "RCCP-EARLIER-START", durationMinutes: 1, eligibleResourceIds: Object.keys(resources), dueDate: originalStart, required: true, tardinessWeight: 1000000 }],
+    options: { maxTimeInSeconds: 10, numSearchWorkers: 2, randomSeed: 1 },
+  });
+  if (!solved.feasible || !solved.tasks[0]?.resourceId) return null;
+  const index = Number(String(solved.tasks[0].resourceId).split("-").at(-1));
+  const selected = candidates[index];
+  return { recommendedStartDate: selected.candidate, recommendedLoadPercentage: selected.loadPercentage, existingLoad: selected.existingLoad, availableCapacity: selected.availableCapacity, solver: { engine: solved.engine, status: solved.status } };
 }
 
 module.exports = {

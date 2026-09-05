@@ -3,6 +3,7 @@
 const { assessDemandFeasibility } = require("./demandFeasibilityService");
 const { buildCapacitySnapshot } = require("./capacityPlanningService");
 const { isOpenForecast } = require("./forecastStatusPolicy");
+const { normalizeMaterialSupplyType, isCustomerSupplied } = require("../../utils/materialSupply");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const asDate = (value) => { const date = value instanceof Date ? new Date(value) : new Date(value); return Number.isNaN(date.getTime()) ? null : date; };
@@ -82,18 +83,36 @@ function normalizeFgFinishSplits(input, options = {}) {
   const demandQty = Math.max(number(options.demandQty), 0);
   const fallbackDate = asDate(options.fallbackDate || options.deliveryDate);
   const deliveryDate = asDate(options.deliveryDate);
+  const deliveryDates = Array.isArray(options.deliveryDates) ? options.deliveryDates.map(asDate) : [];
   const raw = Array.isArray(input) && input.length ? input : [{ targetFinishDate: fallbackDate, qty: demandQty }];
   const splits = raw.map((row, index) => {
     const targetFinishDate = asDate(row.targetFinishDate || row.fgRequiredDate || row.date);
+    const splitDeliveryDate = asDate(row.targetDeliveryDate) || deliveryDates[index] || deliveryDate;
     const qty = number(row.qty);
     if (!targetFinishDate || qty <= 0) throw Object.assign(new Error(`FG finish split ${index + 1} wajib memiliki tanggal valid dan qty lebih dari 0.`), { statusCode: 400 });
-    if (deliveryDate && targetFinishDate > deliveryDate) throw Object.assign(new Error(`FG finish split ${index + 1} tidak boleh melewati target delivery customer.`), { statusCode: 400 });
+    if (splitDeliveryDate && targetFinishDate > splitDeliveryDate) throw Object.assign(new Error(`FG finish split ${index + 1} tidak boleh melewati target delivery customer.`), { statusCode: 400 });
     return { phaseNumber: index + 1, targetFinishDate, qty, notes: String(row.notes || "").trim() || null };
   }).sort((left, right) => left.targetFinishDate - right.targetFinishDate || left.phaseNumber - right.phaseNumber)
     .map((row, index) => ({ ...row, phaseNumber: index + 1 }));
   const total = splits.reduce((sum, row) => sum + row.qty, 0);
   if (Math.abs(total - demandQty) > 0.005) throw Object.assign(new Error(`Total qty target finish FG (${total}) harus sama dengan effective demand (${demandQty}).`), { statusCode: 400 });
   return splits;
+}
+
+function resolveReviewFgFinishInput(input = {}, demandRow = {}, feasibilityFgRequiredDate, effectiveTargetDate) {
+  const deliveryDate = asDate(effectiveTargetDate);
+  const requestedFallback = asDate(input.fgRequiredDate)
+    || asDate(demandRow.fgRequiredDate)
+    || asDate(feasibilityFgRequiredDate)
+    || deliveryDate;
+  const fallbackDate = deliveryDate && requestedFallback > deliveryDate
+    ? deliveryDate
+    : requestedFallback;
+  const hasExplicitSplits = Object.prototype.hasOwnProperty.call(input, "fgFinishSplits");
+  return {
+    splits: hasExplicitSplits ? input.fgFinishSplits : demandRow.fgFinishSplits,
+    fallbackDate,
+  };
 }
 
 // Forecast delivery phases are the presentation anchor. Firm SO quantities are
@@ -276,8 +295,9 @@ function consolidateRequirements(rows = []) {
   const grouped = new Map();
   for (const row of rows) {
     const requiredDate = asDate(row.requiredDate);
-    const key = `${row.supplierCode || "-"}|${row.partCode}|${requiredDate?.toISOString().slice(0, 10) || "-"}`;
-    if (!grouped.has(key)) grouped.set(key, { supplierCode: row.supplierCode || null, partCode: row.partCode, requiredDate, qty: 0, openingQty: 0, pegging: [], moq: number(row.moq), orderMultiple: number(row.orderMultiple), _supply: new Map() });
+    const materialSupplyType = normalizeMaterialSupplyType(row.materialSupplyType);
+    const key = `${materialSupplyType}|${row.supplyCustomerCode || row.supplierCode || "-"}|${row.partCode}|${requiredDate?.toISOString().slice(0, 10) || "-"}`;
+    if (!grouped.has(key)) grouped.set(key, { materialSupplyType, supplyCustomerCode: row.supplyCustomerCode || null, supplierCode: row.supplierCode || null, partCode: row.partCode, requiredDate, qty: 0, openingQty: 0, pegging: [], moq: number(row.moq), orderMultiple: number(row.orderMultiple), _supply: new Map() });
     const target = grouped.get(key);
     const qty = number(row.qty ?? row.grossRequirement);
     target.qty += qty;
@@ -297,7 +317,9 @@ function consolidateRequirements(rows = []) {
     const coveredQty = Math.min(row.qty, row.openingQty + eligibleSupplyQty);
     const shortageQty = Math.max(row.qty - coveredQty, 0);
     const afterMoq = Math.max(shortageQty, row.moq || 0);
-    const suggestedOrderQty = row.orderMultiple > 0 ? Math.ceil(afterMoq / row.orderMultiple) * row.orderMultiple : afterMoq;
+    const suggestedOrderQty = isCustomerSupplied(row.materialSupplyType)
+      ? 0
+      : row.orderMultiple > 0 ? Math.ceil(afterMoq / row.orderMultiple) * row.orderMultiple : afterMoq;
     const { _supply, ...publicRow } = row;
     return { ...publicRow, eligibleSupplyQty, coveredQty, shortageQty, suggestedOrderQty };
   });
@@ -336,10 +358,14 @@ async function buildDemandRows(prisma, filters = {}) {
     const masterBufferPercent = Math.max(number(partByCode.get(target.partCode)?.bufferStock), 0);
     const bufferPercent = decision ? Math.max(number(decision.bufferPercent), 0) : masterBufferPercent;
     const bufferQty = decision ? Math.max(number(decision.bufferQty), 0) : number(target.effectiveDemandQty) * bufferPercent / 100;
-    const defaultFinishSplits = (target.effectiveDeliverySplits || []).map((split) => ({ targetFinishDate: split.targetDate, qty: split.qty }));
+    const effectiveDeliveryDates = (target.effectiveDeliverySplits || []).map((split) => split.targetDate);
+    const defaultFinishSplits = (target.effectiveDeliverySplits || []).map((split) => ({ targetFinishDate: split.targetDate, targetDeliveryDate: split.targetDate, qty: split.qty }));
     const savedSplits = Array.isArray(decision?.fgFinishSplits) ? decision.fgFinishSplits : [];
-    const savedSplitsStillProtectDueDate = savedSplits.every((split) => asDate(split.targetFinishDate || split.fgRequiredDate) <= asDate(effectiveTargetDate));
-    const fgFinishSplits = normalizeFgFinishSplits(savedSplitsStillProtectDueDate && savedSplits.length ? savedSplits : defaultFinishSplits, { demandQty: target.effectiveDemandQty, fallbackDate: savedSplitsStillProtectDueDate ? (decision?.fgRequiredDate || effectiveTargetDate) : effectiveTargetDate, deliveryDate: effectiveTargetDate });
+    const savedSplitQty = savedSplits.reduce((sum, split) => sum + Math.max(number(split.qty), 0), 0);
+    const savedSplitsMatchDemand = Math.abs(savedSplitQty - number(target.effectiveDemandQty)) <= 0.000001;
+    const savedSplitsStillProtectDueDate = savedSplitsMatchDemand
+      && savedSplits.every((split, index) => asDate(split.targetFinishDate || split.fgRequiredDate) <= asDate(effectiveDeliveryDates[index] || effectiveTargetDate));
+    const fgFinishSplits = normalizeFgFinishSplits(savedSplitsStillProtectDueDate && savedSplits.length ? savedSplits : defaultFinishSplits, { demandQty: target.effectiveDemandQty, fallbackDate: savedSplitsStillProtectDueDate ? (decision?.fgRequiredDate || effectiveTargetDate) : effectiveTargetDate, deliveryDate: effectiveTargetDate, deliveryDates: effectiveDeliveryDates });
     const planningStatus = decision && !savedSplitsStillProtectDueDate ? "REPLAN_REQUIRED" : (decision?.status || "UNREVIEWED");
     const constraintDetails = decision?.constraintDetails && typeof decision.constraintDetails === "object" ? decision.constraintDetails : {};
     return { ...target, sourceType: target.demandType === "UNPLANNED_SO" ? "SALES_ORDER" : "FORECAST", targetDeliveryDate: target.targetDate, effectiveTargetDate, demandQty: target.effectiveDemandQty, systemPriorityScore: decision?.systemPriorityScore ?? priority.systemScore, priorityScoreBreakdown: decision?.priorityScoreBreakdown || priority.factors, manualPriorityAdjustment: decision?.manualPriorityAdjustment || 0, finalPriorityScore: decision?.finalPriorityScore ?? priority.score, priorityClass: decision?.priorityClass || priority.priorityClass, urgentFlag: Boolean(decision?.urgentFlag), fgRequiredDate: fgFinishSplits[0]?.targetFinishDate || (savedSplitsStillProtectDueDate ? decision?.fgRequiredDate : null) || effectiveTargetDate, fgFinishSplits, bufferPercent, bufferQty, masterBufferPercent, bufferSource: decision ? "PPIC_OVERRIDE" : "PART_MASTER", feasibilityStatus: decision?.feasibilityStatus || "NOT_SIMULATED", earliestFeasibleDeliveryDate: decision?.earliestFeasibleDeliveryDate || null, criticalConstraint: decision?.criticalConstraint || null, feasibilityOptions: { leadTimeControls: constraintDetails.leadTimeControls || { productionProcess: true, supplierLeadTime: true, receivingQc: true, safety: true }, supplierStrategy: constraintDetails.supplierStrategy || "PREFERRED", supplierSelections: constraintDetails.supplierSelections || {}, vendorProcessAdjustments: constraintDetails.vendorProcessAdjustments || [] }, supplierAlternatives: constraintDetails.supplierAlternatives || [], requiresRiskApproval: Boolean(constraintDetails.requiresRiskApproval), waivedRisks: constraintDetails.waivedRisks || [], planningStatus, decisionId: decision?.id || null };
@@ -351,7 +377,11 @@ async function reviewDemand(prisma, deliveryTargetId, input, actor) {
   if (!target) throw Object.assign(new Error("Delivery target tidak ditemukan."), { statusCode: 404 });
   if (number(input.manualPriorityAdjustment) !== 0 && !String(input.manualAdjustmentReason || "").trim()) throw Object.assign(new Error("Alasan manual priority adjustment wajib diisi."), { statusCode: 400 });
   const demandRow = (await buildDemandRows(prisma, { customerCode: target.customerCode, partCode: target.partCode })).find((row) => row.id === target.id);
-  const effectiveQty = Math.max(number(demandRow?.demandQty ?? target.qty), 0);
+  // A forced solver refresh is executed once per persisted delivery target.
+  // buildDemandRows may expose the aggregate SO quantity on every sibling
+  // target; feeding that aggregate to every run makes each 10k delivery look
+  // like the full 110k order and collapses all FG dates to the month boundary.
+  const effectiveQty = Math.max(number(input.forceSolverDates ? target.qty : (demandRow?.demandQty ?? target.qty)), 0);
   const effectiveTargetDate = demandRow?.effectiveTargetDate || target.targetDate;
   const feasibility = input.runFeasibility === false ? null : await assessDemandFeasibility(prisma, { sourceType: demandRow?.actualSalesOrderQty > 0 ? "SALES_ORDER" : target.sourceType, sourceNumber: target.sourceNumber, deliveryTargetId: target.id, customerCode: target.customerCode, partCode: target.partCode, quantity: effectiveQty, requestedDeliveryDate: effectiveTargetDate, planNumber: input.planNumber, leadTimeControls: input.leadTimeControls, supplierStrategy: input.supplierStrategy, supplierSelections: input.supplierSelections, vendorProcessAdjustments: input.vendorProcessAdjustments });
   const customer = target.customerCode ? await prisma.customer.findFirst({ where: { customerCode: target.customerCode, isDeleted: false }, select: { customerClassification: true } }) : null;
@@ -361,16 +391,53 @@ async function reviewDemand(prisma, deliveryTargetId, input, actor) {
   const part = await prisma.part.findFirst({ where: { partCode: target.partCode, isDeleted: false }, select: { bufferStock: true } });
   const bufferPercent = input.bufferPercent == null ? Math.max(number(part?.bufferStock), 0) : Math.max(number(input.bufferPercent), 0);
   const bufferQty = input.bufferQty == null ? effectiveQty * bufferPercent / 100 : Math.max(number(input.bufferQty), 0);
-  const fallbackFgRequiredDate = asDate(input.fgRequiredDate) || feasibility?.fgRequiredDate || effectiveTargetDate;
-  const fgFinishSplits = normalizeFgFinishSplits(input.fgFinishSplits, { demandQty: effectiveQty, fallbackDate: fallbackFgRequiredDate, deliveryDate: effectiveTargetDate });
+  let solverFinishSplits = null;
+  const finishSplitSolvers = [];
+  if (input.forceSolverDates) {
+    // A decision belongs to exactly one persisted delivery target. The merged
+    // demand row may expose every sibling target for presentation; reusing
+    // those siblings here would multiply N targets into N x N MPS batches.
+    const sourceSplits = [{ targetDate: effectiveTargetDate, qty: effectiveQty }];
+    const solvedSplits = [];
+    for (const split of sourceSplits) {
+      const splitQty = Math.max(number(split.qty), 0);
+      if (splitQty <= 0) continue;
+      const splitTargetDate = split.targetDate || effectiveTargetDate;
+      const sameAsAggregate = sourceSplits.length === 1
+        && Math.abs(splitQty - effectiveQty) <= 0.000001
+        && asDate(splitTargetDate)?.getTime() === asDate(effectiveTargetDate)?.getTime();
+      const splitFeasibility = sameAsAggregate ? feasibility : await assessDemandFeasibility(prisma, {
+        sourceType: demandRow?.actualSalesOrderQty > 0 ? "SALES_ORDER" : target.sourceType,
+        sourceNumber: target.sourceNumber,
+        deliveryTargetId: target.id,
+        customerCode: target.customerCode,
+        partCode: target.partCode,
+        quantity: splitQty,
+        requestedDeliveryDate: splitTargetDate,
+        planNumber: input.planNumber,
+        leadTimeControls: input.leadTimeControls,
+        supplierStrategy: input.supplierStrategy,
+        supplierSelections: input.supplierSelections,
+        vendorProcessAdjustments: input.vendorProcessAdjustments,
+      });
+      solvedSplits.push({ targetFinishDate: splitFeasibility.fgRequiredDate || splitTargetDate, targetDeliveryDate: splitTargetDate, qty: splitQty });
+      finishSplitSolvers.push({ targetDeliveryDate: splitTargetDate, qty: splitQty, solver: splitFeasibility.constraintDetails?.solver || splitFeasibility.solver || null });
+    }
+    solverFinishSplits = solvedSplits;
+  }
+  const finishInput = input.forceSolverDates
+    ? { splits: solverFinishSplits, fallbackDate: feasibility?.fgRequiredDate || effectiveTargetDate }
+    : resolveReviewFgFinishInput(input, demandRow, feasibility?.fgRequiredDate, effectiveTargetDate);
+  const fallbackFgRequiredDate = finishInput.fallbackDate;
+  const fgFinishSplits = normalizeFgFinishSplits(finishInput.splits, { demandQty: effectiveQty, fallbackDate: fallbackFgRequiredDate, deliveryDate: effectiveTargetDate, deliveryDates: (demandRow?.effectiveDeliverySplits || []).map((split) => split.targetDate) });
   const data = {
     sourceType: target.sourceType, sourceNumber: target.sourceNumber, sourceLineId: target.sourceLineId, deliveryTargetId: target.id, customerCode: target.customerCode, partCode: target.partCode, targetDeliveryDate: target.targetDate, demandQty: effectiveQty,
     systemPriorityScore: priority.systemScore, manualPriorityAdjustment: priority.manualAdjustment, manualAdjustmentReason: String(input.manualAdjustmentReason || "").trim() || null, finalPriorityScore: priority.score, priorityClass: priority.priorityClass, priorityScoreBreakdown: priority.factors, urgentFlag: Boolean(input.urgentFlag),
     fgRequiredDate: fgFinishSplits[0]?.targetFinishDate || fallbackFgRequiredDate, fgFinishSplits: fgFinishSplits.map((row) => ({ ...row, targetFinishDate: row.targetFinishDate.toISOString() })), bufferPercent, bufferQty, displacementPolicy: input.displacementPolicy || "SIMULATE_FIRST", displacementReason: input.displacementReason || null,
-    feasibilityStatus: feasibility?.status || input.feasibilityStatus || "NOT_SIMULATED", earliestFeasibleDeliveryDate: feasibility?.earliestFeasibleDeliveryDate || null, criticalConstraint: feasibility?.criticalConstraint || null, constraintDetails: { ...(feasibility?.constraintDetails || {}), forecastTargetDate: target.targetDate, effectiveTargetDate, pullForwardDays: demandRow?.pullForwardDays || 0 }, materialStatus: feasibility?.materialStatus || null, capacityStatus: feasibility?.capacityStatus || null,
+    feasibilityStatus: feasibility?.status || input.feasibilityStatus || "NOT_SIMULATED", earliestFeasibleDeliveryDate: feasibility?.earliestFeasibleDeliveryDate || null, criticalConstraint: feasibility?.criticalConstraint || null, constraintDetails: { ...(feasibility?.constraintDetails || {}), calculationMethod: input.forceSolverDates ? "OR_TOOLS_WASM_CP_SAT_MPS_RECALCULATION_V1" : feasibility?.constraintDetails?.calculationMethod, finishSplitSolvers, forecastTargetDate: target.targetDate, effectiveTargetDate, pullForwardDays: demandRow?.pullForwardDays || 0 }, materialStatus: feasibility?.materialStatus || null, capacityStatus: feasibility?.capacityStatus || null,
     reviewedBy: actor || null, reviewedAt: new Date(), status: input.status || "REVIEWED", sourceChangedAt: target.updatedAt,
   };
   return prisma.demandPlanningDecision.upsert({ where: { deliveryTargetId: target.id }, create: data, update: { ...data, isDeleted: false } });
 }
 
-module.exports = { planningAnchorMonth, mpsWindowMonths, priorityClass, calculatePriority, procurementWindow, consolidateRequirements, capacityHorizonMonths, normalizeFgFinishSplits, mergeForecastWithActualSalesOrders, attachDraftSalesOrders, buildCapacityOverview, buildDemandRows, reviewDemand };
+module.exports = { planningAnchorMonth, mpsWindowMonths, priorityClass, calculatePriority, procurementWindow, consolidateRequirements, capacityHorizonMonths, normalizeFgFinishSplits, resolveReviewFgFinishInput, mergeForecastWithActualSalesOrders, attachDraftSalesOrders, buildCapacityOverview, buildDemandRows, reviewDemand };

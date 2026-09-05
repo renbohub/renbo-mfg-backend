@@ -28,6 +28,11 @@ const mapMaterialPrice = (doc) => {
   return mapped;
 };
 
+function normalizePurchasePackageCode(value) {
+  const form = String(value || "").trim().toUpperCase();
+  return ({ C: "COIL", S: "SHEET", P: "PCS", PIECES: "PCS" })[form] || form || null;
+}
+
 async function normalizeMaterialPriceData(input) {
   const data = normalizeEffectivePriceInput(convertPriceListFields(input), {
     requireEffective: input.effectiveFrom !== undefined || input.unitPrice !== undefined,
@@ -35,6 +40,9 @@ async function normalizeMaterialPriceData(input) {
   });
   if (data.thickness !== undefined && data.thickness !== null && data.thickness !== "") {
     data.thickness = Number(data.thickness);
+  }
+  if (data.purchasePackageUomCode) {
+    data.purchasePackageUomCode = normalizePurchasePackageCode(data.purchasePackageUomCode);
   }
 
   let material = null;
@@ -48,7 +56,7 @@ async function normalizeMaterialPriceData(input) {
         CSP: true,
         materialForm: true,
         defaultPurchaseUomCode: true,
-        materialFormRef: { select: { symbol: true, defaultPurchaseUomCode: true } },
+        materialFormRef: { select: { symbol: true, formCode: true, defaultPurchaseUomCode: true } },
       },
     });
     if (!material) throw Object.assign(new Error("Material tidak ditemukan."), { status: 400 });
@@ -56,9 +64,10 @@ async function normalizeMaterialPriceData(input) {
     data.materialGradeId ??= material.materialGradeId;
     data.thickness ??= material.thickness;
     data.CSP ??= material.CSP;
-    data.purchasePackageUomCode ??= material.materialFormRef?.symbol || material.materialForm;
+    data.purchasePackageUomCode ??= material.materialFormRef?.defaultPurchaseUomCode || material.materialFormRef?.formCode || material.materialFormRef?.symbol || material.materialForm;
     data.uomCode ??= material.defaultPurchaseUomCode || material.materialFormRef?.defaultPurchaseUomCode;
   }
+  data.purchasePackageUomCode = normalizePurchasePackageCode(data.purchasePackageUomCode);
 
   if (data.materialGradeId) {
     const grade = await prisma.materialGrade.findFirst({

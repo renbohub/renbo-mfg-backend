@@ -14,6 +14,7 @@ function handle(next, res, fn) {
 
 exports.workspace = (req, res, next) => handle(next, res, async () => res.json(await service.getWorkspace({ date: req.query.date, revisionId: req.query.revisionId, mode: req.query.mode })));
 exports.autoCorrectPlacement = (req, res, next) => handle(next, res, async () => res.json(await service.autoCorrectPlacement({ date: req.body?.date, revisionId: req.body?.revisionId, expectedVersion: req.body?.expectedVersion, userId: actor(req) })));
+exports.allocateExecutionShortfall = (req, res, next) => handle(next, res, async () => res.status(201).json(await service.allocateExecutionShortfall({ sourceLogId: req.body?.sourceLogId, targetDate: req.body?.targetDate, userId: actor(req) })));
 exports.create = (req, res, next) => handle(next, res, async () => {
   if (req.body?.aiDraftId) await aiDraftService.validateDraftForOfficial({ draftId: req.body.aiDraftId, actor: req.user, draftType: "DAILY_PLAN_RECOVERY", moduleCode: "production", pageCode: "daily-production-schedules" });
   const revision = await service.createDraft({ ...req.body, userId: actor(req) });

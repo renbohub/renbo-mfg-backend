@@ -5,6 +5,7 @@ const { logger } = require("../../middleware/logger");
 
 router.get("/workspace", authorize("monthlyProductionPlan", "read"), ctrl.workspace);
 router.post("/auto-correct", authorize("monthlyProductionPlan", "update"), logger("dailyPlanRevision", "auto-correct-placement"), ctrl.autoCorrectPlacement);
+router.post("/execution-shortfalls/allocate", authorize("monthlyProductionPlan", "update"), logger("dailyPlanRevision", "allocate-execution-shortfall"), ctrl.allocateExecutionShortfall);
 router.post("/", authorize("monthlyProductionPlan", "update"), logger("dailyPlanRevision", "create"), ctrl.create);
 router.patch("/:revisionId/items/:scheduleId", authorize("monthlyProductionPlan", "update"), logger("dailyPlanRevision", "update-item"), ctrl.updateItem);
 router.post("/:revisionId/items/:scheduleId/release", authorize("monthlyProductionPlan", "release"), logger("dailyPlanRevision", "release-item"), ctrl.releaseItem);

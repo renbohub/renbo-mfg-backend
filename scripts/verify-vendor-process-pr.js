@@ -31,14 +31,15 @@ check("group excludes non-vendor and zero quantity", () => {
   assert.deepEqual([...groups.keys()], ["V001"]);
   assert.equal(groups.get("V001").length, 1);
 });
-check("process matching accepts code or name", () => {
+check("process matching prioritizes exact code and falls back to name only without codes", () => {
   assert(processMatches({ vendorProcessCode: "PAINT" }, { processCode: "PAINT" }));
   assert(processMatches({ vendorProcessName: "Painting" }, { processName: "Painting" }));
+  assert(!processMatches({ vendorProcessCode: "PAINT", vendorProcessName: "GSN" }, { processCode: "GSN", processName: "GSN" }));
 });
-check("effective price uses month before base unit price", () => {
+check("effective price uses canonical unit price before legacy month", () => {
   const rate = effectiveVendorRate({ id: "pl", currencyCode: "IDR", details: [{ unitPrice: 10, august: 12, vendorProcessId: "vp", vendorProcess: { vendorProcessCode: "PAINT" } }] }, { processCode: "PAINT" }, new Date("2026-08-12T00:00:00Z"));
-  assert.equal(rate.unitPrice, 12);
-  assert.equal(rate.priceSource, "MONTH_AUGUST");
+  assert.equal(rate.unitPrice, 10);
+  assert.equal(rate.priceSource, "UNIT_PRICE");
 });
 check("capacity controller synchronizes PR on create update remove auto and adoption", () => {
   const source = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/planning/MonthlyProductionPlanController.js"), "utf8");

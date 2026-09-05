@@ -108,208 +108,192 @@ function placementMergeKey(item = {}) {
   ].map((value) => String(value)).join("|");
 }
 
-function nextPlacementSlot({ windows, occupied, earliestStart, duration }) {
-  for (const window of windows) {
-    let cursor = Math.max(number(earliestStart), window.start);
-    if (cursor + duration > window.end) continue;
-    for (const interval of occupied) {
-      if (interval.end <= cursor || interval.start >= window.end) continue;
-      if (interval.start >= cursor + duration) break;
-      cursor = Math.max(cursor, interval.end);
-      if (cursor + duration > window.end) break;
-    }
-    if (cursor + duration <= window.end) return { start: cursor, end: cursor + duration, shift: window.shift, date: window.date, dayBase: window.dayBase };
-  }
-  return null;
+function utcDateTime(date, minute) {
+  const base = new Date(`${dateKey(date)}T00:00:00.000Z`);
+  return new Date(base.getTime() + Math.max(number(minute), 0) * 60000);
 }
 
-function autoCorrectWorkPlacements(items = [], options = {}) {
-  const dayStart = toMinute(options.dayStart || "07:00") ?? 420;
-  const dependencyGapMinutes = Math.max(number(options.dependencyGapMinutes ?? MINIMUM_SUCCESSOR_GAP_MINUTES), 0);
-  const windowsByMachine = options.windowsByMachine instanceof Map
-    ? options.windowsByMachine
-    : new Map(Object.entries(options.windowsByMachine || {}));
-  const identity = (item) => item.productionPlanAllocationId || item.id;
-  const byIdentity = new Map(items.map((item) => [identity(item), item]).filter(([id]) => id));
-  const dependencyItems = new Map([...byIdentity].map(([id, item]) => [id, { ...item, id }]));
-  const depthMemo = new Map();
-  const occupiedByMachine = new Map();
-  const correctedByIdentity = new Map();
-  const lastPlacedEndByGroup = new Map();
-  const warnings = [];
-  const movable = [];
-  const groupFirstStart = new Map();
-
-  for (const item of items) {
-    const start = absoluteScheduleMinutes(item, "plannedStartTime", dayStart);
-    let end = absoluteScheduleMinutes(item, "plannedEndTime", dayStart);
-    if (start != null && end != null && end <= start) end += 1440;
-    if (item.movable === false || ["Released", "In Progress", "Completed"].includes(item.status)) {
-      if (item.machineId && start != null && end != null) {
-        const rows = occupiedByMachine.get(item.machineId) || [];
-        rows.push({ start, end, fixed: true, id: identity(item) });
-        occupiedByMachine.set(item.machineId, rows);
+function resourceAvailabilityFromWindows(windowsByMachine, dayStart = 420) {
+  const source = windowsByMachine instanceof Map ? windowsByMachine : new Map(Object.entries(windowsByMachine || {}));
+  const grouped = {};
+  function add(machineId, date, startMinute, endMinute) {
+    if (!(endMinute > startMinute)) return;
+    grouped[machineId] ||= new Map();
+    const rows = grouped[machineId].get(date) || [];
+    rows.push({ startMinute, endMinute });
+    grouped[machineId].set(date, rows);
+  }
+  for (const [key, windows] of source.entries()) {
+    const separator = String(key).lastIndexOf("|");
+    if (separator < 0) continue;
+    const date = String(key).slice(0, separator);
+    const machineId = String(key).slice(separator + 1);
+    for (const window of normalizePlacementWindows(windows, dayStart)) {
+      const start = window.start;
+      const end = window.end;
+      if (start < 1440) add(machineId, date, start, Math.min(end, 1440));
+      if (end > 1440) {
+        const next = new Date(`${date}T00:00:00.000Z`);
+        next.setUTCDate(next.getUTCDate() + 1);
+        add(machineId, dateKey(next), 0, end - 1440);
       }
-      correctedByIdentity.set(identity(item), { ...item, _startAbsolute: start, _endAbsolute: end });
-    } else {
-      movable.push(item);
-      const key = placementMergeKey(item);
-      const start = operationalMinute(item.plannedStartTime, dayStart);
-      const previous = groupFirstStart.get(key);
-      groupFirstStart.set(key, previous == null ? number(start) : Math.min(previous, number(start)));
     }
   }
-
-  movable.sort((left, right) =>
-    dateKey(left.scheduleDate).localeCompare(dateKey(right.scheduleDate))
-    || dependencyDepth({ ...left, id: identity(left) }, dependencyItems, depthMemo) - dependencyDepth({ ...right, id: identity(right) }, dependencyItems, depthMemo)
-    || number(left.sequence) - number(right.sequence)
-    // Keep identical operations together. The individual records remain
-    // available for lineage/release, but Auto Correct places them as one
-    // continuous production run so the Daily Plan can present one total.
-    || number(groupFirstStart.get(placementMergeKey(left))) - number(groupFirstStart.get(placementMergeKey(right)))
-    || placementMergeKey(left).localeCompare(placementMergeKey(right))
-    || number(operationalMinute(left.plannedStartTime, dayStart)) - number(operationalMinute(right.plannedStartTime, dayStart)));
-
-  for (const item of movable) {
-    const id = identity(item);
-    const mergeKey = placementMergeKey(item);
-    const windows = item.machineId ? machinePlacementWindows(windowsByMachine, item.machineId, item.scheduleDate, dayStart) : [];
-    if (!item.machineId || !windows.length) {
-      warnings.push({ code: item.machineId ? "DAILY_WORK_WINDOW_UNAVAILABLE" : "DAILY_RELEASE_MACHINE_UNAVAILABLE", itemId: item.id || null, machineId: item.machineId || null, message: item.machineId ? "Jam kerja mesin belum tersedia untuk tanggal ini." : "Mesin belum dipilih." });
-      const start = absoluteScheduleMinutes(item, "plannedStartTime", dayStart);
-      let end = absoluteScheduleMinutes(item, "plannedEndTime", dayStart);
-      if (start != null && end != null && end <= start) end += 1440;
-      correctedByIdentity.set(id, { ...item, _startAbsolute: start, _endAbsolute: end });
-      continue;
-    }
-    const duration = allocationDuration(item, options.defaultDurationMinutes || 60);
-    const parsedOriginalStart = absoluteScheduleMinutes(item, "plannedStartTime", dayStart);
-    const previousIdenticalEnd = lastPlacedEndByGroup.get(mergeKey);
-    const originalStart = previousIdenticalEnd != null
-      ? previousIdenticalEnd
-      : parsedOriginalStart != null && windows.some((window) => parsedOriginalStart >= window.start && parsedOriginalStart + duration <= window.end)
-        ? parsedOriginalStart
-        : windows[0].start;
-    const predecessorEnd = (Array.isArray(item.predecessorAllocationIds) ? item.predecessorAllocationIds : [])
-      .map((predecessorId) => correctedByIdentity.get(predecessorId)?._endAbsolute)
-      .filter((value) => value != null);
-    const earliestStart = Math.max(originalStart, predecessorEnd.length ? Math.max(...predecessorEnd) + dependencyGapMinutes : originalStart);
-    const occupied = (occupiedByMachine.get(item.machineId) || []).sort((left, right) => left.start - right.start || left.end - right.end);
-    const slot = nextPlacementSlot({ windows, occupied, earliestStart, duration });
-    if (!slot) {
-      warnings.push({ code: "DAILY_WORK_WINDOW_FULL", itemId: item.id || null, machineId: item.machineId, message: `${item.partCode || "Operation"} tidak mempunyai slot kerja yang cukup sampai akhir horizon Auto Correct.` });
-      const start = absoluteScheduleMinutes(item, "plannedStartTime", dayStart);
-      let end = absoluteScheduleMinutes(item, "plannedEndTime", dayStart);
-      if (start != null && end != null && end <= start) end += 1440;
-      correctedByIdentity.set(id, { ...item, _startAbsolute: start, _endAbsolute: end });
-      continue;
-    }
-    const correctedDate = item.scheduleDate instanceof Date ? new Date(`${slot.date}T00:00:00.000Z`) : slot.date;
-    const corrected = { ...item, scheduleDate: correctedDate, plannedStartTime: displayPlacementTime(slot.start, slot.dayBase), plannedEndTime: displayPlacementTime(slot.end, slot.dayBase), shift: slot.shift, _startAbsolute: slot.start, _endAbsolute: slot.end };
-    occupied.push({ start: slot.start, end: slot.end, fixed: false, id });
-    occupiedByMachine.set(item.machineId, occupied);
-    lastPlacedEndByGroup.set(mergeKey, slot.end);
-    correctedByIdentity.set(id, corrected);
-  }
-
-  const correctedItems = items.map((item) => correctedByIdentity.get(identity(item)) || item).map(({ _startAbsolute, _endAbsolute, ...item }) => item);
-  const changes = correctedItems.filter((item, index) => dateKey(item.scheduleDate) !== dateKey(items[index].scheduleDate) || item.plannedStartTime !== items[index].plannedStartTime || item.plannedEndTime !== items[index].plannedEndTime || String(item.shift || "") !== String(items[index].shift || ""));
-  return { items: correctedItems, changes, warnings };
+  return Object.fromEntries(Object.entries(grouped).map(([machineId, byDate]) => [
+    machineId,
+    [...byDate.entries()].map(([date, windows]) => ({ date, windows })),
+  ]));
 }
 
-function scheduleDailyReleaseAllocations(allocations = [], options = {}) {
-  const defaultStart = toMinute(options.dayStart || "07:00") ?? 420;
-  const dependencyGapMinutes = Math.max(number(options.dependencyGapMinutes ?? MINIMUM_SUCCESSOR_GAP_MINUTES), 0);
-  const byId = new Map((allocations || []).filter((item) => item?.id).map((item) => [item.id, item]));
-  const depthMemo = new Map();
-  const ordered = [...(allocations || [])].sort((left, right) =>
-    dateKey(left.scheduleDate).localeCompare(dateKey(right.scheduleDate))
-    || dependencyDepth(left, byId, depthMemo) - dependencyDepth(right, byId, depthMemo)
-    || number(left.sequence) - number(right.sequence)
-    || String(left.id || "").localeCompare(String(right.id || "")));
-  const machineAvailableAt = new Map();
-  const partMachine = new Map();
-  const scheduledById = new Map();
+function completeCalendar(start, end) {
+  const calendar = {};
+  for (let cursor = new Date(start); cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    calendar[dateKey(cursor)] = "WORKING";
+  }
+  return calendar;
+}
+
+function solverTask(item, options = {}) {
+  const id = String(item.productionPlanAllocationId || item.id);
+  const candidates = candidateMachines(item);
+  const baseStart = operationalMinute(item.plannedStartTime, toMinute(options.dayStart || "07:00") ?? 420);
+  const startDate = utcDateTime(item.scheduleDate, baseStart == null ? 420 : baseStart);
+  const dayEndMinute = Math.max(number(options.operationalDayEndMinute), 31 * 60);
+  const dueDate = utcDateTime(item.scheduleDate, dayEndMinute);
+  const fixed = item.movable === false || ["Released", "In Progress", "Completed"].includes(item.status);
+  return {
+    id,
+    durationMinutes: allocationDuration(item, options.defaultDurationMinutes || 60),
+    eligibleResourceIds: candidates,
+    preferredResourceId: item.machineId || null,
+    assignmentGroupId: [dateKey(item.scheduleDate), item.partCode || item.partId, item.processId || item.mbomProcessId, item.moId || item.moNumber, item.woId || item.woNumber].filter(Boolean).join("|"),
+    requiredResourceIds: item.diesId ? [`DIES:${item.diesId}`] : [],
+    predecessorIds: (item.predecessorAllocationIds || []).map(String),
+    predecessorGapMinutes: Math.max(number(options.dependencyGapMinutes ?? MINIMUM_SUCCESSOR_GAP_MINUTES), 0),
+    releaseDate: fixed ? startDate : utcDateTime(item.scheduleDate, toMinute(options.dayStart || "07:00") ?? 420),
+    dueDate,
+    baselineStartDate: startDate,
+    fixedStartDate: fixed ? startDate : null,
+    required: candidates.length > 0,
+    unscheduledPenalty: 10000000,
+    tardinessWeight: 100000,
+    movementWeight: 1,
+    _source: item,
+  };
+}
+
+function displayTimeFor(date, scheduleDate) {
+  const start = new Date(`${dateKey(scheduleDate)}T00:00:00.000Z`);
+  const minutes = Math.round((new Date(date) - start) / 60000);
+  return toTime(Math.max(minutes, 0));
+}
+
+async function runDailySolver(items = [], options = {}) {
+  if (!items.length) return { items: [], changes: [], warnings: [], solver: { status: "OPTIMAL", engine: "OR_TOOLS_WASM_CP_SAT" } };
+  const { solveFiniteSchedule } = require("./solver/planningSolverService");
+  const dates = items.map((item) => new Date(item.scheduleDate)).filter((date) => !Number.isNaN(date.getTime()));
+  const first = new Date(Math.min(...dates));
+  first.setUTCDate(first.getUTCDate() - 1);
+  const last = new Date(Math.max(...dates));
+  last.setUTCDate(last.getUTCDate() + Math.max(number(options.horizonDays), 14));
+  const resourceAvailability = resourceAvailabilityFromWindows(options.windowsByMachine, toMinute(options.dayStart || "07:00") ?? 420);
+  const taskDefinitions = items.map((item) => solverTask(item, options));
+  if (options.windowsByMachine && (options.windowsByMachine instanceof Map ? options.windowsByMachine.size : Object.keys(options.windowsByMachine).length)) {
+    for (const task of taskDefinitions) for (const resourceId of task.eligibleResourceIds || []) resourceAvailability[resourceId] ||= [];
+  }
+  const solverInput = {
+    horizonStart: first,
+    horizonEnd: last,
+    calendar: completeCalendar(first, last),
+    dailyWindows: [{ startMinute: 0, endMinute: 1440 }],
+    resourceAvailability: Object.keys(resourceAvailability).length ? resourceAvailability : undefined,
+    tasks: taskDefinitions,
+    options: {
+      maxTimeInSeconds: number(options.maxTimeInSeconds) || 30,
+      numSearchWorkers: number(options.numSearchWorkers) || 2,
+      randomSeed: 1,
+    },
+  };
+  let solverRun = null;
+  if (options.prisma) {
+    const { enqueueSolverRun } = require("./solver/planningSolverRunService");
+    solverRun = await enqueueSolverRun(options.prisma, {
+      scope: "DAILY_SCHEDULE",
+      referenceType: options.referenceType || "DAILY_PLAN",
+      referenceNumber: options.referenceNumber || dateKey(first),
+      modelVersion: "OR-TOOLS-WASM-CP-SAT-V1",
+      inputSnapshot: solverInput,
+      requestedBy: options.actor || "system",
+      status: "RUNNING",
+    });
+  }
+  let result;
+  try {
+    result = await solveFiniteSchedule(solverInput);
+    if (!result.feasible) {
+      const infeasible = new Error(`Daily planning solver tidak menemukan schedule feasible (${result.status}).`);
+      infeasible.statusCode = 409;
+      infeasible.code = "DAILY_SOLVER_INFEASIBLE";
+      infeasible.solver = result;
+      throw infeasible;
+    }
+    if (solverRun) {
+      const { completeSolverRun } = require("./solver/planningSolverRunService");
+      await completeSolverRun(options.prisma, solverRun.id, result);
+    }
+  } catch (error) {
+    if (solverRun) {
+      const { failSolverRun } = require("./solver/planningSolverRunService");
+      await failSolverRun(options.prisma, solverRun.id, error);
+    }
+    throw error;
+  }
+  const solvedById = new Map(result.tasks.map((task) => [String(task.id), task]));
   const warnings = [];
-
-  const items = ordered.map((source) => {
-    const item = { ...source };
-    const day = dateKey(item.scheduleDate);
-    const workCenter = item.workCenterId || `MACHINE-GROUP:${item.machineId || "UNASSIGNED"}`;
-    const partKey = `${day}|${workCenter}|${item.partCode || item.id || "PART"}`;
-    const candidates = candidateMachines(item);
-    if (!candidates.length) {
+  const scheduledItems = items.map((item) => {
+    const id = String(item.productionPlanAllocationId || item.id);
+    const solved = solvedById.get(id);
+    if (!solved?.scheduled) {
       warnings.push({
-        code: "DAILY_RELEASE_MACHINE_UNAVAILABLE",
-        allocationId: item.id || null,
-        partCode: item.partCode || null,
-        machineId: null,
-        scheduleDate: day,
-        message: `${item.partCode || "Part"} belum mempunyai mesin aktif pada tanggal Daily Release.`,
+        code: candidateMachines(item).length ? "DAILY_SOLVER_UNSCHEDULED" : "DAILY_RELEASE_MACHINE_UNAVAILABLE",
+        itemId: item.id || null,
+        machineId: item.machineId || null,
+        message: `${item.partCode || "Operation"} tidak dapat ditempatkan oleh planning solver.`,
       });
+      return { ...item, machineId: null, plannedStartTime: null, plannedEndTime: null, solverEngine: result.engine, solverStatus: result.status };
     }
-    const baseStart = toMinute(item.plannedStartTime) ?? defaultStart;
-    const duration = allocationDuration(item, options.defaultDurationMinutes || 60);
-    const predecessorSchedules = (Array.isArray(item.predecessorAllocationIds) ? item.predecessorAllocationIds : [])
-      .map((id) => scheduledById.get(id))
-      .filter((predecessor) => predecessor && dateKey(predecessor.scheduleDate) === day);
-    const dependencyStart = predecessorSchedules.length
-      ? Math.max(...predecessorSchedules.map((predecessor) => number(predecessor._endMinute) + dependencyGapMinutes))
-      : baseStart;
-
-    let machineId = partMachine.get(partKey) || null;
-    if (!machineId || !candidates.includes(machineId)) {
-      machineId = [...candidates].sort((left, right) => {
-        const leftAvailable = number(machineAvailableAt.get(`${day}|${left}`));
-        const rightAvailable = number(machineAvailableAt.get(`${day}|${right}`));
-        if (leftAvailable !== rightAvailable) return leftAvailable - rightAvailable;
-        if (left === item.machineId) return -1;
-        if (right === item.machineId) return 1;
-        return String(left).localeCompare(String(right));
-      })[0] || (Array.isArray(item.eligibleMachineIds) ? null : item.machineId) || null;
-      if (machineId) partMachine.set(partKey, machineId);
-    }
-
-    const machineKey = `${day}|${machineId || "UNASSIGNED"}`;
-    const machineStart = number(machineAvailableAt.get(machineKey));
-    const start = Math.max(baseStart, dependencyStart, machineStart);
-    const end = start + duration;
-    const waitedForMachine = machineStart > baseStart && dependencyStart <= machineStart;
-    if (waitedForMachine && candidates.length <= 1 && !predecessorSchedules.length) {
-      warnings.push({
-        code: "DAILY_RELEASE_SINGLE_MACHINE_QUEUE",
-        allocationId: item.id || null,
-        partCode: item.partCode || null,
-        machineId,
-        scheduleDate: day,
-        message: `${item.partCode || "Part"} diantrikan utuh pada satu-satunya mesin yang tersedia; quantity tidak di-split.`,
-      });
-    }
-    if (end > 1440) {
-      warnings.push({
-        code: "DAILY_RELEASE_DAY_OVERRUN",
-        allocationId: item.id || null,
-        partCode: item.partCode || null,
-        machineId,
-        scheduleDate: day,
-        message: `${item.partCode || "Part"} selesai melewati batas hari dan perlu koreksi PPIC.`,
-      });
-    }
-    machineAvailableAt.set(machineKey, end);
-    const scheduled = {
+    const scheduleDate = dateKey(solved.startDate);
+    if (number(solved.tardinessMinutes) > 0) warnings.push({
+      code: "DAILY_SOLVER_LATE",
+      itemId: item.id || null,
+      machineId: solved.resourceId,
+      tardinessMinutes: solved.tardinessMinutes,
+      message: `${item.partCode || "Operation"} terlambat ${solved.tardinessMinutes} menit terhadap due window.`,
+    });
+    return {
       ...item,
-      machineId,
-      plannedStartTime: toTime(start),
-      plannedEndTime: toTime(end),
-      _startMinute: start,
-      _endMinute: end,
+      machineId: solved.resourceId,
+      scheduleDate: item.scheduleDate instanceof Date ? new Date(`${scheduleDate}T00:00:00.000Z`) : scheduleDate,
+      plannedStartTime: displayTimeFor(solved.startDate, scheduleDate),
+      plannedEndTime: displayTimeFor(solved.endDate, scheduleDate),
+      solverEngine: result.engine,
+      solverStatus: result.status,
+      solverTardinessMinutes: solved.tardinessMinutes,
     };
-    if (item.id) scheduledById.set(item.id, scheduled);
-    return scheduled;
-  }).map(({ _startMinute, _endMinute, ...item }) => item);
-
-  return { items, warnings };
+  });
+  const changes = scheduledItems.filter((item, index) =>
+    dateKey(item.scheduleDate) !== dateKey(items[index].scheduleDate)
+    || item.machineId !== items[index].machineId
+    || item.plannedStartTime !== items[index].plannedStartTime
+    || item.plannedEndTime !== items[index].plannedEndTime);
+  return { items: scheduledItems, changes, warnings, solver: result };
 }
 
-module.exports = { MINIMUM_SUCCESSOR_GAP_MINUTES, toMinute, toTime, allocationDuration, normalizePlacementWindows, nextPlacementSlot, autoCorrectWorkPlacements, scheduleDailyReleaseAllocations };
+async function autoCorrectWorkPlacements(items = [], options = {}) {
+  return runDailySolver(items, options);
+}
+
+async function scheduleDailyReleaseAllocations(allocations = [], options = {}) {
+  return runDailySolver(allocations, options);
+}
+module.exports = { MINIMUM_SUCCESSOR_GAP_MINUTES, toMinute, toTime, allocationDuration, normalizePlacementWindows, autoCorrectWorkPlacements, scheduleDailyReleaseAllocations };

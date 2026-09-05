@@ -2,6 +2,7 @@
 
 const { consolidateRequirements, procurementWindow } = require("./demandPlanningService");
 const { procurementSchedule } = require("./procurementSchedulingService");
+const { isCustomerSupplied } = require("../../utils/materialSupply");
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const dateKey = (value) => value && !Number.isNaN(new Date(value).getTime()) ? new Date(value).toISOString().slice(0, 10) : null;
 
@@ -13,6 +14,18 @@ function resolvePurchaseScheduleForRequirement({ row, suggestionByPartDelivery, 
 }
 
 function resolveProcurementMasterIdentity({ row, order, purchaseSchedule, partMaster, supplierByCode = new Map() }) {
+  const customerSupplied = isCustomerSupplied(row?.materialSupplyType);
+  if (customerSupplied) {
+    return {
+      supplierCode: row.supplyCustomerCode || null,
+      supplierName: row.supplyCustomerCode ? `Customer ${row.supplyCustomerCode}` : "Customer pemilik material",
+      supplierSource: "CUSTOMER_SUPPLIED_BOM",
+      materialCode: partMaster?.material?.materialCode || row?.partCode || null,
+      materialName: partMaster?.material?.materialName || partMaster?.material?.spec || null,
+      isRawMaterial: true,
+      supplierLeadTimeDays: number(row?.leadTime),
+    };
+  }
   const preferredSupplierItem = partMaster?.supplierItems?.[0] || null;
   const recommendedSupplier = preferredSupplierItem?.supplier || partMaster?.supplier || null;
   const supplierCode = purchaseSchedule?.suggestedSupplierCode
@@ -128,21 +141,25 @@ async function procurementView(prisma, identifier, asOf = new Date()) {
     requirementsByPartDate.get(requirementKey).push(requirement);
   }
   const grouped = consolidateRequirements(requirements.map((row) => ({ ...row, qty: row.grossRequirement, onHandQty: row.onHandQty, openSupply: (Array.isArray(row.supplyTimeline) ? row.supplyTimeline : []).map((supply) => ({ id: supply.id, sourceType: supply.sourceType, sourceNumber: supply.sourceNumber, qty: supply.qty, arrivalDate: supply.availableDate || supply.arrivalDate || supply.date })), customerCode: row.customerCode, fgPartCode: row.fgPartCode, targetDeliveryDate: row.targetDeliveryDate, deliveryTargetId: row.deliveryTargetId, sourceType: row.rootDemandSourceType, sourceNumber: row.rootDemandSourceNumber })));
-  const items = grouped.map((row) => {
-    const order = orderByPartDate.get(`${row.partCode}|${new Date(row.requiredDate).toISOString().slice(0, 10)}`) || orders.find((item) => item.partCode === row.partCode);
+  const items = await Promise.all(grouped.map(async (row) => {
+    const customerSupplied = isCustomerSupplied(row.materialSupplyType);
+    const order = customerSupplied ? null : orderByPartDate.get(`${row.partCode}|${new Date(row.requiredDate).toISOString().slice(0, 10)}`) || orders.find((item) => item.partCode === row.partCode);
     const purchaseSchedule = resolvePurchaseScheduleForRequirement({ row, suggestionByPartDelivery, requirementsByPartDate, suggestionByRequirementId });
     const partMaster = partByCode.get(row.partCode) || partByCode.get(purchaseSchedule?.partCode) || null;
     const masterIdentity = resolveProcurementMasterIdentity({ row, order, purchaseSchedule, partMaster, supplierByCode });
     const materialRequiredDate = purchaseSchedule?.materialRequiredDate || row.materialRequiredDate || row.requiredDate;
-    const schedule = procurementSchedule({
-      materialRequiredDate,
-      supplierLeadTimeDays: masterIdentity.supplierLeadTimeDays,
-      asOf,
-    });
+    const schedule = customerSupplied ? {
+      supplierRequiredArrivalDate: materialRequiredDate,
+      latestPoDate: null,
+      latestPrDate: null,
+      procurementWindow: "CUSTOMER_SUPPLIED",
+    } : await procurementSchedule({ materialRequiredDate, supplierLeadTimeDays: masterIdentity.supplierLeadTimeDays, asOf });
     const latestRequirementPr = requirements
       .filter((item) => item.partCode === row.partCode && dateKey(item.requiredDate) === dateKey(row.requiredDate))
       .map((item) => item.latestPrDate).filter(Boolean).sort((a, b) => new Date(a) - new Date(b))[0] || null;
     return {
+      materialSupplyType: row.materialSupplyType,
+      supplyCustomerCode: row.supplyCustomerCode,
       supplierCode: masterIdentity.supplierCode,
       supplierName: masterIdentity.supplierName,
       supplierSource: masterIdentity.supplierSource,
@@ -161,18 +178,18 @@ async function procurementView(prisma, identifier, asOf = new Date()) {
       latestPoDate: schedule.latestPoDate,
       latestPrDate: purchaseSchedule?.latestPrDate || purchaseSchedule?.recommendedOrderDate || latestRequirementPr || schedule.latestPrDate,
       purchaseSuggestionNumber: suggestion?.suggestionNumber || null,
-      scheduleSource: purchaseSchedule?.scheduleSource || row.scheduleSource || "MRP_BACKWARD_SCHEDULE",
+      scheduleSource: purchaseSchedule?.scheduleSource || row.scheduleSource || "OR_TOOLS_WASM_CP_SAT",
       productionLeadTimeHours: number(purchaseSchedule?.productionLeadTimeHours),
       supplierLeadTimeDays: masterIdentity.supplierLeadTimeDays,
       requirementQty: row.qty,
       coveredQty: row.coveredQty,
       shortageQty: row.shortageQty,
       moq: row.moq,
-      suggestedOrderQty: number(order?.qty) || row.suggestedOrderQty,
-      risk: row.shortageQty > 0 && new Date(schedule.latestPrDate) < asOf ? "EXPEDITE" : row.shortageQty > 0 ? "SHORTAGE" : "COVERED",
+      suggestedOrderQty: customerSupplied ? 0 : number(order?.qty) || row.suggestedOrderQty,
+      risk: customerSupplied && row.shortageQty > 0 ? "WAITING_CUSTOMER_MATERIAL" : row.shortageQty > 0 && new Date(schedule.latestPrDate) < asOf ? "EXPEDITE" : row.shortageQty > 0 ? "SHORTAGE" : "COVERED",
       pegging: row.pegging,
     };
-  });
+  }));
   items.sort((left, right) => new Date(left.supplierRequiredArrivalDate) - new Date(right.supplierRequiredArrivalDate)
     || new Date(left.customerDeliveryDate) - new Date(right.customerDeliveryDate)
     || String(left.materialCode || left.partCode).localeCompare(String(right.materialCode || right.partCode)));

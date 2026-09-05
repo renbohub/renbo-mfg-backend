@@ -7,6 +7,8 @@ const { procurementSchedule } = require("../src/prisma/services/planning/procure
 const { resolveProductionRequirementDates } = require("../src/prisma/services/planning/mrpDueDateService");
 const { isUncommittedPlannedSupply } = require("../src/prisma/services/planning/plannedSupplyCommitmentService");
 
+(async () => {
+
 assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 60, policy: "MTO" }), 100, "SO parsial hanya mengonsumsi forecast yang cocok; sisa forecast provisional tetap dipertahankan");
 assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 60, policy: "MTS" }), 100, "MTS harus mempertahankan forecast yang lebih besar");
 assert.strictEqual(effectiveDemandQty({ forecastQty: 100, salesOrderQty: 140, policy: "MTS" }), 140, "SO harus menjadi floor MTS");
@@ -53,21 +55,21 @@ assert.strictEqual(risk.netRequirement, 0, "Open PR mencegah duplicate planned o
 assert.strictEqual(risk.firmNetRequirement, 50, "Open PR belum boleh dianggap firm receipt");
 assert.strictEqual(risk.atRiskSupplyQty, 50, "Coverage non-firm harus tampil sebagai supply at risk");
 
-const firstHalf = procurementSchedule({
+const firstHalf = await procurementSchedule({
   materialRequiredDate: "2026-09-12T00:00:00.000Z",
   supplierLeadTimeDays: 5,
   asOf: "2026-08-01T00:00:00.000Z",
 });
 assert.strictEqual(firstHalf.procurementWindow, "DELIVERY_1_15", "Need bulan depan tanggal 1-15 harus masuk first-half window");
 
-const expedite = procurementSchedule({
+const expedite = await procurementSchedule({
   materialRequiredDate: "2026-08-05T00:00:00.000Z",
   supplierLeadTimeDays: 10,
   asOf: "2026-08-01T00:00:00.000Z",
 });
 assert.strictEqual(expedite.procurementWindow, "EXPEDITE", "Latest PR date yang lewat harus menjadi expedite");
 
-const backward = resolveProductionRequirementDates({
+const backward = await resolveProductionRequirementDates({
   fgRequiredDate: "2026-08-31T00:00:00.000Z",
   customerTargetDate: "2026-08-31T00:00:00.000Z",
   routingMetric: { productionLeadTimeDays: 13, workingHoursPerDay: 8 },
@@ -82,3 +84,4 @@ assert((mrpControllerSource.match(/initialStockAvailableMap:\s*purchaseInitialSt
 assert(mrpControllerSource.includes("totalRequirements: persistedRequirements.length"), "MRP header harus menghitung seluruh Production + Purchase requirement");
 
 console.log("Combined Forecast/SO, time-phased MRP, procurement window checks passed: 22/22 cases");
+})().catch((error) => { console.error(error); process.exitCode = 1; });
