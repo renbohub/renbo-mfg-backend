@@ -51,9 +51,9 @@ const trace = buildMpsCalculationTrace({
   netting: netMpsBucket({ openingAvailableQty: 10, grossDemandQty: 100, targetEndingStockQty: 20 }),
   sourceRows: [],
 });
-assert.equal(trace.version, 2);
+assert.equal(trace.version, 3);
 assert.deepEqual(trace.steps.map((step) => step.key), [
-  "FORECAST", "SALES_ORDER", "GROSS_DEMAND", "OPENING_AVAILABLE",
+  "FORECAST", "SALES_ORDER", "GROSS_DEMAND", "OPENING_FREE_FG", "PEGGED_SO_RESERVATION", "OPENING_NETTABLE",
   "FIRM_RECEIPT", "BUFFER_TARGET", "NET_PRODUCTION", "PROJECTED_ENDING",
 ]);
 

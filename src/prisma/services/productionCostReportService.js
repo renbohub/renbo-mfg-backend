@@ -1,6 +1,6 @@
 const { calculateLiveMbomCosts } = require("./mbomLiveCostingService");
 const {
-  legacyPriceValue,
+  nullablePriceValue,
   resolveEffectiveRecord,
 } = require("./pricing/effectivePriceService");
 
@@ -360,11 +360,11 @@ async function buildProductionCostReport(prisma, options = {}) {
 
     const part = issueParts.get(detail.partCode);
     const partPrice = resolveEffectiveRecord(partPrices.filter((row) => row.partId === part?.id && isEffective(row, detail.issue.issueDate)), detail.issue.issueDate);
-    const partValue = legacyPriceValue(partPrice, detail.issue.issueDate);
-    if (partValue > 0) return { rate: toIdr(partValue, partPrice.currencyCode), source: "PART_PRICE_FALLBACK" };
+    const partValue = nullablePriceValue(partPrice, detail.issue.issueDate);
+    if (partValue !== null && partValue >= 0) return { rate: toIdr(partValue, partPrice.currencyCode), source: "PART_PRICE_FALLBACK" };
     const materialPrice = resolveEffectiveRecord(materialPrices.filter((row) => row.materialId === part?.materialId && isEffective(row, detail.issue.issueDate)), detail.issue.issueDate);
-    const materialValue = legacyPriceValue(materialPrice, detail.issue.issueDate);
-    if (materialValue > 0) return { rate: toIdr(materialValue, materialPrice.currencyCode), source: "MATERIAL_PRICE_FALLBACK" };
+    const materialValue = nullablePriceValue(materialPrice, detail.issue.issueDate);
+    if (materialValue !== null && materialValue >= 0) return { rate: toIdr(materialValue, materialPrice.currencyCode), source: "MATERIAL_PRICE_FALLBACK" };
     return { rate: 0, source: "PRICE_MISSING" };
   }
 

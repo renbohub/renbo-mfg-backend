@@ -1,6 +1,7 @@
+const { businessNow } = require("../../utils/businessClock");
 const CLOSE_PREFIX = "PPIC_PERIOD_CLOSE_";
 
-function normalizeMonth(value, fallback = new Date()) {
+function normalizeMonth(value, fallback = businessNow()) {
   const raw = String(value || "").trim();
   if (/^\d{4}-\d{2}$/.test(raw)) return raw;
   return `${fallback.getUTCFullYear()}-${String(fallback.getUTCMonth() + 1).padStart(2, "0")}`;

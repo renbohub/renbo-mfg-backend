@@ -6,6 +6,7 @@ const { approvalGate } = require("../../services/approvalRuleService");
 
 const gate = (decision) => approvalGate({ moduleCode: "purchasing", pageCode: "purchase-requisitions", actionCode: "approve", documentType: "PurchaseRequisition", param: "prNumber", model: "purchaseRequisition", lookupField: "prNumber", numberField: "prNumber", decision, requireExistingRequest: true });
 router.get("/", authorize("purchaseOrder", "read"), ctrl.list);
+router.get("/number-preview", authorize("purchaseOrder", "create"), ctrl.numberPreview);
 router.post("/", authorize("purchaseOrder", "create"), logger("purchaseRequisition", "create"), ctrl.create);
 router.post("/consolidate-to-po", authorize("purchaseOrder", "create"), logger("purchaseRequisition", "consolidate-to-po"), ctrl.consolidateToPO);
 router.get("/:prNumber", authorize("purchaseOrder", "read"), ctrl.get);

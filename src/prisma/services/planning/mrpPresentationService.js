@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { consolidateRequirements, procurementWindow } = require("./demandPlanningService");
 const { procurementSchedule } = require("./procurementSchedulingService");
@@ -71,7 +72,7 @@ async function resolveRun(prisma, identifier) {
   });
 }
 
-async function procurementView(prisma, identifier, asOf = new Date()) {
+async function procurementView(prisma, identifier, asOf = businessNow()) {
   const run = await resolveRun(prisma, identifier);
   if (!run) throw Object.assign(new Error("MRP run tidak ditemukan."), { statusCode: 404 });
   const [requirements, orders, suggestion] = await Promise.all([

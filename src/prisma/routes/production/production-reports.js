@@ -7,6 +7,7 @@ router.get("/dashboard", authorize("productionReports", "read"), ctrl.dashboard)
 router.get("/machine-daily", authorize("productionReports", "read"), ctrl.machineDailyReport);
 router.get("/cost-actual", authorize("productionReports", "read"), ctrl.productionCostActual);
 router.get("/oee", authorize("productionReports", "read"), ctrl.oeeReport);
+router.get("/oee-monitoring", authorize("productionReports", "read"), ctrl.oeeMonitoring);
 router.get("/yield", authorize("productionReports", "read"), ctrl.yieldReport);
 router.get("/scrap", authorize("productionReports", "read"), ctrl.scrapReport);
 router.get("/output-trend", authorize("productionReports", "read"), ctrl.outputTrend);

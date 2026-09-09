@@ -2,18 +2,14 @@ const { prisma } = require("../../index");
 const { createAiDraftService } = require("../../services/ai/aiDraftService");
 const aiDraftService = createAiDraftService({ prisma });
 const { assertApprovedCurrentMrp } = require("../../services/planning/mrpLifecycleService");
-const { procurementSchedule } = require("../../services/planning/procurementSchedulingService");
-const { resolveProductionRequirementDates } = require("../../services/planning/mrpDueDateService");
-const {
-  loadDemandPlanningConstraintMap,
-  leadTimeControls,
-  procurementPolicyFromDecision,
-  applyDecisionToRoutingMetric,
-} = require("../../services/planning/demandPlanningConstraintService");
+const { SOURCE: PURCHASE_DATE_SOURCE, deliveryNeed, schedule: procurementSchedule, itemDeliveryNeed, loadItemDeliveryNeed } = require("../../services/purchasing/purchaseSuggestionDates");
 const { allocatePurchaseQtyToSources, applyConfirmedMoqPullForward, applyMoqCarryForward, buildMoqAllocationCandidates } = require("../../services/purchasing/purchaseSuggestionAllocationService");
 const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pricing/effectivePriceService");
 const {
   resolveBomPurchaseDefaults,
+  bomSupplierSelect,
+  resolveBomSupplier,
+  supplierItemIsEffective,
   resolvePurchaseSuggestionSupplierMaster,
   findPricedPurchaseSuggestionSupplierMaster,
 } = require("../../services/purchasing/purchaseSuggestionMasterDataService");
@@ -468,6 +464,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
       },
       mbomDetail: {
         select: {
+          ...bomSupplierSelect,
           id: true,
           noReg: true,
           materialScheme: true,
@@ -485,7 +482,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
     requirementsByPartDay.get(key).push(requirement);
   }
 
-  const capacityNeedDates = await buildCapacityNeedDateMap(tx, run);
+
 
   const routingRequestByOrder = new Map();
   for (const order of orders) {
@@ -504,13 +501,6 @@ async function generateForRun(tx, runNumber, user, options = {}) {
       matchingDeliveryPlans,
     });
   }
-  const metricsByHeaderQuantity = await routingMetricsForRequests(tx, [...routingRequestByOrder.values()]);
-  const planningConstraintByTarget = await loadDemandPlanningConstraintMap(
-    tx,
-    [...routingRequestByOrder.values()].flatMap((request) =>
-      (request.matchingDeliveryPlans || []).map((plan) => plan.sourceDeliveryTargetId)),
-  );
-
   const partCodes = unique(orders.map((row) => row.partCode));
   const materialCodes = unique(orders.map((row) => row.part?.material?.materialCode));
   const stockRows = await tx.stockBalance.findMany({
@@ -568,51 +558,19 @@ async function generateForRun(tx, runNumber, user, options = {}) {
           order.requiredDate,
         ]).filter(Boolean).map((value) => new Date(value));
     const customerDeliveryDate = deliveryDates.sort((a, b) => a - b)[0] || new Date(order.requiredDate);
-    const fgRequiredDates = matchingDeliveryPlans
-      .map((plan) => plan.fgRequiredDate || plan.plannedDate)
-      .filter(Boolean)
-      .map((value) => new Date(value));
-    const fgRequiredDate = fgRequiredDates.sort((a, b) => a - b)[0] || customerDeliveryDate;
-    const headerId = routingRequest.headerId || matched.find((row) => row.mpsDetail?.mbomHeaderId)?.mpsDetail?.mbomHeaderId;
-    const baseRouting = metricsByHeaderQuantity.get(routingMetricKey(headerId, routingRequest.scheduleQty)) || { setupMinutes: 0, cycleTimeSeconds: 0, productionLeadTimeHours: 0, scheduleQty: routingRequest.scheduleQty || 0 };
-    const planningDecision = matchingDeliveryPlans
-      .map((plan) => planningConstraintByTarget.get(plan.sourceDeliveryTargetId))
-      .find(Boolean) || null;
-    const routingDecision = applyDecisionToRoutingMetric(baseRouting, planningDecision);
-    const routing = routingDecision.metric || baseRouting;
-    const supplierItem = order.part?.supplierItems?.[0];
-    const suggestedSupplier = supplierItem?.supplier || order.part?.supplier || null;
-    const controls = leadTimeControls(planningDecision);
+    const bomSupplier = resolveBomSupplier(matched);
+    const effectiveSupplierItems = (order.part?.supplierItems || []).filter(row => supplierItemIsEffective(row, run.planningSnapshotAt || run.runDate || new Date()));
+    const supplierItem = bomSupplier
+      ? effectiveSupplierItems.find(row => row.supplierId === bomSupplier.id)
+      : effectiveSupplierItems[0];
+    const suggestedSupplier = bomSupplier || supplierItem?.supplier || order.part?.supplier || null;
+
     const masterPurchasingLeadTimeDays = number(supplierItem?.leadTimeDays ?? suggestedSupplier?.leadTimeDays ?? order.leadTime);
-    const purchasingLeadTimeDays = controls.supplierLeadTime ? masterPurchasingLeadTimeDays : 0;
-    const queueBufferHours = number(options.queueBufferHours);
-    const totalProductionLeadTimeHours = routing.productionLeadTimeHours + queueBufferHours;
-    const exactProductionLeadTimeDays = number(routing.exactProductionLeadTimeDays) + queueBufferHours / WORKING_HOURS_PER_DAY;
-    const scheduledProductionLeadTimeDays = number(routing.productionLeadTimeDays) + Math.ceil(queueBufferHours / WORKING_HOURS_PER_DAY);
-    const capacityProductionStart = matchingDeliveryPlans
-      .map((plan) => capacityNeedDates.byPhase.get(plan.id))
-      .filter(Boolean)
-      .sort((a, b) => a - b)[0]
-      || matched.map((row) => capacityNeedDates.byMpsDetail.get(row.mpsDetailId)).filter(Boolean).sort((a, b) => a - b)[0];
-    // Purchase Suggestion protects the latest permissible production start.
-    // Existing finite-capacity allocations are evidence, not the source of this
-    // deadline; otherwise an early allocation turns into an unnecessarily early PR.
-    const productionSchedule = await resolveProductionRequirementDates({
-      fgRequiredDate,
-      customerTargetDate: customerDeliveryDate,
-      routingMetric: { ...routing, productionLeadTimeDays: scheduledProductionLeadTimeDays },
-    });
-    const calculatedProductionStart = productionSchedule.productionLatestStartDate;
-    const plannedProductionStart = calculatedProductionStart;
-    const materialRequiredDate = plannedProductionStart;
-    const scheduleSource = "OR_TOOLS_WASM_CP_SAT";
-    const procurementPolicy = procurementPolicyFromDecision(planningDecision, options.procurementPolicy || {});
-    const schedule = await procurementSchedule({
-      materialRequiredDate,
-      supplierLeadTimeDays: purchasingLeadTimeDays,
-      ...procurementPolicy,
-      asOf: run.planningSnapshotAt || run.runDate || new Date(),
-    });
+    const purchasingLeadTimeDays = masterPurchasingLeadTimeDays;
+    const materialRequiredDate = deliveryNeed(matched, order.requiredDate);
+    const plannedProductionStart = materialRequiredDate;
+    const scheduleSource = PURCHASE_DATE_SOURCE;
+    const schedule = procurementSchedule({ materialRequiredDate, supplierLeadTimeDays: purchasingLeadTimeDays, asOf: run.planningSnapshotAt || run.runDate || new Date() });
     // recommendedOrderDate is the PO release deadline. latestPrDate remains a
     // separate internal approval milestone and must not be labelled as PO.
     const recommendedOrderDate = schedule.latestPoDate;
@@ -691,6 +649,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
           qty: round(matchedNetTotal > 0 ? netRequirement * rowBasis / matchedNetTotal : netRequirement / Math.max(matched.length, 1)),
           grossQty: number(row.grossRequirement),
           requiredDate: row.requiredDate,
+          materialRequiredDate: row.materialRequiredDate || row.requiredDate,
           mpsNumber: row.mpsDetail?.mpsNumber || null,
         };
       }),
@@ -705,27 +664,18 @@ async function generateForRun(tx, runNumber, user, options = {}) {
       latestPrDate: schedule.latestPrDate,
       procurementWindow: schedule.procurementWindow,
       scheduleSource,
-      productionLeadTimeHours: round(totalProductionLeadTimeHours),
+      productionLeadTimeHours: 0,
       productionLeadTimeBreakdown: {
-        ...routing,
-        queueBufferHours,
-        totalProductionLeadTimeHours: round(totalProductionLeadTimeHours),
-        totalProductionLeadTimeDays: scheduledProductionLeadTimeDays,
-        exactProductionLeadTimeDays: round(exactProductionLeadTimeDays),
-        scheduledProductionLeadTimeDays,
-        planningEvidence: routingDecision.planningEvidence,
-        fgRequiredDate,
+        dateSource: PURCHASE_DATE_SOURCE,
         procurementSchedule: schedule,
-        procurementPolicy,
         masterPurchasingLeadTimeDays,
         effectivePurchasingLeadTimeDays: purchasingLeadTimeDays,
-        capacityReferenceStartDate: capacityProductionStart || null,
         lotSizing: { netRequirement, moq, orderMultiple, recommendedPurchaseQty, excessQty, moqSource },
       },
       purchasingLeadTimeDays,
-      setupTimeMinutes: round(routing.setupMinutes),
-      cycleTimeSeconds: round(routing.cycleTimeSeconds),
-      queueBufferHours,
+      setupTimeMinutes: 0,
+      cycleTimeSeconds: 0,
+      queueBufferHours: 0,
       grossRequirement,
       onHandStock: round(stock.onHand),
       reservedStock: round(stock.reserved),
@@ -751,7 +701,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
   const groupedItems = new Map();
   for (const item of rawItems) {
     const identity = item.materialCode || item.partCode;
-    const key = [identity, day(item.materialRequiredDate), item.suggestedSupplierCode || "", item.warehouseCode || "", item.uomCode || ""].join("|");
+    const key = [identity, require("../../services/planning/weeklyProcurementService").procurementWeek(item.materialRequiredDate).key, item.suggestedSupplierCode || "", item.warehouseCode || "", item.uomCode || ""].join("|");
     const current = groupedItems.get(key);
     if (!current) {
       groupedItems.set(key, { ...item, _rawGrossRequirement: item.grossRequirement, _rawNetRequirement: item.netRequirement });
@@ -813,7 +763,7 @@ async function generateForRun(tx, runNumber, user, options = {}) {
       warehouseCode: options.warehouseCode || null,
       status: "Draft",
       generatedBy: user,
-      notes: "Generated by backward scheduling from customer delivery, routing time, purchasing lead time, stock, open PO, MOQ and order multiple.",
+      notes: "Delivery Need from exploded MRP requirements. Purchase Max = Delivery Need minus supplier lead time in calendar days.",
       items: { create: items },
   };
   return existing && options.force === true
@@ -889,9 +839,8 @@ async function autoConfirmSupplierItem(tx, item, actor, asOf) {
 
   const effectiveLeadTimeDays = 2;
   const recalculatedSchedule = await procurementSchedule({
-    materialRequiredDate: item.materialRequiredDate,
+    materialRequiredDate: await loadItemDeliveryNeed(tx, item),
     supplierLeadTimeDays: effectiveLeadTimeDays,
-    ...(item.productionLeadTimeBreakdown?.procurementPolicy || {}),
   });
   const shortageQty = round(Math.max(number(item.netRequirement) - confirmedQty, 0));
   const row = await tx.purchaseSuggestionItem.update({
@@ -899,7 +848,10 @@ async function autoConfirmSupplierItem(tx, item, actor, asOf) {
     data: {
       confirmationStatus: "Confirmed",
       confirmedQty,
-      confirmedDeliveryDate: item.materialRequiredDate,
+      confirmedDeliveryDate: recalculatedSchedule.materialRequiredDate,
+      materialRequiredDate: recalculatedSchedule.materialRequiredDate,
+      plannedProductionStart: recalculatedSchedule.materialRequiredDate,
+      scheduleSource: PURCHASE_DATE_SOURCE,
       confirmedMoq: optionalNumber(master.moq) ?? number(item.moq),
       confirmedLeadTimeDays: effectiveLeadTimeDays,
       orderMultiple: optionalNumber(master.orderMultiple) ?? number(item.orderMultiple),
@@ -1013,10 +965,20 @@ exports.list = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
-exports.get = async (req, res, next) => {
-  try {
-    const item = await prisma.purchaseSuggestion.findFirst({ where: { suggestionNumber: req.params.suggestionNumber, isDeleted: false }, include: { items: { where: { isDeleted: false }, orderBy: [{ materialRequiredDate: "asc" }, { materialCode: "asc" }, { partCode: "asc" }], include: { supplierAllocations: { where: { isDeleted: false }, orderBy: { deliveryDate: "asc" } } } } } });
-    if (!item) return res.status(404).json({ message: "Purchase Suggestion tidak ditemukan" });
+// MOQ pulled forward is inventory coverage, not an additional production lot.
+// In particular an all-MOQ remainder must keep the original requirement's BOM
+// and quantity instead of adding a later, unrelated FG to that BOM's cycle load.
+function suggestionSchedulingRequirements(row, requirementById) {
+  const direct = (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : [])
+    .filter((source) => source.allocationType !== "MOQ_PULL_FORWARD");
+  return unique([row.mrpRequirementId, ...direct.map((source) => source.id)])
+    .map((id) => requirementById.get(id)).filter(Boolean);
+}
+exports.suggestionSchedulingRequirements = suggestionSchedulingRequirements;
+
+async function readSuggestion(prisma, suggestionNumber) {
+    const item = await prisma.purchaseSuggestion.findFirst({ where: { suggestionNumber, isDeleted: false }, include: { items: { where: { isDeleted: false }, orderBy: [{ materialRequiredDate: "asc" }, { materialCode: "asc" }, { partCode: "asc" }], include: { supplierAllocations: { where: { isDeleted: false }, orderBy: { deliveryDate: "asc" } } } } } });
+    if (!item) return null;
     const materialIds = unique(item.items.map((row) => row.materialId));
     const itemPartCodes = unique(item.items.map((row) => row.partCode));
     const requirementIds = unique(item.items.flatMap((row) => [
@@ -1024,52 +986,14 @@ exports.get = async (req, res, next) => {
       ...(Array.isArray(row.sourceRequirements) ? row.sourceRequirements.map((source) => source.id) : []),
       ...(Array.isArray(row.productionLeadTimeBreakdown?.moqAllocation?.allocationPool) ? row.productionLeadTimeBreakdown.moqAllocation.allocationPool.map((source) => source.id) : []),
     ]));
-    const [materials, requirements, schedulingRequirements] = await Promise.all([
+    const [materials, requirements, plannedOrders] = await Promise.all([
       materialIds.length ? prisma.material.findMany({ where: { id: { in: materialIds }, isDeleted: false }, select: { id: true, width: true, thickness: true, materialForm: true } }) : [],
-      requirementIds.length ? prisma.mRPRequirement.findMany({ where: { id: { in: requirementIds }, isDeleted: false }, select: { id: true, deliveryTargetId: true, targetDeliveryDate: true, part: { select: { partCode: true, partNumber: true, partName: true } }, mbomDetail: { select: { materialScheme: true, materialWidth: true, materialForm: { select: { id: true, formCode: true, symbol: true } }, alternateMaterialForm: { select: { id: true, formCode: true, symbol: true } } } } } }) : [],
-      prisma.mRPRequirement.findMany({
-        where: { runNumber: item.runNumber, orderType: "Purchase", isDeleted: false, mpsDetailId: { not: null } },
-        select: { id: true, mpsDetailId: true, mpsDetail: { select: { mbomHeaderId: true, qtyPlanned: true } } },
-      }),
+      requirementIds.length ? prisma.mRPRequirement.findMany({ where: { id: { in: requirementIds }, isDeleted: false }, select: { id: true, requiredDate: true, materialRequiredDate: true, deliveryTargetId: true, targetDeliveryDate: true, part: { select: { partCode: true, partNumber: true, partName: true } }, mbomDetail: { select: { ...bomSupplierSelect, materialScheme: true, materialWidth: true, materialForm: { select: { id: true, formCode: true, symbol: true } }, alternateMaterialForm: { select: { id: true, formCode: true, symbol: true } } } } } }) : [],
+      prisma.plannedOrder.findMany({ where: { runNumber: item.runNumber, orderType: "Purchase", isDeleted: false }, select: { orderNumber: true, requiredDate: true } }),
     ]);
     const materialById = new Map(materials.map((row) => [row.id, row]));
     const requirementById = new Map(requirements.map((row) => [row.id, row]));
-    const schedulingRequirementById = new Map(schedulingRequirements.map((row) => [row.id, row]));
-    const itemRoutingRequestById = new Map();
-    for (const row of item.items) {
-      const directSources = (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : [])
-        .filter((source) => source.allocationType !== "MOQ_PULL_FORWARD");
-      const sourceRows = directSources.length ? directSources : (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : []);
-      const linkedRequirements = unique([row.mrpRequirementId, ...sourceRows.map((source) => source.id)])
-        .map((id) => schedulingRequirementById.get(id))
-        .filter(Boolean);
-      const headerId = linkedRequirements.find((requirement) => requirement.mpsDetail?.mbomHeaderId)?.mpsDetail?.mbomHeaderId || null;
-      const uniqueDetails = new Map(linkedRequirements.filter((requirement) => requirement.mpsDetailId).map((requirement) => [requirement.mpsDetailId, requirement.mpsDetail]));
-      itemRoutingRequestById.set(row.id, {
-        headerId,
-        scheduleQty: round([...uniqueDetails.values()].reduce((sum, detail) => sum + number(detail?.qtyPlanned), 0)),
-      });
-    }
-    const uniqueQtyByHeader = new Map();
-    const legacyQtyByHeader = new Map();
-    const requirementCountByHeader = new Map();
-    const countedMpsDetailsByHeader = new Map();
-    for (const requirement of schedulingRequirements) {
-      const headerId = requirement.mpsDetail?.mbomHeaderId;
-      if (!headerId) continue;
-      legacyQtyByHeader.set(headerId, number(legacyQtyByHeader.get(headerId)) + number(requirement.mpsDetail?.qtyPlanned));
-      requirementCountByHeader.set(headerId, number(requirementCountByHeader.get(headerId)) + 1);
-      if (!countedMpsDetailsByHeader.has(headerId)) countedMpsDetailsByHeader.set(headerId, new Set());
-      const countedDetails = countedMpsDetailsByHeader.get(headerId);
-      if (countedDetails.has(requirement.mpsDetailId)) continue;
-      countedDetails.add(requirement.mpsDetailId);
-      uniqueQtyByHeader.set(headerId, number(uniqueQtyByHeader.get(headerId)) + number(requirement.mpsDetail?.qtyPlanned));
-    }
-    const schedulingMetrics = await routingMetricsForRequests(prisma, [...itemRoutingRequestById.values()]);
-    const planningConstraintByTarget = await loadDemandPlanningConstraintMap(prisma, unique([
-      ...requirements.map((row) => row.deliveryTargetId),
-      ...item.items.flatMap((row) => (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : []).map((source) => source.deliveryTargetId)),
-    ]));
+    const orderByNumber = new Map(plannedOrders.map((row) => [row.orderNumber, row]));
     const [relatedParts, currentRuns, latestReviewedDemand] = await Promise.all([
       prisma.part.findMany({
         where: { isDeleted: false, OR: [
@@ -1128,55 +1052,23 @@ exports.get = async (req, res, next) => {
       };
     });
     const responseItems = await Promise.all(presentationItems.map(async (row) => {
-      const routingRequest = itemRoutingRequestById.get(row.id) || {};
-      const headerId = routingRequest.headerId || schedulingRequirementById.get(row.mrpRequirementId)?.mpsDetail?.mbomHeaderId;
-      const baseMetric = schedulingMetrics.get(routingMetricKey(headerId, routingRequest.scheduleQty));
-      const planningDecision = (Array.isArray(row.sourceRequirements) ? row.sourceRequirements : [])
-        .map((source) => planningConstraintByTarget.get(source.deliveryTargetId || requirementById.get(source.id)?.deliveryTargetId))
-        .find(Boolean)
-        || planningConstraintByTarget.get(requirementById.get(row.mrpRequirementId)?.deliveryTargetId)
-        || null;
-      const routingDecision = applyDecisionToRoutingMetric(baseMetric, planningDecision);
-      const metric = routingDecision.metric || baseMetric;
-      const legacyQty = number(legacyQtyByHeader.get(headerId));
-      const legacyCycleLoadHours = metric ? round(metric.cycleTimeSeconds * legacyQty / 3600) : 0;
-      const legacyTotalHours = metric
-        ? round(metric.summedComponentLeadHours + metric.routingRunHours + metric.setupHours + legacyCycleLoadHours + number(row.queueBufferHours))
-        : number(row.productionLeadTimeHours);
-      const currentTotalHours = metric ? round(metric.productionLeadTimeHours + number(row.queueBufferHours)) : number(row.productionLeadTimeHours);
-      const currentTotalDays = metric
-        ? round(metric.productionLeadTimeDays + Math.ceil(number(row.queueBufferHours) / WORKING_HOURS_PER_DAY))
-        : round(number(row.productionLeadTimeHours) / WORKING_HOURS_PER_DAY);
-      const scheduledProductionLeadTimeDays = Math.ceil(currentTotalDays);
-      const calculatedLeadTimeBreakdown = metric ? {
-        ...metric,
-        queueBufferHours: number(row.queueBufferHours),
-        totalProductionLeadTimeHours: currentTotalHours,
-        totalProductionLeadTimeDays: currentTotalDays,
-        exactProductionLeadTimeDays: round(metric.exactProductionLeadTimeDays + number(row.queueBufferHours) / WORKING_HOURS_PER_DAY),
-        scheduledProductionLeadTimeDays,
-        storedProductionLeadTimeHours: number(row.productionLeadTimeHours),
-        legacyDetected: Math.abs(number(row.productionLeadTimeHours) - legacyTotalHours) <= 0.001 && Math.abs(legacyQty - metric.scheduleQty) > 0.001,
-        legacyRequirementCount: number(requirementCountByHeader.get(headerId)),
-        legacyAccumulatedQty: legacyQty,
-        legacyCycleLoadHours,
-        legacyTotalHours,
-        planningEvidence: routingDecision.planningEvidence || row.productionLeadTimeBreakdown?.planningEvidence || null,
-        ...(row.productionLeadTimeBreakdown?.moqAllocation ? { moqAllocation: row.productionLeadTimeBreakdown.moqAllocation } : {}),
-      } : row.productionLeadTimeBreakdown;
-      const fgRequiredDate = row.productionLeadTimeBreakdown?.fgRequiredDate || row.customerDeliveryDate;
-      const productionDates = metric && fgRequiredDate
-        ? await resolveProductionRequirementDates({ fgRequiredDate, customerTargetDate: row.customerDeliveryDate, routingMetric: { ...metric, productionLeadTimeDays: scheduledProductionLeadTimeDays } })
-        : null;
-      const calculatedProductionDueDate = productionDates?.productionLatestStartDate || row.materialRequiredDate;
-      const controls = leadTimeControls(planningDecision);
+      const useBomDefault = !row.alternativeSupplierCode && !row.bypassConfirmationReason
+        && !CONFIRMED_STATUSES.has(row.confirmationStatus) && !["Ready for PR", "Partially Ready"].includes(row.status)
+        && !number(row.qtyConvertedToPr) && !(row.supplierAllocations || []).length;
+      const bomSupplier = useBomDefault ? resolveBomSupplier(suggestionSchedulingRequirements(row, requirementById)) : null;
+      if (bomSupplier && row.suggestedSupplierCode !== bomSupplier.supplierCode) {
+        const master = await resolvePurchaseSuggestionSupplierMaster(prisma, row, bomSupplier.supplierCode);
+        row = { ...row, suggestedSupplierCode: bomSupplier.supplierCode, suggestedSupplierName: bomSupplier.supplierName,
+          confirmedLeadTimeDays: null,
+          purchasingLeadTimeDays: master.leadTimeDays ?? bomSupplier.leadTimeDays ?? 0,
+          estimatedUnitPrice: master.unitPrice, currencyCode: master.currencyCode, priceSource: master.sources.price };
+      }
+
+      const calculatedProductionDueDate = itemDeliveryNeed(row, requirementById, orderByNumber);
       const masterSupplierLeadTimeDays = number(row.confirmedLeadTimeDays ?? row.purchasingLeadTimeDays);
-      const effectiveSupplierLeadTimeDays = controls.supplierLeadTime ? masterSupplierLeadTimeDays : 0;
-      const procurementPolicy = procurementPolicyFromDecision(planningDecision, row.productionLeadTimeBreakdown?.procurementPolicy || {});
-      const calculatedProcurementSchedule = calculatedProductionDueDate
-        ? await procurementSchedule({ materialRequiredDate: calculatedProductionDueDate, supplierLeadTimeDays: effectiveSupplierLeadTimeDays, ...procurementPolicy })
-        : null;
-      const calculatedPurchaseDueDate = calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate;
+      const effectiveSupplierLeadTimeDays = masterSupplierLeadTimeDays;
+      const calculatedProcurementSchedule = procurementSchedule({ materialRequiredDate: calculatedProductionDueDate, supplierLeadTimeDays: effectiveSupplierLeadTimeDays });
+      const calculatedPurchaseDueDate = calculatedProcurementSchedule.latestPoDate;
       const allocatedRequirementIds = new Set(presentationItems.flatMap((candidate) => (Array.isArray(candidate.sourceRequirements) ? candidate.sourceRequirements : []).map((source) => String(source.id))));
       const externalCandidates = externalRequirements.filter((requirement) => {
         const relatedPart = relatedPartByCode.get(requirement.partCode);
@@ -1216,19 +1108,24 @@ exports.get = async (req, res, next) => {
         || { form: null, width: null, source: "NOT_FOUND", materialScheme: null };
       return {
         ...row,
-        scheduleSource: "OR_TOOLS_WASM_CP_SAT",
+        scheduleSource: PURCHASE_DATE_SOURCE,
+        materialRequiredDate: calculatedProductionDueDate,
+        plannedProductionStart: calculatedProductionDueDate,
+        recommendedOrderDate: calculatedPurchaseDueDate,
+        latestPrDate: calculatedProcurementSchedule.latestPrDate,
         calculatedProductionDueDate,
         calculatedPurchaseDueDate,
+        procurementWindow: calculatedProcurementSchedule?.procurementWindow || row.procurementWindow,
         supplierRequiredArrivalDate: calculatedProcurementSchedule?.supplierRequiredArrivalDate || row.productionLeadTimeBreakdown?.procurementSchedule?.supplierRequiredArrivalDate || null,
         latestPoDate: calculatedProcurementSchedule?.latestPoDate || row.recommendedOrderDate,
         calculatedLatestPrDate: calculatedProcurementSchedule?.latestPrDate || row.latestPrDate,
-        productionLeadTimeBreakdown: calculatedLeadTimeBreakdown ? {
-          ...calculatedLeadTimeBreakdown,
-          procurementSchedule: calculatedProcurementSchedule || calculatedLeadTimeBreakdown.procurementSchedule || null,
-          procurementPolicy,
+        productionLeadTimeBreakdown: {
+          dateSource: PURCHASE_DATE_SOURCE,
+          ...(row.productionLeadTimeBreakdown?.moqAllocation ? { moqAllocation: row.productionLeadTimeBreakdown.moqAllocation } : {}),
+          procurementSchedule: calculatedProcurementSchedule,
           masterPurchasingLeadTimeDays: masterSupplierLeadTimeDays,
           effectivePurchasingLeadTimeDays: effectiveSupplierLeadTimeDays,
-        } : calculatedLeadTimeBreakdown,
+        },
         masterMaterialWidth: materialById.get(row.materialId)?.width ?? null,
         masterMaterialThickness: materialById.get(row.materialId)?.thickness ?? null,
         masterMaterialForm: materialById.get(row.materialId)?.materialForm ?? null,
@@ -1253,10 +1150,28 @@ exports.get = async (req, res, next) => {
         },
       };
     }));
-    res.json({
+    const selectedSupplierCodes = unique(responseItems.map(row => row.alternativeSupplierCode).filter(Boolean));
+    const selectedSuppliers = selectedSupplierCodes.length
+      ? await prisma.supplier.findMany({ where: { supplierCode: { in: selectedSupplierCodes } }, select: { supplierCode: true, supplierName: true } })
+      : [];
+    const selectedSupplierByCode = new Map(selectedSuppliers.map(supplier => [supplier.supplierCode, supplier]));
+    return {
       ...item,
-      items: responseItems,
-    });
+      items: responseItems.map(row => ({
+        ...row,
+        effectiveSupplierCode: row.alternativeSupplierCode || row.suggestedSupplierCode || null,
+        effectiveSupplierName: row.alternativeSupplierCode
+          ? selectedSupplierByCode.get(row.alternativeSupplierCode)?.supplierName || row.alternativeSupplierCode
+          : row.suggestedSupplierName || row.suggestedSupplierCode || null,
+      })),
+    };
+}
+exports.readSuggestion = readSuggestion;
+exports.get = async (req, res, next) => {
+  try {
+    const item = await readSuggestion(prisma, req.params.suggestionNumber);
+    if (!item) return res.status(404).json({ message: "Purchase Suggestion tidak ditemukan" });
+    res.json(item);
   } catch (error) { next(error); }
 };
 
@@ -1327,35 +1242,31 @@ exports.autoConfirmSuppliers = async (req, res, next) => {
   }
 };
 
-exports.updateItem = async (req, res, next) => {
-  try {
-    if (req.body?.aiDraftId) await aiDraftService.validateDraftForOfficial({ draftId: req.body.aiDraftId, actor: req.user, draftType: "PURCHASING_RECOVERY", moduleCode: "purchasing", pageCode: "purchase-suggestions" });
-    let item = await prisma.purchaseSuggestionItem.findFirst({ where: { id: req.params.itemId, suggestionNumber: req.params.suggestionNumber, isDeleted: false } });
-    if (!item) return res.status(404).json({ message: "Item Purchase Suggestion tidak ditemukan" });
-    const confirmationStatus = text(req.body.confirmationStatus) || item.confirmationStatus;
-    const confirmedQty = req.body.confirmedQty == null ? item.confirmedQty : number(req.body.confirmedQty);
-    const bypassConfirmationReason = text(req.body.bypassConfirmationReason);
+async function applyItemConfirmation(tx, item, body, user = {}) {
+    const confirmationStatus = text(body.confirmationStatus) || item.confirmationStatus;
+    const confirmedQty = body.confirmedQty == null ? item.confirmedQty : number(body.confirmedQty);
+    const bypassConfirmationReason = text(body.bypassConfirmationReason);
     const ready = CONFIRMED_STATUSES.has(confirmationStatus) || Boolean(bypassConfirmationReason);
-    const updated = await prisma.$transaction(async (tx) => {
+
       const previousSupplierCode = item.alternativeSupplierCode || item.suggestedSupplierCode || null;
-      const selectedSupplierCode = text(req.body.alternativeSupplierCode) || previousSupplierCode;
+      const selectedSupplierCode = text(body.alternativeSupplierCode) || previousSupplierCode;
       const supplierChanged = Boolean(selectedSupplierCode && selectedSupplierCode !== previousSupplierCode);
       const supplierMaster = selectedSupplierCode
         ? await resolvePurchaseSuggestionSupplierMaster(tx, item, selectedSupplierCode, { asOf: new Date() })
         : null;
-      const requestedMoq = optionalNumber(req.body.confirmedMoq);
+      const requestedMoq = optionalNumber(body.confirmedMoq);
       const confirmedMoq = requestedMoq
         ?? (supplierChanged ? supplierMaster?.moq : optionalNumber(item.confirmedMoq))
         ?? supplierMaster?.moq
         ?? number(item.moq);
       const effectiveOrderMultiple = supplierMaster?.orderMultiple ?? number(item.orderMultiple);
       const normalizedConfirmedQty = roundedPurchaseQty(confirmedQty, confirmedMoq, effectiveOrderMultiple);
-      if (Array.isArray(req.body.supplierAllocations)) {
+      if (Array.isArray(body.supplierAllocations)) {
         if (number(item.qtyConvertedToPr) > 0) {
           throw Object.assign(new Error("Alokasi supplier tidak dapat diubah setelah sebagian qty dibuat menjadi PR."), { status: 409 });
         }
         await tx.purchaseSuggestionSupplierAllocation.updateMany({ where: { suggestionItemId: item.id, isDeleted: false }, data: { isDeleted: true } });
-        for (const allocation of req.body.supplierAllocations) {
+        for (const allocation of body.supplierAllocations) {
           const allocationStatus = text(allocation.confirmationStatus) || "Not Confirmed";
           const allocationSupplierCode = text(allocation.supplierCode);
           const allocationMaster = allocationSupplierCode
@@ -1381,7 +1292,7 @@ exports.updateItem = async (req, res, next) => {
             materialWidth: item.materialCode ? materialWidth || null : null,
             materialLength: item.materialCode && purchasePackageUomCode === "SHEET" ? materialLength : null,
             purchasePackageUomCode: item.materialCode ? purchasePackageUomCode : null,
-            confirmedBy: CONFIRMED_STATUSES.has(allocationStatus) ? req.user?.username || req.user?.email : null, confirmedAt: CONFIRMED_STATUSES.has(allocationStatus) ? new Date() : null, status: CONFIRMED_STATUSES.has(allocationStatus) ? "Confirmed" : "Draft",
+            confirmedBy: CONFIRMED_STATUSES.has(allocationStatus) ? user?.username || user?.email : null, confirmedAt: CONFIRMED_STATUSES.has(allocationStatus) ? new Date() : null, status: CONFIRMED_STATUSES.has(allocationStatus) ? "Confirmed" : "Draft",
           } });
         }
       }
@@ -1391,17 +1302,17 @@ exports.updateItem = async (req, res, next) => {
           ? {
               supplierCode: selectedSupplierCode,
               confirmedQty: normalizedConfirmedQty,
-              deliveryDate: date(req.body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
+              deliveryDate: date(body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
             }
           : null,
         splitAllocations: allocations.filter((allocation) => CONFIRMED_STATUSES.has(allocation.confirmationStatus)),
       });
       const effectiveConfirmedQty = sumSupplierAllocationQty(allConfirmedSupplierAllocations);
-      if (req.body.moqAllocationEdited === true && Array.isArray(req.body.moqDemandAllocations)) {
+      if (body.moqAllocationEdited === true && Array.isArray(body.moqDemandAllocations)) {
         const suggestionItems = await tx.purchaseSuggestionItem.findMany({
           where: { suggestionNumber: item.suggestionNumber, isDeleted: false },
         });
-        const externalRequirementIds = unique(req.body.moqDemandAllocations
+        const externalRequirementIds = unique(body.moqDemandAllocations
           .filter((allocation) => String(allocation.sourceItemId || "").startsWith("MRP:"))
           .map((allocation) => String(allocation.sourceItemId).slice(4)));
         if (externalRequirementIds.length) {
@@ -1454,7 +1365,7 @@ exports.updateItem = async (req, res, next) => {
           items: suggestionItems,
           currentItemId: item.id,
           confirmedPurchaseQty: effectiveConfirmedQty,
-          selections: req.body.moqDemandAllocations,
+          selections: body.moqDemandAllocations,
         });
         for (const changedItem of reallocation.changed.filter((candidate) => String(candidate.id) !== String(item.id) && !String(candidate.id).startsWith("MRP:"))) {
           await tx.purchaseSuggestionItem.update({ where: { id: changedItem.id }, data: {
@@ -1476,31 +1387,31 @@ exports.updateItem = async (req, res, next) => {
         .map((allocation) => number(allocation.leadTimeDays));
       const effectiveLeadTimeDays = confirmedAllocationLeadTimes.length
         ? Math.max(...confirmedAllocationLeadTimes)
-        : optionalNumber(req.body.confirmedLeadTimeDays)
+        : optionalNumber(body.confirmedLeadTimeDays)
           ?? (supplierChanged ? supplierMaster?.leadTimeDays : optionalNumber(item.confirmedLeadTimeDays))
           ?? supplierMaster?.leadTimeDays
           ?? number(item.purchasingLeadTimeDays);
       const recalculatedSchedule = await procurementSchedule({
-        materialRequiredDate: item.materialRequiredDate,
+        materialRequiredDate: await loadItemDeliveryNeed(tx, item),
         supplierLeadTimeDays: effectiveLeadTimeDays,
-        ...(item.productionLeadTimeBreakdown?.procurementPolicy || {}),
       });
+      item = { ...item, materialRequiredDate: recalculatedSchedule.materialRequiredDate };
       const recalculatedOrderDate = recalculatedSchedule.latestPoDate;
       const headerPurchasePackageUomCode = String(
-        req.body.purchasePackageUomCode
+        body.purchasePackageUomCode
           || (supplierChanged ? supplierMaster?.purchasePackageUomCode : item.purchasePackageUomCode)
           || supplierMaster?.purchasePackageUomCode
           || "",
       ).trim().toUpperCase() || null;
-      const headerMaterialWidth = optionalNumber(req.body.confirmedMaterialWidth)
+      const headerMaterialWidth = optionalNumber(body.confirmedMaterialWidth)
         ?? (supplierChanged ? supplierMaster?.materialWidth : optionalNumber(item.confirmedMaterialWidth))
         ?? supplierMaster?.materialWidth
         ?? 0;
-      const headerMaterialLength = number(req.body.confirmedMaterialLength ?? item.confirmedMaterialLength);
-      const confirmedUnitPrice = optionalNumber(req.body.confirmedUnitPrice)
+      const headerMaterialLength = number(body.confirmedMaterialLength ?? item.confirmedMaterialLength);
+      const confirmedUnitPrice = optionalNumber(body.confirmedUnitPrice)
         ?? (supplierChanged ? supplierMaster?.unitPrice : optionalNumber(item.estimatedUnitPrice))
         ?? supplierMaster?.unitPrice;
-      const confirmedCurrencyCode = text(req.body.currencyCode)
+      const confirmedCurrencyCode = text(body.currencyCode)
         || (supplierChanged ? supplierMaster?.currencyCode : item.currencyCode)
         || supplierMaster?.currencyCode
         || null;
@@ -1517,10 +1428,13 @@ exports.updateItem = async (req, res, next) => {
         ? (number(item.qtyConvertedToPr) + 0.000001 >= effectiveConfirmedQty ? "Converted to PR" : "Partially Converted to PR")
         : (ready || allocations.some((allocation) => CONFIRMED_STATUSES.has(allocation.confirmationStatus)) ? (shortageQty > 0 ? "Partially Ready" : "Ready for PR") : "Waiting Supplier Confirmation");
       const row = await tx.purchaseSuggestionItem.update({ where: { id: item.id }, data: {
-        confirmationStatus, confirmedQty: normalizedConfirmedQty || null, confirmedDeliveryDate: date(req.body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
+        confirmationStatus, confirmedQty: normalizedConfirmedQty || null, confirmedDeliveryDate: date(body.confirmedDeliveryDate) || item.confirmedDeliveryDate,
         confirmedMoq, confirmedLeadTimeDays: effectiveLeadTimeDays,
         orderMultiple: effectiveOrderMultiple,
         recommendedOrderDate: recalculatedOrderDate,
+        materialRequiredDate: recalculatedSchedule.materialRequiredDate,
+        plannedProductionStart: recalculatedSchedule.materialRequiredDate,
+        scheduleSource: PURCHASE_DATE_SOURCE,
         latestPrDate: recalculatedSchedule.latestPrDate,
         procurementWindow: recalculatedSchedule.procurementWindow,
         confirmedMaterialWidth: item.materialCode ? headerMaterialWidth || null : null,
@@ -1557,12 +1471,20 @@ exports.updateItem = async (req, res, next) => {
         netRequirement: item.netRequirement,
         excessQty: item.excessQty,
         projectedStockAfterOrder: item.projectedStockAfterOrder,
-        supplierRemark: text(req.body.supplierRemark), alternativeSupplierCode: selectedSupplierCode, alternativeMaterialCode: text(req.body.alternativeMaterialCode), bypassConfirmationReason, shortageQty,
+        supplierRemark: text(body.supplierRemark), alternativeSupplierCode: selectedSupplierCode, alternativeMaterialCode: text(body.alternativeMaterialCode), bypassConfirmationReason, shortageQty,
         status: nextStatus,
       }, include: { supplierAllocations: { where: { isDeleted: false } } } });
       await refreshHeaderStatus(tx, item.suggestionNumber);
       return row;
-    });
+}
+exports.applyItemConfirmation = applyItemConfirmation;
+
+exports.updateItem = async (req, res, next) => {
+  try {
+    if (req.body?.aiDraftId) await aiDraftService.validateDraftForOfficial({ draftId: req.body.aiDraftId, actor: req.user, draftType: "PURCHASING_RECOVERY", moduleCode: "purchasing", pageCode: "purchase-suggestions" });
+    let item = await prisma.purchaseSuggestionItem.findFirst({ where: { id: req.params.itemId, suggestionNumber: req.params.suggestionNumber, isDeleted: false } });
+    if (!item) return res.status(404).json({ message: "Item Purchase Suggestion tidak ditemukan" });
+    const updated = await prisma.$transaction((tx) => applyItemConfirmation(tx, item, req.body, req.user));
     if (req.body?.aiDraftId) await aiDraftService.markAiDraftConfirmed({ draftId: req.body.aiDraftId, userId: req.user?.id, officialEntityType: "PURCHASE_SUGGESTION_ITEM", officialEntityId: updated.id });
     res.json(updated);
   } catch (error) { if (error.status) return res.status(error.status).json({ message: error.message }); next(error); }
@@ -1590,6 +1512,7 @@ exports.convertToPr = async (req, res, next) => {
       if (!selected.length) throw Object.assign(new Error("Tidak ada item yang siap dibuat menjadi PR"), { status: 409 });
       for (const item of selected) {
         if (!CONFIRMED_STATUSES.has(item.confirmationStatus) && !item.bypassConfirmationReason && !item.supplierAllocations.length) throw Object.assign(new Error(`${item.materialCode || item.partCode}: konfirmasi supplier atau alasan bypass wajib diisi.`), { status: 409 });
+        item.materialRequiredDate = await loadItemDeliveryNeed(tx, item);
       }
       const groups = new Map();
       const totalConfirmedQtyById = new Map();
@@ -1653,7 +1576,8 @@ exports.convertToPr = async (req, res, next) => {
           if (!supplierCode) {
             throw Object.assign(new Error(`${item.materialCode || item.partCode}: supplier wajib dipilih sebelum Draft PR dibuat.`), { status: 409 });
           }
-          const key = `${prCategory.code}|${supplierCode}`;
+          const week = require("../../services/planning/weeklyProcurementService").procurementWeek(item.materialRequiredDate).key;
+          const key = `${prCategory.code}|${supplierCode}|${week}`;
           if (!groups.has(key)) groups.set(key, []);
           groups.get(key).push({ item, allocation: { ...allocation, supplierCode }, prCategory });
         }
@@ -1673,6 +1597,7 @@ exports.convertToPr = async (req, res, next) => {
           prNumber, requestedBy: req.user?.username || req.user?.email || "Purchasing", requiredDate, priority: "Normal",
           poType: prCategory.poType,
           sourceType: "PURCHASE_SUGGESTION", procurementGroup: prCategory.procurementGroup,
+          demandBucket: require("../../services/planning/weeklyProcurementService").procurementWeek(entries[0].item.materialRequiredDate).key,
           warehouseCode: entries[0].item.warehouseCode, status: "Draft",
           // Header is auditable as one PR category x one supplier.
           // Supplier also remains snapshotted on every detail/allocation.

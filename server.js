@@ -101,7 +101,7 @@ const { refreshLicense, getLicenseStatus } = require("./src/prisma/services/lice
 const jwt = require("jsonwebtoken");
 
 // Middleware untuk authenticate socket connection
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token || socket.handshake.query.token;
     
@@ -110,9 +110,12 @@ io.use((socket, next) => {
     }
 
     // Verify JWT token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "your-secret-key");
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secret-key");
+    const { prisma } = require("./src/prisma");
+    const user = await prisma.user.findUnique({ where: { id: decoded.id }, select: { id: true, username: true, isDeleted: true, partnerAccess: { select: { id: true } } } });
+    if (!user || user.isDeleted || user.partnerAccess) return next(new Error("Internal account required"));
     socket.userId = decoded.id;
-    socket.username = decoded.username;
+    socket.username = user.username;
     next();
   } catch (err) {
     console.error("Socket authentication error:", err.message);
@@ -183,6 +186,18 @@ function registerAiShutdown() {
 // --- Setup Auto-Cleanup Scheduler
 const cron = require('node-cron');
 const { notificationHelper } = require('./src/prisma/utils/notificationHelper');
+const { runReorderNotifications } = require('./src/prisma/services/inventory/reorderNotificationService');
+let reorderRunning = false;
+async function checkReorderLevels() {
+  if (reorderRunning || process.env.REORDER_ALERTS_ENABLED === 'false') return;
+  reorderRunning = true;
+  try {
+    const { prisma } = require('./src/prisma');
+    await runReorderNotifications(prisma, notification => notificationHelper.broadcast(notification));
+  } catch (error) { console.error('Reorder notification check failed:', error.message); }
+  finally { reorderRunning = false; }
+}
+cron.schedule('*/5 * * * *', checkReorderLevels);
 
 // Schedule auto-cleanup setiap hari jam 2 pagi (02:00)
 cron.schedule('0 2 * * *', async () => {
@@ -264,6 +279,7 @@ async function startServer() {
     registerAiShutdown();
 
     server.listen(PORT, () => {
+      checkReorderLevels();
       console.log("✅ Server is running on port:", PORT);
       console.log("🔗 API Base URL: http://localhost:" + PORT + "/api");
       console.log("🕐 Auto-cleanup scheduled: Every day at 02:00 AM");

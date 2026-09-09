@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const { validateScheduleItems, summarizeRevision, buildExecutionExceptions } = require("./dailyPlanRevisionDomain");
 const { createProductionShortfallCarryover } = require("./productionShortfallCarryoverService");
@@ -192,7 +193,7 @@ async function hydrateSchedules(client, schedules = []) {
 }
 
 async function getWorkspace({ date, revisionId, mode } = {}, client = prisma) {
-  const range = dayRange(date || new Date());
+  const range = dayRange(date || businessNow());
   const productionMode = String(mode || "").toUpperCase() === "PRODUCTION";
   const executionStatuses = ["Released", "In Progress", "Completed"];
   const revisions = await client.dailyPlanRevision.findMany({
@@ -345,7 +346,7 @@ function placementHorizon(value, days = 31) {
 }
 
 async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId } = {}) {
-  const range = dayRange(date || new Date());
+  const range = dayRange(date || businessNow());
   const revision = revisionId
     ? await prisma.dailyPlanRevision.findFirst({ where: { id: revisionId, isDeleted: false }, include: { schedules: { where: { isDeleted: false }, orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }] } } })
     : await prisma.dailyPlanRevision.findFirst({ where: { planDate: { gte: range.start, lte: range.end }, status: { in: ["Draft", "Ready", "Partially Released"] }, isDeleted: false }, orderBy: { version: "desc" }, include: { schedules: { where: { isDeleted: false }, orderBy: [{ machineId: "asc" }, { plannedStartTime: "asc" }, { sequence: "asc" }] } } });
@@ -428,7 +429,7 @@ async function autoCorrectPlacement({ date, revisionId, expectedVersion, userId 
   return { scope: "ALLOCATION_PREVIEW", changedCount: result.changes.length, warnings: result.warnings, planNumbers: [...new Set(allocations.map((item) => item.plan.planNumber))] };
 }
 
-function placementWindowsForMachine(machine = {}, override = null, scheduleDate = new Date()) {
+function placementWindowsForMachine(machine = {}, override = null, scheduleDate = businessNow()) {
   if (["HOLIDAY", "CLOSED", "UNAVAILABLE", "OFF"].includes(String(override?.dayStatus || "WORKING").toUpperCase())) return [];
   const day = new Date(scheduleDate).getUTCDay() || 7;
   const profileRules = (machine.workingHourProfile?.rules || [])

@@ -3,6 +3,7 @@
 const { planningMonthKey } = require("../../utils/planningMonth");
 const { getMpsWorkbench, demandPhases } = require("./mpsWorkbenchService");
 const { calculateShiftMinutes } = require("./workingHourCalendarService");
+const { hydrateWorkCenterProfiles, poolCapacityHours, poolSignature } = require("./rccpWorkCenterService");
 const {
   utcDate,
   dateKey,
@@ -77,6 +78,8 @@ function availableCapacityHours(profile, workingDays) {
 }
 
 function availableCapacityHoursForPeriod(profile, periodStart, periodEnd, calendarOverrides = []) {
+  const pooled = poolCapacityHours(profile, periodStart, periodEnd, profile.poolOverrides || calendarOverrides);
+  if (pooled !== null) return round(pooled);
   const start = utcDate(periodStart);
   const end = utcDate(periodEnd);
   const overrides = new Map(calendarOverrides.map((row) => [dateKey(row.scheduleDate), row]));
@@ -130,7 +133,7 @@ function calculateRccpLoad(input = {}) {
     availableCapacity,
     totalLoad,
     loadPercentage,
-    status: capacityStatusForLoad(loadPercentage, input),
+    status: availableCapacity <= EPSILON && totalLoad > EPSILON ? "OVERLOAD" : capacityStatusForLoad(loadPercentage, input),
   };
 }
 
@@ -161,7 +164,7 @@ function profileResource(process = {}) {
 async function bootstrapProfilesFromRouting(tx, doc, details, runBy, configuration) {
   const missingPartIds = details.filter((row) => !(row.part?.rccpResourceProfiles || []).length).map((row) => row.partId).filter(Boolean);
   if (!missingPartIds.length) return;
-  const workbench = await getMpsWorkbench(tx, { month: planningMonthKey(doc.periodStart), page: 1, pageSize: 500, includeSimulation: false });
+  const workbench = await getMpsWorkbench(tx, { month: planningMonthKey(doc.periodStart), page: 1, pageSize: 500, allItemsForEvaluation: true, includeSimulation: false });
   for (const item of workbench.items || []) {
     const detail = details.find((row) => row.id === item.id || row.partCode === item.partCode);
     if (!detail?.partId || !missingPartIds.includes(detail.partId)) continue;
@@ -244,15 +247,40 @@ async function existingLoadByWeeklyBucket(tx, mpsId, horizonStart, horizonEnd) {
       mpsId: { not: mpsId }, invalidatedAt: null, status: { in: VALID_RESULT_STATUSES },
       capacityHorizonStart: { lte: horizonEnd }, capacityHorizonEnd: { gte: horizonStart },
     },
-    include: { timeBuckets: { where: { bucketEnd: { gte: horizonStart }, bucketStart: { lte: horizonEnd } } } },
+    include: { loads: true, timeBuckets: { where: { bucketEnd: { gte: horizonStart }, bucketStart: { lte: horizonEnd } } } },
     orderBy: { createdAt: "desc" },
   });
   const latestByMps = new Map();
   rows.forEach((run) => { if (!latestByMps.has(run.mpsId)) latestByMps.set(run.mpsId, run); });
   const loads = new Map();
   for (const run of latestByMps.values()) {
+    // Old runs use process aliases (PRG, SPOT, etc.). Map their dated load to
+    // the same physical work-center pool; never drop existing load on migration.
+    const aliases = new Map();
+    if (run.timeBuckets.length) {
+      const sourceDetails = await tx.mPSDetail.findMany({ where: { mps: { id: run.mpsId }, isDeleted: false },
+        include: { part: { include: { rccpResourceProfiles: { where: { isActive: true, isCritical: true } } } } } });
+      await hydrateWorkCenterProfiles(tx, sourceDetails, profileMatchesProcess);
+      for (const detail of sourceDetails) for (const profile of detail.part?.rccpResourceProfiles || []) {
+        const alias = profile.originalResourceCode || profile.resourceCode;
+        if (aliases.has(alias) && aliases.get(alias) !== profile.resourceCode) throw validationError([{ code: "RCCP_POOL_MIGRATION_AMBIGUOUS", message: "Run RCCP lama memakai satu alias untuk beberapa work center; periksa ulang MPS terkait." }]);
+        aliases.set(alias, profile.resourceCode);
+      }
+      for (const load of run.loads || []) {
+        const currentProfiles = sourceDetails.flatMap(d => d.part?.rccpResourceProfiles || []);
+        if ((load.partBreakdown || []).some(part => {
+          if (!part.capacityBasis) return false;
+          const basis = currentProfiles.find(profile => profile.id === part.resourceProfileId)?.capacityBasis;
+          return !basis || basis.workCenterId !== part.capacityBasis.workCenterId || basis.specification !== part.capacityBasis.specification;
+        })) throw validationError([{ code: "RCCP_POOL_CHANGED", message: "Work center/spesifikasi rencana lain berubah; periksa ulang RCCP rencana tersebut sebelum memakai bebannya." }]);
+        const resolved = new Set((load.partBreakdown || []).map(part => sourceDetails.flatMap(d => d.part?.rccpResourceProfiles || [])
+          .find(profile => profile.id === part.resourceProfileId)?.resourceCode).filter(Boolean));
+        if (resolved.size > 1) throw validationError([{ code: "RCCP_POOL_CHANGED", message: "Pool mesin run lama telah terpisah; hitung ulang MPS terkait sebelum melanjutkan." }]);
+        if (resolved.size === 1) aliases.set(load.resourceCode, [...resolved][0]);
+      }
+    }
     for (const bucket of run.timeBuckets) {
-      const key = `${bucket.resourceCode}|${dateKey(bucket.bucketStart)}`;
+      const key = `${aliases.get(bucket.resourceCode) || bucket.resourceCode}|${dateKey(bucket.bucketStart)}`;
       loads.set(key, round(number(loads.get(key)) + number(bucket.currentMpsLoad)));
     }
   }
@@ -320,6 +348,7 @@ function resourceFamily(value) {
 }
 
 function profileMatchesProcess(profile = {}, process = {}) {
+  if (profile.matchedProcessCodes) return profile.matchedProcessCodes.includes(process.processCode);
   const profileFamilies = [profile.resourceCode, profile.resourceName].map(resourceFamily).filter(Boolean);
   const processFamilies = [process.processCode, process.processName].map(resourceFamily).filter(Boolean);
   return profileFamilies.some((profileFamily) => processFamilies.includes(profileFamily));
@@ -637,9 +666,11 @@ async function runRccp(prisma, mpsNumber, options = {}) {
       month: planningMonthKey(doc.periodStart),
       page: 1,
       pageSize: 100,
+      allItemsForEvaluation: true,
       includeSimulation: true,
     });
     const workbenchByDetail = new Map((workbench.items || []).map((item) => [item.id, item]));
+    await hydrateWorkCenterProfiles(tx, positiveDetails, profileMatchesProcess);
     const phaseRows = positiveDetails.flatMap((detail) => {
       const workbenchItem = workbenchByDetail.get(detail.id)
         || (workbench.items || []).find((item) => item.partCode === detail.partCode);
@@ -666,7 +697,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
     const latestRequiredDate = phaseRows.reduce((max, row) => !max || row.phase.fgRequiredDate > max ? row.phase.fgRequiredDate : max, null);
     const calendarScanStart = new Date(earliestDue);
     calendarScanStart.setUTCDate(calendarScanStart.getUTCDate() - 180);
-    const machineIds = [...new Set(positiveDetails.flatMap((detail) => detail.part.rccpResourceProfiles.map((profile) => profile.machineId)).filter(Boolean))];
+    const machineIds = [...new Set(positiveDetails.flatMap((detail) => detail.part.rccpResourceProfiles.flatMap((profile) => profile.poolMachines?.map(m => m.id) || [profile.machineId])).filter(Boolean))];
     const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
       where: { machineId: { in: machineIds }, scheduleDate: { gte: calendarScanStart, lte: latestRequiredDate }, isDeleted: false },
       select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
@@ -679,6 +710,7 @@ async function runRccp(prisma, mpsNumber, options = {}) {
     }
 
     const offsetRows = [];
+    positiveDetails.forEach(detail => detail.part.rccpResourceProfiles.forEach(profile => { if (profile.poolMachines) profile.poolOverrides = calendarOverrides; }));
     for (const { detail, phase, resourceRequirements } of phaseRows) {
       const activeRequirements = resourceRequirements.filter((requirement) => number(requirement.qty) > EPSILON);
       const timeline = await backwardOffsetPhase({
@@ -850,6 +882,8 @@ async function runRccp(prisma, mpsNumber, options = {}) {
       const loadPercentage = availableCapacity > EPSILON ? round(totalLoad / availableCapacity * 100, 4) : 0;
       const status = worstCapacityStatus(buckets.filter((bucket) => bucket.currentMpsLoad > EPSILON).map((bucket) => bucket.status));
       const partBreakdown = resourceOffsets.map((row) => ({
+        resourceProfileId: row.profile.id, originalResourceCode: row.profile.originalResourceCode || row.profile.resourceCode,
+        capacityBasis: row.profile.capacityBasis || null,
         mpsDetailId: row.detail.id, partId: row.detail.partId, partCode: row.detail.partCode,
         partNumber: row.detail.part?.partNumber || row.detail.partCode, partName: row.detail.part?.partName || row.detail.partCode,
         mpsPhaseId: row.phase.id, phaseQty: row.phase.qty, resourceRequirementQty: row.resourceRequirementQty,
@@ -1002,6 +1036,8 @@ async function applyRecommendation(prisma, runId, recommendationId, input = {}) 
     if (!recommendation) throw Object.assign(new Error("Recommendation RCCP tidak ditemukan."), { statusCode: 404, code: "RCCP_RECOMMENDATION_NOT_FOUND" });
     if (recommendation.status !== "PROPOSED") throw Object.assign(new Error("Recommendation sudah diproses."), { statusCode: 409, code: "RCCP_RECOMMENDATION_ALREADY_APPLIED" });
     if (recommendation.run.invalidatedAt) throw Object.assign(new Error("RCCP run sudah invalid."), { statusCode: 409, code: "RCCP_INVALID" });
+    try { await assertMpsApprovalAllowed(tx, recommendation.run.mps); }
+    catch (error) { if (error.code !== "RCCP_APPROVAL_BLOCKED") throw error; }
 
     const detail = await tx.rccpOffsetDetail.findFirst({
       where: {
@@ -1020,22 +1056,21 @@ async function applyRecommendation(prisma, runId, recommendationId, input = {}) 
     let newBucket = buckets.find((row) => dateKey(row.bucketStart) === dateKey(newBucketStart));
     if (!oldBucket) throw Object.assign(new Error("Bucket asal recommendation tidak ditemukan. Jalankan RCCP ulang."), { statusCode: 409, code: "RCCP_RECOMMENDATION_SOURCE_BUCKET_MISSING" });
     if (!newBucket) {
-      const profile = detail.resourceProfileId ? await tx.rccpResourceProfile.findFirst({ where: { id: detail.resourceProfileId } }) : null;
+      let profile = detail.resourceProfileId ? await tx.rccpResourceProfile.findFirst({ where: { id: detail.resourceProfileId } }) : null;
       if (!profile) throw Object.assign(new Error("Resource profile recommendation tidak ditemukan."), { statusCode: 409, code: "RCCP_RECOMMENDATION_PROFILE_MISSING" });
+      const source = await tx.mPSDetail.findMany({ where: { id: detail.mpsDetailId }, include: { part: { include: { rccpResourceProfiles: true } } } });
+      await hydrateWorkCenterProfiles(tx, source, profileMatchesProcess);
+      profile = source.flatMap(d => d.part?.rccpResourceProfiles || []).find(p => p.id === profile.id) || profile;
+      if (profile.resourceCode !== detail.resourceCode) throw validationError([{ code: "RCCP_POOL_CHANGED", message: "Work center berubah; jalankan RCCP ulang sebelum menerapkan rekomendasi." }]);
       const newBucketEnd = new Date(newBucketStart); newBucketEnd.setUTCDate(newBucketEnd.getUTCDate() + 6);
-      const calendarOverrides = profile.machineId ? await tx.capacityCalendarOverride.findMany({
-        where: { machineId: profile.machineId, scheduleDate: { gte: newBucketStart, lte: newBucketEnd }, isDeleted: false },
-        select: { scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
+      const machineIds = profile.poolMachines?.map(m => m.id) || [profile.machineId].filter(Boolean);
+      const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
+        where: { machineId: { in: machineIds }, scheduleDate: { gte: newBucketStart, lte: newBucketEnd }, isDeleted: false },
+        select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
       }) : [];
       const availableCapacity = availableCapacityHoursForPeriod(profile, newBucketStart, newBucketEnd, calendarOverrides);
-      const otherRuns = await tx.rccpRun.findMany({
-        where: { id: { not: runId }, mpsId: { not: recommendation.run.mpsId }, invalidatedAt: null, status: { in: VALID_RESULT_STATUSES } },
-        include: { timeBuckets: { where: { resourceCode: detail.resourceCode, bucketStart: newBucketStart } } },
-        orderBy: { createdAt: "desc" },
-      });
-      const latestByMps = new Map();
-      otherRuns.forEach((row) => { if (!latestByMps.has(row.mpsId)) latestByMps.set(row.mpsId, row); });
-      const existingLoad = round([...latestByMps.values()].reduce((sum, row) => sum + number(row.timeBuckets[0]?.currentMpsLoad), 0));
+      const existing = await existingLoadByWeeklyBucket(tx, recommendation.run.mpsId, newBucketStart, newBucketEnd);
+      const existingLoad = number(existing.get(`${profile.resourceCode}|${dateKey(newBucketStart)}`));
       const existingPercentage = availableCapacity > EPSILON ? round(existingLoad / availableCapacity * 100, 4) : 0;
       newBucket = await tx.rccpTimeBucket.create({
         data: {
@@ -1115,10 +1150,14 @@ async function assertMpsApprovalAllowed(tx, doc) {
   if (latest.mpsRevision !== doc.revision) throw validationError([{ code: "MPS_CHANGED_AFTER_RCCP", message: "MPS berubah setelah RCCP; jalankan capacity check ulang." }]);
   const partIds = [...new Set(latest.loads.flatMap((load) => (Array.isArray(load.partBreakdown) ? load.partBreakdown : []).map((part) => part.partId)).filter(Boolean))];
   const resourceCodes = [...new Set(latest.loads.map((load) => load.resourceCode))];
-  const profiles = partIds.length ? await tx.rccpResourceProfile.findMany({
+  let profiles = partIds.length ? await tx.rccpResourceProfile.findMany({
     where: { partId: { in: partIds }, resourceCode: { in: resourceCodes } },
   }) : [];
-  const machineIds = [...new Set(profiles.map((profile) => profile.machineId).filter(Boolean))];
+  const sourceDetails = await tx.mPSDetail.findMany({ where: { mpsNumber: doc.mpsNumber, isDeleted: false },
+    include: { part: { include: { rccpResourceProfiles: true } } } });
+  await hydrateWorkCenterProfiles(tx, sourceDetails, profileMatchesProcess);
+  profiles = sourceDetails.flatMap(detail => detail.part?.rccpResourceProfiles || []);
+  const machineIds = [...new Set(profiles.flatMap((profile) => profile.poolMachines?.map(m => m.id) || [profile.machineId]).filter(Boolean))];
   const freshnessStart = latest.capacityHorizonStart || doc.periodStart;
   const freshnessEnd = latest.capacityHorizonEnd || doc.periodEnd;
   const calendarOverrides = machineIds.length ? await tx.capacityCalendarOverride.findMany({
@@ -1126,10 +1165,14 @@ async function assertMpsApprovalAllowed(tx, doc) {
     select: { machineId: true, scheduleDate: true, dayStatus: true, shiftsPerDay: true, shiftOverrides: true },
   }) : [];
   let capacityChanged = false;
+  profiles.forEach(profile => { if (profile.poolMachines) profile.poolOverrides = calendarOverrides; });
   for (const load of latest.loads) {
     const breakdown = Array.isArray(load.partBreakdown) ? load.partBreakdown : [];
-    const loadProfiles = breakdown.map((part) => profiles.find((profile) => profile.partId === part.partId && profile.resourceCode === load.resourceCode));
+    const loadProfiles = breakdown.map((part) => profiles.find((profile) => profile.partId === part.partId
+      && (part.resourceProfileId ? profile.id === part.resourceProfileId : profile.resourceCode === load.resourceCode)));
     if (loadProfiles.some((profile) => !profile || !profile.isActive || !profile.isCritical)) { capacityChanged = true; break; }
+    if (loadProfiles.some((profile, index) => profile.resourceCode !== load.resourceCode
+      || poolSignature(profile.capacityBasis) !== poolSignature(breakdown[index].capacityBasis))) { capacityChanged = true; break; }
     if (breakdown.some((part, index) => Math.abs(number(loadProfiles[index].standardTimeHours) - number(part.standardTimeHours)) > EPSILON
       || Math.abs(number(loadProfiles[index].setupTimeHours) - number(part.setupTimeHours)) > EPSILON
       || number(loadProfiles[index].sequence) !== number(part.sequence)
@@ -1139,6 +1182,11 @@ async function assertMpsApprovalAllowed(tx, doc) {
       || resolvedCalendarId(loadProfiles[index]) !== String(part.calendarId || ""))) { capacityChanged = true; break; }
     const currentAvailable = capacityForProfilesAcrossBuckets(loadProfiles, freshnessStart, freshnessEnd, calendarOverrides);
     if (!Number.isFinite(currentAvailable) || Math.abs(currentAvailable - number(load.availableCapacity)) > EPSILON) { capacityChanged = true; break; }
+    if ((latest.timeBuckets || []).filter(bucket => bucket.resourceCode === load.resourceCode).some(bucket => {
+      const capacities = loadProfiles.filter(profile => profile.isCapacityConstrained).map(profile =>
+        availableCapacityHoursForPeriod(profile, bucket.bucketStart, bucket.bucketEnd, calendarOverrides.filter(row => row.machineId === profile.machineId)));
+      return capacities.length && Math.abs(Math.min(...capacities) - number(bucket.availableCapacity)) > EPSILON;
+    })) { capacityChanged = true; break; }
   }
   const currentSettings = await settings(tx);
   const thresholdChanged = Math.abs(currentSettings.warningThreshold - number(latest.warningThreshold)) > EPSILON

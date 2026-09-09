@@ -1,4 +1,6 @@
 const crypto = require("crypto");
+const { normalizeChecklist } = require('../../services/incoming/partnerPortalDomain');
+const { publicDocument } = require('../../services/incoming/incomingDocumentService');
 const { prisma } = require("../../index");
 const { generateMovementNumber } = require("../../utils/movementNumberGenerator");
 const { assertQuantity, isDiscreteUom } = require("../../utils/uomQuantity");
@@ -58,6 +60,20 @@ exports.receivePurchaseOrder = async (req, res, next) => {
         },
       });
       if (!po) throw Object.assign(new Error("Purchase Order not found"), { statusCode: 404 });
+      let partnerNotice = null;
+      if (req.body.partnerNoticeId) {
+        await tx.$queryRaw`SELECT id FROM "tbl_partner_delivery_notice" WHERE id = ${req.body.partnerNoticeId} FOR UPDATE`;
+        partnerNotice = await tx.partnerDeliveryNotice.findFirst({ where: { id: String(req.body.partnerNoticeId), poNumber, status: 'Submitted' }, include: { documents: true } });
+        if (!partnerNotice) throw Object.assign(new Error('Pendaftaran supplier tidak cocok dengan PO atau sudah diterima/dibatalkan.'), { statusCode: 409 });
+        if (deliveryNoteNumber !== partnerNotice.deliveryNoteNumber) throw Object.assign(new Error('Nomor surat jalan harus sesuai pendaftaran supplier.'), { statusCode: 400 });
+        const registered = new Map();
+        for (const line of partnerNotice.details) { const key = JSON.stringify([line.poDetailId, line.supplierLotNumber]); registered.set(key, (registered.get(key) || 0) + Number(line.qty)); }
+        for (const line of details) {
+          const key = JSON.stringify([line.poDetailId, String(line.supplierLotNumber || '').trim()]);
+          if (!registered.has(key) || Number(line.qtyReceived) > registered.get(key) + 0.000001) throw Object.assign(new Error('Barang, lot atau jumlah GR tidak sesuai pendaftaran supplier.'), { statusCode: 400 });
+          registered.set(key, registered.get(key) - Number(line.qtyReceived));
+        }
+      }
       if (!["Sent", "Confirmed", "Partial Receipt"].includes(po.status)) {
         throw Object.assign(new Error("Purchase Order harus berstatus Sent, Confirmed, atau Partial Receipt sebelum dibuatkan Goods Receipt"), { statusCode: 409 });
       }
@@ -178,6 +194,11 @@ exports.receivePurchaseOrder = async (req, res, next) => {
         receivedInRequest.set(poDetail.id, previouslyReceivedInRequest + Number(line.qtyReceived));
       }
       const gr = await tx.goodsReceipt.create({ data: { grNumber, poNumber, poType: po.poType, stockType: normalizeInventoryStockType(po.poType), warehouseCode, deliveryNoteNumber: deliveryNoteNumber || null, receivedBy: req.user?.username || req.user?.email || null, receivedDate: new Date(), status: "Received Pending Inspection", notes: notes || null, details: { create: receiptDetails } }, include: { details: { include: { allocations: true } } } });
+      if (partnerNotice) {
+        await tx.partnerDeliveryNotice.update({ where: { id: partnerNotice.id }, data: { grNumber, status: 'Received' } });
+        const files = partnerNotice.documents.map(doc => ({ ...publicDocument(doc), fileUrl: `/api/incoming/documents/${doc.id}` }));
+        if (files.length) await tx.goodsReceiptDetail.updateMany({ where: { grNumber }, data: { deliveryNoteFiles: files } });
+      }
       await Promise.all(receiptDetails.map((detail) => tx.purchaseOrderDetail.update({ where: { id: detail.poDetailId }, data: { qtyReceived: { increment: detail.qtyReceived } } })));
       const updatedPoDetails = await tx.purchaseOrderDetail.findMany({
         where: { poNumber, isDeleted: false },
@@ -582,6 +603,9 @@ exports.completeInspection = async (req, res, next) => {
         const grDetail = inspection.gr.details.find((item) => item.id === decision.grDetailId);
         if (!line || !grDetail) throw Object.assign(new Error("Invalid inspection detail"), { statusCode: 400 });
         const accepted = Number(decision.qtyAccepted || 0); const rejected = Number(decision.qtyRejected || 0);
+        if (!Number.isFinite(accepted) || !Number.isFinite(rejected)) throw Object.assign(new Error('Qty hasil inspeksi harus berupa angka terbatas.'), { statusCode: 400 });
+        const checklist = normalizeChecklist(decision.checklist || line.checklist?.rows, { final: true, actor: req.user?.username || req.user?.id || '' });
+        if (checklist.rows.some(row => row.result === 'FAIL') && rejected === 0 && !String(decision.notes || '').trim()) throw Object.assign(new Error('Penerimaan dengan checklist FAIL wajib memiliki alasan keputusan pada catatan IQC.'), { statusCode: 400 });
         const rejectedDisposition = normalizeDisposition(decision.rejectedDisposition || decision.disposition);
         assertQuantity(accepted || rejected || 1, grDetail.uomCode, `Qty inspection line ${line.lineNumber}`);
         if (accepted < 0 || rejected < 0 || Math.abs(accepted + rejected - Number(grDetail.qtyReceived)) > 0.000001) throw Object.assign(new Error("Qty accepted + rejected wajib sama dengan qty received pada setiap baris"), { statusCode: 400 });
@@ -592,6 +616,7 @@ exports.completeInspection = async (req, res, next) => {
         const immediatelyDisposed = rejected > 0 && FINAL_REJECT_DISPOSITIONS.has(rejectedDisposition);
         await tx.incomingInspectionDetail.update({ where: { id: line.id }, data: {
           qtyInspected: accepted + rejected, qtyAccepted: accepted, qtyRejected: rejected,
+          checklist,
           disposition: rejected > 0 ? (accepted > 0 ? "PARTIAL_ACCEPT" : "REJECT") : "ACCEPT",
           rejectedDisposition: rejected > 0 ? rejectedDisposition : null,
           dispositionReference: rejected > 0 ? String(decision.dispositionReference || "").trim() || null : null,

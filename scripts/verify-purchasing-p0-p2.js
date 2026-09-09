@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..");
-const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
+const read = (relative) => fs.readFileSync(path.join(root, relative.startsWith("../frontend/") && !fs.existsSync(path.join(root, "../frontend")) ? relative.replace("../frontend/", "../renbo-mfg-frontend/") : relative), "utf8");
 const po = read("src/prisma/controllers/purchasing/PurchaseOrderController.js");
 const pr = read("src/prisma/controllers/purchasing/PurchaseRequisitionController.js");
 const purchaseQtyService = read("src/prisma/services/purchasing/purchaseOrderQuantityService.js");

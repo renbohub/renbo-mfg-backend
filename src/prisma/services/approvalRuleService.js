@@ -1,5 +1,11 @@
 const crypto = require("crypto");
 const { prisma } = require("../index");
+const { isDemoMode, businessNow } = require("../utils/businessClock");
+
+function isDemoSalesOrderApproval(request) {
+  return isDemoMode() && request?.moduleCode === 'sales' && request?.pageCode === 'sales-orders'
+    && request?.actionCode === 'approve' && request?.documentType === 'SalesOrderHeader';
+}
 
 const ACTIVE_REQUEST_STATUSES = ["Pending", "In Approval"];
 
@@ -276,7 +282,8 @@ async function processApprovalAction({ requestId, requestNumber: number, user, d
   if (!ACTIVE_REQUEST_STATUSES.includes(request.status)) {
     throw Object.assign(new Error(`Approval request sudah berstatus ${request.status}.`), { statusCode: 409 });
   }
-  if (!request.rule.allowSelfApproval) {
+  const demoApproval = isDemoSalesOrderApproval(request);
+  if (!request.rule.allowSelfApproval && !demoApproval) {
     const sameUserId = request.requestedByUserId && request.requestedByUserId === user?.id;
     const sameUsername = request.requestedBy && normalize(request.requestedBy) === normalize(user?.username || user?.email);
     if (sameUserId || sameUsername) throw Object.assign(new Error("Self approval tidak diizinkan oleh rule."), { statusCode: 403 });
@@ -308,7 +315,9 @@ async function processApprovalAction({ requestId, requestNumber: number, user, d
       actedByUserId: user?.id || null,
       actedBy: user?.username || user?.email || "system",
       notes: notes || null,
-      metadata: metadata && typeof metadata === "object" ? metadata : undefined,
+      metadata: demoApproval
+        ? { ...(metadata && typeof metadata === "object" ? metadata : {}), demoApproval: true, demoDate: businessNow().toISOString().slice(0, 10) }
+        : metadata && typeof metadata === "object" ? metadata : undefined,
     },
   });
 
@@ -440,6 +449,7 @@ function approvalGate(config) {
 }
 
 module.exports = {
+  isDemoSalesOrderApproval,
   ACTIVE_REQUEST_STATUSES,
   REQUEST_INCLUDE,
   resolveApprovalRule,
@@ -450,4 +460,6 @@ module.exports = {
   approvalGate,
   canResumeCompletedApproval,
   matchesConditions,
+  canApproveStep,
+  incompleteSteps,
 };

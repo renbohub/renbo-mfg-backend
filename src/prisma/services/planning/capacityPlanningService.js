@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_PLAN_STATUSES = ["Draft", "Confirmed", "Released", "In Progress"];
 const ACTIVE_SCHEDULE_STATUSES = ["Draft", "Released", "In Progress", "Completed"];
@@ -12,6 +13,7 @@ const { intervalsOverlap, isDiesCapacityBlockingEnabled, isDiesTonnageCompatible
 const { buildProductionMaterialGate, materialGateForJob } = require("./materialReadinessService");
 const { loadDemandPlanningConstraintMap, effectiveVendorLeadTime } = require("./demandPlanningConstraintService");
 const { calculateShiftMinutes } = require("./workingHourCalendarService");
+const { inhouseRouteForExecution } = require("./routingExecutionPolicy");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 2) => Number(number(value).toFixed(digits));
@@ -288,10 +290,10 @@ function predecessorGroupReadiness(group, predecessorPlanQty, successorQty, succ
   };
 }
 
-function parseDateOnly(value, fallback = new Date()) {
+function parseDateOnly(value, fallback = businessNow()) {
   const source = value || fallback;
   const parsed = source instanceof Date ? new Date(source) : new Date(`${String(source).slice(0, 10)}T00:00:00.000Z`);
-  if (Number.isNaN(parsed.getTime())) return parseDateOnly(fallback, new Date());
+  if (Number.isNaN(parsed.getTime())) return parseDateOnly(fallback, businessNow());
   return new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), parsed.getUTCDate()));
 }
 
@@ -512,7 +514,7 @@ function compareAllocationConsumptionOrder(left, right) {
 }
 
 function resolveRange(query = {}) {
-  const today = parseDateOnly(new Date());
+  const today = parseDateOnly(businessNow());
   const defaultStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
   const defaultEnd = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 0));
   const start = parseDateOnly(query.startDate, defaultStart);
@@ -647,7 +649,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const planningGranularity = String(effectiveQuery.planningGranularity || "DAY").toUpperCase() === "WEEK" ? "WEEK" : "DAY";
   const rollingLookbackWeeks = Math.min(Math.max(Math.trunc(number(effectiveQuery.rollingLookbackWeeks)), 0), 12);
   const freezeFenceDays = Math.min(Math.max(Math.trunc(number(effectiveQuery.freezeFenceDays)), 0), 31);
-  const freezeFenceDate = new Date();
+  const freezeFenceDate = businessNow();
   freezeFenceDate.setHours(0, 0, 0, 0);
   freezeFenceDate.setDate(freezeFenceDate.getDate() + freezeFenceDays);
   const workingAvailableMinutes = round(evaluateFromSet(formulas, "CAPACITY_BASE_MINUTES", {
@@ -768,7 +770,7 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     prisma.dies.findMany({
       where: { isDeleted: false, status: "Active" },
       select: {
-        id: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true,
+        id: true, status: true, diesCode: true, diesName: true, diesType: true, tonnage: true, cavity: true,
         shotCounter: true, maxShotLifetime: true, nextMaintenanceDate: true,
         diesParts: { where: { isActive: true }, select: { partId: true, isPrimary: true, effectiveDate: true, expiryDate: true, expectedOutput: true } },
         maintenances: { where: { isDeleted: false }, select: { maintenanceNumber: true, maintenanceDate: true, startDate: true, endDate: true } },
@@ -840,15 +842,18 @@ async function buildCapacitySnapshot(prisma, query = {}) {
   const eligibleMachinesForRoute = (route, activeOnly = true) => {
     const specificationCode = routeSpecificationCode(route);
     if (!specificationCode) return route.machineId ? [machineById.get(route.machineId)].filter(Boolean) : [];
-    return machines.filter((machine) => machine.machineSpecificationCode === specificationCode && (!activeOnly || machine.status === "Active"));
+    const approved = route.machinePlanningPolicy?.primaryMachineId ? [route.machinePlanningPolicy.primaryMachineId, ...(route.machinePlanningPolicy.resources || []).map((r) => r.machineId)] : null;
+    return machines.filter((machine) => machine.machineSpecificationCode === specificationCode && (!activeOnly || machine.status === "Active") && (!approved || approved.includes(machine.id)));
   };
   const availableMinutesForMachine = (machine, dueDate) => Object.entries(rowByMachineId.get(machine.id)?.cells || {}).reduce((sum, [key, cell]) => {
     if (dueDate && parseDateOnly(key) > parseDateOnly(dueDate)) return sum;
     return sum + Math.max(number(cell.availableMinutes) - number(cell.downtimeMinutes) - number(cell.firmMinutes) - number(cell.proposedMinutes), 0);
   }, 0);
+  const planningPolicyForRoute = (route) => require("./routingMachinePolicy").resolveRoutingMachinePolicy(route, machines, availableDies, { start: range.start, end: new Date(new Date(range.endExclusive).getTime() - 86400000) });
   const bestEligibleMachine = (route, dueDate, overrideMachineId = null) => {
     if (overrideMachineId) return eligibleMachinesForRoute(route).find((machine) => machine.id === overrideMachineId) || null;
-    return eligibleMachinesForRoute(route).sort((left, right) => availableMinutesForMachine(right, dueDate) - availableMinutesForMachine(left, dueDate) || left.machineCode.localeCompare(right.machineCode))[0] || null;
+    const policy = planningPolicyForRoute(route);
+    return eligibleMachinesForRoute(route).filter((machine) => policy.automaticMachineIds.includes(machine.id)).sort((left, right) => availableMinutesForMachine(right, dueDate) - availableMinutesForMachine(left, dueDate) || left.machineCode.localeCompare(right.machineCode))[0] || null;
   };
   const machineOverrideByRouteDate = new Map(machineOverrides.map((item) => [`${item.plan.planNumber}|${item.lineNumber}|${item.mbomProcessId}|${dateKey(item.scheduleDate)}`, item]));
   const issues = [];
@@ -1043,6 +1048,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
             processId: true,
             sequence: true,
             cycleTime: true,
+            machinePlanningPolicy: true,
+            routingMode: true,
+            vendorId: true,
+            machineId: true,
             diesId: true,
             machineSpecificationCode: true,
             process: { select: { processCode: true, processName: true } },
@@ -1067,6 +1076,31 @@ async function buildCapacitySnapshot(prisma, query = {}) {
       orderBy: [{ scheduleDate: "asc" }, { lineNumber: "asc" }, { createdAt: "asc" }],
     })
     : [];
+  // Use the selected executor's engineering settings throughout capacity,
+  // tooling and dependency checks, while keeping BOM defaults unchanged.
+  for (const allocation of productionPlanAllocations) {
+    const source = allocation.mbomProcess;
+    if (!source) continue;
+    const sourceMode = source.routingMode === "VENDOR" ? "VENDOR" : "INHOUSE";
+    const selectedMode = allocation.routingMode === "VENDOR" ? "VENDOR" : "INHOUSE";
+    if (sourceMode === selectedMode) continue;
+    const execution = source.machinePlanningPolicy?.execution;
+    const common = { planNumber: allocation.plan.planNumber, lineNumber: allocation.lineNumber, routeId: source.id, allocationId: allocation.id, severity: "blocking", category: "EXECUTOR" };
+    if (!execution?.allowedModes?.includes(selectedMode)) {
+      pushIssue(issues, { ...common, code: "PLAN_EXECUTOR_NOT_APPROVED", message: "Pelaksana allocation belum diizinkan pada Routing BOM.", resolution: "Lengkapi alternatif pelaksana di BOM, lalu tinjau kembali Monthly Plan." }, issueKeys);
+      continue;
+    }
+    if (selectedMode === "INHOUSE") {
+      const effective = inhouseRouteForExecution(source);
+      const policy = planningPolicyForRoute(effective);
+      const qualificationErrors = [...policy.errors];
+      if (!policy.resources.some(resource => resource.machineId === allocation.machineId)) qualificationErrors.push("Mesin allocation belum dikualifikasi sebagai mesin utama/cadangan pada BOM.");
+      if (qualificationErrors.length) pushIssue(issues, { ...common, code: "PLAN_EXECUTOR_MACHINE_NOT_QUALIFIED", message: [...new Set(qualificationErrors)].join(" "), resolution: "Periksa mesin, cycle time, dan tooling alternatif pada Routing BOM." }, issueKeys);
+      allocation.mbomProcess = effective;
+    } else if (!(execution.vendorIds || []).includes(allocation.vendorId)) {
+      pushIssue(issues, { ...common, code: "PLAN_EXECUTOR_VENDOR_NOT_APPROVED", message: "Vendor allocation belum termasuk alternatif vendor pada Routing BOM.", resolution: "Pilih vendor alternatif yang sudah dikualifikasi di BOM." }, issueKeys);
+    }
+  }
   const currentAllocationIds = new Set(productionPlanAllocations.map((row) => row.id));
   const referencedExternalIds = [...new Set(productionPlanAllocations.flatMap((row) =>
     Array.isArray(row.predecessorAllocationIds) ? row.predecessorAllocationIds.map(String) : []))]
@@ -1734,9 +1768,10 @@ async function buildCapacitySnapshot(prisma, query = {}) {
     // Monthly Plan is a capacity commitment, not an ideal-cycle stopwatch.
     // Keep a fixed 20% runtime allowance for minor downtime, handling, and
     // normal micro-stops. Daily execution can later refine the exact hours.
-    const cycleMinutes = resolveCycleMinutes(allocation.mbomProcess?.cycleTime, machine, workingAvailableMinutes)
+    const allocationResourcePolicy = allocation.mbomProcess?.machinePlanningPolicy?.resources?.find((r) => r.machineId === machine?.id);
+    const cycleMinutes = resolveCycleMinutes(allocationResourcePolicy?.cycleTimeSeconds || allocation.mbomProcess?.cycleTime, machine, workingAvailableMinutes)
       * MONTHLY_PLAN_RUNTIME_ALLOWANCE_FACTOR;
-    const loadMinutes = evaluateFromSet(formulas, "LOAD_MINUTES", {
+    const loadMinutes = number(allocationResourcePolicy?.setupMinutes) + evaluateFromSet(formulas, "LOAD_MINUTES", {
       qty: number(allocation.plannedQty),
       cycleTimeMinutes: cycleMinutes,
       efficiencyPercent: 100,
@@ -2030,12 +2065,13 @@ async function buildCapacitySnapshot(prisma, query = {}) {
         routingMode,
         machineSpecificationCode: routeSpecificationCode(route),
         allowedMachineIds,
+        machinePlanningPolicy: planningPolicyForRoute(route),
         requiresDies: isDiesCapacityBlockingEnabled() && isPressResource(machineById.get(route.machineId) || machineById.get(allowedMachineIds[0]), route),
         diesId: routeOverride?.diesId || route.diesId || null,
         allowedDiesIds: availableDies.filter((dies) => route.diesId === dies.id || dies.diesParts.some((mapping) => mapping.partId === route.mbomDetail?.partId)).map((dies) => dies.id),
         cycleMinutesByMachine: Object.fromEntries(allowedMachineIds.map((machineId) => [
           machineId,
-          round(resolveCycleMinutes(route.cycleTime, machineById.get(machineId), workingAvailableMinutes), 6),
+          round(resolveCycleMinutes(route.machinePlanningPolicy?.resources?.find((r) => r.machineId === machineId)?.cycleTimeSeconds || route.cycleTime, machineById.get(machineId), workingAvailableMinutes) * MONTHLY_PLAN_RUNTIME_ALLOWANCE_FACTOR, 6),
         ])),
         vendorId,
         vendorLeadTimeDays: number(vendor?.leadTimeDays),

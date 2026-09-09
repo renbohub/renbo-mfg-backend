@@ -7,6 +7,12 @@ const { convertNumericFields } = require("../../utils/numericConverter");
 const { assertReference, referenceError } = require("../../utils/referenceValidation");
 
 const validateReferences = async (data, current = {}) => {
+  if (Object.prototype.hasOwnProperty.call(data, 'sizeClass')) {
+    data.sizeClass = data.sizeClass === '' ? null : data.sizeClass;
+    if (data.sizeClass != null && !['SMALL', 'MEDIUM', 'LARGE'].includes(data.sizeClass)) {
+      throw referenceError('sizeClass', 'Kelompok ukuran dies harus SMALL, MEDIUM, atau LARGE.');
+    }
+  }
   if (String(data.ownerType || current.ownerType || "").toLowerCase() === "customer" && !(data.customerCode || current.customerCode)) {
     throw referenceError("customerCode", "Customer pemilik wajib dipilih untuk Dies milik customer.", "REFERENCE_REQUIRED");
   }

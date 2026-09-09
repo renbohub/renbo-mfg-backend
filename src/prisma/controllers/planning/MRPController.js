@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { randomUUID } = require("crypto");
 const { Prisma } = require("@prisma/client");
 const { prisma } = require("../../index");
@@ -2315,7 +2316,7 @@ async function applyTimePhasedPurchaseNetting(requirements = [], supplyEvents = 
         materialRequiredDate: row.requiredDate,
         supplierLeadTimeDays: leadTime,
         ...procurementPolicyFromDecision(planningDecision, options.procurementPolicy || {}),
-        asOf: options.asOf || new Date(),
+        asOf: options.asOf || businessNow(),
       });
       row.supplierRequiredArrivalDate = schedule.supplierRequiredArrivalDate;
       row.orderDate = schedule.latestPoDate;
@@ -2603,7 +2604,7 @@ function isWithinSoDemandTimeFence(targetDate, fenceConfig = {}) {
   const dueDate = parseDate(targetDate);
   if (!dueDate) return false;
 
-  const today = new Date();
+  const today = businessNow();
   today.setHours(0, 0, 0, 0);
   const fenceDate = new Date(today);
   fenceDate.setDate(fenceDate.getDate() + fenceDays);
@@ -3251,6 +3252,23 @@ async function buildOpenSupplyMap(tx, partCodes, cutoffDate, options = {}) {
 }
 
 async function buildPurchasingSupplyTimeline(tx, requirements = [], cutoffDate, options = {}) {
+  const customerRows = requirements.filter((r) => isCustomerSupplied(r.materialSupplyType));
+  if (customerRows.length) {
+    const service = require("../../services/planning/customerSupplyService");
+    const requests = await service.loadSupplyRequests(tx, customerRows);
+    const parts = await tx.part.findMany({ where: { partCode: { in: customerRows.map((r) => r.partCode) } }, select: { partCode: true, material: { select: { materialCode: true } } } });
+    const byPart = new Map(parts.map((p) => [p.partCode, p.material?.materialCode]));
+    const events = new Map();
+    for (const row of customerRows) {
+      const component = { ...row, uomCode: row.uomCode || options.uomCodeByPartCode?.[row.partCode], materialCode: byPart.get(row.partCode) || null };
+      row._planningStockKey = service.poolKey(component);
+      for (const event of service.supplyEventsFor(component, requests)) {
+        if (!cutoffDate || new Date(event.availableDate) <= new Date(cutoffDate)) events.set(event.id, { ...event, supplyKey: row._planningStockKey, partCode: row.partCode });
+      }
+    }
+    const regular = await buildPurchasingSupplyTimeline(tx, requirements.filter((r) => !isCustomerSupplied(r.materialSupplyType)), cutoffDate, options);
+    return [...regular, ...events.values()];
+  }
   const partCodes = [...new Set(requirements.map((row) => normalizePartCode(row.partCode)).filter(Boolean))];
   if (!partCodes.length) return [];
   const cutoff = parseDate(cutoffDate) || new Date(Math.max(...requirements.map((row) => new Date(row.requiredDate).getTime())));
@@ -3507,7 +3525,7 @@ async function buildOpenMoSupplyMap(tx, partCodes, cutoffDate) {
 // ============================================
 exports.generateNumber = async (req, res, next) => {
   try {
-    const planningMonth = String(req.query.planningMonth || req.query.planningAnchorMonth || new Date().toISOString().slice(0, 7));
+    const planningMonth = String(req.query.planningMonth || req.query.planningAnchorMonth || businessNow().toISOString().slice(0, 7));
     res.json({ ...(await nextMonthlyMrpIdentity(prisma, planningMonth)), planningMonth });
   } catch (e) {
     next(e);
@@ -3840,6 +3858,7 @@ exports.get = async (req, res, next) => {
                 partName: true,
                 itemType: true,
                 rawType: true,
+                hasDrawing: true,
                 material: {
                   select: {
                     materialCode: true,
@@ -4291,7 +4310,7 @@ exports.get = async (req, res, next) => {
         include: {
           part: {
             select: {
-              partCode: true, partNumber: true, partName: true, itemType: true, rawType: true,
+              partCode: true, partNumber: true, partName: true, itemType: true, rawType: true, hasDrawing: true,
               material: {
                 select: {
                   materialCode: true, materialName: true, materialForm: true,
@@ -4365,6 +4384,7 @@ exports.get = async (req, res, next) => {
       requirementTrace,
       productionScheduleTrace,
       requirements: groupedRequirements,
+      weeklyPurchases: require("../../services/planning/weeklyProcurementService").groupWeeklyPurchases(enrichedPlannedOrders),
       plannedOrders: enrichedPlannedOrders.map((row) => ({ ...row, purchaseRequests: prByPlannedOrder.get(row.orderNumber) || [], purchaseRequest: prByPlannedOrder.get(row.orderNumber)?.[0] || null })),
     }));
   } catch (e) {
@@ -4701,7 +4721,7 @@ exports.runMRP = async (req, res, next) => {
       if (cyclePeriodEnd) {
         resolvedCutoffDate = new Date(cyclePeriodEnd);
       } else {
-        resolvedCutoffDate = new Date();
+        resolvedCutoffDate = businessNow();
         resolvedCutoffDate.setDate(resolvedCutoffDate.getDate() + resolvedPlanHorizon);
       }
     }
@@ -4727,7 +4747,7 @@ exports.runMRP = async (req, res, next) => {
           isCurrentPlan: calculationLifecycle.isCurrentPlan,
           planHorizon: resolvedPlanHorizon,
           cutoffDate: resolvedCutoffDate,
-          planningSnapshotAt: parseDate(planningSnapshotAt) || new Date(),
+          planningSnapshotAt: parseDate(planningSnapshotAt) || businessNow(),
           scenarioKey: String(scenarioKey || "").trim() || null,
           scenarioName: String(scenarioName || "").trim() || null,
           scenarioStatus,
@@ -4867,7 +4887,7 @@ exports.runMRP = async (req, res, next) => {
             isDeleted: false,
             status: "Active",
             referenceType: "PART_ALLOCATION",
-            OR: [{ expiryDate: null }, { expiryDate: { gte: new Date() } }],
+            OR: [{ expiryDate: null }, { expiryDate: { gte: businessNow() } }],
           },
           select: {
             partCode: true,
@@ -5511,7 +5531,7 @@ exports.runMRP = async (req, res, next) => {
           initialStockAvailableMap: purchaseInitialStockAvailableMap,
           partnerMap,
           planningConstraintByTarget,
-          asOf: parseDate(planningSnapshotAt) || new Date(),
+          asOf: parseDate(planningSnapshotAt) || businessNow(),
           procurementPolicy: scenarioAssumptions?.procurementPolicy || {},
         });
         for (const requirement of purchaseRequirements) {
@@ -5545,7 +5565,7 @@ exports.runMRP = async (req, res, next) => {
         // Generate planned orders dari requirements (generate nomor secara berurutan)
         let poSeq = 0;
         let moSeq = 0;
-        const today = new Date();
+        const today = businessNow();
         const dateStr = today.toISOString().split("T")[0].replace(/-/g, "");
 
         // Cari sequence terakhir sekali di luar loop. Referensi di PR/MO/MPP ikut
@@ -6043,7 +6063,10 @@ async function explodeMBOM(
     },
   });
 
-  if (!mbomHeader || !mbomHeader.details || mbomHeader.details.length === 0) {
+  if (!mbomHeader) {
+    throw Object.assign(new Error(`BOM ${mbomHeaderId} tidak tersedia atau tidak berlaku pada tanggal kebutuhan. Perbarui pilihan revisi BOM di MPS lalu hitung ulang; material tidak boleh dilewati diam-diam.`), { statusCode: 409, code: "MRP_BOM_NOT_EFFECTIVE" });
+  }
+  if (!mbomHeader.details || mbomHeader.details.length === 0) {
     return { requirements };
   }
 
@@ -6443,7 +6466,9 @@ async function explodeMBOM(
         grossRequirement,
         onHandQty,
       }),
-      _planningStockKey: stockKey,
+      _planningStockKey: customerSuppliedMaterial
+        ? require("../../services/planning/customerSupplyService").poolKey({ partCode, materialCode: detail.part.material?.materialCode, supplyCustomerCode: detail.supplyCustomer?.customerCode || options.customerCode, uomCode: materialPlanningRules.planningUomByPartCode[normalizedPartCode] || detail.uomCode })
+        : stockKey,
     };
 
     if (orderType === "Purchase" && options.initialAvailableMap?.[stockKey] === undefined) {
@@ -6595,7 +6620,7 @@ exports.getRequirements = async (req, res, next) => {
 };
 
 exports.procurementView = async (req, res, next) => {
-  try { res.json(await procurementView(prisma, req.params.runNumber, parseDate(req.query.asOf) || new Date())); }
+  try { res.json(await procurementView(prisma, req.params.runNumber, parseDate(req.query.asOf) || businessNow())); }
   catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };
 
@@ -6844,7 +6869,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
       }
 
       const partnerMap = await buildPlannedOrderPartnerMap(tx, partCodes);
-      const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      const dateStr = businessNow().toISOString().slice(0, 10).replace(/-/g, "");
       const lastPlo = await tx.plannedOrder.findFirst({
         where: { orderNumber: { startsWith: `PLO-${dateStr}-` } },
         orderBy: { orderNumber: "desc" },
@@ -6924,7 +6949,7 @@ exports.updateRequirementBuffer = async (req, res, next) => {
 };
 
 async function nextGeneratedPurchaseRequestNumber(tx, procurementGroup) {
-  const dateKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const dateKey = businessNow().toISOString().slice(0, 10).replace(/-/g, "");
   // Raw-material requisitions are Material Master demand documents. MRP is
   // retained in PurchaseRequisitionSource, not exposed as the PR header identity.
   const documentType = procurementGroup === "MATERIAL" ? "MAT" : "MRP";
@@ -7074,7 +7099,7 @@ function buildMrpPurchaseRequestDetails(orders, partByCode, runNumber, requireme
       // preserves the two MRP demand lines and lets Purchasing split supplier,
       // package/form, and ordered quantity per demand without losing pegging.
       ? ["MATERIAL", part.material.id || part.material.materialCode, order.orderNumber, order.uomCode || "KG"].join("|")
-      : [category, order.partCode, order.uomCode || "UNIT"].join("|");
+      : [category, order.partCode, order.uomCode || "UNIT", require("../../services/planning/weeklyProcurementService").procurementWeek(order.requiredDate).key, order.supplierCode || "", order.vendorCode || ""].join("|");
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push({
       order,
@@ -7402,15 +7427,15 @@ const createPurchaseRequestOutputLegacy = async (req, res, next) => {
       for (const order of releasedOrders) {
         const part = partByCode.get(order.partCode);
         const procurementGroup = procurementCategoryForPart(part);
-        const demandBucket = new Date(order.requiredDate).toISOString().slice(0, 7);
+        const demandBucket = require("../../services/planning/weeklyProcurementService").procurementWeek(order.requiredDate).key;
         const groupKey = procurementGroup === "MATERIAL"
           ? `MATERIAL|${part?.material?.id || part?.material?.materialCode}|${demandBucket}`
-          : procurementGroup;
+          : `${procurementGroup}|${demandBucket}`;
         if (!groupedOrders.has(groupKey)) {
           groupedOrders.set(groupKey, {
             groupKey,
             procurementGroup,
-            demandBucket: procurementGroup === "MATERIAL" ? demandBucket : null,
+            demandBucket,
             material: procurementGroup === "MATERIAL" ? part?.material : null,
             orders: [],
           });
@@ -7429,7 +7454,7 @@ const createPurchaseRequestOutputLegacy = async (req, res, next) => {
         } = group;
         const headerSourceType = procurementGroup === "MATERIAL" ? "SYSTEM" : "MRP";
         const requiredDate = categoryOrders.reduce((earliest, order) =>
-          !earliest || new Date(order.requiredDate) < earliest ? new Date(order.requiredDate) : earliest, null) || new Date();
+          !earliest || new Date(order.requiredDate) < earliest ? new Date(order.requiredDate) : earliest, null) || businessNow();
         const requestDetails = buildMrpPurchaseRequestDetails(categoryOrders, partByCode, runNumber, requirements);
         const explicitTarget = requestedTargets[groupKey]
           || requestedTargets[material?.materialCode]
@@ -7455,6 +7480,7 @@ const createPurchaseRequestOutputLegacy = async (req, res, next) => {
                   procurementGroup,
                   status: "Draft",
                   isDeleted: false,
+                  demandBucket,
                   ...(procurementGroup === "MATERIAL" ? {
                     headerMaterialId: material?.id,
                     demandBucket,
@@ -7469,6 +7495,9 @@ const createPurchaseRequestOutputLegacy = async (req, res, next) => {
         }
         if (target && (target.status !== "Draft" || target.sourceType !== headerSourceType || target.procurementGroup !== procurementGroup)) {
           throw Object.assign(new Error(`PR ${target.prNumber} harus Draft, bertipe header ${headerSourceType}, dan kelompoknya ${procurementGroup}.`), { status: 409 });
+        }
+        if (target && target.demandBucket !== demandBucket) {
+          throw Object.assign(new Error(`PR ${target.prNumber} bukan kelompok minggu ${demandBucket}. Pilih PR pada minggu yang sama.`), { status: 409 });
         }
         if (target && procurementGroup === "MATERIAL"
           && (target.headerMaterialId !== material?.id || target.demandBucket !== demandBucket)) {
@@ -7604,7 +7633,7 @@ exports.createProductionPlanOutput = async (req, res, next) => {
     if (!run.mpsNumber) return res.status(409).json({ message: "MRP ini tidak terhubung ke MPS sehingga Production Planning tidak dapat dibuat" });
     const monthlyPlan = require("./MonthlyProductionPlanController");
     const delegatedReq = Object.create(req);
-    delegatedReq.body = { ...(req.body || {}), mpsNumber: run.mpsNumber };
+    delegatedReq.body = { ...(req.body || {}), mpsNumber: run.mpsNumber, sourceMrpRunNumber: run.runNumber };
     return monthlyPlan.createFromMps(delegatedReq, res, next);
   } catch (error) { next(error); }
 };
@@ -8044,6 +8073,9 @@ exports.bulkRemove = async (req, res, next) => {
 };
 
 exports.__test = {
+  buildPurchasingSupplyTimeline,
+  applyTimePhasedPurchaseNetting,
+  explodeMBOM,
   canonicalMrpLifecycleStatus,
   expandMpsDetailsByDeliveryPhases,
   demandPeggingForPhase,
@@ -8068,4 +8100,3 @@ exports.__test = {
   enrichMPlusOnePreviewRequirements,
   supersedePreviousMrpArtifacts,
 };
-

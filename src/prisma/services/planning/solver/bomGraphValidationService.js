@@ -84,11 +84,12 @@ function assertBomGraphStructure(header = {}) {
   return validation;
 }
 
-async function selectAuthoritativeMbom(prisma, { partId, effectiveAt = new Date(), select, include } = {}) {
+async function selectAuthoritativeMbom(prisma, { partId, selectedId, effectiveAt = require("../../../utils/businessClock").businessNow(), select, include } = {}) {
   const at = new Date(effectiveAt);
   const candidates = await prisma.mBOMHeader.findMany({
     where: {
       partId,
+      ...(selectedId ? { id: selectedId } : {}),
       isDeleted: false,
       AND: [
         { OR: [{ effectiveDate: null }, { effectiveDate: { lte: at } }] },
@@ -107,6 +108,7 @@ async function selectAuthoritativeMbom(prisma, { partId, effectiveAt = new Date(
     error.candidates = candidates.map((row) => ({ id: row.id, noReg: row.noReg, revision: row.revision }));
     throw error;
   }
+  if (selectedId && !candidates.length) throw Object.assign(new Error("BOM yang dipilih MPS tidak berlaku pada tanggal produksi."), { code: "MPS_BOM_NOT_EFFECTIVE", statusCode: 409 });
   return candidates[0] || null;
 }
 

@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const MPSController = require("./MPSController");
 const MRPController = require("./MRPController");
@@ -25,7 +26,7 @@ function invoke(controller, req) {
 }
 
 async function nextMrpNumber(tx = prisma) {
-  const dateKey = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const dateKey = businessNow().toISOString().slice(0, 10).replace(/-/g, "");
   const prefix = `MRP-${dateKey}-`;
   const last = await tx.mRPRun.findFirst({ where: { runNumber: { startsWith: prefix } }, orderBy: { runNumber: "desc" }, select: { runNumber: true } });
   const sequence = Number(last?.runNumber?.split("-").pop() || 0) + 1;

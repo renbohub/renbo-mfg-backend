@@ -60,6 +60,13 @@ function worksheetRows(sheet, sheetName, hidden) {
       values.push(displayValue(sheet[XLSX.utils.encode_cell({ r: rowIndex, c: columnIndex })]));
     }
     const score = headerScore(values);
+    const explicitLabels = values.map(value => String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, ""));
+    // Master templates have an explicit contract. Do not let customer names or
+    // address text farther down the sheet outscore their actual header row.
+    if (explicitLabels.includes("operation") && (explicitLabels.includes("customercode") || explicitLabels.includes("partcode"))) {
+      headerIndex = rowIndex;
+      break;
+    }
     if (score > bestScore) {
       bestScore = score;
       headerIndex = rowIndex;

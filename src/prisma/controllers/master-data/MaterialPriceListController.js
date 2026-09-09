@@ -5,6 +5,10 @@ const { convertPriceListFields } = require("../../utils/numericConverter");
 const {
   normalizeEffectivePriceInput,
   createEffectiveVersion,
+  normalizeMonthlyPriceInput,
+  saveMonthlyPrice,
+  monthlyPriceView,
+  MONTH_FIELDS,
 } = require("../../services/pricing/effectivePriceService");
 
 // Include config untuk materialpricelist
@@ -33,10 +37,11 @@ function normalizePurchasePackageCode(value) {
   return ({ C: "COIL", S: "SHEET", P: "PCS", PIECES: "PCS" })[form] || form || null;
 }
 
-async function normalizeMaterialPriceData(input) {
-  const data = normalizeEffectivePriceInput(convertPriceListFields(input), {
+async function normalizeMaterialPriceData(input, options = {}) {
+  const data = normalizeEffectivePriceInput(input.pricingMode === "MONTHLY" ? input : convertPriceListFields(input), {
     requireEffective: input.effectiveFrom !== undefined || input.unitPrice !== undefined,
     actor: input.createdBy,
+    existing: options.existing,
   });
   if (data.thickness !== undefined && data.thickness !== null && data.thickness !== "") {
     data.thickness = Number(data.thickness);
@@ -184,6 +189,7 @@ exports.get = async (req, res, next) => {
     });
     if (!doc)
       return res.status(404).json({ message: "MaterialPriceList not found" });
+    if (req.query.monthlyForm === "true") return res.json(await monthlyPriceView(prisma, "materialPriceList", doc));
     res.json(mapMaterialPrice(doc));
   } catch (e) {
     next(e);
@@ -208,7 +214,8 @@ exports.create = async (req, res, next) => {
           thickness: convertedData.thickness,
           CSP: convertedData.CSP || null,
         };
-    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+    const saveVersion = req.body.pricingMode === "MONTHLY" ? saveMonthlyPrice : createEffectiveVersion;
+    const saved = await prisma.$transaction((tx) => saveVersion(tx, {
       model: "materialPriceList",
       data: convertedData,
       scopeWhere: {
@@ -232,9 +239,24 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const current = await prisma.materialPriceList.findUnique({ where: { id: req.params.id } });
-    if (!current) return res.status(404).json({ message: "MaterialPriceList not found" });
-    const convertedData = await normalizeMaterialPriceData({ ...current, ...req.body, id: undefined, createdAt: undefined, updatedAt: undefined });
+    if (!current || current.isDeleted) return res.status(404).json({ message: "MaterialPriceList not found" });
+    const monthly = req.body.pricingMode === "MONTHLY";
+    const existing = monthly ? await monthlyPriceView(prisma, "materialPriceList", current) : undefined;
+    const input = { ...current, ...req.body, id: undefined, createdAt: undefined, updatedAt: undefined };
+    // Omitted months inherit from the projected annual plan; an explicit null clears an override.
+    // Keep the stored material association on historical records while the form uses grade/thickness.
+    if (monthly) MONTH_FIELDS.forEach((month) => { input[month] = req.body[month]; });
+    const convertedData = await normalizeMaterialPriceData(input, { existing });
     delete convertedData.createdBy;
+    if (req.body.pricingMode === "MONTHLY") {
+      if (!convertedData.supplierId || !convertedData.uomCode) return res.status(400).json({ message: "Supplier dan UOM harga wajib dipilih." });
+      const identity = convertedData.materialId ? { materialId: convertedData.materialId } : { materialId: null, materialSubstanceId: convertedData.materialSubstanceId, materialGradeId: convertedData.materialGradeId, thickness: convertedData.thickness, CSP: convertedData.CSP || null };
+      const doc = await prisma.$transaction((tx) => saveMonthlyPrice(tx, {
+        model: "materialPriceList", id: req.params.id, data: convertedData, include: includeMaterialPriceList,
+        scopeWhere: { ...identity, supplierId: convertedData.supplierId, currencyCode: convertedData.currencyCode || "IDR", uomCode: convertedData.uomCode || null },
+      }));
+      return res.json(mapMaterialPrice(doc));
+    }
     const doc = await prisma.materialPriceList.update({
       where: { id: req.params.id },
       data: convertedData,

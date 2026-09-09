@@ -58,4 +58,10 @@ async function failSolverRun(prisma, id, error) {
   } });
 }
 
-module.exports = { jsonSafe, inputHash, runNumber, enqueueSolverRun, completeSolverRun, failSolverRun };
+function assertDemandSolverEvidence(solver) {
+  if (solver?.engine !== "OR_TOOLS_WASM_CP_SAT" || ![solver.backward, solver.forward].every((result) => result?.feasible === true && ["OPTIMAL", "FEASIBLE"].includes(result.status))) {
+    throw Object.assign(new Error("Hasil demand belum memiliki backward/forward CP-SAT yang feasible."), { code: "DEMAND_SOLVER_EVIDENCE_INVALID", solver });
+  }
+  return solver;
+}
+module.exports = { jsonSafe, inputHash, runNumber, enqueueSolverRun, completeSolverRun, failSolverRun, assertDemandSolverEvidence };

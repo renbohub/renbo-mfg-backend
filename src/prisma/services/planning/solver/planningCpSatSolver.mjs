@@ -2,6 +2,15 @@ import { CpModel, CpSolver, Domain, LinearExpr } from "or-tools-wasm/cp-sat";
 
 const integer = (value, fallback = 0) => Number.isFinite(Number(value)) ? Math.round(Number(value)) : fallback;
 
+// or-tools-wasm shares one native module within this Node process. Its async
+// solve entry point must not be re-entered by simultaneous HTTP/job requests.
+let runtimeTail = Promise.resolve();
+function solveExclusive(solver, model) {
+  const result = runtimeTail.then(() => solver.solve(model));
+  runtimeTail = result.catch(() => {});
+  return result;
+}
+
 function solveOptions(options = {}) {
   return {
     maxTimeInSeconds: Math.max(Number(options.maxTimeInSeconds || 30), 1),
@@ -16,10 +25,13 @@ export async function solveBackwardChain(input = {}) {
   if (!tasks.length) throw new Error("Backward chain membutuhkan minimal satu task.");
   const horizon = Math.max(integer(input.horizonMinutes), 1);
   const target = Math.min(Math.max(integer(input.targetMinute, horizon), 0), horizon);
+  const unavailable = tasks.filter((task) => Array.isArray(task.allowedStartMinutes)
+    && !task.allowedStartMinutes.some((value) => Number.isFinite(Number(value)) && Number(value) >= 0 && integer(value) + Math.max(integer(task.durationMinutes), 0) <= horizon));
+  if (unavailable.length) return { status: "INFEASIBLE", feasible: false, tasks: [], blockers: unavailable.map((task) => ({ code: "NO_ALLOWED_START", taskId: task.id })), diagnostics: "Tidak ada slot kalender yang dapat memuat task." };
   const model = new CpModel();
   const variables = tasks.map((task, index) => {
     const duration = Math.max(integer(task.durationMinutes), 0);
-    const allowedStarts = (task.allowedStartMinutes || []).map((value) => integer(value)).filter((value) => value >= 0 && value + duration <= horizon);
+    const allowedStarts = (task.allowedStartMinutes || []).filter((value) => Number.isFinite(Number(value))).map((value) => integer(value)).filter((value) => value >= 0 && value + duration <= horizon);
     const start = allowedStarts.length
       ? model.newIntVarFromDomain(Domain.fromValues(allowedStarts), `start_${index}_${task.id}`)
       : model.newIntVar(0, horizon, `start_${index}_${task.id}`);
@@ -34,7 +46,7 @@ export async function solveBackwardChain(input = {}) {
   model.maximize(variables[0].start);
   const solver = new CpSolver();
   Object.assign(solver.parameters, solveOptions(input.options));
-  const status = await solver.solve(model);
+  const status = await solveExclusive(solver, model);
   const statusName = solver.statusName(status);
   if (!["OPTIMAL", "FEASIBLE"].includes(statusName)) {
     return { status: statusName, feasible: false, tasks: [], diagnostics: solver.responseStats() };
@@ -71,7 +83,9 @@ export async function solveFiniteSchedule(input = {}) {
   for (const [index, task] of tasks.entries()) {
     const id = String(task.id || `TASK-${index + 1}`);
     if (byId.has(id)) throw new Error(`Task solver duplikat: ${id}`);
-    const duration = Math.max(integer(task.durationMinutes), 1);
+    const duration = task.durationMinutesByResourceId
+      ? model.newIntVar(1, horizon, `duration_${index}`)
+      : Math.max(integer(task.durationMinutes), 1);
     const release = Math.min(Math.max(integer(task.releaseMinute), 0), horizon);
     const due = Math.min(Math.max(integer(task.dueMinute, horizon), 0), horizon);
     const start = model.newIntVar(release, horizon, `start_${index}`);
@@ -82,11 +96,17 @@ export async function solveFiniteSchedule(input = {}) {
     const assignments = [];
     for (const resourceId of eligible) {
       const selected = model.newBoolVar(`resource_${index}_${assignments.length}`);
+      if (task.durationMinutesByResourceId) model.addEquality(duration, Math.max(integer(task.durationMinutesByResourceId[resourceId], integer(task.durationMinutes)), 1)).onlyEnforceIf(selected);
       const interval = model.newOptionalIntervalVar(start, duration, end, selected, `interval_${index}_${assignments.length}`);
       assignments.push({ resourceId, selected, interval });
       const resourceIntervals = resources.get(resourceId) || [];
       resourceIntervals.push(interval);
       resources.set(resourceId, resourceIntervals);
+      for (const toolId of [...new Set(task.requiredResourcesByResourceId?.[resourceId] || [])]) {
+        const toolIntervals = resources.get(toolId) || [];
+        toolIntervals.push(model.newOptionalIntervalVar(start, duration, end, selected, `tool_${index}_${assignments.length}_${toolId}`));
+        resources.set(toolId, toolIntervals);
+      }
       if (task.preferredResourceId && String(task.preferredResourceId) !== resourceId) {
         assignmentMovementTerms.push(selected.times(Math.max(integer(task.resourceMovementWeight, 10), 1)));
       }
@@ -142,12 +162,11 @@ export async function solveFiniteSchedule(input = {}) {
     assignmentGroups.set(String(row.task.assignmentGroupId), grouped);
   }
   for (const grouped of assignmentGroups.values()) {
-    const reference = grouped[0];
-    for (const row of grouped.slice(1)) {
-      for (const candidate of reference.assignments) {
-        const matching = row.assignments.find((item) => item.resourceId === candidate.resourceId);
-        if (matching) model.addEquality(candidate.selected, matching.selected);
-      }
+    const ids = [...new Set(grouped.flatMap((row) => row.assignments.map((a) => a.resourceId)))];
+    const choices = ids.map((id, index) => ({ id, chosen: model.newBoolVar(`campaign_${assignmentGroups.size}_${grouped[0].index}_${index}`) }));
+    model.add(LinearExpr.sum(choices.map((c) => c.chosen)).le(1));
+    for (const row of grouped) {
+      for (const candidate of row.assignments) model.addImplication(candidate.selected, choices.find((c) => c.id === candidate.resourceId).chosen);
     }
   }
   for (const row of byId.values()) {
@@ -162,7 +181,7 @@ export async function solveFiniteSchedule(input = {}) {
   model.minimize(objectiveTerms.length ? LinearExpr.sum(objectiveTerms) : 0);
   const solver = new CpSolver();
   Object.assign(solver.parameters, solveOptions(input.options));
-  const status = await solver.solve(model);
+  const status = await solveExclusive(solver, model);
   const statusName = solver.statusName(status);
   if (!["OPTIMAL", "FEASIBLE"].includes(statusName)) {
     return { status: statusName, feasible: false, tasks: [], resourceSchedules: {}, diagnostics: solver.responseStats() };
@@ -177,6 +196,7 @@ export async function solveFiniteSchedule(input = {}) {
       resourceId: assignment?.resourceId || null,
       startMinute: present ? Number(solver.value(row.start)) : null,
       endMinute: present ? Number(solver.value(row.end)) : null,
+      durationMinutes: present ? Number(solver.value(row.end)) - Number(solver.value(row.start)) : null,
       tardinessMinutes: present ? Number(solver.value(row.late)) : null,
     };
   });

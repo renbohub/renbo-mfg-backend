@@ -15,7 +15,7 @@ const { solveFiniteSchedule } = require("./solver/planningSolverService");
 const { aiRuntimeSupervisor } = require("../ai/aiRuntimeSupervisor");
 const { resolveModelFile, validateRuntimeConfig } = require("../ai/aiModelProfileService");
 
-const RULE_VERSION = "MPP-OR-TOOLS-WASM-CP-SAT-V1";
+const RULE_VERSION = "MPP-PRIMARY-MACHINE-TOOLING-V2";
 const ACTIVE_SCENARIO_STATUSES = [
   "READY",
   "READY_WITH_OVERLOAD",
@@ -61,9 +61,11 @@ function recommendationBatchPolicy(snapshot = {}, input = {}) {
   const configuredTwoShiftMinutes = shiftHours > 0 && shiftsPerDay > 0
     ? shiftHours * Math.min(shiftsPerDay, 2) * 60
     : 14 * 60;
+  const setupMinutes = Math.max(0, ...(snapshot.manualAllocationCatalog || []).flatMap((c) => (c.machinePlanningPolicy?.resources || []).map((r) => number(r.setupMinutes))));
+  if (setupMinutes >= configuredTwoShiftMinutes) throw httpError(422, "Setup mesin melebihi slot harian. Tinjau master setup dan kalender sebelum alokasi.");
   return {
     minimumBatchMinutes: Math.max(number(input.minimumBatchMinutes) || 60, 1),
-    maximumBatchMinutes: Math.max(number(input.maximumBatchMinutes) || configuredTwoShiftMinutes, 60),
+    maximumBatchMinutes: Math.max((number(input.maximumBatchMinutes) || configuredTwoShiftMinutes) - setupMinutes, 1),
     batchPolicy: "MINIMUM_ONE_HOUR_MAXIMUM_TWO_SHIFTS_SOURCE_LIMITED",
   };
 }
@@ -172,6 +174,7 @@ function recommendationItemToEditorChange(item, scenario) {
     targetChildKey: value.targetChildKey || null,
     routingMode: vendorMode ? "VENDOR" : "INHOUSE",
     targetMachineId: value.targetMachineId || null,
+    diesId: value.diesId || null,
     vendorId: value.vendorId || null,
     targetVendorId: value.vendorId || null,
     vendorReturnDate: value.vendorReturnDate || null,
@@ -306,6 +309,28 @@ function extractOfficialAllocations(snapshot) {
   return allocations;
 }
 
+function toolAvailabilityForSnapshot(plan, snapshot, officialAllocations) {
+  const rescheduled = new Set(officialAllocations.map((a) => a.id));
+  const blocked = new Map();
+  for (const machine of snapshot.machines || []) for (const [day, cell] of Object.entries(machine.cells || {})) {
+    for (const item of cell.items || []) if (item.diesId && item.source !== "PROPOSED" && !rescheduled.has(item.allocationId)) {
+      if (!blocked.has(item.diesId)) blocked.set(item.diesId, new Set());
+      blocked.get(item.diesId).add(dateKey(day));
+    }
+  }
+  const toolIds = [...new Set((snapshot.manualAllocationCatalog || []).flatMap((c) => (c.machinePlanningPolicy?.resources || []).map((r) => r.diesId)).filter(Boolean))];
+  return Object.fromEntries(toolIds.map((id) => {
+    const tool = (snapshot.catalogs?.dies || []).find((d) => d.id === id);
+    const windows = [];
+    for (let day = new Date(`${dateKey(plan.periodStart)}T00:00:00Z`); dateKey(day) <= dateKey(plan.periodEnd); day.setUTCDate(day.getUTCDate() + 1)) {
+      const key = dateKey(day);
+      const maintenance = (tool?.maintenances || []).some((m) => key >= dateKey(m.startDate || m.maintenanceDate) && key <= dateKey(m.endDate || m.startDate || m.maintenanceDate));
+      if (!maintenance && !blocked.get(id)?.has(key)) windows.push({ date: key, startMinute: 0, endMinute: 840 });
+    }
+    return [`TOOL:${id}`, windows];
+  }));
+}
+
 function adaptCapacitySnapshot({ plan, snapshot }) {
   if (snapshot?.recommendationInput) {
     const input = jsonSafe(snapshot.recommendationInput);
@@ -328,6 +353,7 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
     (item) => !item.planNumber || item.planNumber === plan.planNumber,
   );
   const officialAllocations = extractOfficialAllocations(snapshot);
+  const toolAvailability = toolAvailabilityForSnapshot(plan, snapshot, officialAllocations);
   const existingQtyByRoute = new Map();
   for (const allocation of officialAllocations) {
     const key = `${Number(allocation.lineNumber || 0)}|${String(allocation.mbomProcessId || "")}`;
@@ -362,6 +388,12 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
         fgRequiredDate,
         routes: ordered.map((catalog) => {
           const vendor = String(catalog.routingMode || "INHOUSE").toUpperCase() === "VENDOR";
+          const policy = vendor ? null : catalog.machinePlanningPolicy;
+          if (policy?.errors?.length) throw httpError(422, `${catalog.outputPartCode || catalog.partCode} / ${catalog.processCode}: ${policy.errors.join(" ")}`);
+          const resources = vendor ? vendorResources(snapshot, catalog) : machineResources(snapshot, catalog)
+            .filter((resource) => !policy || policy.automaticMachineIds.includes(resource.machineId));
+          const cycleMinutesByMachine = Object.fromEntries(resources.map((resource) => [resource.machineId,
+            catalog.cycleMinutesByMachine?.[resource.machineId] || policy?.resources.find((r) => r.machineId === resource.machineId)?.cycleTimeSeconds / 60]));
           return {
             lineNumber: number(catalog.lineNumber),
             sequence: number(catalog.sequence),
@@ -371,13 +403,15 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
             outputPartCode: catalog.outputPartCode || catalog.partCode,
             inputPartCode: catalog.inputPartCode || null,
             inputQtyPerOutput: number(catalog.inputQtyPerOutput) || 1,
+            machinePlanningPolicy: policy,
+            cycleMinutesByMachine,
             minutesPerUnit: vendor
               ? 0
-              : Math.min(
-                  ...Object.values(catalog.cycleMinutesByMachine || {})
+              : Math.max(
+                  ...Object.values(cycleMinutesByMachine)
                     .map(number)
                     .filter((value) => value > 0),
-                  Number.MAX_SAFE_INTEGER,
+                  0,
                 ) || 0,
             leadDays: Math.max(
               vendor ? number(catalog.vendorLeadTimeDays) : number(catalog.leadDays),
@@ -387,9 +421,7 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
             minimumOrderQty: number(catalog.minimumOrderQty),
             orderMultipleQty: number(catalog.orderMultipleQty),
             fgRequiredDate,
-            resources: vendor
-              ? vendorResources(snapshot, catalog)
-              : machineResources(snapshot, catalog),
+            resources,
           };
         }),
       };
@@ -404,6 +436,7 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
     receipts: jsonSafe(snapshot.recommendationMaterial?.receipts || []),
     consumptions: jsonSafe(snapshot.recommendationMaterial?.consumptions || []),
     existingAllocations: officialAllocations,
+    toolAvailability,
     jobs,
     auditSnapshot: jsonSafe({
       planNumber: plan.planNumber,
@@ -422,6 +455,7 @@ function adaptCapacitySnapshot({ plan, snapshot }) {
         routes: catalogs.length,
         officialAllocations: officialAllocations.length,
       },
+      machinePolicyFingerprint: require("crypto").createHash("sha256").update(JSON.stringify([catalogs.map((c) => [c.lineNumber, c.mbomProcessId, c.machinePlanningPolicy, c.cycleMinutesByMachine, c.allowedDiesIds]), toolAvailability])).digest("hex"),
     }),
   };
 }
@@ -455,6 +489,10 @@ async function optimizeRecommendationWithCpSat(input, recommendation) {
       recommendationIndex,
       lineNumber: item.lineNumber,
       routeSequence: number(route.sequence),
+      assignmentGroupId: !vendor && route.machinePlanningPolicy?.mode !== "PARALLEL" ? `ROUTE:${route.mbomProcessId}` : undefined,
+      preferredResourceId: route.machinePlanningPolicy?.primaryMachineId,
+      durationMinutesByResourceId: !vendor && route.machinePlanningPolicy ? Object.fromEntries(route.machinePlanningPolicy.resources.map((r) => [r.machineId, Math.max(Math.ceil(number(route.cycleMinutesByMachine?.[r.machineId] || r.cycleTimeSeconds / 60) * number(item.proposedValue.qty) + r.setupMinutes), 1)])) : undefined,
+      requiredResourcesByResourceId: !vendor && route.machinePlanningPolicy ? Object.fromEntries(route.machinePlanningPolicy.resources.map((r) => [r.machineId, r.diesId ? [`TOOL:${r.diesId}`] : []])) : undefined,
       durationMinutes: Math.max(Math.ceil(number(item.proposedValue.batchDurationMinutes) || calculatedDuration), 1),
       eligibleResourceIds: (route.resources || []).map((resource) => String(resource.machineId || resource.vendorId || resource.id)).filter(Boolean),
       releaseDate: item.proposedValue.materialAvailableDate || item.trace?.materialAvailableDate || input.periodStart,
@@ -478,7 +516,7 @@ async function optimizeRecommendationWithCpSat(input, recommendation) {
       task.predecessorIds = rows.filter((candidate) => candidate.routeSequence < task.routeSequence).map((candidate) => candidate.id);
     }
   }
-  const resourceAvailability = {};
+  const resourceAvailability = { ...(input.toolAvailability || {}) };
   for (const [resourceId, resource] of resourceById) {
     const dated = resource.availableMinutesByDate || {};
     if (Object.keys(dated).length) {
@@ -496,7 +534,7 @@ async function optimizeRecommendationWithCpSat(input, recommendation) {
     scheduleDirection: "BACKWARD",
     options: { maxTimeInSeconds: 60, numSearchWorkers: 2, randomSeed: 1 },
   });
-  if (!solver.feasible) throw Object.assign(new Error(`OR-Tools tidak menemukan Monthly Plan yang feasible (${solver.status}).`), { solver });
+  if (!solver.feasible) throw Object.assign(new Error(`Monthly Plan belum muat pada mesin utama/mesin paralel yang disetujui (${solver.status}). Periksa kapasitas, setup, dan dies; PPIC perlu meninjau lembur, pemindahan batch, atau proses vendor.`), { solver });
   const solvedByIndex = new Map(solver.tasks.map((task) => [task.recommendationIndex, task]));
   const optimizedItems = (recommendation.items || [])
     .filter((item) => item.itemType !== "OVERLOAD_EXCEPTION")
@@ -512,6 +550,8 @@ async function optimizeRecommendationWithCpSat(input, recommendation) {
           ...item.proposedValue,
           targetDate: solved.startDate.toISOString().slice(0, 10),
           targetMachineId: resource?.machineId || null,
+          diesId: routeByIdentity.get(routeIdentity(item.lineNumber, item.mbomProcessId))?.machinePlanningPolicy?.resources.find((r) => r.machineId === resource?.machineId)?.diesId || item.proposedValue.diesId || null,
+          batchDurationMinutes: solved.durationMinutes,
           vendorId: resource?.vendorId || null,
           vendorReturnDate: resource?.vendorId ? solved.endDate.toISOString().slice(0, 10) : null,
           targetRowKey: resource?.matrixRowKey || item.proposedValue.targetRowKey,
@@ -631,8 +671,6 @@ function createRecommendationService(dependencies = {}) {
       include: { items: { orderBy: { sequence: "asc" } } },
       orderBy: { createdAt: "desc" },
     });
-    if (reusable) return reusable;
-
     const snapshot = await buildSnapshot(prisma, {
       planNumber: plan.planNumber,
       startDate: plan.periodStart,
@@ -641,6 +679,7 @@ function createRecommendationService(dependencies = {}) {
       manualAllocation: true,
     });
     const input = adaptCapacitySnapshot({ plan, snapshot });
+    if (reusable && reusable.inputSnapshot?.machinePolicyFingerprint === input.auditSnapshot?.machinePolicyFingerprint) return reusable;
     const scenario = await prisma.monthlyPlanRecommendationScenario.create({
       data: {
         planId: plan.id,
@@ -754,6 +793,12 @@ function createRecommendationService(dependencies = {}) {
           where: { id: scenario.planId, isDeleted: false },
         }));
       if (!plan) throw httpError(404, "Monthly Production Plan tidak ditemukan.");
+      if (scenario.ruleVersion !== RULE_VERSION) throw httpError(409, "Aturan penjadwalan berubah. Generate ulang recommendation sebelum apply.");
+      if (scenario.inputSnapshot?.machinePolicyFingerprint) {
+        const currentSnapshot = await buildSnapshot(tx, { planNumber: plan.planNumber, startDate: plan.periodStart, endDate: plan.periodEnd, planningMode: "PRODUCTION", manualAllocation: true });
+        const currentInput = adaptCapacitySnapshot({ plan, snapshot: currentSnapshot });
+        if (currentInput.auditSnapshot.machinePolicyFingerprint !== scenario.inputSnapshot.machinePolicyFingerprint) throw httpError(409, "Master mesin/tooling BOM berubah. Generate ulang recommendation sebelum apply.");
+      }
       if (
         new Date(plan.updatedAt).getTime() !==
         new Date(scenario.basePlanUpdatedAt).getTime()

@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -81,8 +82,8 @@ async function resolveDiesAssignment(prisma, {
       where: {
         partId: route.mbomDetail.partId,
         isActive: true,
-        effectiveDate: { lte: dateOnly(scheduleDate) || new Date() },
-        OR: [{ expiryDate: null }, { expiryDate: { gte: dateOnly(scheduleDate) || new Date() } }],
+        effectiveDate: { lte: dateOnly(scheduleDate) || businessNow() },
+        OR: [{ expiryDate: null }, { expiryDate: { gte: dateOnly(scheduleDate) || businessNow() } }],
         dies: { isDeleted: false, status: "Active" },
       },
       orderBy: [{ isPrimary: "desc" }, { effectiveDate: "desc" }],
@@ -113,7 +114,7 @@ async function resolveDiesAssignment(prisma, {
     );
   }
   if (!route?.diesId && route?.mbomDetail?.partId) {
-    const scheduleDay = dateOnly(scheduleDate) || new Date();
+    const scheduleDay = dateOnly(scheduleDate) || businessNow();
     const compatiblePart = dies.diesParts.some((mapping) => mapping.partId === route.mbomDetail.partId
       && mapping.effectiveDate <= scheduleDay
       && (!mapping.expiryDate || mapping.expiryDate >= scheduleDay));

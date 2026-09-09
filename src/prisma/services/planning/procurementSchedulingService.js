@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { solveBackwardMilestones } = require("./solver/planningSolverService");
 
@@ -10,7 +11,7 @@ function monthOffset(from, to) {
   return (right.getUTCFullYear() - left.getUTCFullYear()) * 12 + right.getUTCMonth() - left.getUTCMonth();
 }
 
-function classifyProcurementWindow({ materialRequiredDate, latestPrDate, asOf = new Date() }) {
+function classifyProcurementWindow({ materialRequiredDate, latestPrDate, asOf = businessNow() }) {
   const need = new Date(materialRequiredDate);
   const release = new Date(latestPrDate || materialRequiredDate);
   const today = new Date(asOf);
@@ -32,7 +33,7 @@ async function procurementSchedule({
   receivingQcDays = 1,
   safetyLeadTimeDays = 1,
   holidays = [],
-  asOf = new Date(),
+  asOf = businessNow(),
 }) {
   const leadTimeBreakdown = {
     prApprovalDays: Math.max(number(prApprovalDays), 0),

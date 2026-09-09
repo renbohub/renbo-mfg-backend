@@ -1,6 +1,7 @@
 const { prisma } = require("../../index");
 const { mapDoc } = require("../../utils/mapDoc");
 const { compareRoutingOperations } = require("../../utils/routingSequence");
+const routingService = require('../../services/engineering/partRoutingService');
 
 const text = (value) => String(value || "").trim();
 const safeCode = (value) => text(value).toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-|-$/g, "") || "UNCLASSIFIED";
@@ -180,7 +181,7 @@ async function loadRoutings() {
       }),
     };
   }).filter((item) => !storedCodes.has(item.routingCode));
-  return [...stored.map((item) => ({ ...item, source: "ROUTING_MASTER" })), ...projected]
+  return [...(await routingService.enrich(prisma,stored)).map((item) => ({ ...item, source: "ROUTING_MASTER" })), ...projected]
     .sort((left, right) => left.routingCode.localeCompare(right.routingCode, undefined, { numeric: true }));
 }
 
@@ -281,17 +282,26 @@ exports.getRouting = async (req, res, next) => {
 
 exports.createRouting = async (req, res, next) => {
   try {
-    const { operations = [], ...data } = req.body;
-    const sequences = operations.map((item) => item.sequence);
-    if (new Set(sequences).size !== sequences.length) return res.status(400).json({ message: "Routing operation sequence must be unique" });
-    const item = await prisma.routingHeader.create({ data: { ...data, operations: { create: operations } }, include: { part: true, operations: { include: { workCenter: true }, orderBy: { sequence: "asc" } } } });
+    const item = await routingService.saveRouting(prisma, req.body, {partKey:req.params.partKey});
     res.status(201).json(mapDoc(item));
   } catch (error) { next(error); }
 };
+exports.updateRouting = async (req,res,next) => {try{res.json(await routingService.saveRouting(prisma,req.body,{key:req.params.key,partKey:req.params.partKey}));}catch(error){next(error);}};
+exports.removeRouting = async (req,res,next) => {try{res.json(await routingService.removeRouting(prisma,req.params.key,req.params.partKey));}catch(error){next(error);}};
+exports.partRoutings = async (req,res,next) => {try{res.json(await routingService.listPartRoutings(prisma,req.params.partKey));}catch(error){next(error);}};
+exports.routingOptions = async (req,res,next) => {try{
+  if(req.params.partKey)await routingService.findPart(prisma,req.params.partKey,true);
+  const q=text(req.query.q);
+  const [processes,workCenters,parts]=await Promise.all([
+    prisma.process.findMany({where:{isDeleted:false},select:{id:true,processCode:true,processName:true},orderBy:{processCode:'asc'}}),
+    prisma.workCenter.findMany({where:{isActive:true},select:{id:true,workCenterCode:true,workCenterName:true},orderBy:{workCenterCode:'asc'}}),
+    req.params.partKey?Promise.resolve([]):prisma.part.findMany({where:{isDeleted:false,AND:[{OR:[{status:null},{status:'Active'}]},...(q?[{OR:[{partCode:{contains:q,mode:'insensitive'}},{partName:{contains:q,mode:'insensitive'}}]}]:[])]},select:{id:true,partCode:true,partName:true},take:100,orderBy:{partCode:'asc'}}),
+  ]);res.json({processes,workCenters,parts});
+}catch(error){next(error);}};
 
 exports.linkMbomProcess = async (req, res, next) => {
   try {
-    const item = await prisma.mBOMProcess.update({ where: { id: req.params.id }, data: { routingOperationId: req.body.routingOperationId || null }, include: { routingOperation: true, machine: true, process: true } });
+    const item = await routingService.linkMbomProcess(prisma,req.params.id,req.body);
     res.json(mapDoc(item));
   } catch (error) { next(error); }
 };

@@ -63,6 +63,7 @@ router.post("/:id/process-rework", authorize("stockRework", "update"), logger("s
 // Standard CRUD routes
 router.get("/", authorizeStockBalanceRead, ctrl.list);
 router.get("/:id", authorizeStockBalanceRead, ctrl.get);
+router.patch("/:id/policy", authorize("stockBalances", "update"), logger("stockBalances", "policy-update"), ctrl.updatePolicy);
 router.patch("/:id/remove", authorize("stockBalances", "delete"), logger("stockBalances", "delete"), ctrl.remove);
 
 module.exports = router;

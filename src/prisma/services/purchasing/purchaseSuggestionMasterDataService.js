@@ -1,6 +1,6 @@
 "use strict";
 
-const { resolveEffectiveRecord, legacyPriceValue } = require("../pricing/effectivePriceService");
+const { resolveEffectiveRecord, nullablePriceValue } = require("../pricing/effectivePriceService");
 
 const asNumber = (value) => value !== null && value !== "" && Number.isFinite(Number(value))
   ? Number(value)
@@ -34,9 +34,26 @@ function resolveBomPurchaseDefaults(requirement) {
 
 function supplierItemIsEffective(row, at) {
   if (!row || row.isActive === false) return false;
+  at = new Date(at);
   const from = row.validFrom ? new Date(row.validFrom) : null;
   const until = row.validUntil ? new Date(row.validUntil) : null;
   return (!from || from <= at) && (!until || until >= at);
+}
+
+const bomSupplierSelect = { supplierId: true, supplier: { select: { id: true, supplierCode: true, supplierName: true, leadTimeDays: true, status: true, isDeleted: true } } };
+function resolveBomSupplier(requirements = []) {
+  const rows = requirements.filter(row => row.mbomDetail?.supplierId);
+  const ids = [...new Set(rows.map(row => row.mbomDetail.supplierId))];
+  if (ids.length > 1) throw Object.assign(new Error("Kebutuhan MRP ini memiliki default supplier BOM berbeda. Pisahkan kebutuhan per supplier sebelum membuat Purchase Suggestion."), { status: 409, code: "BOM_SUPPLIER_CONFLICT" });
+  if (!ids.length) return null;
+  const supplier = rows[0].mbomDetail.supplier;
+  if (!supplier || supplier.isDeleted || supplier.status === "Inactive") throw Object.assign(new Error("Default supplier BOM tidak aktif atau tidak ditemukan. Periksa supplier pada BOM sumber MRP."), { status: 409, code: "BOM_SUPPLIER_UNAVAILABLE" });
+  return supplier;
+}
+async function loadBomSupplier(db, item) {
+  const ids = [...new Set([item.mrpRequirementId, ...(Array.isArray(item.sourceRequirements) ? item.sourceRequirements : []).filter(row => row.allocationType !== "MOQ_PULL_FORWARD").map(row => row.id)].filter(Boolean))];
+  if (!ids.length) return null;
+  return resolveBomSupplier(await db.mRPRequirement.findMany({ where: { id: { in: ids }, isDeleted: false }, select: { mbomDetail: { select: bomSupplierSelect } } }));
 }
 
 function materialPriceMatches(row, material) {
@@ -144,7 +161,7 @@ async function resolvePurchaseSuggestionSupplierMaster(db, item, supplierCodeInp
   const priceSource = priceRecord
     ? (priceRecord === materialPrice ? "MATERIAL_PRICE_LIST" : "PART_PRICE_LIST")
     : supplierItem?.price != null ? "SUPPLIER_ITEM" : "PRICE_NOT_FOUND";
-  const unitPrice = priceRecord ? legacyPriceValue(priceRecord, lookupDate) : asNumber(supplierItem?.price);
+  const unitPrice = priceRecord ? nullablePriceValue(priceRecord, lookupDate) : asNumber(supplierItem?.price);
 
   const fallbackForm = normalizePurchaseFormCode(
     materialPrice?.purchasePackageUomCode
@@ -188,6 +205,13 @@ async function resolvePurchaseSuggestionSupplierMaster(db, item, supplierCodeInp
 }
 
 async function findPricedPurchaseSuggestionSupplierMaster(db, item, options = {}) {
+  const bomSupplier = item.alternativeSupplierCode ? null : await loadBomSupplier(db, item);
+  // A BOM choice is authoritative. Missing prices must not silently switch it.
+  const selectedCode = item.alternativeSupplierCode || bomSupplier?.supplierCode;
+  if (selectedCode) {
+    const master = await resolvePurchaseSuggestionSupplierMaster(db, item, selectedCode, options);
+    return { master: master?.unitPrice != null && asNumber(master.unitPrice) >= 0 ? master : null, supplierCodes: [selectedCode] };
+  }
   const lookupDate = options.asOf ? new Date(options.asOf) : new Date();
   if (Number.isNaN(lookupDate.getTime())) {
     throw Object.assign(new Error("Tanggal lookup master supplier tidak valid."), { status: 400 });
@@ -241,7 +265,7 @@ async function findPricedPurchaseSuggestionSupplierMaster(db, item, options = {}
   for (const supplierCode of supplierCodes) {
     try {
       const master = await resolvePurchaseSuggestionSupplierMaster(db, item, supplierCode, { asOf: lookupDate });
-      if (asNumber(master?.unitPrice) > 0) return { master, supplierCodes };
+      if (master?.unitPrice != null && asNumber(master.unitPrice) >= 0) return { master, supplierCodes };
     } catch (error) {
       if (![400, 404].includes(error.status)) throw error;
     }
@@ -250,6 +274,10 @@ async function findPricedPurchaseSuggestionSupplierMaster(db, item, options = {}
 }
 
 module.exports = {
+  bomSupplierSelect,
+  resolveBomSupplier,
+  loadBomSupplier,
+  supplierItemIsEffective,
   normalizePurchaseFormCode,
   resolveBomPurchaseDefaults,
   resolvePurchaseSuggestionSupplierMaster,

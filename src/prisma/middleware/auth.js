@@ -35,6 +35,15 @@ exports.auth = async (req, res, next) => {
     }
     
     req.user = user;
+    // Resolve the binding on every request so revocation takes effect with existing JWTs.
+    req.partnerAccess = await prisma.partnerAccess.findUnique({
+      where: { userId: user.id }, include: { supplier: true, vendor: true },
+    });
+    const requestPath = req.originalUrl.split("?")[0].replace(/\/$/, "");
+    if (req.partnerAccess && !(requestPath.startsWith("/api/partner-portal/")
+      || (req.method === "GET" && requestPath === "/api/users/profile"))) {
+      return res.status(403).json({ code: "PARTNER_PORTAL_ONLY", message: "Akun ini hanya dapat menggunakan Portal Supplier & Vendor." });
+    }
     req.user.effectiveRoles = (user.roleAssignments || [])
       .filter((assignment) => assignment.role?.isActive && !assignment.role?.isDeleted)
       .map((assignment) => ({

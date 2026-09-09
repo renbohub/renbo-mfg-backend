@@ -6,6 +6,46 @@ const round = (value, digits = 6) => {
   return Math.round((number(value) + Number.EPSILON) * factor) / factor;
 };
 
+function timePhasedProductionFloor({ openingAvailableQty = 0, receipts = [], demands = [] } = {}) {
+  const valid = (date) => date && Number.isFinite(new Date(date).getTime());
+  const events = [
+    ...receipts.filter((row) => valid(row.date)).map((row) => ({ date: new Date(row.date), qty: Math.max(number(row.qty), 0), receipt: true })),
+    ...demands.filter((row) => valid(row.date)).map((row) => ({ date: new Date(row.date), qty: Math.max(number(row.qty), 0), receipt: false })),
+  ].sort((a, b) => a.date - b.date || Number(b.receipt) - Number(a.receipt));
+  let available = Math.max(number(openingAvailableQty), 0); let production = 0;
+  for (const event of events) {
+    available += event.receipt ? event.qty : -event.qty;
+    if (available < 0) { production -= available; available = 0; }
+  }
+  return round(production);
+}
+
+function buildDatedMpsDemand({ targets = [], policyDemandQty = 0, productionPercent = 100, reservations = [], fallbackDate } = {}) {
+  const reservedBySo = new Map();
+  for (const row of reservations) {
+    const key = String(row.referenceNumber || "").trim();
+    reservedBySo.set(key, number(reservedBySo.get(key)) + Math.max(number(row.appliedQty), 0));
+  }
+  const sorted = [...targets].sort((a, b) => new Date(a.fgRequiredDate || a.targetDate) - new Date(b.fgRequiredDate || b.targetDate));
+  const firm = sorted.filter((row) => row.sourceType === "SALES_ORDER");
+  const events = firm.map((row) => {
+    const demandQty = Math.max(number(row.qty), 0);
+    const key = String(row.sourceNumber || "").trim();
+    const reservedQty = Math.min(number(reservedBySo.get(key)), demandQty);
+    reservedBySo.set(key, number(reservedBySo.get(key)) - reservedQty);
+    return { date: row.fgRequiredDate || row.targetDate, qty: demandQty - reservedQty, demandQty, reservedQty, sourceNumber: row.sourceNumber, sourceType: row.sourceType };
+  });
+  // Firm commitments cannot be reduced by an EFD/production-percent override.
+  let remaining = Math.max(number(policyDemandQty) - firm.reduce((sum, row) => sum + Math.max(number(row.qty), 0), 0), 0);
+  for (const row of sorted.filter((target) => target.sourceType !== "SALES_ORDER")) {
+    const qty = Math.min(Math.max(number(row.qty), 0), remaining);
+    remaining -= qty;
+    events.push({ date: row.fgRequiredDate || row.targetDate, qty: qty * Math.max(number(productionPercent), 0) / 100, sourceType: row.sourceType });
+  }
+  if (remaining > 0) events.push({ date: fallbackDate, qty: remaining * Math.max(number(productionPercent), 0) / 100, sourceType: "EFD_RESIDUAL" });
+  return events;
+}
+
 function netMpsBucket(input = {}) {
   const openingAvailableQty = Math.max(number(input.openingAvailableQty), 0);
   const firmScheduledReceiptQty = Math.max(number(input.firmScheduledReceiptQty), 0);
@@ -16,14 +56,15 @@ function netMpsBucket(input = {}) {
   const availableBeforeProduction = openingAvailableQty + firmScheduledReceiptQty;
   const netProductionBeforeOverride = Math.max(grossDemandQty + targetEndingStockQty - availableBeforeProduction, 0);
   const firmSalesOrderShortageQty = Math.max(actualSalesOrderQty - availableBeforeProduction, 0);
-  const plannedProductionQty = Math.max(netProductionBeforeOverride * productionPercent / 100, firmSalesOrderShortageQty);
+  const timePhasedMinimumQty = timePhasedProductionFloor({ openingAvailableQty: input.timePhasedOpeningAvailableQty ?? openingAvailableQty, receipts: input.receiptEvents, demands: input.demandEvents });
+  const plannedProductionQty = Math.max(netProductionBeforeOverride * productionPercent / 100, firmSalesOrderShortageQty, timePhasedMinimumQty);
   const projectedEndingStockQty = Math.max(availableBeforeProduction + plannedProductionQty - grossDemandQty, 0);
   return {
     openingAvailableQty: round(openingAvailableQty), firmScheduledReceiptQty: round(firmScheduledReceiptQty),
     availableBeforeProduction: round(availableBeforeProduction), grossDemandQty: round(grossDemandQty),
     targetEndingStockQty: round(targetEndingStockQty), netProductionBeforeOverride: round(netProductionBeforeOverride),
     productionPercent: round(productionPercent), firmSalesOrderShortageQty: round(firmSalesOrderShortageQty),
-    plannedProductionQty: round(plannedProductionQty), projectedEndingStockQty: round(projectedEndingStockQty),
+    plannedProductionQty: round(plannedProductionQty), projectedEndingStockQty: round(projectedEndingStockQty), timePhasedMinimumQty,
   };
 }
 
@@ -46,7 +87,7 @@ function allocateMpsProductionToPhases({ openingAvailableQty = 0, firmScheduledR
 }
 
 function buildMpsCalculationTrace({ month, partCode, policy, forecastQty, actualSalesOrderQty, bufferBaseQty, bufferPercent, openingFreeQty, peggedReservationQty, reservationRows = [], netting, sourceRows = [] } = {}) {
-  return { version: 3, formula: "max((grossDemand + targetEnding - (freeFG + peggedSOReservation) - firmReceipts) * productionPercent / 100, actualSO - availableBeforeProduction)", month, partCode, policy, steps: [
+  return { version: 3, formula: "max((grossDemand + targetEnding - (freeFG + peggedSOReservation) - firmReceipts) * productionPercent / 100, actualSO - availableBeforeProduction, timePhasedMinimumQty)", month, partCode, policy, steps: [
     { order: 1, key: "FORECAST", label: "Forecast setelah consumption", formula: "sum(forecast delivery target - qty yang dikonsumsi SO)", value: round(forecastQty), sources: sourceRows.filter((row) => row.sourceType === "FORECAST") },
     { order: 2, key: "SALES_ORDER", label: "Firm Sales Order", formula: "sum(outstanding confirmed SO delivery target)", value: round(actualSalesOrderQty), sources: sourceRows.filter((row) => row.sourceType === "SALES_ORDER") },
     { order: 3, key: "GROSS_DEMAND", label: "Gross demand sesuai policy", formula: "sum(effective delivery target Forecast/SO setelah consumption)", value: netting.grossDemandQty },
@@ -61,10 +102,11 @@ function buildMpsCalculationTrace({ month, partCode, policy, forecastQty, actual
     },
     {
       order: 9, key: "NET_PRODUCTION", label: "Net planned production",
-      formula: "max(max(grossDemand + targetEnding - openingAvailable - firmReceipt, 0) * productionPercent / 100, actualSO - openingAvailable - firmReceipt)", value: netting.plannedProductionQty,
+      formula: "max(max(grossDemand + targetEnding - openingAvailable - firmReceipt, 0) * productionPercent / 100, actualSO - openingAvailable - firmReceipt, timePhasedMinimumQty)", value: netting.plannedProductionQty,
+      inputs: { timePhasedMinimumQty: netting.timePhasedMinimumQty || 0 },
     },
     { order: 10, key: "PROJECTED_ENDING", label: "Projected ending FG", formula: "max(openingAvailable + firmReceipt + netProduction - grossDemand, 0)", value: netting.projectedEndingStockQty },
   ] };
 }
 
-module.exports = { netMpsBucket, allocateMpsProductionToPhases, buildMpsCalculationTrace };
+module.exports = { netMpsBucket, allocateMpsProductionToPhases, buildMpsCalculationTrace, timePhasedProductionFloor, buildDatedMpsDemand };

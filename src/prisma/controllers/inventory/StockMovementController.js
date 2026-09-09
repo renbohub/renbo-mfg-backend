@@ -325,6 +325,7 @@ function materialPieceAuditNote(input, conversion) {
 }
 
 async function createMovementInTransaction(tx, input, actor, formulas) {
+    require("../../services/inventory/manualMovementPolicy").assertManualMovementAllowed(input);
     const usesMaterialPieceConversion = String(input.inputMode || "").toUpperCase() === MATERIAL_PIECE_MODE;
     const movementType = String(input.movementType || "").toUpperCase();
     if (!MOVEMENT_TYPES.has(movementType)) throw Object.assign(new Error("movementType harus IN, OUT, TRANSFER, atau ADJUSTMENT."), { statusCode: 400 });

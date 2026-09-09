@@ -218,3 +218,21 @@ assert.strictEqual(matrix.summary.attentionCount, 4);
 assert.strictEqual(matrix.summary.overloadedCells, 1, "overload MPP hanya boleh dihitung dari allocation tersimpan");
 
 console.log("Monthly Production Plan matrix contract passed.");
+
+// Separate real machines even when they share the same Work Center or family.
+const machineDate = '2026-09-01';
+const machineFixture = (id, code, load, qty = load) => ({ id, machineCode: code, machineName: code, lineCode: 'LINE-A', machineFamily: 'PRESS', cells: { [machineDate]: { availableMinutes: 100, loadMinutes: load, items: qty ? [{ source: 'MANUAL', allocationId: `allocation-${id}`, partCode: 'PART-SPLIT', processCode: 'PRESS', qty, minutes: load, planNumber: 'PP-SPLIT' }] : [] } } });
+const splitMachines = buildMonthlyProductionMatrix({ dates: [machineDate], machines: [machineFixture('m1', 'M-001', 120, 60), machineFixture('m2', 'M-002', 20, 10), machineFixture('m3', 'M-003', 0), machineFixture('m4', 'M-004', 0)] }, [{ id: 'shared-center', workCenterCode: 'PRESS', machines: [{ machine: { id: 'm1' } }, { machine: { id: 'm2' } }] }, { id: 'other-center', workCenterCode: 'SECONDARY', machines: [{ machine: { id: 'm1' } }] }]);
+assert.strictEqual(splitMachines.grouping, 'MACHINE');
+assert.strictEqual(splitMachines.summary.machineCount, 4);
+assert.strictEqual(new Set(splitMachines.rows.map(row => row.key)).size, 4, 'one row per machine, including machines with no Work Center');
+assert.strictEqual(splitMachines.summary.totalPlannedQty, 70, 'Work Center links must never duplicate machine quantity');
+assert.strictEqual(splitMachines.summary.overloadedCells, 1, 'spare capacity on another machine must not hide overload');
+const firstMachine = splitMachines.rows.find(row => row.machineId === 'm1');
+const secondMachine = splitMachines.rows.find(row => row.machineId === 'm2');
+assert.strictEqual(firstMachine.days[machineDate].loadPercent, 120);
+assert.strictEqual(secondMachine.days[machineDate].loadPercent, 20);
+assert.strictEqual(firstMachine.days[machineDate].machines.length, 1);
+assert.strictEqual(firstMachine.days[machineDate].allocations[0].machineId, 'm1');
+assert.strictEqual(splitMachines.rows.find(row => row.machineId === 'm3').children.length, 0, 'idle machines remain available as editor destinations');
+console.log('Machine grouping, idle destinations, quantities and individual overload passed.');

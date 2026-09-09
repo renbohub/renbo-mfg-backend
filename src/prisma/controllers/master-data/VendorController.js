@@ -131,7 +131,7 @@ exports.list = async (req, res, next) => {
 exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.vendor.findFirst({
-      where: { vendorCode: req.params.vendorCode, isDeleted: false },
+      where: { OR: [{ vendorCode: req.params.vendorCode }, { id: req.params.vendorCode }], isDeleted: false },
       include: includeVendorMainBusinesses,
     });
     if (!doc) return res.status(404).json({ message: "Vendor not found" });

@@ -1,4 +1,25 @@
 const { prisma } = require("../index");
+const clock = require("../utils/businessClock");
+
+exports.getCurrentDate = async (_req, res, next) => {
+  try {
+    const demoDate = await clock.readDemoDate(prisma);
+    res.set("Cache-Control", "no-store").json({ demoDate, enabled: Boolean(demoDate) });
+  } catch (error) { next(error); }
+};
+
+exports.updateCurrentDate = async (req, res, next) => {
+  try {
+    const demoDate = clock.validateDate(req.body?.demoDate);
+    const data = { settingValue: demoDate || "", isDeleted: false, updatedBy: req.user?.username || "system" };
+    await prisma.systemSetting.upsert({
+      where: { settingKey: clock.KEY },
+      create: { settingKey: clock.KEY, description: "Tanggal acuan demo seluruh pengguna aplikasi", ...data },
+      update: data,
+    });
+    res.json({ demoDate, enabled: Boolean(demoDate) });
+  } catch (error) { next(error); }
+};
 const {
   toNonNegativeInt,
   getSoDemandTimeFenceSetting,

@@ -320,9 +320,18 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
 
   const ensureMachineCenter = (machine = {}) => {
     const center = machineToCenter.get(machine.id);
-    if (center) return ensureCenter({ key: `WC:${center.id}`, code: center.workCenterCode, name: center.workCenterName, type: "INHOUSE", lineCode: center.lineCode || machine.lineCode || null });
-    const fallbackCode = machine.lineCode || machine.machineSpecificationCode || machine.machineFamily || machine.machineCode || "UNASSIGNED";
-    return ensureCenter({ key: `MACHINE:${fallbackCode}`, code: fallbackCode, name: machine.lineCode ? `Line ${machine.lineCode}` : (machine.machineSpecificationName || machine.machineFamily || machine.machineName || machine.machineCode || "Mesin belum dikelompokkan"), type: "INHOUSE", lineCode: machine.lineCode || null });
+    // Machine identity must not depend on its line, family or Work Center.
+    // A shared Work Center must never hide overload behind another machine's spare capacity.
+    const row = ensureCenter({ key: `MACHINE:${machine.id || machine.machineCode}`, code: center?.workCenterCode || null, name: center?.workCenterName || null, type: "INHOUSE", lineCode: machine.lineCode || center?.lineCode || null });
+    Object.assign(row, {
+      machineId: machine.id || null,
+      machineCode: machine.machineCode,
+      machineName: machine.machineName || machine.machineCode,
+      workCenterId: center?.id || null,
+      resourceCode: machine.machineCode,
+      resourceName: machine.machineName || machine.machineCode,
+    });
+    return row;
   };
 
   for (const machine of snapshot.machines || []) {
@@ -366,13 +375,13 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
         pushUnique(childDay.uomCodes, item.uomCode || "PCS");
         pushUnique(childDay.planNumbers, item.planNumber || item.reference);
         addDemandTrace(child, childDay, item);
-        addEditorAllocation(childDay, item, inputStockByPart);
+        addEditorAllocation(childDay, { ...item, machineId: machine.id }, inputStockByPart);
         day.qty += number(item.qty);
         day.minutes += number(item.minutes);
         day.itemCount += 1;
         pushUnique(day.uomCodes, item.uomCode || "PCS");
         pushUnique(day.planNumbers, item.planNumber || item.reference);
-        addEditorAllocation(day, item, inputStockByPart);
+        addEditorAllocation(day, { ...item, machineId: machine.id }, inputStockByPart);
       }
     }
   }
@@ -611,8 +620,8 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
       monthlyProductionQty: round(dates.reduce((sum, key) => sum + number(child.days[key]?.qty), 0), 3),
     })).sort((left, right) => (left.type === "BLOCKER" ? -1 : right.type === "BLOCKER" ? 1 : left.partCode.localeCompare(right.partCode))),
     fgRequirements: [...row.fgRequirements.values()].sort((left, right) => left.processCode.localeCompare(right.processCode) || left.fgRequiredDate.localeCompare(right.fgRequiredDate) || left.partCode.localeCompare(right.partCode)),
-  })).filter((row) => row.children.length || Object.values(row.days).some((day) => day.loadMinutes > 0))
-    .sort((left, right) => (left.blockerCount > 0 ? -1 : 1) - (right.blockerCount > 0 ? -1 : 1) || left.type.localeCompare(right.type) || left.workCenterCode.localeCompare(right.workCenterCode));
+  })).filter((row) => row.machineId || row.children.length || Object.values(row.days).some((day) => day.loadMinutes > 0))
+    .sort((left, right) => (left.blockerCount > 0 ? -1 : 1) - (right.blockerCount > 0 ? -1 : 1) || left.type.localeCompare(right.type) || String(left.resourceCode || left.workCenterCode).localeCompare(String(right.resourceCode || right.workCenterCode), undefined, { numeric: true }));
 
   const resultFgRequirements = fgRequirements.map((requirement, index) => {
     const part = partByCode.get(requirement.partCode) || {};
@@ -634,6 +643,7 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
   const overloadedCells = resultRows.reduce((sum, row) => sum + dates.filter((key) => number(row.days[key]?.loadPercent) > 100).length, 0);
   const crossMonthRequirements = unallocatedRequirements.filter((item) => item.crossMonth);
   return {
+    grouping: "MACHINE",
     dates,
     rows: resultRows,
     fgRequirements: resultFgRequirements,
@@ -643,7 +653,9 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
     })) : [],
     unallocatedRequirements: unallocatedRequirements.sort((left, right) => left.suggestedDate.localeCompare(right.suggestedDate) || String(left.machineCode).localeCompare(String(right.machineCode)) || String(left.partCode).localeCompare(String(right.partCode))),
     summary: {
-      workCenterCount: resultRows.length,
+      machineCount: resultRows.filter((row) => row.machineId).length,
+      vendorCount: resultRows.filter((row) => row.type === "OUTSOURCE").length,
+      workCenterCount: new Set(resultRows.map((row) => row.workCenterId).filter(Boolean)).size,
       partCount: resultRows.reduce((sum, row) => sum + row.children.filter((child) => child.type === "PART").length, 0),
       planCount: new Set([...resultRows.flatMap((row) => Object.values(row.days).flatMap((day) => day.planNumbers)), ...unallocatedRequirements.map((item) => item.planNumber)].filter(Boolean)).size,
       blockerCount: resultRows.reduce((sum, row) => sum + row.blockerCount, 0),

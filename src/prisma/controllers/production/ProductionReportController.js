@@ -1,8 +1,17 @@
 const { prisma } = require("../../index");
 const { mapDoc } = require("../../utils/mapDoc");
 const { buildProductionCostReport } = require("../../services/productionCostReportService");
+const { buildOeeMonitoring } = require("../../services/oeeMonitoringService");
 
 const num = value => Number(value || 0);
+
+exports.oeeMonitoring = async (req, res, next) => {
+  try {
+    res.json(await buildOeeMonitoring(prisma, req.query));
+  } catch (error) {
+    next(error);
+  }
+};
 
 function processFromWorkOrder(workOrder) {
   const processCode = workOrder?.process?.processCode || "-";
@@ -1062,4 +1071,3 @@ exports.qcSummary = async (req, res, next) => {
     next(e);
   }
 };
-

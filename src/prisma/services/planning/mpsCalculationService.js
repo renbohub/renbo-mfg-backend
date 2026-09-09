@@ -56,4 +56,11 @@ function buildMpsCalculationBreakdown(input = {}) {
   };
 }
 
-module.exports = { buildMpsCalculationBreakdown };
+function scheduledProductionCoverage({ qty, finishAt, requiredAt, current = false } = {}) {
+  if (!finite(qty)) return null;
+  if (Number(qty) <= 0) return 0;
+  if (!current || !finishAt || !requiredAt || !Number.isFinite(new Date(finishAt).getTime()) || !Number.isFinite(new Date(requiredAt).getTime())) return null;
+  return new Date(finishAt) <= new Date(requiredAt) ? Number(qty) : 0;
+}
+
+module.exports = { buildMpsCalculationBreakdown, scheduledProductionCoverage };

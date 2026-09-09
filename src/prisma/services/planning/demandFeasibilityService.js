@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { recommendMonthlyCapacity } = require("./capacityRecommendationService");
 const { netTimePhasedDemand } = require("./timePhasedNettingService");
@@ -254,7 +255,7 @@ function applyVendorAdjustmentsToProcessSteps(processSteps, vendorProcesses, pol
 async function calculateLeadTimeFeasibility(input = {}) {
   const requestedDeliveryDate = startOfDay(input.requestedDeliveryDate || input.targetDeliveryDate);
   if (!requestedDeliveryDate) throw Object.assign(new Error("Requested delivery date wajib valid."), { statusCode: 400 });
-  const today = startOfDay(input.today || new Date());
+  const today = startOfDay(input.today || businessNow());
   const calendar = input.productionCalendar || {};
   const holidays = Object.entries(calendar).filter(([, status]) => String(status).toUpperCase() === "HOLIDAY").map(([key]) => key);
   const dispatchDays = Math.max(number(input.dispatchDays ?? 1), 0);
@@ -373,6 +374,7 @@ async function calculateLeadTimeFeasibility(input = {}) {
     dailyWindows: [{ startMinute: 0, endMinute: productionHoursPerDay * 60 }],
     tasks: earliestTasks,
   }) : { status: "OPTIMAL", feasible: true, tasks: [] };
+  if (!forward.feasible) throw Object.assign(new Error(`CP-SAT forward schedule tidak feasible (${forward.status}).`), { code: "PLANNING_SOLVER_INFEASIBLE", solver: forward });
   const forwardById = new Map((forward.tasks || []).map((task) => [task.id, task]));
   const finalForwardTask = forward.tasks?.[forward.tasks.length - 1] || null;
   const earliestFeasibleDeliveryDate = finalForwardTask?.endDate || today;
@@ -422,7 +424,7 @@ async function purchaseSuggestionRoutingMetric(prisma, mbomHeaderId, quantity) {
 
 function classifyFeasibility({ timeline, capacity = null, masterDataComplete = true, materialCovered = null }) {
   if (!masterDataComplete) return { status: "MASTER_DATA_INCOMPLETE", capacityStatus: capacity?.status || "NOT_SIMULATED", materialStatus: "MASTER_DATA_INCOMPLETE", criticalConstraint: "MASTER_DATA" };
-  const now = timeline.today || startOfDay(new Date());
+  const now = timeline.today || startOfDay(businessNow());
   const leadTimeLate = timeline.latestPrDate && timeline.latestPrDate < now;
   const deliveryLate = timeline.earliestFeasibleDeliveryDate > timeline.requestedDeliveryDate;
   const capacityLate = capacity && (capacity.ready === false || number(capacity.blockerCount) > 0);
@@ -443,7 +445,7 @@ function classifyFeasibility({ timeline, capacity = null, masterDataComplete = t
 
 const categoryKey = (value) => String(value || "").replace(/[^a-z]/gi, "").toUpperCase();
 
-async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth = 10, supplierSelections = {}, supplierStrategy = "PREFERRED", effectiveAt = null }) {
+async function explodeDemandBom(prisma, { partId, partCode, quantity, mbomHeaderId, maxDepth = 10, supplierSelections = {}, supplierStrategy = "PREFERRED", effectiveAt = null }) {
   const headers = new Map();
   const trace = [];
   const purchased = new Map();
@@ -454,7 +456,8 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
     if (headers.has(childPartId)) return headers.get(childPartId);
     const header = await selectAuthoritativeMbom(prisma, {
       partId: childPartId,
-      effectiveAt: effectiveAt || new Date(),
+      selectedId: childPartId === partId ? mbomHeaderId : undefined,
+      effectiveAt: effectiveAt || businessNow(),
       select: {
         id: true, noReg: true, partId: true,
         details: {
@@ -465,7 +468,7 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
             supplyCustomer: { select: { customerCode: true, customerName: true } },
             part: {
               select: {
-                id: true, partCode: true, partName: true,
+                id: true, partCode: true, partName: true, material: { select: { materialCode: true } },
                 supplierItems: {
                   where: { isActive: true }, orderBy: [{ isPreferred: "desc" }, { priority: "asc" }],
                   select: { id: true, leadTimeDays: true, moq: true, orderMultiple: true, purchaseUomCode: true, isPreferred: true, priority: true, supplier: { select: { supplierCode: true, supplierName: true, leadTimeDays: true } } },
@@ -530,7 +533,7 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
       pathByDetail.set(detail.id, rowPath);
       trace.push({
         level: depth + Math.max(number(detail.levelComponent), 0), mbomNumber: header.noReg, parentPartCode: currentPartCode, partCode: detail.part.partCode,
-        partName: detail.part.partName || null, category, usagePerParent, requiredQty, uomCode: detail.uomCode || supplierItem?.purchaseUomCode || null,
+        partName: detail.part.partName || null, category, usagePerParent, requiredQty, uomCode: category === "PURCHASE" && number(detail.grossWeight) > 0 ? "kg" : detail.uomCode || supplierItem?.purchaseUomCode || null,
         materialSupplyType, supplyCustomerCode: detail.supplyCustomer?.customerCode || null, supplyCustomerName: detail.supplyCustomer?.customerName || null,
         path: rowPath, supplierItemId: supplierItem?.id || null, supplierCode: supplierItem?.supplier?.supplierCode || null, supplierName: supplierItem?.supplier?.supplierName || null,
         supplierSelectionSource: supplierResolution.selectionSource, supplierOptions,
@@ -540,6 +543,10 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
         const purchaseKey = `${detail.part.partCode}|${materialSupplyType}|${detail.supplyCustomer?.customerCode || ""}`;
         const existing = purchased.get(purchaseKey) || { partCode: detail.part.partCode, partName: detail.part.partName || null, qty: 0, uomCode: detail.uomCode || supplierItem?.purchaseUomCode || null, materialSupplyType, supplyCustomerCode: detail.supplyCustomer?.customerCode || null, supplyCustomerName: detail.supplyCustomer?.customerName || null, supplierItemId: supplierItem?.id || null, supplierCode: supplierItem?.supplier?.supplierCode || null, supplierName: supplierItem?.supplier?.supplierName || null, supplierSelectionSource: supplierResolution.selectionSource, supplierOptions: customerSupplied ? [] : supplierOptions, supplierLeadTimeDays, moq: number(supplierItem?.moq), orderMultiple: number(supplierItem?.orderMultiple), paths: [] };
         existing.qty += requiredQty;
+        if (number(detail.grossWeight) > 0) {
+          existing.uomCode = "kg";
+          existing.materialCode = detail.part.material?.materialCode || null;
+        }
         existing.supplierLeadTimeDays = Math.max(existing.supplierLeadTimeDays, supplierLeadTimeDays);
         existing.paths.push(rowPath);
         purchased.set(purchaseKey, existing);
@@ -558,12 +565,12 @@ async function explodeDemandBom(prisma, { partId, partCode, quantity, maxDepth =
   return { rootHeader, trace, componentRequirements: [...purchased.values()] };
 }
 
-async function loadDemandContext(prisma, { partCode, quantity, requestedDeliveryDate, supplierSelections = {}, supplierStrategy = "PREFERRED" }) {
+async function loadDemandContext(prisma, { partCode, quantity, requestedDeliveryDate, mbomHeaderId, supplierSelections = {}, supplierStrategy = "PREFERRED" }) {
   const part = await prisma.part.findFirst({
     where: { partCode, isDeleted: false },
     select: { id: true, partCode: true, partName: true },
   });
-  const explosion = part ? await explodeDemandBom(prisma, { partId: part.id, partCode: part.partCode, quantity, supplierSelections, supplierStrategy, effectiveAt: requestedDeliveryDate }) : { rootHeader: null, trace: [], componentRequirements: [] };
+  const explosion = part ? await explodeDemandBom(prisma, { partId: part.id, partCode: part.partCode, quantity, mbomHeaderId, supplierSelections, supplierStrategy, effectiveAt: requestedDeliveryDate }) : { rootHeader: null, trace: [], componentRequirements: [] };
   const header = explosion.rootHeader;
   const details = header?.details || [];
   const processSteps = details.flatMap((detail) => (detail.mbomProcesses || []).map((row) => {
@@ -598,30 +605,37 @@ async function loadDemandContext(prisma, { partCode, quantity, requestedDelivery
 }
 
 async function loadMaterialCoverage(prisma, componentRequirements, requiredDate, options = {}) {
-  const partCodes = [...new Set((componentRequirements || []).map((row) => row.partCode).filter(Boolean))];
+  const customerSupply = require("./customerSupplyService");
+  const customerComponents = componentRequirements.filter((r) => isCustomerSupplied(r.materialSupplyType));
+  const customerRequests = customerComponents.length ? await customerSupply.loadSupplyRequests(prisma, customerComponents) : [];
+  const partCodes = [...new Set((componentRequirements || []).flatMap((row) => [row.partCode, ...(options.includeSupplyEvents ? [row.materialCode] : [])]).filter(Boolean))];
   if (!partCodes.length) return { covered: null, shortages: [], components: [] };
   const supplyCache = options.supplyCache instanceof Map ? options.supplyCache : null;
   const supplyKey = [...partCodes].sort().join("|");
   let supplyPromise = supplyCache?.get(supplyKey);
   if (!supplyPromise) {
     supplyPromise = Promise.all([
-      prisma.stockBalance.findMany({ where: { isDeleted: false, OR: [{ partCode: { in: partCodes } }, { materialCode: { in: partCodes } }, { partNumber: { in: partCodes } }] }, select: { partCode: true, materialCode: true, partNumber: true, qtyAvailable: true } }),
-      prisma.purchaseOrderDetail.findMany({ where: { isDeleted: false, partCode: { in: partCodes }, po: { isDeleted: false, status: { notIn: ["Cancelled", "Rejected"] } } }, select: { partCode: true, qty: true, qtyReceived: true, deliveryDate: true, poNumber: true, po: { select: { deliveryDate: true, status: true } } } }),
-      prisma.purchaseRequisitionDetail.findMany({ where: { isDeleted: false, partCode: { in: partCodes }, pr: { isDeleted: false, status: { in: ["Draft","Submitted","Approved","Partially Ordered"] } } }, select: { partCode: true, qty: true, orderedQty: true, prNumber: true, pr: { select: { requiredDate: true, status: true } } } }),
+      prisma.stockBalance.findMany({ where: { isDeleted: false, OR: [{ partCode: { in: partCodes } }, { materialCode: { in: partCodes } }, { partNumber: { in: partCodes } }] }, select: { partCode: true, materialCode: true, partNumber: true, uomCode: true, qtyAvailable: true } }),
+      prisma.purchaseOrderDetail.findMany({ where: { isDeleted: false, OR: [{ partCode: { in: partCodes } }, ...(options.includeSupplyEvents ? [{ materialCode: { in: partCodes } }] : [])], po: { isDeleted: false, status: { notIn: ["Cancelled", "Rejected"] } } }, select: { id: true, materialCode: true, uomCode: true, partCode: true, qty: true, qtyReceived: true, deliveryDate: true, poNumber: true, po: { select: { deliveryDate: true, status: true } } } }),
+      prisma.purchaseRequisitionDetail.findMany({ where: { isDeleted: false, OR: [{ partCode: { in: partCodes } }, ...(options.includeSupplyEvents ? [{ materialCode: { in: partCodes } }] : [])], pr: { isDeleted: false, status: { in: ["Draft","Submitted","Approved","Partially Ordered"] } } }, select: { id: true, materialCode: true, uomCode: true, partCode: true, qty: true, orderedQty: true, prNumber: true, pr: { select: { requiredDate: true, status: true } } } }),
     ]);
     if (supplyCache) supplyCache.set(supplyKey, supplyPromise);
   }
   const [balances, openPo, openPr] = await supplyPromise;
   const components = componentRequirements.map((component) => {
-    const openingQty = balances.filter((row) => [row.partCode,row.materialCode,row.partNumber].includes(component.partCode)).reduce((sum,row) => sum + number(row.qtyAvailable), 0);
-    const supplyEvents = isCustomerSupplied(component.materialSupplyType) ? [] : [
-      ...openPo.filter((row) => row.partCode === component.partCode && number(row.qty) > number(row.qtyReceived)).map((row) => ({ sourceType: "PO", sourceNumber: row.poNumber, qty: number(row.qty) - number(row.qtyReceived), availableDate: row.deliveryDate || row.po.deliveryDate, confidence: ["Confirmed","Partial Receipt","Sent","Approved"].includes(row.po.status) ? "FIRM" : "PLANNED" })),
-      ...openPr.filter((row) => row.partCode === component.partCode && number(row.qty) > number(row.orderedQty)).map((row) => ({ sourceType: "PR", sourceNumber: row.prNumber, qty: number(row.qty) - number(row.orderedQty), availableDate: row.pr.requiredDate, confidence: "PLANNED" })),
+    const identities = [component.partCode, ...(options.includeSupplyEvents ? [component.materialCode] : [])].filter(Boolean);
+    // Customer stock is held in its own owner ledger; ordinary warehouse stock
+    // must not cover customer material or be borrowed across customer owners.
+    const openingQty = isCustomerSupplied(component.materialSupplyType) ? 0 : balances.filter((row) => [row.partCode,row.materialCode,row.partNumber].some((code) => code && identities.includes(code)) && (!options.includeSupplyEvents || String(row.uomCode || "").toLowerCase() === String(component.uomCode || "").toLowerCase())).reduce((sum,row) => sum + number(row.qtyAvailable), 0);
+    const sameUnit = (row) => !options.includeSupplyEvents || String(row.uomCode || "").toLowerCase() === String(component.uomCode || "").toLowerCase();
+    const supplyEvents = isCustomerSupplied(component.materialSupplyType) ? customerSupply.supplyEventsFor(component, customerRequests) : [
+      ...openPo.filter((row) => (identities.includes(row.partCode) || (options.includeSupplyEvents && row.materialCode && identities.includes(row.materialCode))) && sameUnit(row) && number(row.qty) > number(row.qtyReceived)).map((row) => ({ id: row.id, sourceType: "PO", sourceNumber: row.poNumber, qty: number(row.qty) - number(row.qtyReceived), availableDate: row.deliveryDate || row.po.deliveryDate, confidence: ["Confirmed","Partial Receipt","Sent","Approved"].includes(row.po.status) ? "FIRM" : "PLANNED" })),
+      ...openPr.filter((row) => (identities.includes(row.partCode) || (options.includeSupplyEvents && row.materialCode && identities.includes(row.materialCode))) && sameUnit(row) && number(row.qty) > number(row.orderedQty)).map((row) => ({ id: row.id, sourceType: "PR", sourceNumber: row.prNumber, qty: number(row.qty) - number(row.orderedQty), availableDate: row.pr.requiredDate, confidence: "PLANNED" })),
     ];
     const result = netTimePhasedDemand({ openingQty, supplyEvents, demandEvents: [{ qty: component.qty, requiredDate }] })[0];
     const eligibleSupply = result?.eligibleSupply || [];
     const lateSupply = supplyEvents.filter((row) => asDate(row.availableDate) > asDate(requiredDate));
-    return { ...component, requiredDate, openingQty, eligibleSupply, eligibleSupplyQty: eligibleSupply.reduce((sum, row) => sum + number(row.qty), 0), lateSupply, lateSupplyQty: lateSupply.reduce((sum, row) => sum + number(row.qty), 0), shortageQty: number(result?.firmNetRequirement), expectedShortageQty: number(result?.netRequirement) };
+    return { ...component, requiredDate, openingQty, ...(options.includeSupplyEvents ? { supplyEvents } : {}), eligibleSupply, eligibleSupplyQty: eligibleSupply.reduce((sum, row) => sum + number(row.qty), 0), lateSupply, lateSupplyQty: lateSupply.reduce((sum, row) => sum + number(row.qty), 0), shortageQty: number(result?.firmNetRequirement), expectedShortageQty: number(result?.netRequirement) };
   });
   const shortages = components.filter((row) => row.shortageQty > 0.000001);
   return { covered: shortages.length === 0, shortages, components };
@@ -632,7 +646,7 @@ async function simulateCapacity(prisma, input) {
   try {
     const result = await recommendMonthlyCapacity(prisma, input.planNumber, {
       planningMode: "SIMULATION",
-      scenarioKey: input.scenarioKey || `demand-feasibility-${dateKey(new Date())}`,
+      scenarioKey: input.scenarioKey || `demand-feasibility-${dateKey(businessNow())}`,
       persist: false,
     });
     return { ready: Boolean(result.ready), blockerCount: (result.blockers || []).length, earliestFeasibleCompletion: result.earliestFeasibleCompletion || null, blockers: result.blockers || [] };
@@ -676,7 +690,7 @@ async function assessDemandFeasibility(prisma, input = {}) {
   const productionLeadTimeBreakdown = vendorAdjustment.breakdown;
   const processSteps = applyVendorAdjustmentsToProcessSteps(context.processSteps, vendorAdjustment.vendorProcesses, capacityPolicy);
   const timeline = await calculateLeadTimeFeasibility({ ...controlledInput, ...context, processSteps, supplierLeadTimeDays: controlledInput.supplierLeadTimeDays, capacityShiftsPerDay: capacityPolicy.shiftsPerDay, capacityHoursPerShift: capacityPolicy.hoursPerShift, productionLeadTimeBreakdown });
-  const coverage = input.materialCovered == null ? await loadMaterialCoverage(prisma, context.componentRequirements, timeline.materialRequiredDate, { supplyCache: input.materialSupplyCache }) : { covered: Boolean(input.materialCovered), shortages: [], components: [] };
+  const coverage = input.materialCovered == null ? await loadMaterialCoverage(prisma, context.componentRequirements, timeline.materialRequiredDate, { supplyCache: input.materialSupplyCache, includeSupplyEvents: input.includeSupplyEvents }) : { covered: Boolean(input.materialCovered), shortages: [], components: [] };
   const capacity = await simulateCapacity(prisma, input);
   const holidays = Object.entries(input.productionCalendar || {}).filter(([, status]) => status === "HOLIDAY").map(([key]) => key);
   const materialCoverage = await Promise.all(coverage.components.map(async (row) => {

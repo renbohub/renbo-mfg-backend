@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { additionalDemandQty, pendingDeltaQty } = require("./additionalDemandDomain");
 
@@ -77,7 +78,7 @@ function aggregateCoverageByPartMonth(items = []) {
 }
 
 async function loadAdditionalDemandCoverage(prisma, options = {}) {
-  const year = Number.parseInt(options.year, 10) || new Date().getUTCFullYear();
+  const year = Number.parseInt(options.year, 10) || businessNow().getUTCFullYear();
   const start = new Date(Date.UTC(year, 0, 1));
   const end = new Date(Date.UTC(year + 1, 0, 1));
   const customerCode = String(options.customerCode || "").trim();

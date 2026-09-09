@@ -1444,25 +1444,24 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
       statusCode: 400,
     });
   }
-  const capacityVendorAllocations = mo.monthlyProductionPlanNumber && mo.monthlyProductionPlanLineNumber != null
+  // Monthly Plan owns the actual executor. Load both modes so a BOM-default
+  // vendor process moved fully (or partly) in-house cannot create a second,
+  // full-quantity vendor order from the BOM fallback below.
+  const officialAllocations = mo.monthlyProductionPlanNumber && mo.monthlyProductionPlanLineNumber != null
     ? await tx.productionPlanAllocation.findMany({
       where: {
         isDeleted: false,
         status: { in: ["Draft", "Published"] },
-        routingMode: "VENDOR",
+        planningMode: "PRODUCTION",
         plan: { planNumber: mo.monthlyProductionPlanNumber, isDeleted: false },
-        ...(capacityAllocationIds.length
-          ? { id: { in: capacityAllocationIds } }
-          : {
-              OR: [
-                { lineNumber: mo.monthlyProductionPlanLineNumber },
-                {
-                  dailyProductionSchedules: {
-                    some: { moId: mo.id, shift: "VENDOR", isDeleted: false },
-                  },
-                },
-              ],
-            }),
+        OR: [
+          { lineNumber: mo.monthlyProductionPlanLineNumber },
+          // Exploded child operations can have their own Monthly Plan line.
+          // Exact BOM identity keeps common process codes under other FGs apart.
+          { mbomProcess: { noReg: mbomHeader.noReg } },
+          ...(capacityAllocationIds.length ? [{ id: { in: capacityAllocationIds } }] : []),
+          { dailyProductionSchedules: { some: { moId: mo.id, isDeleted: false } } },
+        ],
       },
       include: {
         vendor: { select: { id: true, vendorCode: true, vendorName: true } },
@@ -1475,12 +1474,18 @@ async function generateVendorProcessOrdersFromRouting(tx, mo, options = {}) {
       orderBy: [{ vendorSendDate: "asc" }, { scheduleDate: "asc" }, { createdAt: "asc" }],
     })
     : [];
-  const capacityVendorProcessIds = new Set(capacityVendorAllocations.map((row) => row.mbomProcessId));
+  const explicitProcessIds = new Set(officialAllocations.map((row) => row.mbomProcessId));
+  const requestedAllocationIds = new Set(capacityAllocationIds);
+  const capacityVendorAllocations = officialAllocations.filter((row) =>
+    row.routingMode === "VENDOR" && toNumber(row.plannedQty) > 0
+    && (!requestedAllocationIds.size || requestedAllocationIds.has(row.id)));
   const requestedStartSequence = toNumber(
     options.startSequence ?? mo?.sourceStartSequence,
     0,
   ) || inferStartSequenceFromSourcePartCode(operations, mo?.sourcePartCode);
-  const bomVendorOperations = operations.filter((operation) => !capacityVendorProcessIds.has(operation.process.id));
+  // Publishing a selected batch must not generate unrelated BOM operations.
+  const bomVendorOperations = requestedAllocationIds.size ? []
+    : operations.filter((operation) => !explicitProcessIds.has(operation.process.id));
   const scopedOperations = requestedStartSequence > 0
     ? bomVendorOperations.filter(operation => toNumber(operation.sequence) >= requestedStartSequence)
     : bomVendorOperations;

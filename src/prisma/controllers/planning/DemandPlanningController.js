@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { prisma } = require("../../index");
 const { buildDemandRows, buildCapacityOverview, reviewDemand, planningAnchorMonth } = require("../../services/planning/demandPlanningService");
@@ -189,7 +190,7 @@ async function displacementSimulation(deliveryTargetId, proposedCompletion = nul
   const plans = await prisma.monthlyProductionPlan.findMany({ where: { isDeleted: false, status: { in: ["Draft", "Confirmed", "Released"] } }, select: { id: true, planNumber: true, freezeFenceDays: true, dailyProductionSchedules: { where: { isDeleted: false, status: { in: ["Draft", "Released", "In Progress", "Completed"] } }, select: { scheduleNumber: true, scheduleDate: true, plannedEndTime: true, status: true, customerCode: true, customerTargetDate: true, priorityScore: true } } } });
   const schedules = plans.flatMap((plan) => plan.dailyProductionSchedules.map((schedule) => ({ ...schedule, planNumber: plan.planNumber, plannedEnd: schedule.scheduleDate })));
   const maxFenceDays = plans.reduce((max, plan) => Math.max(max, number(plan.freezeFenceDays)), 0);
-  const freezeFenceDate = new Date(); freezeFenceDate.setUTCDate(freezeFenceDate.getUTCDate() + maxFenceDays);
+  const freezeFenceDate = businessNow(); freezeFenceDate.setUTCDate(freezeFenceDate.getUTCDate() + maxFenceDays);
   const affected = simulateDisplacement({ proposedCompletion: proposedCompletion || target.targetDate }, schedules, freezeFenceDate).filter((row) => row.affectedCustomer !== target.customerCode || row.deltaDays !== 0);
   return { target, affected, requiresApproval: affected.some((row) => ["OVERRIDE_APPROVAL_REQUIRED", "RESCHEDULE_PROPOSAL_REQUIRED"].includes(row.decision)) };
 }
@@ -203,7 +204,7 @@ exports.list = async (req, res, next) => {
     const feasibilityStatus = text(req.query.feasibilityStatus);
     const filtered = items.filter((row) => (!priorityClass || row.priorityClass === priorityClass) && (!feasibilityStatus || row.feasibilityStatus === feasibilityStatus));
     const capacityMonths = await buildCapacityOverview(prisma, demandRows);
-    res.json({ items: filtered, total: filtered.length, planningAnchorMonth: text(req.query.planningAnchorMonth) || planningAnchorMonth(new Date()), capacityMonths, summary: { forecastQty: filtered.reduce((sum, row) => sum + number(row.forecastQty), 0), actualSalesOrderQty: filtered.reduce((sum, row) => sum + number(row.actualSalesOrderQty), 0), draftSalesOrderQty: filtered.reduce((sum, row) => sum + number(row.draftSalesOrderQty), 0), draftSalesOrderCount: filtered.reduce((sum, row) => sum + (row.draftSalesOrders || []).length, 0), demandQty: filtered.reduce((sum, row) => sum + number(row.demandQty), 0), outstandingQty: filtered.reduce((sum, row) => sum + number(row.outstandingQty), 0), critical: filtered.filter((row) => row.priorityClass === "P0").length, atRisk: filtered.filter((row) => ["AT_RISK", "NOT_FEASIBLE"].includes(row.feasibilityStatus)).length, unreviewed: filtered.filter((row) => row.planningStatus === "UNREVIEWED").length } });
+    res.json({ items: filtered, total: filtered.length, planningAnchorMonth: text(req.query.planningAnchorMonth) || planningAnchorMonth(businessNow()), capacityMonths, summary: { forecastQty: filtered.reduce((sum, row) => sum + number(row.forecastQty), 0), actualSalesOrderQty: filtered.reduce((sum, row) => sum + number(row.actualSalesOrderQty), 0), draftSalesOrderQty: filtered.reduce((sum, row) => sum + number(row.draftSalesOrderQty), 0), draftSalesOrderCount: filtered.reduce((sum, row) => sum + (row.draftSalesOrders || []).length, 0), demandQty: filtered.reduce((sum, row) => sum + number(row.demandQty), 0), outstandingQty: filtered.reduce((sum, row) => sum + number(row.outstandingQty), 0), critical: filtered.filter((row) => row.priorityClass === "P0").length, atRisk: filtered.filter((row) => ["AT_RISK", "NOT_FEASIBLE"].includes(row.feasibilityStatus)).length, unreviewed: filtered.filter((row) => row.planningStatus === "UNREVIEWED").length } });
   } catch (error) { next(error); }
 };
 

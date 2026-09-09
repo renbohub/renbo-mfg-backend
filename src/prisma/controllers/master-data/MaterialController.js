@@ -264,7 +264,7 @@ exports.list = async (req, res, next) => {
 exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.material.findFirst({
-      where: { materialCode: req.params.materialCode, isDeleted: false },
+      where: { OR: [{ materialCode: req.params.materialCode }, { id: req.params.materialCode }], isDeleted: false },
       include: MATERIAL_INCLUDE,
     });
     if (!doc) return res.status(404).json({ message: "Material not found" });

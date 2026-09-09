@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const CHECK_STATUS = Object.freeze({ PASS: "PASS", WARNING: "WARNING", FAIL: "FAIL", NOT_CHECKED: "NOT_CHECKED", NA: "NA" });
 const OVERALL_STATUS = Object.freeze({ FEASIBLE: "FEASIBLE", FEASIBLE_WITH_RISK: "FEASIBLE_WITH_RISK", NOT_FEASIBLE: "NOT_FEASIBLE", NOT_EVALUATED: "NOT_EVALUATED", NA: "NA" });
@@ -29,6 +30,9 @@ function summarizeChecks(checks = [], metadata = {}) {
   const warningCount = count(CHECK_STATUS.WARNING);
   const failCount = count(CHECK_STATUS.FAIL);
   const notCheckedCount = count(CHECK_STATUS.NOT_CHECKED);
+  const checkedCount = applicable.filter((row) => row.evaluationAttempted === true).length;
+  const missingFields = [...new Set(applicable.flatMap((row) => row.missingFields || []))];
+  const missingDataCount = applicable.filter((row) => row.status === CHECK_STATUS.NOT_CHECKED || row.missingFields?.length).length;
   const hasCriticalFail = applicable.some((row) => row.critical && row.status === CHECK_STATUS.FAIL);
   const hasCriticalUnknown = applicable.some((row) => row.critical && row.status === CHECK_STATUS.NOT_CHECKED);
   let status = OVERALL_STATUS.NA;
@@ -49,11 +53,15 @@ function summarizeChecks(checks = [], metadata = {}) {
     warningCount,
     failCount,
     notCheckedCount,
+    checkedCount,
+    evaluatedCount: applicable.length - missingDataCount,
+    missingDataCount,
+    missingFields,
     primaryConstraint: constraint ? { code: constraint.code, label: constraint.label, impact: constraint.gap?.display || constraint.actual?.impactDisplay || constraint.reason } : null,
     earliestFeasibleDeliveryAt: metadata.earliestFeasibleDeliveryAt || null,
     lateByWorkingDays: metadata.lateByWorkingDays ?? null,
     evaluatedAt: metadata.evaluatedAt || new Date().toISOString(),
-    sourceDataAsOf: metadata.sourceDataAsOf || metadata.evaluatedAt || new Date().toISOString(),
+    sourceDataAsOf: metadata.sourceDataAsOf || metadata.evaluatedAt || businessNow().toISOString(),
     rulesVersion: metadata.rulesVersion || "SCHEDULE_FEASIBILITY_V1",
     formulaVersion: metadata.formulaVersion || "MPS_EXISTING_NETTING_V1",
   };
@@ -73,6 +81,10 @@ function summarizeMpsAssessments(assessments = []) {
     warningCount: rows.reduce((sum, row) => sum + Number(row.warningCount || 0), 0),
     failCount: rows.reduce((sum, row) => sum + Number(row.failCount || 0), 0),
     notCheckedCount: rows.reduce((sum, row) => sum + Number(row.notCheckedCount || 0), 0),
+    checkedCount: rows.reduce((sum, row) => sum + Number(row.checkedCount || 0), 0),
+    evaluatedCount: rows.reduce((sum, row) => sum + Number(row.evaluatedCount || 0), 0),
+    missingDataCount: rows.reduce((sum, row) => sum + Number(row.missingDataCount || 0), 0),
+    missingFields: [...new Set(rows.flatMap((row) => row.missingFields || []))],
     primaryConstraint: worst?.primaryConstraint || null,
     counts,
   };

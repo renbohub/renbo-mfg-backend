@@ -509,28 +509,9 @@ function normalizeDowntimeEntry(entry = {}, parentLog = {}) {
 
 exports.hmiReasons = async (req, res, next) => {
   try {
-    const requestedAreaId = Number(req.query.areaId);
-    const areaFilter = Number.isInteger(requestedAreaId) && requestedAreaId > 0
-      ? ` WHERE area_id = ${requestedAreaId}`
-      : "";
-    const [rejections, rejectionSubs, downtimes, downtimeSubs] = await Promise.all([
-      prisma.$queryRawUnsafe(`SELECT rejection_id AS id, rejection_desc AS description, area_id AS \"areaId\" FROM hmi_list_rejection${areaFilter} ORDER BY rejection_desc, rejection_id`),
-      prisma.$queryRawUnsafe('SELECT rejection_sub_id AS id, rejection_sub_desc AS description, rejection_id AS "parentId" FROM hmi_list_rejection_sub ORDER BY rejection_sub_desc, rejection_sub_id'),
-      prisma.$queryRawUnsafe(`SELECT downtime_id AS id, downtime_desc AS description, area_id AS \"areaId\" FROM hmi_list_downtime${areaFilter} ORDER BY downtime_desc, downtime_id`),
-      prisma.$queryRawUnsafe('SELECT downtime_sub_id AS id, downtime_sub_desc AS description, downtime_id AS "parentId" FROM hmi_list_downtime_sub ORDER BY downtime_sub_desc, downtime_sub_id'),
-    ]);
-    const nest = (parents, children) => parents.map((parent) => ({
-      ...parent,
-      children: children.filter((child) => Number(child.parentId) === Number(parent.id)),
-    }));
-    res.json({
-      source: "HMI_DATABASE",
-      rejections: nest(rejections, rejectionSubs),
-      downtimes: nest(downtimes, downtimeSubs),
-    });
-  } catch (error) {
-    next(error);
-  }
+    const service = require("../../services/hmiReasonMasterService");
+    res.json(await service.catalog(prisma, req.query));
+  } catch (error) { next(error); }
 };
 
 function summarizeDowntimeEntries(entries = [], parentLog = {}) {

@@ -2,6 +2,7 @@ const { prisma } = require("../../index");
 const { calculateLiveMbomCosts } = require("../../services/mbomLiveCostingService");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
 const { resolveEffectiveRecord, legacyPriceValue } = require("../../services/pricing/effectivePriceService");
+const { BOOKED_STATUSES, dashboardOptions, applyPeriod } = require("../../services/sales/salesDashboardScope");
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
@@ -89,6 +90,8 @@ const comparisonPayload = ({ module, title, subtitle, year, modes, defaultMetric
 });
 
 async function salesDashboard(year, module = "sales", options = {}) {
+  const scope = dashboardOptions(options);
+  const customerWhere = scope.customerCode ? { customerCode: scope.customerCode } : {};
   const years = [year, year - 1, year - 2];
   const actualBasis = normalizeActualBasis(options.actualBasis);
   const qtyByYear = new Map(years.map((value) => [value, monthBucket()]));
@@ -97,7 +100,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
   let pipelineCount = 0;
   if (actualBasis === "BOOKED") {
     const orders = await prisma.salesOrderHeader.findMany({
-      where: { isDeleted: false, status: { not: "Cancelled" }, soDate: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) } },
+      where: { isDeleted: false, ...customerWhere, status: { in: BOOKED_STATUSES }, soDate: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) } },
       select: {
         soNumber: true, soDate: true, status: true, totalAmount: true, currencyCode: true,
         currency: { select: { exchangeRate: true } },
@@ -120,6 +123,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
       where: {
         isDeleted: false,
         status: "Delivered",
+        ...(scope.customerCode ? { soHeader: { is: customerWhere } } : {}),
         OR: [
           { actualDate: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) } },
           { deliveredAt: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) } },
@@ -132,7 +136,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
       },
     });
     schedules.forEach((schedule) => {
-      const actualDate = schedule.actualDate || schedule.deliveredAt;
+      const actualDate = schedule.deliveredAt || schedule.actualDate;
       const actualYear = new Date(actualDate).getFullYear();
       if (!qtyByYear.has(actualYear)) return;
       const rate = schedule.soHeader?.currencyCode === "IDR" ? 1 : number(schedule.soHeader?.currency?.exchangeRate) || 1;
@@ -145,7 +149,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
   } else {
     const ledger = await prisma.salesActualLedger.findMany({
       where: {
-        actualBasis,
+        actualBasis, ...customerWhere,
         actualDate: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) },
         status: "POSTED",
         isDeleted: false,
@@ -165,6 +169,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
       where: {
         actualBasis,
         sourceType: "EXCEL_IMPORT",
+        ...customerWhere,
         actualDate: { gte: new Date(year - 2, 0, 1), lt: new Date(year + 1, 0, 1) },
         status: "POSTED",
         isDeleted: false,
@@ -182,7 +187,7 @@ async function salesDashboard(year, module = "sales", options = {}) {
   const forecastQty = monthBucket();
   const forecastValue = monthBucket();
   const forecasts = await prisma.forecast.findMany({
-    where: { isDeleted: false, isCurrentVersion: true, status: { not: "Obsolete" } },
+    where: { isDeleted: false, ...customerWhere, isCurrentVersion: true, status: { notIn: ["Obsolete", "Cancelled"] } },
     select: {
       forecastNumber: true,
       details: {
@@ -255,7 +260,11 @@ async function salesDashboard(year, module = "sales", options = {}) {
   payload.actualBasis = actualBasis;
   payload.actualBasisLabel = SALES_ACTUAL_BASIS[actualBasis];
   payload.actualBasisOptions = Object.entries(SALES_ACTUAL_BASIS).map(([value, label]) => ({ value, label }));
-  return payload;
+  payload.filters = scope;
+  payload.refreshIntervalSeconds = 30;
+  payload.definitions.push({ label: "Sumber actual", value: SALES_ACTUAL_BASIS[actualBasis], note: "BOOKED mengecualikan Draft, In Approval, Cancelled dan Superseded; status operasional lama tetap dihitung. DELIVERED memakai tanggal POD bila tersedia." });
+  if (scope.customerCode) payload.context.push({ label: "Customer", value: scope.customerCode });
+  return applyPeriod(payload, scope.period);
 }
 
 async function productionDashboard(year) {
@@ -828,9 +837,10 @@ exports.get = async (req, res, next) => {
     };
     const builder = builders[module];
     if (!builder) return res.status(404).json({ message: `Dashboard modul ${module} tidak tersedia.` });
-    const options = { actualBasis: req.query.actualBasis };
+    const options = { actualBasis: req.query.actualBasis, customerCode: req.query.customerCode, period: req.query.period };
     res.json(await builder(year, options));
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     next(error);
   }
 };

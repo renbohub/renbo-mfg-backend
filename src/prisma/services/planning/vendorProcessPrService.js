@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { generateDocNumber } = require("../../controllers/purchasing/utils/purchasingHelpers");
 const { legacyPriceValue } = require("../pricing/effectivePriceService");
 
@@ -30,6 +31,38 @@ function capacityAllocationMarker(allocationId) {
   return `[CAPACITY-ALLOCATION:${allocationId}]`;
 }
 
+const inactiveCommercialStatuses = new Set(["CANCELLED", "CANCELED", "REJECTED"]);
+const activeCommercialRecord = (row) => Boolean(row && !row.isDeleted
+  && !inactiveCommercialStatuses.has(String(row.status || "").toUpperCase()));
+
+function isAutomaticCapacityProposal(row, detail, pr) {
+  const marker = String(row.notes || "").match(/\[CAPACITY-ALLOCATION:([^\]]+)\]/)?.[0];
+  return pr.sourceType === "SYSTEM"
+    && String(pr.notes || "").includes("[CAPACITY-VENDOR-PR:")
+    && row.status === "Confirmed" && row.confirmedBy === "capacity-planning"
+    && Boolean(marker) && String(detail.notes || "").includes(marker)
+    && !row.poNumber && number(detail.orderedQty) <= EPSILON
+    && !detail.supplierConfirmedAt && !detail.supplierConfirmedBy;
+}
+
+function isVendorPrProtected(pr = {}) {
+  // A Draft header may already own a PO or a confirmed sourcing decision.
+  // Treat those commitments as immutable during automatic plan synchronization.
+  const liveHeader = activeCommercialRecord(pr);
+  if (liveHeader && String(pr.status || "").toUpperCase() !== "DRAFT") return true;
+  if ((pr.purchaseOrders || []).some((link) => activeCommercialRecord(link.po))) return true;
+  return (pr.details || []).filter((detail) => !detail.isDeleted).some((detail) => {
+    if ((detail.poDetails || []).some((row) => !row.isDeleted && activeCommercialRecord(row.po))) return true;
+    if ((detail.sourcingAllocations || []).some((row) => activeCommercialRecord(row)
+      && (["CONFIRMED", "ORDERED"].includes(String(row.status || "").toUpperCase()) || row.confirmedAt || row.poNumber)
+      // PPIC's generated choice uses the legacy Confirmed status, but is still
+      // a planning proposal until Purchasing confirms or orders the demand.
+      && !isAutomaticCapacityProposal(row, detail, pr))) return true;
+    // The counter also protects legacy orders without an exact PO-detail FK.
+    return liveHeader && number(detail.orderedQty) > EPSILON;
+  });
+}
+
 function groupVendorAllocations(allocations = []) {
   const groups = new Map();
   for (const allocation of allocations) {
@@ -51,16 +84,16 @@ function effectiveVendorRate(priceList, process, date) {
   if (!priceList) return null;
   const matchingDetail = (priceList.details || []).find((row) => processMatches(row.vendorProcess, process)) || null;
   if (!matchingDetail) return null;
-  const monthRate = optionalNumber(matchingDetail[MONTH_PRICE_FIELDS[(date || new Date()).getUTCMonth()]]);
+  const monthRate = optionalNumber(matchingDetail[MONTH_PRICE_FIELDS[(date || businessNow()).getUTCMonth()]]);
   const directRate = optionalNumber(matchingDetail.unitPrice);
-  const unitPrice = legacyPriceValue(matchingDetail, date || new Date());
+  const unitPrice = legacyPriceValue(matchingDetail, date || businessNow());
   if (unitPrice == null || unitPrice < 0) return null;
   return {
     unitPrice,
     currencyCode: priceList.currencyCode || "IDR",
     priceListId: priceList.id,
     vendorProcessId: matchingDetail.vendorProcessId,
-    priceSource: directRate != null ? "UNIT_PRICE" : monthRate > 0 ? `MONTH_${MONTH_PRICE_FIELDS[(date || new Date()).getUTCMonth()].toUpperCase()}` : "PRICE_NOT_FOUND",
+    priceSource: directRate != null ? "UNIT_PRICE" : monthRate > 0 ? `MONTH_${MONTH_PRICE_FIELDS[(date || businessNow()).getUTCMonth()].toUpperCase()}` : "PRICE_NOT_FOUND",
   };
 }
 
@@ -78,7 +111,7 @@ async function resolveVendorPrices(client, allocations) {
     orderBy: [{ effectiveFrom: "desc" }, { pricingYear: "desc" }, { updatedAt: "desc" }],
   });
   for (const allocation of allocations) {
-    const priceDate = allocation.vendorSendDate || allocation.scheduleDate || new Date();
+    const priceDate = allocation.vendorSendDate || allocation.scheduleDate || businessNow();
     const partId = allocation.planDetail?.partId || allocation.mbomProcess?.mbomDetail?.partId || null;
     const eligible = lists.filter((row) => row.vendorId === allocation.vendorId
       && (!row.partId || !partId || row.partId === partId)
@@ -219,7 +252,14 @@ async function syncVendorProcessDraftPrForPlan(client, planId, actor = "system")
     mpsDetailIds.length ? client.mPSDemandSource.findMany({ where: { mpsDetailId: { in: mpsDetailIds } }, orderBy: [{ targetDeliveryDate: "asc" }, { createdAt: "asc" }] }) : [],
     client.purchaseRequisition.findMany({
       where: { isDeleted: false, sourceType: "SYSTEM", notes: { contains: `[CAPACITY-VENDOR-PR:${plan.planNumber}:` } },
-      include: { details: { where: { isDeleted: false }, include: { sources: { where: { isDeleted: false } } } } },
+      include: {
+        purchaseOrders: { include: { po: { select: { poNumber: true, status: true, isDeleted: true } } } },
+        details: { where: { isDeleted: false }, include: {
+          sources: { where: { isDeleted: false } },
+          poDetails: { where: { isDeleted: false }, include: { po: { select: { poNumber: true, status: true, isDeleted: true } } } },
+          sourcingAllocations: { where: { isDeleted: false } },
+        } },
+      },
     }),
     resolveVendorPrices(client, allocations),
   ]);
@@ -228,15 +268,16 @@ async function syncVendorProcessDraftPrForPlan(client, planId, actor = "system")
     if (!sourceByMpsDetail.has(source.mpsDetailId)) sourceByMpsDetail.set(source.mpsDetailId, []);
     sourceByMpsDetail.get(source.mpsDetailId).push(source);
   }
+  const protectedPrIds = new Set(existingPrs.filter(isVendorPrProtected).map((pr) => pr.id));
   const protectedAllocationIds = new Set(existingPrs
-    .filter((pr) => pr.status !== "Draft")
+    .filter((pr) => protectedPrIds.has(pr.id))
     .flatMap((pr) => pr.details || [])
     .flatMap((detail) => detail.sources || [])
     .filter((source) => source.sourceType === "CAPACITY_ALLOCATION")
     .map((source) => source.sourceNumber));
   const availableAllocations = allocations.filter((row) => !protectedAllocationIds.has(row.id));
   const groups = groupVendorAllocations(availableAllocations);
-  const drafts = existingPrs.filter((pr) => pr.status === "Draft");
+  const drafts = existingPrs.filter((pr) => pr.status === "Draft" && !protectedPrIds.has(pr.id));
   const result = { created: [], updated: [], removed: [], warnings: [] };
 
   for (const draft of drafts) {
@@ -259,7 +300,7 @@ async function syncVendorProcessDraftPrForPlan(client, planId, actor = "system")
       demandSources: sourceByMpsDetail.get(allocation.planDetail?.mpsDetailId) || [],
       price: priceByAllocation.get(allocation.id),
     }));
-    const requiredDate = rows.map((row) => row.vendorSendDate || row.scheduleDate).filter(Boolean).sort((a, b) => a - b)[0] || new Date();
+    const requiredDate = rows.map((row) => row.vendorSendDate || row.scheduleDate).filter(Boolean).sort((a, b) => a - b)[0] || businessNow();
     const totalAmount = detailRows.reduce((sum, row) => sum + number(row.totalAmount), 0);
     const priceMissing = detailRows.filter((row) => number(row.estimatedPrice) <= 0).length;
     const notes = `${marker} Draft PR Vendor Process otomatis dari ${plan.planNumber}; vendor ${vendorCode} - ${vendor.vendorName || "-"}; ${rows.length} allocation; ${priceMissing ? `${priceMissing} harga belum tersedia di Vendor Price List.` : "harga dari Vendor Price List."}`;
@@ -272,7 +313,7 @@ async function syncVendorProcessDraftPrForPlan(client, planId, actor = "system")
       const prNumber = await generateDocNumber("purchaseRequisition", "PR", "prNumber", client);
       const created = await client.purchaseRequisition.create({
         data: {
-          prNumber, prDate: new Date(), requestedBy: actor, requiredDate, priority: "Urgent", poType: "Out Process",
+          prNumber, prDate: businessNow(), requestedBy: actor, requiredDate, priority: "Urgent", poType: "Out Process",
           sourceType: "SYSTEM", procurementGroup: "VENDOR_PROCESS", status: "Draft", totalAmount, notes,
           details: { create: detailRows.map((row, index) => ({ ...row, lineNumber: index + 1 })) },
         },
@@ -281,7 +322,7 @@ async function syncVendorProcessDraftPrForPlan(client, planId, actor = "system")
       result.created.push({ prNumber: created.prNumber, vendorCode, itemCount: detailRows.length, totalQty: rows.reduce((sum, row) => sum + number(row.plannedQty), 0) });
     }
   }
-  if (protectedAllocationIds.size) result.warnings.push(`${protectedAllocationIds.size} allocation sudah terhubung PR non-Draft dan tidak diubah otomatis.`);
+  if (protectedPrIds.size) result.warnings.push(`${protectedPrIds.size} PR vendor memiliki status atau komitmen purchasing yang terlindungi; ${protectedAllocationIds.size} allocation tidak diubah otomatis. Gunakan Replan untuk perubahan pelaksana.`);
   return result;
 }
 
@@ -292,4 +333,5 @@ module.exports = {
   groupVendorAllocations,
   processMatches,
   effectiveVendorRate,
+  isVendorPrProtected,
 };

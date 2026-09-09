@@ -1,7 +1,8 @@
 const { prisma } = require("../../index");
-const { generateDocNumber, generatePONumber } = require("./utils/purchasingHelpers");
+const { generateDocNumber, previewDocNumber, generatePONumber } = require("./utils/purchasingHelpers");
 const { submitDocumentForApproval } = require("../../services/approvalRuleService");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
+const { prPartWhere } = require("../../services/purchasing/prPartEligibility");
 // Commercial PO quantity is intentionally separate from exact MRP demand pegging.
 const {
   resolveCommercialOrderQty,
@@ -243,6 +244,18 @@ async function normalizeRequisitionDetails(details, client) {
   const materialById = new Map(materials.map((material) => [material.id, material]));
   const materialByCode = new Map(materials.map((material) => [normalize(material.materialCode), material]));
 
+  const scopedCategories = [...new Set([
+    ...details.map((detail) => normalizeCategory(detail.procurementCategory || detail.prCategory || detail.itemCategory || detail.rawType)),
+    ...parts.map(classifyPart),
+  ])].filter((category) => prPartWhere(category));
+  const eligiblePartIds = new Map(await Promise.all(scopedCategories.map(async (category) => {
+    const eligible = parts.length ? await client.part.findMany({
+      where: { AND: [prPartWhere(category), { id: { in: parts.map((part) => part.id) } }] },
+      select: { id: true },
+    }) : [];
+    return [category, new Set(eligible.map((part) => part.id))];
+  })));
+
   const rows = details.map((detail, index) => {
     const line = index + 1;
     const numberMatches = partsByNumber.get(normalize(detail.partNumber)) || [];
@@ -259,6 +272,19 @@ async function normalizeRequisitionDetails(details, client) {
       || null;
     const categoryHint = normalizeCategory(detail.procurementCategory || detail.prCategory || detail.itemCategory || detail.rawType);
     const category = categoryHint || (material ? "MATERIAL" : classifyPart(part));
+    if (part && prPartWhere(category) && !eligiblePartIds.get(category)?.has(part.id)) {
+      const requirement = category === "VENDOR_PROCESS"
+        ? "part dengan penanda SUBCONTRACT/Vendor atau routing vendor pada mBOM"
+        : category === "PURCHASE_PART" ? "Purchase Part berdrawing (RAW / PURCHASE_PART)" : "Purchase Part tanpa drawing (RAW / PURCHASE_PART)";
+      throw Object.assign(new Error(`Baris ${line}: ${part.partCode} tidak sesuai kategori PR. Pilih ${requirement}.`), { statusCode: 400 });
+    }
+    if (category === "VENDOR_PROCESS") {
+      if (!part) throw Object.assign(new Error(`Baris ${line}: Part Out Process wajib dipilih dari Part Master.`), { statusCode: 400 });
+      if (!clean(detail.preferredVendor)) throw Object.assign(new Error(`Baris ${line}: Preferred Vendor wajib dipilih.`), { statusCode: 400 });
+      if (clean(detail.proposedSupplierCode || detail.supplierCode || detail.preferredSupplier)) {
+        throw Object.assign(new Error(`Baris ${line}: Out Process menggunakan vendor, bukan supplier.`), { statusCode: 400 });
+      }
+    }
     if (categoryHint === "MATERIAL" && part && ["PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(classifyPart(part))) {
       throw Object.assign(new Error(`Baris ${line}: Purchase Part tidak dapat dicatat sebagai Raw Material.`), { statusCode: 400 });
     }
@@ -305,6 +331,10 @@ async function normalizeRequisitionDetails(details, client) {
     }
     const purchaseQtyKg = calculatedLotKg ?? requestedPurchaseQtyKg;
     const requestedMaterialForm = normalize(detail.purchasePackageUomCode);
+    const requestedCsp = normalize(detail.CSP);
+    if (category === "MATERIAL" && requestedCsp && !["C", "S", "P"].includes(requestedCsp)) {
+      throw Object.assign(new Error(`Baris ${line}: C/S/P harus C, S, atau P.`), { statusCode: 400 });
+    }
     const hasGenericConversion = [
       detail.purchasePackageQty,
       detail.conversionUomCode,
@@ -359,8 +389,9 @@ async function normalizeRequisitionDetails(details, client) {
           throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: qty alokasi harus lebih dari 0.`), { statusCode: 400 });
         }
         const allocationSupplierCode = clean(allocation.supplierCode);
-        if (!allocationSupplierCode) {
-          throw Object.assign(new Error(`Baris ${line}, alokasi supplier ${allocationIndex + 1}: supplier wajib dipilih.`), { statusCode: 400 });
+        const allocationVendorCode = clean(allocation.vendorCode);
+        if (category === "VENDOR_PROCESS" ? (!allocationVendorCode || allocationSupplierCode) : (!allocationSupplierCode || allocationVendorCode)) {
+          throw Object.assign(new Error(`Baris ${line}, alokasi ${allocationIndex + 1}: ${category === "VENDOR_PROCESS" ? "vendor wajib dipilih tanpa supplier" : "supplier wajib dipilih tanpa vendor"}.`), { statusCode: 400 });
         }
         const allocationForm = normalize(allocation.purchasePackageUomCode || allocation.orderUomCode);
         const allocationPackageQty = num(allocation.purchasePackageQty ?? allocation.orderQty, 0);
@@ -391,7 +422,7 @@ async function normalizeRequisitionDetails(details, client) {
           : null;
         return {
           supplierCode: allocationSupplierCode,
-          vendorCode: clean(allocation.vendorCode),
+          vendorCode: allocationVendorCode,
           demandCoveredQty,
           commercialQty: num(allocation.commercialQty ?? demandCoveredQty),
           demandUomCode: uomCode,
@@ -416,10 +447,10 @@ async function normalizeRequisitionDetails(details, client) {
       partCode: category === "MATERIAL" ? (part?.partCode || null) : (part?.partCode || clean(detail.partCode)),
       partNumber: category === "MATERIAL" ? (part?.partNumber || null) : (part?.partNumber || clean(detail.partNumber)),
       partName: category === "MATERIAL" ? (part?.partName || null) : (part?.partName || clean(detail.partName)),
-      materialId: material?.id || null,
-      materialCode: material?.materialCode || null,
-      materialName: material?.materialName || null,
-      materialType: material?.materialType || null,
+      materialId: category === "VENDOR_PROCESS" ? null : material?.id || null,
+      materialCode: category === "VENDOR_PROCESS" ? null : material?.materialCode || null,
+      materialName: category === "VENDOR_PROCESS" ? null : material?.materialName || null,
+      materialType: category === "VENDOR_PROCESS" ? null : material?.materialType || null,
       // Product and Part use different tables/IDs. Never write Part.id into
       // productId for Material/Purchase Part lines (it would violate the FK).
       productId: ["MATERIAL", "PURCHASE_PART", "UNIVERSAL_PURCHASE_PART"].includes(category) ? null : clean(detail.productId),
@@ -428,7 +459,7 @@ async function normalizeRequisitionDetails(details, client) {
       thickness: category === "MATERIAL" && material?.thickness != null ? num(material.thickness) : (detail.thickness == null ? null : num(detail.thickness)),
       width: category === "MATERIAL" && material?.width != null ? num(material.width) : (detail.width == null ? null : num(detail.width)),
       CSP: category === "MATERIAL"
-        ? ({ COIL: "C", SHEET: "S", PCS: "P" }[purchasePackageUomCode] || null)
+        ? (requestedCsp || { COIL: "C", SHEET: "S", PCS: "P" }[purchasePackageUomCode] || null)
         : clean(detail.CSP),
       qty,
       uomCode,
@@ -473,6 +504,13 @@ async function normalizeRequisitionDetails(details, client) {
     const found = new Set(suppliers.map((supplier) => supplier.supplierCode));
     const missing = supplierCodes.filter((code) => !found.has(code));
     if (missing.length) throw Object.assign(new Error(`Supplier tidak ditemukan: ${missing.join(", ")}`), { statusCode: 400 });
+  }
+  const vendorCodes = [...new Set(rows.flatMap((row) => [row.preferredVendor, ...(row.sourcingAllocations?.create || []).map((allocation) => allocation.vendorCode)]).filter(Boolean))];
+  if (vendorCodes.length) {
+    const vendors = await client.vendor.findMany({ where: { vendorCode: { in: vendorCodes }, isDeleted: false }, select: { vendorCode: true } });
+    const found = new Set(vendors.map((vendor) => vendor.vendorCode));
+    const missing = vendorCodes.filter((code) => !found.has(code));
+    if (missing.length) throw Object.assign(new Error(`Vendor tidak ditemukan: ${missing.join(", ")}`), { statusCode: 400 });
   }
   return rows;
 }
@@ -613,6 +651,13 @@ exports.list = async (req, res, next) => {
 exports.get = async (req, res, next) => {
   try { const row = await prisma.purchaseRequisition.findFirst({ where: { prNumber: req.params.prNumber, isDeleted: false }, include }); if (!row) return res.status(404).json({ message: "Purchase Requisition tidak ditemukan." }); res.json(await attachProcurementClassification(row)); } catch (e) { next(e); }
 };
+exports.numberPreview = async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json({ prNumber: await previewDocNumber("purchaseRequisition", "PR", "prNumber"), provisional: true });
+  } catch (error) { next(error); }
+};
+
 exports.create = async (req, res, next) => {
   try {
     const input = bodyObject(req.body), header = bodyObject(input.header || input), details = Array.isArray(input.details) ? input.details : [];
@@ -638,7 +683,7 @@ exports.create = async (req, res, next) => {
         ? materialHeaderSnapshot(rows, requiredDate || new Date())
         : materialHeaderSnapshot([], null);
       const totalAmount = rows.reduce((s, d) => s + d.totalAmount, 0);
-      return tx.purchaseRequisition.create({ data: { prNumber, prDate: prDate || new Date(), requestedBy: header.requestedBy || req.user?.username || req.user?.email || null, departmentId: header.departmentId || null, requiredDate: requiredDate || new Date(), priority: header.priority || "Normal", poType: header.poType || (procurementGroup === "MATERIAL" ? "Material" : "Other"), procurementGroup, ...materialHeader, sourceType: normalizeSourceType(header.sourceType || input.sourceType || "MANUAL"), totalAmount, notes: header.notes || null, details: { create: rows } }, include });
+      return tx.purchaseRequisition.create({ data: { prNumber, prDate: prDate || new Date(), requestedBy: req.user?.username || req.user?.email || header.requestedBy || null, departmentId: header.departmentId || null, requiredDate: requiredDate || new Date(), priority: header.priority || "Normal", poType: procurementGroup === "VENDOR_PROCESS" ? "Out Process" : header.poType || (procurementGroup === "MATERIAL" ? "Material" : "Other"), procurementGroup, ...materialHeader, sourceType: normalizeSourceType(header.sourceType || input.sourceType || "MANUAL"), totalAmount, notes: header.notes || null, details: { create: rows } }, include });
     });
     res.status(201).json(await attachProcurementClassification(result));
   } catch (e) { if (e.statusCode) return res.status(e.statusCode).json({ message: e.message }); next(e); }
@@ -671,7 +716,8 @@ exports.update = async (req, res, next) => {
       return res.status(409).json({ message: "PR yang sudah terhubung ke PO atau memiliki qty ordered tidak dapat diedit." });
     }
     const input = bodyObject(req.body), header = bodyObject(input.header || input);
-    const data = {}; ["requestedBy", "departmentId", "priority", "poType", "notes"].forEach((k) => { if (header[k] !== undefined) data[k] = header[k]; });
+    const data = {}; ["departmentId", "priority", "poType", "notes"].forEach((k) => { if (header[k] !== undefined) data[k] = header[k]; });
+    if (current.procurementGroup === "VENDOR_PROCESS") data.poType = "Out Process";
     if (header.departmentId !== undefined) data.departmentId = clean(header.departmentId);
     if (header.sourceType !== undefined && normalizeSourceType(header.sourceType) !== current.sourceType) return res.status(409).json({ message: "sourceType PR tidak dapat diubah setelah dokumen dibuat." });
     if (header.prDate !== undefined) {

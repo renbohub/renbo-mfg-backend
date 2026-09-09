@@ -1,0 +1,15 @@
+"use strict";
+const router = require("express").Router();
+const { prisma } = require("../../index");
+const { authorize } = require("../../middleware/auth");
+const { logger } = require("../../middleware/logger");
+const service = require("../../services/hmiReasonMasterService");
+const run = fn => async (req,res,next) => { try { await fn(req,res); } catch (error) { next(error); } };
+router.get("/catalog", authorize("hmiReasonMasters","read"), run(async (req,res)=>res.json(await service.catalog(prisma,req.query))));
+router.get("/:kind", authorize("hmiReasonMasters","read"), run(async (req,res)=>res.json(await service.list(prisma,req.params.kind,req.query))));
+router.get("/:kind/:id", authorize("hmiReasonMasters","read"), run(async (req,res)=>res.json(await service.get(prisma,req.params.kind,req.params.id))));
+router.post("/:kind", authorize("hmiReasonMasters","create"), logger("hmiReasonMasters","create"), run(async (req,res)=>res.status(201).json(await service.save(prisma,req.params.kind,null,req.body,req.user.id))));
+router.patch("/:kind/:id", authorize("hmiReasonMasters","update"), logger("hmiReasonMasters","update"), run(async (req,res)=>res.json(await service.save(prisma,req.params.kind,req.params.id,req.body,req.user.id))));
+router.post("/:kind/:id/archive", authorize("hmiReasonMasters","delete"), logger("hmiReasonMasters","delete"), run(async (req,res)=>res.json(await service.archive(prisma,req.params.kind,req.params.id,false,req.user.id))));
+router.post("/:kind/:id/restore", authorize("hmiReasonMasters","update"), logger("hmiReasonMasters","restore"), run(async (req,res)=>res.json(await service.archive(prisma,req.params.kind,req.params.id,true,req.user.id))));
+module.exports = router;

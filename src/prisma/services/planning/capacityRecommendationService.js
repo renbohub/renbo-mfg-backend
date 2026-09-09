@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { canonicalizeRoutingOperations, compareRoutingOperations } = require("../../utils/routingSequence");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
 const { findPreset, findActivePreset, shiftDurationMinutes } = require("./capacitySimulationPresetService");
@@ -13,7 +14,14 @@ const DEFAULT_CANDIDATE_BUDGET = 50000;
 const MAX_CANDIDATE_BUDGET = 500000;
 const RETAINED_PLACEMENT_CANDIDATES = 4;
 const AUTO_CAPACITY_OVERRIDE_PREFIX = "[AUTO-CAPACITY-RECOMMENDATION]";
-const VERSION = "OR-TOOLS-WASM-CP-SAT-V1";
+const VERSION = "PRIMARY-MACHINE-TOOLING-V2";
+const { resolveRoutingMachinePolicy } = require("./routingMachinePolicy");
+function automaticCandidates(route, machines) {
+  return route.resolvedMachinePolicy ? machines.filter((m) => route.resolvedMachinePolicy.automaticMachineIds.includes(m.id)) : machines;
+}
+function setupMinutesForMachine(route, machine) {
+  return Number(route.resolvedMachinePolicy?.resources.find((r) => r.machineId === machine?.id)?.setupMinutes || 0);
+}
 const SCORING_MODEL = "CAPACITY_ALLOCATION_SCORE_V2";
 const EARLY_START_TOLERANCE_DAYS = 2;
 const MINIMUM_RUNTIME_ALLOWANCE_FACTOR = 1.2;
@@ -124,7 +132,7 @@ function isReplaceableAutoAllocation(row, today, firmAllocationIds = new Set()) 
   if (row?.status === "Draft") return true;
   return !scheduleDate || scheduleDate >= today;
 }
-function jakartaClock(value = new Date()) {
+function jakartaClock(value = businessNow()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Jakarta",
     year: "numeric",
@@ -499,7 +507,7 @@ function shiftCapacityTransferQuantity(jobQty, graph, receiptQty, machineBySpeci
     : 480;
   const receiptCapacities = graph.ordered.flatMap((task) => {
     if (routeMode(task.route) === "VENDOR") return [];
-    const eligible = machineBySpecification.get(specificationCode(task.route)) || [];
+    const eligible = automaticCandidates(task.route, machineBySpecification.get(specificationCode(task.route)) || []);
     const cycles = eligible.map((machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85)).filter((value) => value > 0);
     const factor = task.phasePlannedQty != null
       ? number(task.phasePlannedQty) / Math.max(number(task.phaseReceiptQty), EPSILON)
@@ -512,7 +520,8 @@ function shiftCapacityTransferQuantity(jobQty, graph, receiptQty, machineBySpeci
         ? 1
         : number(task.detail.qtyPlanned) / Math.max(number(receiptQty), EPSILON);
     if (!cycles.length || factor <= EPSILON) return [];
-    return [Math.floor(shiftMinutes / Math.min(...cycles) / factor)];
+    const setup = Math.max(0, ...eligible.map((machine) => setupMinutesForMachine(task.route, machine)));
+    return [Math.floor(Math.max(shiftMinutes - setup, 0) / Math.max(...cycles) / factor)];
   }).filter((value) => value > 0);
   return Math.min(Math.max(receiptCapacities.length ? Math.min(...receiptCapacities) : number(jobQty), 1), number(jobQty));
 }
@@ -1173,7 +1182,7 @@ function effectiveCycleMinutes(route, machine, efficiency = 85) {
   // load fit inside two physical shifts while the same day had only 13.6
   // effective hours in the authoritative capacity check.
   const runtimeAllowance = MINIMUM_RUNTIME_ALLOWANCE_FACTOR / factor;
-  const seconds = number(route.cycleTime) || number(machine?.cycleTime);
+  const seconds = number(route.resolvedMachinePolicy?.resources.find((r) => r.machineId === machine?.id)?.cycleTimeSeconds) || number(route.cycleTime) || number(machine?.cycleTime);
   if (seconds > 0) return seconds / 60 * runtimeAllowance;
   const rate = number(machine?.capacity);
   const unit = String(machine?.capacityUnit || "").toUpperCase();
@@ -1212,6 +1221,14 @@ function buildMachineDiesOptions(route, machines, diesForRoute, options = {}) {
   const availableMachines = [];
   const excludedPressMachineIds = [];
   for (const machine of machines || []) {
+    const resourcePolicy = route.resolvedMachinePolicy?.resources.find((r) => r.machineId === machine.id);
+    if (resourcePolicy?.diesId) {
+      const assignedDies = (diesForRoute(route, [machine]) || []).filter((d) => d.id === resourcePolicy.diesId && isDiesTonnageCompatible(d, machine));
+      if (!assignedDies.length) { excludedPressMachineIds.push(machine.id); continue; }
+      availableMachines.push(machine);
+      diesCandidatesByMachine.set(machine.id, assignedDies);
+      continue;
+    }
     const press = isPressResource(machine, route);
     if (!press) {
       availableMachines.push(machine);
@@ -1338,7 +1355,7 @@ function scheduleFitFirstPerRoute({ graph, job, batches, receiptQty, receiptQtyB
       continue;
     }
     const spec = specificationCode(route);
-    const eligible = spec ? machineBySpecification.get(spec) || [] : [];
+    const eligible = automaticCandidates(route, spec ? machineBySpecification.get(spec) || [] : []);
     if (!eligible.length) return { failed: { code: "MACHINE_SPECIFICATION_UNAVAILABLE", route, qty: totalQty, specificationCode: spec }, allocations, usage: trialUsage, manualByRoute: trialManualByRoute, batches };
     const cycleByMachine = (machine) => effectiveCycleMinutes(route, machine, preset?.efficiency || 85);
     const cycleEligible = cycleCapableMachines(eligible, cycleByMachine);
@@ -1352,7 +1369,7 @@ function scheduleFitFirstPerRoute({ graph, job, batches, receiptQty, receiptQtyB
     if (!machineResources.machines.length) return { failed: { code: machineResources.excludedPressMachineIds.length ? "DIES_UNAVAILABLE" : "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty: totalQty, specificationCode: spec }, allocations, usage: trialUsage, diesUsage: trialDiesUsage, manualByRoute: trialManualByRoute, batches };
     const candidateMachines = machineResources.machines;
     const scoringContext = { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId };
-    const fullPlacement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => Math.max(totalQty * cycleByMachine(machine), 1), mode, periodStart, periodEnd, preset, scoringContext });
+    const fullPlacement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => Math.max(totalQty * cycleByMachine(machine) + setupMinutesForMachine(route, machine), 1), mode, periodStart, periodEnd, preset, scoringContext });
     if (fullPlacement && !preserveBatchBoundaries) {
       if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, fullPlacement.machine.id);
       occupy(trialUsage, fullPlacement.machine.id, { ...fullPlacement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
@@ -1371,7 +1388,7 @@ function scheduleFitFirstPerRoute({ graph, job, batches, receiptQty, receiptQtyB
       const qty = chunk.qty;
       const chunkPinnedMachineId = pinnedMachineByLane.get(laneKey) || null;
       const chunkMachines = candidateMachinesForLane(candidateMachines, cycleByMachine, chunkPinnedMachineId, pinMachineLane);
-      const placement = findPlacement({ machines: chunkMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest, due, duration: (machine) => Math.max(qty * cycleByMachine(machine), 1), mode, periodStart, periodEnd, preset, scoringContext: { ...scoringContext, pinnedMachineId: chunkPinnedMachineId } });
+      const placement = findPlacement({ machines: chunkMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest, due, duration: (machine) => Math.max(qty * cycleByMachine(machine) + setupMinutesForMachine(route, machine), 1), mode, periodStart, periodEnd, preset, scoringContext: { ...scoringContext, pinnedMachineId: chunkPinnedMachineId } });
       if (!placement) return { failed: { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty, specificationCode: spec }, allocations, usage: trialUsage, manualByRoute: trialManualByRoute, batches };
       if (pinMachineLane && !chunkPinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
       occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
@@ -1819,12 +1836,16 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const capacityConstraints = { ...capacityConstraintAudit, downtime: downtimeConstraintAudit };
   const diesUsage = new Map();
   const diesById = new Map(dies.map((row) => [row.id, row]));
+  const policyDies = dies.map((d) => ({ ...d, diesParts: diesParts.filter((mapping) => mapping.diesId === d.id) }));
+  for (const route of routes) if (routeMode(route) !== "VENDOR") route.resolvedMachinePolicy = resolveRoutingMachinePolicy(route, machines, policyDies, { start: plan.periodStart, end: schedulingHorizonEnd });
   const diesPartsByPartId = new Map();
   for (const mapping of diesParts) {
     if (!diesPartsByPartId.has(mapping.partId)) diesPartsByPartId.set(mapping.partId, []);
     diesPartsByPartId.get(mapping.partId).push(mapping);
   }
   const diesForRoute = (route, eligibleMachines = []) => {
+    const policyTools = route.resolvedMachinePolicy?.resources.filter((r) => eligibleMachines.some((m) => m.id === r.machineId)).map((r) => diesById.get(r.diesId)).filter(Boolean);
+    if (policyTools?.length) return policyTools;
     if (!isPressResource(eligibleMachines[0] || route.machine, route)) return [];
     if (route.diesId) return [diesById.get(route.diesId)].filter(Boolean);
     const scheduleStart = dateOnly(plan.periodStart);
@@ -1983,6 +2004,12 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       cumulativeQty.set(groupKey, runningCumulativeQty);
       continue;
     }
+    const policyErrors = relatedRoutes.filter((t) => t.route.resolvedMachinePolicy?.errors.length);
+    if (policyErrors.length) {
+      for (const task of policyErrors) blockers.push({ phaseId: job.id, phaseNumber: job.phaseNumber, partCode: task.detail.partCode, code: "ROUTING_MACHINE_POLICY_REQUIRED", qty: round(job.qty), message: `${task.detail.partCode} / ${task.route.process?.processCode || task.route.id}: ${task.route.resolvedMachinePolicy.errors.join(" ")}` });
+      for (const segment of resultSegmentsForJob(job)) phaseResults.push({ phaseId: segment.id, phaseNumber: segment.phaseNumber, dueDate: dateKey(segment.due || job.due), qty: round(segment.qty), status: "BLOCKED", blocker: "ROUTING_MACHINE_POLICY_REQUIRED" });
+      continue;
+    }
     const graph = buildRouteGraph(relatedRoutes, headers, bomDetails);
     let attempt = null;
     const customerDue = absoluteMinute(plan.periodStart, targetFgDue, DAY_MINUTES);
@@ -2029,7 +2056,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const taskQty = capacityTaskBatchQuantity(task, job.qty, receiptQtyBeforeJob, receiptQty, receiptQtyBeforeJob, job);
       if (routeMode(task.route) === "VENDOR") return Math.max(leadMinutes(task.route, job.planningDecision), 1);
       const spec = specificationCode(task.route);
-      const eligible = spec ? machineBySpecification.get(spec) || [] : [];
+      const eligible = automaticCandidates(task.route, spec ? machineBySpecification.get(spec) || [] : []);
       const capable = cycleCapableMachines(eligible, (machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85));
       if (!capable.length) return 0;
       return taskQty * Math.min(...capable.map((machine) => effectiveCycleMinutes(task.route, machine, preset?.efficiency || 85)));
@@ -2125,7 +2152,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
             continue;
           }
           const spec = specificationCode(route);
-          const eligible = spec ? machineBySpecification.get(spec) || [] : [];
+          const eligible = automaticCandidates(route, spec ? machineBySpecification.get(spec) || [] : []);
           if (!eligible.length) { failed = { code: "MACHINE_SPECIFICATION_UNAVAILABLE", route, qty, specificationCode: spec }; break; }
           const cycleByMachine = (machine) => effectiveCycleMinutes(route, machine, preset?.efficiency || 85);
           const cycleEligible = cycleCapableMachines(eligible, cycleByMachine);
@@ -2138,7 +2165,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
           const machineResources = buildMachineDiesOptions(route, laneMachines, diesForRoute);
           if (!machineResources.machines.length) { failed = { code: machineResources.excludedPressMachineIds.length ? "DIES_UNAVAILABLE" : "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty, specificationCode: spec }; break; }
           const candidateMachines = machineResources.machines;
-          const placement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => qty * cycleByMachine(machine), mode, periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset, scoringContext: { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId } });
+          const placement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => qty * cycleByMachine(machine) + setupMinutesForMachine(route, machine), mode, periodStart: plan.periodStart, periodEnd: schedulingHorizonEnd, preset, scoringContext: { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId } });
           if (!placement) { failed = { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty, specificationCode: spec }; break; }
           if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
           occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
@@ -2423,6 +2450,11 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   }
 
   let monthlySolverAudit = null;
+  const masterDataBlockers = blockers.filter((b) => b.code === "ROUTING_MACHINE_POLICY_REQUIRED");
+  if (masterDataBlockers.length && options.persist !== false) {
+    const messages = [...new Set(masterDataBlockers.map((b) => b.message))];
+    throw Object.assign(new Error(`Master alokasi mesin belum lengkap. ${messages.slice(0, 8).join("\n")}${messages.length > 8 ? `\nDan ${messages.length - 8} routing lainnya.` : ""}`), { statusCode: 422, code: "ROUTING_MACHINE_POLICY_REQUIRED", blockers: masterDataBlockers });
+  }
   if (generated.length) {
     const machineById = new Map(machines.map((machine) => [machine.id, machine]));
     const calendar = {};
@@ -2449,14 +2481,12 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
       const routeSpecification = specificationCode(route);
       const machineCandidates = routeMode(route) === "VENDOR"
         ? [`VENDOR:${route.vendorId || item.vendor?.id || "UNASSIGNED"}`]
-        : [...new Set([
-            ...(routeSpecification ? (machineBySpecification.get(routeSpecification) || []).map((machine) => machine.id) : []),
-            item.machine?.id,
-          ].filter(Boolean))];
+        : [item.machine?.id].filter(Boolean);
       return {
         id: `ALLOC-${index}`,
         durationMinutes: Math.max(Math.ceil(item.end - item.start), 1),
         eligibleResourceIds: machineCandidates,
+        assignmentGroupId: routeMode(route) !== "VENDOR" && route.resolvedMachinePolicy?.mode !== "PARALLEL" ? `ROUTE:${route.id}` : undefined,
         requiredResourceIds: item.dies?.id ? [`DIES:${item.dies.id}`] : [],
         predecessorIds: (item.predecessorToken || []).map((token) => `ALLOC-${token}`),
         predecessorGapMinutes: MINIMUM_SUCCESSOR_GAP_MINUTES,
@@ -2690,6 +2720,8 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
 }
 
 module.exports = {
+  automaticCandidates,
+  setupMinutesForMachine,
   recommendMonthlyCapacity,
   shouldScheduleLateVisibility,
   generatedBatchQuantity,

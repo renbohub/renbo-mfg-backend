@@ -1,12 +1,12 @@
 const {
-  legacyPriceValue,
+  nullablePriceValue,
   resolveEffectiveRecord,
 } = require("./pricing/effectivePriceService");
 const { resolveVendorProcessPrice } = require("./pricing/vendorProcessPricingService");
 const { isCustomerSupplied } = require("../utils/materialSupply");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
-const priceValue = (record, costingDate) => legacyPriceValue(record, costingDate);
+const priceValue = (record, costingDate) => nullablePriceValue(record, costingDate);
 
 const emptyEstimate = () => ({
   total: 0,
@@ -158,7 +158,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
       costingDate,
     );
     const partValue = priceValue(partPrice, costingDate);
-    if (partValue > 0) {
+    if (partValue !== null && partValue >= 0) {
       return {
         value: toIdr(partValue, partPrice.currencyCode),
         found: true,
@@ -180,7 +180,7 @@ async function calculateLiveMbomCosts(prisma, options = {}) {
     });
     const materialPrice = resolveEffectiveRecord(candidates, costingDate);
     const materialValue = priceValue(materialPrice, costingDate);
-    if (materialValue > 0) {
+    if (materialValue !== null && materialValue >= 0) {
       return {
         value: toIdr(materialValue, materialPrice.currencyCode),
         found: true,

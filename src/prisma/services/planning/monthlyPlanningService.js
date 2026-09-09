@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { getFormulaSet, evaluateFromSet } = require("../masterFormulaService");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
 const {
@@ -16,14 +17,14 @@ const {
   resolveMbomRevision,
   selectedRevisionId,
 } = require("./mbomRevisionService");
-const { netMpsBucket, buildMpsCalculationTrace } = require("./mpsNettingService");
+const { netMpsBucket, buildMpsCalculationTrace, buildDatedMpsDemand } = require("./mpsNettingService");
 const { invalidateRccp } = require("./rccpService");
 const { refreshMpsDeliveryFeasibility, invalidateMpsDeliveryGate } = require("./mpsDeliveryFeasibilityService");
 const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
 const { buildDeliveryPerformance } = require("./deliveryPerformanceService");
 const { buildYearlyDemand } = require("./yearlyDemandService");
 const { reviewDemand } = require("./demandPlanningService");
-const { enqueueSolverRun, completeSolverRun, failSolverRun } = require("./solver/planningSolverRunService");
+const { enqueueSolverRun, completeSolverRun, failSolverRun, assertDemandSolverEvidence } = require("./solver/planningSolverRunService");
 
 const FG_RECEIPT_PREFIX = "[FG-RECEIPT]";
 const MONTHLY_SOURCE_PREFIX = "MONTH:";
@@ -283,7 +284,7 @@ function alignExplicitForecastConsumptionAcrossBuckets(buckets) {
 }
 
 async function collectMonthlyDemand(tx, requestedMonths = null, anchorMonth = null, selectedDeliveryTargetIds = null) {
-  const currentMonth = planningMonthKey(new Date());
+  const currentMonth = planningMonthKey(businessNow());
   const effectiveAnchor = anchorMonth || currentMonth;
   const selectedIds = selectedDeliveryTargetIds?.size
     ? selectedDeliveryTargetIds
@@ -530,7 +531,7 @@ function resolveActiveCanonicalMpsLifecycle(status, demandChanged, simulationOnl
 
 async function previewMonthlyMbomSelections(tx, options = {}) {
   const selection = normalizeMpsRunSelection(options);
-  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || new Date());
+  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || businessNow());
   const requestedMonths = selection.months.length
     ? new Set(selection.months)
     : null;
@@ -557,7 +558,7 @@ async function previewMonthlyMbomSelections(tx, options = {}) {
 
 async function refreshMonthlyDemandSolver(prisma, options = {}) {
   const selection = normalizeMpsRunSelection(options);
-  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || new Date());
+  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || businessNow());
   const requestedMonths = selection.months.length ? new Set(selection.months) : null;
   const selectedDemand = await collectMonthlyDemand(prisma, requestedMonths, anchorMonth, selection.selectedDeliveryTargetIds);
   const deliveryTargetIds = uniq([...selectedDemand.buckets.values()]
@@ -600,7 +601,7 @@ async function refreshMonthlyDemandSolver(prisma, options = {}) {
         deliveryTargetId,
         fgRequiredDate: decision.fgRequiredDate,
         feasibilityStatus: decision.feasibilityStatus,
-        solver: decision.constraintDetails?.solver || null,
+        solver: assertDemandSolverEvidence(decision.constraintDetails?.solver),
       });
     }
     const result = {
@@ -620,7 +621,7 @@ async function refreshMonthlyDemandSolver(prisma, options = {}) {
 
 async function syncMonthlyMps(tx, options = {}) {
   const selection = normalizeMpsRunSelection(options);
-  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || new Date());
+  const anchorMonth = planningMonthKey(options.planningAnchorMonth || selection.months[0] || businessNow());
   const requestedMonths = selection.months.length
     ? new Set(selection.months)
     : null;
@@ -728,16 +729,21 @@ async function syncMonthlyMps(tx, options = {}) {
     })
     : [];
   const firmReceiptByPartMonth = new Map();
+  const datedReceiptsByPartMonth = new Map();
   const firstPlanningMonth = monthKeys[0];
   for (const order of openManufacturingOrders) {
     const fulfilledQty = Math.max(number(order.qtyGood), number(order.qtyProduced));
     const remainingQty = Math.max(number(order.qtyPlanned) - fulfilledQty - number(order.qtyReject), 0);
     if (remainingQty <= 0) continue;
-    const scheduledMonth = order.plannedEndDate ? planningMonthKey(order.plannedEndDate) : firstPlanningMonth;
+    // Undated or overdue unfinished orders are not evidence of future supply.
+    if (!order.plannedEndDate || !Number.isFinite(new Date(order.plannedEndDate).getTime()) || new Date(order.plannedEndDate) < utcMonthStart(firstPlanningMonth)) continue;
+    const scheduledMonth = planningMonthKey(order.plannedEndDate);
     const receiptMonth = monthKeys.find((candidate) => candidate >= scheduledMonth) || null;
     if (!receiptMonth) continue;
     const key = `${receiptMonth}|${order.part?.partCode || ""}`;
     firmReceiptByPartMonth.set(key, number(firmReceiptByPartMonth.get(key)) + remainingQty);
+    if (!datedReceiptsByPartMonth.has(key)) datedReceiptsByPartMonth.set(key, []);
+    datedReceiptsByPartMonth.get(key).push({ date: order.plannedEndDate, qty: remainingQty });
   }
   const docs = [];
   const changedMpsNumbers = [];
@@ -754,6 +760,9 @@ async function syncMonthlyMps(tx, options = {}) {
       include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } } },
     });
     const wasCreated = !doc;
+    if (doc && options.initialEtaMode !== undefined && doc.etaMode !== options.initialEtaMode) {
+      throw Object.assign(new Error("MPS sudah tersedia. Refresh MPS dan simpan Sumber ETA pada header sebelum menghitung ulang."), { statusCode: 409 });
+    }
     if (!doc) {
       const mpsNumber = await nextMonthlyMpsNumber(tx, month);
       doc = await tx.mPS.create({
@@ -761,6 +770,7 @@ async function syncMonthlyMps(tx, options = {}) {
           mpsNumber,
           sourceKey,
           mpsName: `MPS Bulanan ${month}`,
+          etaMode: options.initialEtaMode === undefined ? "MANUAL" : require("../purchasing/etaModeService").validateMode(options.initialEtaMode),
           periodStart: utcMonthStart(month),
           periodEnd: utcMonthEnd(month),
           forecastNumber: null,
@@ -865,7 +875,8 @@ async function syncMonthlyMps(tx, options = {}) {
         const key = `${bucket.partCode}|${String(soNumber || "").trim()}`;
         const pool = reservationByPartSo.get(key);
         if (!pool || pool.qty <= 0.000001) continue;
-        const usedQty = Math.min(pool.qty, reservationDemandRemaining);
+        const matchingSoDemandQty = bucket.sourceRows.filter((source) => source.sourceType === "SALES_ORDER" && String(source.sourceNumber || "").trim() === String(soNumber || "").trim()).reduce((sum, source) => sum + Math.max(number(source.qty), 0), 0);
+        const usedQty = Math.min(pool.qty, reservationDemandRemaining, matchingSoDemandQty);
         peggedReservationQty += usedQty;
         reservationDemandRemaining -= usedQty;
         pool.qty -= usedQty;
@@ -882,7 +893,12 @@ async function syncMonthlyMps(tx, options = {}) {
       peggedReservationQty = normalizeQuantity(peggedReservationQty, uomCode);
       const openingAvailableQty = normalizeQuantity(openingFreeQty + peggedReservationQty, uomCode);
       const firmScheduledReceiptQty = normalizeQuantity(firmReceiptByPartMonth.get(`${month}|${bucket.partCode}`) || 0, uomCode);
-      const netting = netMpsBucket({ openingAvailableQty, firmScheduledReceiptQty, grossDemandQty: grossDemandWithCarryoverQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty });
+      // Protect each delivery deadline; a receipt later in the same month cannot
+      // reduce the production required for an earlier delivery.
+      const demandEvents = buildDatedMpsDemand({ targets: deliveryTargets, policyDemandQty, productionPercent, reservations: appliedReservationRows, fallbackDate: utcMonthEnd(month) });
+      if (carryoverShortageQty > 0) demandEvents.push({ date: utcMonthStart(month), qty: carryoverShortageQty * productionPercent / 100 });
+      const receiptEvents = datedReceiptsByPartMonth.get(`${month}|${bucket.partCode}`) || [];
+      const netting = netMpsBucket({ openingAvailableQty, timePhasedOpeningAvailableQty: openingFreeQty, firmScheduledReceiptQty, grossDemandQty: grossDemandWithCarryoverQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty, demandEvents, receiptEvents });
       const qtyPlanned = normalizeQuantity(netting.plannedProductionQty, uomCode);
       projectedFgByPart.set(bucket.partCode, normalizeQuantity(netting.projectedEndingStockQty, uomCode));
       const customerCodes = uniq(bucket.customerCodes);
@@ -933,6 +949,7 @@ async function syncMonthlyMps(tx, options = {}) {
           forecastQty, actualSalesOrderQty, bufferBaseQty, bufferPercent, openingFreeQty, peggedReservationQty,
           reservationRows: appliedReservationRows, netting, sourceRows: bucket.sourceRows,
           }),
+          timePhasedNetting: { minimumProductionQty: netting.timePhasedMinimumQty, openingFreeQty, reservationRule: "OWN_SALES_ORDER_ONLY", demandEvents, receiptEvents },
           efd: { month, qty: policyDemandQty, source: currentEfd.source, ruleMode: currentEfd.ruleMode, override: currentEfd.override || null },
           previousEfd: { month: previousMonth, qty: previousEfdQty, deliveredQty: deliveredPreviousQty, shortageQty: carryoverShortageQty },
           bufferEfd: { month: nextPlanningMonthKey(month), qty: bufferBaseQty, source: nextEfd?.source || (referenceEfdByPartMonth.has(nextForecastKey) ? "YEARLY_EFD_LOOKAHEAD" : "FORECAST_FALLBACK"), ruleMode: nextEfd?.ruleMode || currentEfd.ruleMode },

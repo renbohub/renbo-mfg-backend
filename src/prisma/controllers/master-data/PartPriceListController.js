@@ -5,6 +5,9 @@ const { convertPriceListFields } = require("../../utils/numericConverter");
 const {
   normalizeEffectivePriceInput,
   createEffectiveVersion,
+  normalizeMonthlyPriceInput,
+  saveMonthlyPrice,
+  monthlyPriceView,
 } = require("../../services/pricing/effectivePriceService");
 
 // Include config untuk partpricelist
@@ -13,29 +16,8 @@ const includePartPriceList = {
   supplier: true,
 };
 
-async function assertPurchasePart(partId) {
-  if (!partId) {
-    const error = new Error("Part wajib dipilih.");
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const part = await prisma.part.findFirst({
-    where: { id: partId, isDeleted: false },
-    select: { id: true, itemType: true, rawType: true },
-  });
-  if (!part) {
-    const error = new Error("Part tidak ditemukan atau sudah tidak aktif.");
-    error.statusCode = 400;
-    throw error;
-  }
-  if (String(part.itemType || "").toUpperCase() !== "RAW" || String(part.rawType || "").toUpperCase() !== "PURCHASE_PART") {
-    const error = new Error("Part Price List hanya dapat dibuat untuk Purchase Part (RAW / PURCHASE_PART).");
-    error.statusCode = 400;
-    throw error;
-  }
-  return part;
-}
+const { assertEligiblePricePart, eligibleVendorPartIds, priceEligibility } = require('../../services/pricing/bomVendorPartEligibility');
+const assertPurchasePart = (db, data) => assertEligiblePricePart(db, data, { purchaseOnly: true });
 
 exports.list = async (req, res, next) => {
   try {
@@ -76,8 +58,9 @@ exports.list = async (req, res, next) => {
       prisma.partPriceList.count({ where }),
     ]);
 
+    const eligibleIds=await eligibleVendorPartIds(prisma);
     res.json({
-      items: items.map(mapDoc),
+      items: items.map(item=>({...mapDoc(item),priceEligibility:priceEligibility(item.part,eligibleIds,true)})),
       total,
       page: Number(page),
       limit: Number(limit),
@@ -95,7 +78,9 @@ exports.get = async (req, res, next) => {
     });
     if (!doc)
       return res.status(404).json({ message: "PartPriceList not found" });
-    res.json(doc);
+    const eligibility=priceEligibility(doc.part,await eligibleVendorPartIds(prisma),true);
+    if (req.query.monthlyForm === "true") return res.json({...await monthlyPriceView(prisma, "partPriceList", doc),priceEligibility:eligibility});
+    res.json({...doc,priceEligibility:eligibility});
   } catch (e) {
     next(e);
   }
@@ -103,14 +88,14 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const convertedData = normalizeEffectivePriceInput(convertPriceListFields(req.body), {
+    const convertedData = normalizeEffectivePriceInput(req.body.pricingMode === "MONTHLY" ? req.body : convertPriceListFields(req.body), {
       actor: req.user?.username || req.user?.email || "system",
     });
-    await assertPurchasePart(convertedData.partId);
     if (!convertedData.supplierId || convertedData.unitPrice === undefined) {
       return res.status(400).json({ message: "Supplier dan harga satuan wajib diisi." });
     }
-    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+    const saveVersion = req.body.pricingMode === "MONTHLY" ? saveMonthlyPrice : createEffectiveVersion;
+    const saved = await prisma.$transaction(async (tx) => { await assertPurchasePart(tx, convertedData); return saveVersion(tx, {
       model: "partPriceList",
       data: convertedData,
       scopeWhere: {
@@ -118,7 +103,7 @@ exports.create = async (req, res, next) => {
         supplierId: convertedData.supplierId,
         currencyCode: convertedData.currencyCode || "IDR",
       },
-    }));
+    }); }, {isolationLevel:'Serializable'});
     const doc = await prisma.partPriceList.findUnique({
       where: { id: saved.id },
       include: includePartPriceList,
@@ -134,9 +119,19 @@ exports.update = async (req, res, next) => {
   try {
     const existing = await prisma.partPriceList.findFirst({
       where: { id: req.params.id, isDeleted: false },
-      select: { partId: true, supplierId: true, currencyCode: true, effectiveFrom: true },
+      include: includePartPriceList,
     });
     if (!existing) return res.status(404).json({ message: "PartPriceList not found" });
+    if (req.body.pricingMode === "MONTHLY") {
+      const existingView = await monthlyPriceView(prisma, 'partPriceList', existing);
+      const data = normalizeMonthlyPriceInput({partId:existing.partId,supplierId:existing.supplierId,currencyCode:existing.currencyCode,uomCode:existing.uomCode,...req.body}, {existing:existingView});
+      if (!data.supplierId || !data.uomCode) return res.status(400).json({ message: "Supplier dan UOM harga wajib dipilih." });
+      const doc = await prisma.$transaction(async (tx) => { await assertPurchasePart(tx, data); return saveMonthlyPrice(tx, {
+        model: "partPriceList", id: req.params.id, data, include: includePartPriceList,
+        scopeWhere: { partId: data.partId, supplierId: data.supplierId, currencyCode: data.currencyCode || "IDR" },
+      }); }, {isolationLevel:'Serializable'});
+      return res.json(mapDoc(doc));
+    }
     const convertedData = normalizeEffectivePriceInput(convertPriceListFields({ ...req.body, effectiveFrom: req.body.effectiveFrom || existing.effectiveFrom }), { requireEffective: true });
     if ((convertedData.partId && convertedData.partId !== existing.partId)
       || (convertedData.supplierId && convertedData.supplierId !== existing.supplierId)
@@ -147,12 +142,11 @@ exports.update = async (req, res, next) => {
     convertedData.partId = existing.partId;
     convertedData.supplierId = existing.supplierId;
     convertedData.currencyCode = existing.currencyCode;
-    await assertPurchasePart(existing.partId);
-    const doc = await prisma.partPriceList.update({
+    const doc = await prisma.$transaction(async tx => { await assertPurchasePart(tx, convertedData); return tx.partPriceList.update({
       where: { id: req.params.id },
       data: convertedData,
       include: includePartPriceList,
-    });
+    }); }, {isolationLevel:'Serializable'});
 
     res.json(mapDoc(doc));
   } catch (e) {
@@ -233,16 +227,15 @@ exports.bulkCreate = async (req, res, next) => {
           }
         }
 
-        await assertPurchasePart(convertedData.partId);
-
         // Create part price list baru
-        const saved = convertedData.effectiveFrom
-          ? await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+        delete convertedData.partCode;
+        const saved = await prisma.$transaction(async tx => { await assertPurchasePart(tx, convertedData); return convertedData.effectiveFrom
+          ? createEffectiveVersion(tx, {
               model: "partPriceList",
               data: convertedData,
               scopeWhere: { partId: convertedData.partId, supplierId: convertedData.supplierId || null, currencyCode: convertedData.currencyCode || "IDR" },
-            }))
-          : await prisma.partPriceList.create({ data: convertedData });
+            })
+          : tx.partPriceList.create({ data: convertedData }); }, {isolationLevel:'Serializable'});
         const doc = await prisma.partPriceList.findUnique({ where: { id: saved.id }, include: includePartPriceList });
 
         results.success.push(mapDoc(doc));

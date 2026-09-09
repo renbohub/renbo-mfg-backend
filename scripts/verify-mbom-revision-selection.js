@@ -35,4 +35,13 @@ assert.equal(selectedRevisionId({ "2026-08|FG-001": "rev-2", "FG-002": "rev-1" }
 assert.equal(selectedRevisionId({ "FG-002": "rev-1" }, "2026-09", "FG-002"), "rev-1");
 assert.throws(() => resolveMbomRevision({ revisions, selectionDate: "2026-08-20", selectedId: "missing" }), /tidak ditemukan/);
 
-console.log("MBOM revision selection: 12/12 PASS");
+const overlapping = [
+  { id: "r6", revision: 6, effectiveDate: "2026-09-01", expiryDate: "2026-09-01T23:59:59Z" },
+  { id: "r7", revision: 7, effectiveDate: "2026-08-20", expiryDate: null },
+];
+assert.equal(resolveMbomRevision({ revisions: overlapping, selectionDate: "2026-09-01" }).revision.id, "r7", "Backdated newer revision must not lose to rev6 on earliest MPS date");
+assert.equal(resolveMbomRevision({ revisions: overlapping, selectionDate: "2026-09-30" }).revision.id, "r7");
+assert.equal(resolveMbomRevision({ revisions: overlapping, selectionDate: "2026-08-19" }).revision, null);
+assert.equal(resolveMbomRevision({ revisions: overlapping, selectionDate: "2026-09-01", selectedId: "r6" }).revision.id, "r6", "An explicit manual choice must remain explicit");
+assert.equal(resolveMbomRevision({ revisions: [...overlapping, { id: "r8", revision: 8, effectiveDate: "2026-10-01" }], selectionDate: "2026-09-01" }).revision.id, "r7", "Future revisions must not be selected early");
+console.log("MBOM revision selection: historical, manual, missing, overlapping/backdated and future revisions PASS");

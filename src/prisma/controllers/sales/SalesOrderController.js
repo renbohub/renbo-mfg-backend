@@ -5,6 +5,9 @@ const { replaceDeliveryTargets, retireDeliveryTargets, assertCompleteDeliveryTar
 const { resolveSalesLinePreview } = require("../../services/sales/salesPricingService");
 const { OPEN_FORECAST_STATUSES } = require("../../services/planning/forecastStatusPolicy");
 const { syncAutomaticDeliverySchedule } = require("../../services/outgoing/automaticDeliveryScheduleService");
+const workflow = require("../../services/sales/salesOrderWorkflowService");
+const attachmentService = require("../../services/sales/salesOrderAttachmentService");
+const { REQUEST_INCLUDE } = require("../../services/approvalRuleService");
 
 const include = {
   customer: true, currency: true, quotation: true,
@@ -28,7 +31,7 @@ function detailData(row, index, soNumber) {
   const tax = number(row.tax);
   const pricing = row.priceResolution || {};
   const margin = row.marginPreview || {};
-  return { soNumber, lineNumber: index + 1, partCode: text(row.partCode), partNumber: text(row.partNumber), partName: text(row.partName), uomCode: text(row.uomCode), mbomHeaderId: text(row.mbomHeaderId || row.resolvedMbomHeaderId), qty, unitPrice, discount, discountType, tax, totalAmount: beforeTax + beforeTax * tax / 100, priceSource: text(pricing.code || row.priceSource), priceSourceId: text(pricing.priceSourceId || row.priceSourceId), originalMasterPrice: pricing.originalMasterPrice == null ? (row.originalMasterPrice == null ? null : number(row.originalMasterPrice)) : number(pricing.originalMasterPrice), priceOverrideReason: text(pricing.overrideReason || row.priceOverrideReason), priceOverriddenBy: pricing.code === "PRICE_OVERRIDE" ? text(row.priceOverriddenBy) : null, priceOverriddenAt: pricing.code === "PRICE_OVERRIDE" ? new Date() : null, estimatedMaterialCost: number(margin.estimatedBomMaterialCost), estimatedProcessCost: number(margin.estimatedProcessCost), estimatedOverheadCost: number(margin.estimatedOverheadCost), estimatedBomCostPerUnit: number(margin.estimatedBomCostPerUnit), estimatedTotalCost: number(margin.estimatedTotalCost), estimatedGrossContribution: number(margin.estimatedGrossContribution), estimatedMarginPercent: number(margin.estimatedMarginPercent), costingStatus: text(row.costingStatus), status: text(row.status) || "Pending", deliveryDate: date(row.deliveryDate), notes: text(row.notes) };
+  return { soNumber, lineNumber: index + 1, partCode: text(row.partCode), partNumber: text(row.partNumber), partName: text(row.partName), uomCode: text(row.uomCode), mbomHeaderId: text(row.mbomHeaderId || row.resolvedMbomHeaderId), qty, unitPrice, discount, discountType, tax, totalAmount: beforeTax + beforeTax * tax / 100, priceSource: text(pricing.code || row.priceSource), priceSourceId: text(pricing.priceSourceId || row.priceSourceId), originalMasterPrice: pricing.originalMasterPrice == null ? (row.originalMasterPrice == null ? null : number(row.originalMasterPrice)) : number(pricing.originalMasterPrice), priceOverrideReason: text(pricing.overrideReason || row.priceOverrideReason), priceOverriddenBy: pricing.code === "PRICE_OVERRIDE" ? text(row.priceOverriddenBy) : null, priceOverriddenAt: pricing.code === "PRICE_OVERRIDE" ? new Date() : null, estimatedMaterialCost: number(margin.estimatedBomMaterialCost), estimatedProcessCost: number(margin.estimatedProcessCost), estimatedOverheadCost: number(margin.estimatedOverheadCost), estimatedBomCostPerUnit: number(margin.estimatedBomCostPerUnit), estimatedTotalCost: number(margin.estimatedTotalCost), estimatedGrossContribution: number(margin.estimatedGrossContribution), estimatedMarginPercent: number(margin.estimatedMarginPercent), costingStatus: text(row.costingStatus), status: "Pending", deliveryDate: date(row.deliveryDate), notes: text(row.notes) };
 }
 
 function canOverridePrice(user) {
@@ -51,18 +54,18 @@ async function resolveAuthoritativeDetails(tx, rows, body, user) {
   }));
 }
 function headerData(body, user, totalAmount) {
-  return { soDate: date(body.soDate) || new Date(), quotationNumber: text(body.quotationNumber), customerCode: text(body.customerCode), customerName: text(body.customerName), contact: text(body.contact), phone: text(body.phone), email: text(body.email), billingAddress: text(body.billingAddress), shippingAddress: text(body.shippingAddress), paymentTerms: text(body.paymentTerms), taxId: text(body.taxId), currencyCode: text(body.currencyCode) || "IDR", deliveryDate: date(body.deliveryDate), status: text(body.status) || "Draft", totalAmount, notes: text(body.notes), createdBy: user?.username || user?.email || null };
+  return { soDate: date(body.soDate) || new Date(), quotationNumber: text(body.quotationNumber), customerPoNumber: text(body.customerPoNumber), customerCode: text(body.customerCode), customerName: text(body.customerName), contact: text(body.contact), phone: text(body.phone), email: text(body.email), billingAddress: text(body.billingAddress), shippingAddress: text(body.shippingAddress), paymentTerms: text(body.paymentTerms), taxId: text(body.taxId), currencyCode: text(body.currencyCode) || "IDR", deliveryDate: null, status: "Draft", totalAmount, notes: text(body.notes), createdBy: user?.username || user?.email || null };
 }
 
 exports.list = async (req, res, next) => {
   try {
     const page = Math.max(number(req.query.page) || 1, 1); const limit = Math.min(Math.max(number(req.query.limit) || 20, 1), 500); const q = text(req.query.q || req.query.search); const status = text(req.query.status);
-    const where = { isDeleted: false, ...(status ? { status } : {}), ...(q ? { OR: [{ soNumber: { contains: q, mode: "insensitive" } }, { quotationNumber: { contains: q, mode: "insensitive" } }, { customerName: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
+    const where = { isDeleted: false, ...(status ? { status } : {}), ...(q ? { OR: [{ soNumber: { contains: q, mode: "insensitive" } }, { quotationNumber: { contains: q, mode: "insensitive" } }, { customerPoNumber: { contains: q, mode: "insensitive" } }, { customerName: { contains: q, mode: "insensitive" } }, { status: { contains: q, mode: "insensitive" } }] } : {}) };
     const [items, total] = await Promise.all([prisma.salesOrderHeader.findMany({ where, include: { customer: true, quotation: true }, orderBy: { soDate: "desc" }, skip: (page - 1) * limit, take: limit }), prisma.salesOrderHeader.count({ where })]);
     res.json({ items, total, page, limit });
   } catch (error) { next(error); }
 };
-exports.get = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); const targetIds=doc.details.flatMap((row)=>row.deliveryTargets.map((target)=>target.id));const decisions=targetIds.length?await prisma.demandPlanningDecision.findMany({where:{deliveryTargetId:{in:targetIds},isDeleted:false}}):[];const decisionByTarget=new Map(decisions.map((row)=>[row.deliveryTargetId,row]));res.json({...doc,details:doc.details.map((row)=>({...row,priceOverride:row.priceSource==="PRICE_OVERRIDE",deliveryTargets:row.deliveryTargets.map((target)=>({...target,planningDecision:decisionByTarget.get(target.id)||null}))}))}); } catch (error) { next(error); } };
+exports.get = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); const targetIds=doc.details.flatMap((row)=>row.deliveryTargets.map((target)=>target.id));const decisions=targetIds.length?await prisma.demandPlanningDecision.findMany({where:{deliveryTargetId:{in:targetIds},isDeleted:false}}):[];const decisionByTarget=new Map(decisions.map((row)=>[row.deliveryTargetId,row]));res.json({...doc,attachments:doc.attachments.map(attachmentService.publicAttachment),details:doc.details.map((row)=>({...row,priceOverride:row.priceSource==="PRICE_OVERRIDE",deliveryTargets:row.deliveryTargets.map((target)=>({...target,planningDecision:decisionByTarget.get(target.id)||null}))}))}); } catch (error) { next(error); } };
 exports.generateNumber = async (_req, res, next) => { try { res.json({ soNumber: await nextNumber() }); } catch (error) { next(error); } };
 exports.linePreview = async (req, res, next) => {
   try {
@@ -135,7 +138,7 @@ exports.createFromQuotation = async (quotation, options = {}, user) => prisma.$t
   const details = resolvedRows.map((row, index) => detailData(row, index, soNumber));
   const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0);
   const so = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData({ ...quotation, ...options, quotationNumber: quotation.quotationNumber, soDate: options.soDate || new Date(), deliveryDate: options.deliveryDate || quotation.details[0]?.deliveryDate, status: "Draft" }, user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include });
-  await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(options.customerCode || quotation.customerCode), lines: so.details, inputRows: quotation.details, headerDeliveryDate: options.deliveryDate || quotation.details[0]?.deliveryDate, user: user?.username || user?.email });
+  await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(options.customerCode || quotation.customerCode), lines: so.details, inputRows: quotation.details, user: user?.username || user?.email });
   await syncAutomaticDeliverySchedule(tx, so);
   await tx.quotationHeader.update({ where: { quotationNumber: quotation.quotationNumber }, data: { convertedToSO: soNumber, status: "Converted" } });
   await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dari quotation mengubah demand." });
@@ -144,6 +147,7 @@ exports.createFromQuotation = async (quotation, options = {}, user) => prisma.$t
 
 exports.create = async (req, res, next) => {
   try {
+    workflow.assertDraftInput(req.body);
     if (req.body.quotationNumber) {
       const quotation = await prisma.quotationHeader.findFirst({ where: { quotationNumber: req.body.quotationNumber, isDeleted: false }, include: { details: { where: { isDeleted: false } } } });
       if (!quotation) return res.status(404).json({ message: "Quotation referensi tidak ditemukan" });
@@ -153,17 +157,18 @@ exports.create = async (req, res, next) => {
     }
     const rows = Array.isArray(req.body.details) ? req.body.details : [];
     if (!rows.length) return res.status(400).json({ message: "Minimal satu item Sales Order wajib diisi" });
-    const doc = await prisma.$transaction(async (tx) => { const soNumber = text(req.body.soNumber) || await nextNumber(tx); const resolvedRows = await resolveAuthoritativeDetails(tx, rows, req.body, req.user); const details = resolvedRows.map((row, index) => detailData(row, index, soNumber)); const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); const created = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData(req.body, req.user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(req.body.customerCode), lines: created.details, inputRows: rows, headerDeliveryDate: req.body.deliveryDate, user: req.user?.username || req.user?.email }); await syncAutomaticDeliverySchedule(tx, created); await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dibuat; net-change MRP dijadwalkan." }); return tx.salesOrderHeader.findUnique({ where: { soNumber }, include }); });
+    const doc = await prisma.$transaction(async (tx) => { const soNumber = text(req.body.soNumber) || await nextNumber(tx); const resolvedRows = await resolveAuthoritativeDetails(tx, rows, req.body, req.user); const details = resolvedRows.map((row, index) => detailData(row, index, soNumber)); const totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); const created = await tx.salesOrderHeader.create({ data: { soNumber, ...headerData(req.body, req.user, totalAmount), details: { create: details.map(({ soNumber: _parent, ...row }) => row) } }, include }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: text(req.body.customerCode), lines: created.details, inputRows: rows, user: req.user?.username || req.user?.email }); await syncAutomaticDeliverySchedule(tx, created); await queueDirtyPartCodes(tx, details.map((row) => row.partCode), { reason: "SO", sourceNumber: soNumber, notes: "Sales Order dibuat; net-change MRP dijadwalkan." }); return tx.salesOrderHeader.findUnique({ where: { soNumber }, include }); });
     res.status(201).json(doc);
   } catch (error) { next(error); }
 };
 
 exports.update = async (req, res, next) => {
   try {
+    workflow.assertDraftInput(req.body);
     const existing = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true, deliveryTargets: { where: { isDeleted: false } } } } } });
     if (!existing) return res.status(404).json({ message: "Sales Order tidak ditemukan" });
     if (existing.status !== "Draft") return res.status(409).json({ message: `Sales Order ${existing.soNumber} sudah ${existing.status} dan tidak dapat diedit. Gunakan workflow revisi.` });
-    const doc = await prisma.$transaction(async (tx) => { const rows = Array.isArray(req.body.details) ? req.body.details : null; let totalAmount = existing.totalAmount; let details = null; if (rows) { const resolvedRows = await resolveAuthoritativeDetails(tx, rows, { ...existing, ...req.body }, req.user); details = resolvedRows.map((row, index) => detailData(row, index, existing.soNumber)); totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); await tx.salesOrderDetail.deleteMany({ where: { soNumber: existing.soNumber } }); if (details.length) await tx.salesOrderDetail.createMany({ data: details }); const createdLines = await tx.salesOrderDetail.findMany({ where: { soNumber: existing.soNumber, isDeleted: false }, orderBy: { lineNumber: "asc" } }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: existing.soNumber, customerCode: text(req.body.customerCode || existing.customerCode), lines: createdLines, inputRows: rows, headerDeliveryDate: req.body.deliveryDate || existing.deliveryDate, user: req.user?.username || req.user?.email, trackChange: true, previousTargets: existing.details.flatMap((row) => row.deliveryTargets || []), impactSourceNumbers: [existing.soNumber, existing.revisionOfSoNumber] }); } const data = headerData({ ...existing, ...req.body }, req.user, totalAmount); delete data.createdBy; const updated = await tx.salesOrderHeader.update({ where: { soNumber: existing.soNumber }, data, include }); await syncAutomaticDeliverySchedule(tx, updated); await queueDirtyPartCodes(tx, [...existing.details.map((row) => row.partCode), ...(details || []).map((row) => row.partCode)], { reason: "SO", sourceNumber: existing.soNumber, notes: "Sales Order diubah; net-change MRP dijadwalkan." }); return tx.salesOrderHeader.findUnique({ where: { soNumber: existing.soNumber }, include }); });
+    const doc = await prisma.$transaction(async (tx) => { await workflow.lockSalesOrder(tx, existing.soNumber); const current = await tx.salesOrderHeader.findUnique({ where: { soNumber: existing.soNumber } }); if (!current || current.isDeleted || current.status !== "Draft" || current.updatedAt.getTime() !== existing.updatedAt.getTime()) throw Object.assign(new Error("SO berubah sejak dimuat. Muat ulang sebelum menyimpan."), { statusCode: 409 }); const rows = Array.isArray(req.body.details) ? req.body.details : null; let totalAmount = existing.totalAmount; let details = null; if (rows) { if (!rows.length) throw Object.assign(new Error("Minimal satu item SO wajib diisi."), { statusCode: 400 }); const resolvedRows = await resolveAuthoritativeDetails(tx, rows, { ...existing, ...req.body }, req.user); details = resolvedRows.map((row, index) => detailData(row, index, existing.soNumber)); totalAmount = details.reduce((sum, row) => sum + row.totalAmount, 0); await tx.salesOrderDetail.deleteMany({ where: { soNumber: existing.soNumber } }); if (details.length) await tx.salesOrderDetail.createMany({ data: details }); const createdLines = await tx.salesOrderDetail.findMany({ where: { soNumber: existing.soNumber, isDeleted: false }, orderBy: { lineNumber: "asc" } }); await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: existing.soNumber, customerCode: text(req.body.customerCode || existing.customerCode), lines: createdLines, inputRows: rows, user: req.user?.username || req.user?.email, trackChange: true, previousTargets: existing.details.flatMap((row) => row.deliveryTargets || []), impactSourceNumbers: [existing.soNumber, existing.revisionOfSoNumber] }); } const data = headerData({ ...existing, ...req.body }, req.user, totalAmount); delete data.createdBy; const updated = await tx.salesOrderHeader.update({ where: { soNumber: existing.soNumber }, data, include }); await syncAutomaticDeliverySchedule(tx, updated); await queueDirtyPartCodes(tx, [...existing.details.map((row) => row.partCode), ...(details || []).map((row) => row.partCode)], { reason: "SO", sourceNumber: existing.soNumber, notes: "Sales Order diubah; net-change MRP dijadwalkan." }); return tx.salesOrderHeader.findUnique({ where: { soNumber: existing.soNumber }, include }); });
     res.json(doc);
   } catch (error) { next(error); }
 };
@@ -176,6 +181,7 @@ exports.revise = async (req, res, next) => {
     const reason = text(req.body?.reason);
     if (!reason) return res.status(400).json({ message: "Alasan revisi Sales Order wajib diisi." });
     const result = await prisma.$transaction(async (tx) => {
+      await workflow.lockSalesOrder(tx, req.params.soNumber);
       const existing = await tx.salesOrderHeader.findFirst({
         where: { soNumber: req.params.soNumber, isDeleted: false },
         include: {
@@ -215,7 +221,7 @@ exports.revise = async (req, res, next) => {
         },
         include,
       });
-      await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: existing.customerCode, lines: created.details, inputRows: existing.details.map((row) => ({ ...row, deliveryTargets: row.deliveryTargets })), headerDeliveryDate: existing.deliveryDate, user: req.user?.username || req.user?.email });
+      await replaceDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: soNumber, customerCode: existing.customerCode, lines: created.details, inputRows: existing.details.map((row) => ({ ...row, deliveryTargets: row.deliveryTargets })), user: req.user?.username || req.user?.email });
       await tx.salesOrderHeader.update({
         where: { soNumber: existing.soNumber },
         data: { status: "Superseded", notes: [existing.notes, `Digantikan oleh ${soNumber}: ${reason}`].filter(Boolean).join("; ") },
@@ -243,20 +249,45 @@ exports.revise = async (req, res, next) => {
     next(error);
   }
 };
-exports.remove = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); if (!["Draft", "Cancelled"].includes(doc.status)) return res.status(400).json({ message: "Hanya Sales Order Draft/Cancelled yang dapat dihapus" }); await prisma.$transaction(async (tx) => { await retireDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: doc.soNumber, status: "CANCELLED", user: req.user?.username || req.user?.email, markDeleted: true }); await tx.salesOrderHeader.update({ where: { soNumber: doc.soNumber }, data: { isDeleted: true, details: { updateMany: { where: {}, data: { isDeleted: true } } } } }); await queueDirtyPartCodes(tx, doc.details.map((row) => row.partCode), { reason: "SO", sourceNumber: doc.soNumber, notes: "Sales Order dihapus; net-change MRP dijadwalkan." }); }); res.json({ ok: true }); } catch (error) { next(error); } };
+exports.remove = async (req, res, next) => { try { const doc = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, select: { partCode: true } } } }); if (!doc) return res.status(404).json({ message: "Sales Order tidak ditemukan" }); if (!["Draft", "Cancelled"].includes(doc.status)) return res.status(400).json({ message: "Hanya Sales Order Draft/Cancelled yang dapat dihapus" }); await prisma.$transaction(async (tx) => { await workflow.lockSalesOrder(tx, doc.soNumber); const current = await tx.salesOrderHeader.findUnique({ where: { soNumber: doc.soNumber } }); if (!current || current.isDeleted || !["Draft", "Cancelled"].includes(current.status)) throw Object.assign(new Error("SO berubah; muat ulang dokumen."), { statusCode: 409 }); await retireDeliveryTargets(tx, { sourceType: "SALES_ORDER", sourceNumber: doc.soNumber, status: "CANCELLED", user: req.user?.username || req.user?.email, markDeleted: true }); await tx.salesOrderHeader.update({ where: { soNumber: doc.soNumber }, data: { isDeleted: true, details: { updateMany: { where: {}, data: { isDeleted: true } } } } }); await queueDirtyPartCodes(tx, doc.details.map((row) => row.partCode), { reason: "SO", sourceNumber: doc.soNumber, notes: "Sales Order dihapus; net-change MRP dijadwalkan." }); }); res.json({ ok: true }); } catch (error) { next(error); } };
 
-exports.confirm = async (req, res, next) => {
+function workflowHandler(action) {
+  return async (req, res, next) => {
+    try {
+      const result = await prisma.$transaction(async tx => {
+        await workflow.lockSalesOrder(tx, req.params.soNumber);
+        const so = await tx.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include });
+        if (!so) throw Object.assign(new Error('Sales Order tidak ditemukan.'), { statusCode: 404 });
+        const user = req.user;
+        if (action === 'withdraw') return workflow.withdraw(tx, so, user, req.body?.notes);
+        if (!so.details.length || so.details.some(row => Number(row.qty) <= 0 || !row.partCode)) throw Object.assign(new Error('Semua line SO harus memiliki part dan qty lebih dari 0.'), { statusCode: 400 });
+        await assertCompleteDeliveryTargets(tx, 'SALES_ORDER', so.soNumber, so.details);
+        if (action === 'submit') return workflow.submit(tx, so, user);
+        return workflow.decide(tx, so, user, action === 'reject' ? 'Rejected' : 'Approved', req.body?.notes, async () => {
+          const reservation = await syncReservationsForConfirmedSO(tx, so, so.details);
+          const updated = await tx.salesOrderHeader.update({ where: { id: so.id }, data: { status: 'Confirmed', approvedBy: user?.username || user?.email || 'system', approvedDate: new Date() }, include });
+          await queueDirtyPartCodes(tx, so.details.map(row => row.partCode), { reason: 'SO', sourceNumber: so.soNumber, notes: 'SO dikonfirmasi setelah seluruh approval selesai.' });
+          return { ...updated, reservationWarnings: reservation.warnings || [] };
+        });
+      }, { timeout: 30000 });
+      workflow.broadcast(result.notifications);
+      const document = result.document;
+      res.json({ ...document, ...(document.attachments ? { attachments: document.attachments.map(attachmentService.publicAttachment) } : {}), approval: result.request, approvalComplete: Boolean(result.final) });
+    } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, warnings: error.warnings }); next(error); }
+  };
+}
+exports.submit = workflowHandler('submit');
+exports.confirm = workflowHandler('approve');
+exports.reject = workflowHandler('reject');
+exports.withdraw = workflowHandler('withdraw');
+exports.approvalHistory = async (req, res, next) => {
   try {
-    const result = await prisma.$transaction(async (tx) => {
-      const so = await tx.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false }, include: { details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" } } } });
-      if (!so) throw Object.assign(new Error("Sales Order tidak ditemukan."), { statusCode: 404 });
-      if (so.status !== "Draft") throw Object.assign(new Error(`Sales Order hanya dapat dikonfirmasi dari Draft. Status saat ini ${so.status}.`), { statusCode: 409 });
-      if (!so.details.length || so.details.some((row) => Number(row.qty || 0) <= 0 || !row.partCode)) throw Object.assign(new Error("Semua line SO harus memiliki part dan qty lebih dari 0."), { statusCode: 400 });
-      await assertCompleteDeliveryTargets(tx, "SALES_ORDER", so.soNumber, so.details);
-      const reservation = await syncReservationsForConfirmedSO(tx, so, so.details);
-      const updated = await tx.salesOrderHeader.update({ where: { id: so.id }, data: { status: "Confirmed", approvedBy: req.user?.username || req.user?.email || "system", approvedDate: new Date() }, include });
-      return { ...updated, reservationWarnings: reservation.warnings || [] };
-    });
-    res.json(result);
-  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, warnings: error.warnings }); next(error); }
+    const so = await prisma.salesOrderHeader.findFirst({ where: { soNumber: req.params.soNumber, isDeleted: false } });
+    if (!so) return res.status(404).json({ message: 'Sales Order tidak ditemukan.' });
+    const items = await prisma.approvalRequest.findMany({ where: { ...workflow.KEY, documentId: so.id, isDeleted: false }, include: REQUEST_INCLUDE, orderBy: { requestedAt: 'desc' } });
+    res.json({ items });
+  } catch (error) { next(error); }
 };
+exports.addAttachment = async (req,res,next) => { try { res.status(201).json(await attachmentService.add(prisma,req.params.soNumber,req.file,req.user,req.body)); } catch(error) { next(error); } };
+exports.removeAttachment = async (req,res,next) => { try { res.json(await attachmentService.remove(prisma,req.params.soNumber,req.params.attachmentId)); } catch(error) { next(error); } };
+exports.downloadAttachment = async (req,res,next) => { try { await attachmentService.download(prisma,req,res); } catch(error) { next(error); } };

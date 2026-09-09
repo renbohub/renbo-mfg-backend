@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { planningMonthKey, utcMonthStart } = require("../../utils/planningMonth");
 
@@ -33,7 +34,7 @@ function selectCurrentStatus(schedules = []) {
 }
 
 async function buildDeliveryPerformance(tx, options = {}) {
-  const month = planningMonthKey(options.month || new Date());
+  const month = planningMonthKey(options.month || businessNow());
   const previousMonth = shiftMonth(month, -1);
   const nextMonth = shiftMonth(month, 1);
   const partCodes = [...new Set((options.partCodes || []).map(text).filter(Boolean))];
@@ -79,6 +80,7 @@ async function buildDeliveryPerformance(tx, options = {}) {
       },
       select: {
         scheduleNumber: true, soNumber: true, plannedDate: true, actualDate: true, deliveredAt: true, status: true, updatedAt: true,
+        packedAt: true, shippedAt: true, carrier: true, vehicle: true,
         details: { where: { isDeleted: false, soDetail: { partCode: { in: partCodes }, isDeleted: false } }, select: { soDetailId: true, qty: true, qtyDelivered: true, soDetail: { select: { partCode: true } } } },
       },
       orderBy: [{ plannedDate: "asc" }, { scheduleNumber: "asc" }],
@@ -101,6 +103,11 @@ async function buildDeliveryPerformance(tx, options = {}) {
       const publicSchedule = {
         scheduleNumber: schedule.scheduleNumber,
         soNumber: schedule.soNumber,
+        soDetailId: detail.soDetailId,
+        packedAt: schedule.packedAt,
+        shippedAt: schedule.shippedAt,
+        carrier: schedule.carrier,
+        vehicle: schedule.vehicle,
         plannedDate: schedule.plannedDate,
         actualDate: schedule.actualDate || schedule.deliveredAt,
         status: schedule.status,

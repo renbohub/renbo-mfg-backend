@@ -94,7 +94,7 @@ exports.list = async (req, res, next) => {
 exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.customer.findFirst({
-      where: { customerCode: req.params.customerCode, isDeleted: false },
+      where: { OR: [{ customerCode: req.params.customerCode }, { id: req.params.customerCode }], isDeleted: false },
     });
     if (!doc) return res.status(404).json({ message: "Customer not found" });
     res.json(mapDoc(doc));

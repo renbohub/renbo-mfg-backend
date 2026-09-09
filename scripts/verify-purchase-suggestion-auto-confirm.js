@@ -66,6 +66,19 @@ async function run() {
     suggestedSupplierCode: "S001",
   }, { asOf: new Date("2026-08-28T00:00:00.000Z") });
   assert.strictEqual(missing.master, null, "Item harus tetap tanpa konfirmasi jika semua supplier tidak mempunyai harga");
+  const bomDb = { ...fakeDb, mRPRequirement: { findMany: async () => [{ mbomDetail: { supplierId: suppliers.S001.id, supplier: suppliers.S001 } }] } };
+  const bomMissing = await findPricedPurchaseSuggestionSupplierMaster(bomDb, {
+    partId: part.id, mrpRequirementId: "REQ-1", suggestedSupplierCode: "S002",
+  });
+  assert.equal(bomMissing.master, null, "BOM supplier without price must not silently switch to a priced supplier");
+  assert.deepEqual(bomMissing.supplierCodes, ["S001"]);
+  const explicit = await findPricedPurchaseSuggestionSupplierMaster(bomDb, {
+    partId: part.id, mrpRequirementId: "REQ-1", alternativeSupplierCode: "S002",
+  });
+  assert.equal(explicit.master.supplierCode, "S002", "manual alternative remains authoritative");
+  const { resolveBomSupplier } = require("../src/prisma/services/purchasing/purchaseSuggestionMasterDataService");
+  assert.throws(() => resolveBomSupplier([{ mbomDetail: { supplierId: "S1", supplier: suppliers.S001 } }, { mbomDetail: { supplierId: "S2", supplier: suppliers.S002 } }]), { code: "BOM_SUPPLIER_CONFLICT" });
+  assert.throws(() => resolveBomSupplier([{ mbomDetail: { supplierId: "S1", supplier: { ...suppliers.S001, status: "Inactive" } } }]), { code: "BOM_SUPPLIER_UNAVAILABLE" });
   console.log("Purchase Suggestion auto supplier confirmation: PASS");
 }
 

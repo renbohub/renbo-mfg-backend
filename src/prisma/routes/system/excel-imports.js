@@ -3,6 +3,7 @@ const multer = require("multer");
 const ctrl = require("../../controllers/system/ExcelImportController");
 const forecastImport = require("../../controllers/planning/ExcelForecastImportController");
 const historicalImport = require("../../controllers/system/HistoricalExcelImportController");
+const legacy = require("../../controllers/system/LegacyMasterImportController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
@@ -16,6 +17,11 @@ const upload = multer({
 });
 
 router.post("/upload-preview", authorize("excelImports", "create"), upload.single("file"), ctrl.uploadPreview);
+router.get("/legacy-template/:kind", authorize("excelImports", "read"), legacy.template);
+router.post("/legacy-preview", authorize("excelImports", "read"), legacy.preview);
+router.post("/legacy-stage", authorize("excelImports", "create"), logger("excelImports", "legacy-stage"), legacy.stage);
+router.post("/:key/apply-legacy", authorize("excelImports", "create"), logger("excelImports", "apply-legacy"), legacy.apply);
+router.get("/:key/legacy-report", authorize("excelImports", "read"), legacy.report);
 router.post("/preview", authorize("excelImports", "read"), ctrl.preview);
 router.post("/forecast-preview", authorize("forecast", "read"), forecastImport.preview);
 router.post("/historical-preview", authorize("excelImports", "read"), historicalImport.preview);

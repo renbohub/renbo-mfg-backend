@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { assessDemandFeasibility } = require("./demandFeasibilityService");
 const { buildCapacitySnapshot } = require("./capacityPlanningService");
@@ -9,8 +10,8 @@ const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const asDate = (value) => { const date = value instanceof Date ? new Date(value) : new Date(value); return Number.isNaN(date.getTime()) ? null : date; };
 const dayDiff = (left, right) => Math.ceil((asDate(left) - asDate(right)) / 86400000);
 
-function planningAnchorMonth(value = new Date()) {
-  const date = asDate(value) || new Date();
+function planningAnchorMonth(value = businessNow()) {
+  const date = asDate(value) || businessNow();
   // The anchor is the first month in the three-month MPS delivery window:
   // day 1-19 = previous/current/next, day 20-EOM = current/next/next+1.
   const offset = date.getUTCDate() >= 20 ? 0 : -1;
@@ -18,7 +19,7 @@ function planningAnchorMonth(value = new Date()) {
   return anchor.toISOString().slice(0, 7);
 }
 
-function mpsWindowMonths(value = new Date()) {
+function mpsWindowMonths(value = businessNow()) {
   const anchor = planningAnchorMonth(value);
   const start = asDate(`${anchor}-01`);
   return [0, 1, 2].map((offset) => new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + offset, 1)).toISOString().slice(0, 7));
@@ -32,7 +33,7 @@ function priorityClass(score) {
 }
 
 function calculatePriority(input = {}) {
-  const today = asDate(input.today || new Date());
+  const today = asDate(input.today || businessNow());
   const targetDeliveryDate = asDate(input.targetDeliveryDate);
   const remainingDays = targetDeliveryDate ? dayDiff(targetDeliveryDate, today) : 999;
   const factors = {

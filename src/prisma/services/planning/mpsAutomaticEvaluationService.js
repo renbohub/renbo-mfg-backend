@@ -4,6 +4,7 @@ const { runRccp } = require("./rccpService");
 const { refreshMpsDeliveryFeasibility } = require("./mpsDeliveryFeasibilityService");
 const { getMpsWorkbench } = require("./mpsWorkbenchService");
 const { planningMonthKey } = require("../../utils/planningMonth");
+const { refreshProductionEvidence } = require("./mpsProductionEvidenceService");
 
 function errorSummary(error) {
   return {
@@ -14,8 +15,10 @@ function errorSummary(error) {
 }
 
 function rccpSummary(run) {
+  const completed = Boolean(run?.id) && !["NOT_CHECKED", "RUNNING", "INVALID"].includes(run.status || "NOT_CHECKED");
   return {
-    completed: true,
+    completed,
+    ...(!completed ? { code: "MPS_RCCP_INCOMPLETE", message: "RCCP belum menghasilkan evaluasi aktif untuk revisi ini." } : {}),
     runId: run?.id || null,
     status: run?.status || "NOT_CHECKED",
     approvalAllowed: Boolean(run?.approvalAllowed),
@@ -24,8 +27,10 @@ function rccpSummary(run) {
 }
 
 function deliverySummary(gate) {
+  const completed = Boolean(gate?.feasibilityStatus) && !["STALE", "UNKNOWN", "NOT_CHECKED", "NOT_EVALUATED"].includes(gate.feasibilityStatus);
   return {
-    completed: true,
+    completed,
+    ...(!completed ? { code: "MPS_DELIVERY_INCOMPLETE", message: gate?.reason || "Snapshot delivery belum current; pemeriksaan belum lengkap." } : {}),
     feasibilityStatus: gate?.feasibilityStatus || "NOT_CHECKED",
     dispositionStatus: gate?.dispositionStatus || "PENDING",
     officialGateStatus: gate?.officialGateStatus || "BLOCKED",
@@ -44,6 +49,7 @@ async function runAutomaticMpsEvaluation(prisma, documents = [], options = {}, s
   const executeRccp = services.runRccp || runRccp;
   const refreshDelivery = services.refreshMpsDeliveryFeasibility || refreshMpsDeliveryFeasibility;
   const readWorkbench = services.getMpsWorkbench || getMpsWorkbench;
+  const evaluateProduction = services.refreshProductionEvidence || refreshProductionEvidence;
   const uniqueDocuments = [...new Map((documents || [])
     .filter((document) => document?.mpsNumber)
     .map((document) => [document.mpsNumber, document])).values()];
@@ -76,24 +82,47 @@ async function runAutomaticMpsEvaluation(prisma, documents = [], options = {}, s
     }
 
     try {
+      const evidence = await evaluateProduction(prisma, document.mpsNumber, options);
+      item.productionEvidence = { ...evidence, completed: evidence.failedPhaseCount === 0 };
+      if (!item.productionEvidence.completed) item.productionEvidence.message = `${evidence.failedPhaseCount} fase produksi gagal dievaluasi; buka checksheet untuk detail error.`;
+    } catch (error) {
+      item.productionEvidence = { completed: false, ...errorSummary(error) };
+    }
+
+    try {
       const month = planningMonthKey(document.periodStart || options.planningAnchorMonth);
       if (!month) throw Object.assign(new Error("Periode MPS tidak tersedia untuk checklist."), { code: "MPS_PERIOD_MISSING" });
       const workbench = await readWorkbench(prisma, {
         month,
         page: 1,
         pageSize: 100,
-        includeSimulation: true,
+        allItemsForEvaluation: true,
+        includeFeasibilityDetail: true,
       });
+      if (workbench?.mps?.mpsNumber !== document.mpsNumber || !workbench.feasibilitySummary
+        || (document.revision != null && Number(document.revision) !== Number(workbench.mps.revision))) {
+        throw Object.assign(new Error("Dokumen/revisi MPS berubah saat pemeriksaan; hitung ulang checklist revisi aktif."), { code: "MPS_CHECKLIST_REVISION_CHANGED" });
+      }
       item.checklist = {
-        completed: true,
+        completed: item.productionEvidence.completed && Number(workbench.feasibilitySummary.notCheckedCount || 0) === 0 && Number(workbench.feasibilitySummary.missingDataCount || 0) === 0,
+        attempted: true,
         status: workbench?.feasibilitySummary?.status || "NOT_EVALUATED",
         okCount: Number(workbench?.feasibilitySummary?.okCount) || 0,
         totalCount: Number(workbench?.feasibilitySummary?.totalCount) || 0,
         failCount: Number(workbench?.feasibilitySummary?.failCount) || 0,
         warningCount: Number(workbench?.feasibilitySummary?.warningCount) || 0,
         notCheckedCount: Number(workbench?.feasibilitySummary?.notCheckedCount) || 0,
+        missingDataCount: Number(workbench?.feasibilitySummary?.missingDataCount ?? workbench?.feasibilitySummary?.notCheckedCount) || 0,
+        checkedCount: Number(workbench?.feasibilitySummary?.checkedCount) || 0,
+        missingFields: workbench?.feasibilitySummary?.missingFields || [],
         evaluatedAt: workbench?.generatedAt || null,
       };
+      if (!item.checklist.completed) {
+        item.checklist.code = "MPS_CHECKLIST_DATA_INCOMPLETE";
+        item.checklist.message = item.productionEvidence.completed
+          ? `${item.checklist.missingDataCount} area masih memerlukan data sumber; lengkapi datanya lalu klik Periksa Checksheet.`
+          : "Sebagian pemeriksaan produksi gagal; periksa detail error lalu klik Periksa Checksheet kembali.";
+      }
     } catch (error) {
       item.checklist = { completed: false, ...errorSummary(error) };
     }
@@ -103,6 +132,7 @@ async function runAutomaticMpsEvaluation(prisma, documents = [], options = {}, s
   const failedSteps = items.reduce((count, item) => count
     + (item.rccp?.completed ? 0 : 1)
     + (item.delivery?.completed ? 0 : 1)
+    + (item.productionEvidence?.completed ? 0 : 1)
     + (item.checklist?.completed ? 0 : 1), 0);
   return {
     mode: "AUTOMATIC_ON_MPS_CALCULATION",

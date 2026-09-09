@@ -51,7 +51,7 @@ assert.equal(converted.unitPrice, 30000, "harga vendor harus dikonversi ke IDR s
 const controller = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/mbom/BOMController.js"), "utf8");
 const liveCost = fs.readFileSync(path.join(__dirname, "../src/prisma/services/mbomLiveCostingService.js"), "utf8");
 const report = fs.readFileSync(path.join(__dirname, "../src/prisma/services/mbomReportService.js"), "utf8");
-const frontend = fs.readFileSync(path.join(__dirname, "../../frontend/public/js/bom-table-editor.js"), "utf8");
+const frontend = fs.readFileSync(path.join(__dirname, "../../renbo-mfg-frontend/public/js/bom-table-editor.js"), "utf8");
 
 assert(controller.includes("normalizeVendorRoutingDetails"), "payload vendor lama harus dinormalisasi ke routing");
 assert(controller.includes("entityVendorProcess.findFirst"), "backend harus memvalidasi vendor eligible");

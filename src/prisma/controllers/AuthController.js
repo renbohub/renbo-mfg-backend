@@ -5,6 +5,8 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const { prisma } = require("../index");
 const { normalizeEmail, normalizeUsername } = require("../utils/strictIdentifiers");
+const { publicAccess } = require('../middleware/partnerAccess');
+const USER_PARTNER_INCLUDE = { include: { supplier: { select: { supplierName: true } }, vendor: { select: { vendorName: true } } } };
 const JWT_SECRET = process.env.JWT_SECRET || "secret-key";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN; // e.g. '30d', '3600', or 'unlimited' to disable expiry
 
@@ -109,6 +111,7 @@ function mapUserConflictToResponse(conflict, { username, email } = {}) {
 // Reusable untuk mapping return user
 function mapUser(user) {
   if (!user) return null;
+  if (user.partnerAccess) return { id: user.id, username: user.username, fullName: user.fullName, email: user.email, partnerAccess: publicAccess(user.partnerAccess), isSuperAdmin: false, roles: [], listMenu: [], effectivePermissions: [], employee: null, employeeId: null };
   const roleAssignments = (user.roleAssignments || []).filter(
     (assignment) => assignment.role?.isActive && !assignment.role?.isDeleted,
   );
@@ -166,6 +169,7 @@ const USER_EMPLOYEE_SELECT = {
 };
 
 const USER_PUBLIC_SELECT = {
+  partnerAccess: USER_PARTNER_INCLUDE,
   id: true,
   username: true,
   fullName: true,
@@ -258,9 +262,10 @@ exports.login = async (req, res, next) => {
       include: {
         employee: { select: USER_EMPLOYEE_SELECT },
         roleAssignments: USER_ROLE_INCLUDE,
+        partnerAccess: USER_PARTNER_INCLUDE,
       },
     });
-    if (!user) {
+    if (!user || user.isDeleted) {
       return res.status(401).json({
         code: 'AUTH_USER_NOT_FOUND',
         message: 'Username or email not found',
@@ -317,7 +322,7 @@ exports.updateProfile = async (req, res, next) => {
     if (!userId) return res.status(401).json({ message: "No user context" });
 
     // mencegah perubahan privileged fields
-    const privileged = ["isSuperAdmin", "isDeleted", "password"];
+    const privileged = ["isSuperAdmin", "isDeleted", "password", "partnerAccess", "roleAssignments", "listMenu"];
     for (const p of privileged) {
       if (typeof req.body[p] !== "undefined") {
         return res.status(403).json({ message: `Forbidden: cannot change ${p}` });
@@ -495,6 +500,7 @@ exports.getByEmail = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
+    if (Object.hasOwn(req.body, 'partnerAccess')) return res.status(403).json({ message: 'Kelola binding melalui administrasi portal partner.' });
     if (typeof req.body.username !== "undefined") {
       req.body.username = normalizeUsername(req.body.username);
       if (!req.body.username) {

@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const { consumeDeliveryTargets, planningPolicy } = require("./demandConsumptionService");
 const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");
@@ -15,7 +16,7 @@ const unique = (values) => [...new Set(values.filter(Boolean))];
 
 function validYear(value) {
   const year = Number.parseInt(value, 10);
-  const current = new Date().getUTCFullYear();
+  const current = businessNow().getUTCFullYear();
   return Number.isInteger(year) && year >= 2000 && year <= current + 10 ? year : current;
 }
 

@@ -9,7 +9,15 @@ router.patch("/work-centers/bulk-remove", authorize("machines", "delete"), logge
 router.patch("/work-centers/:key/remove", authorize("machines", "delete"), logger("work-center", "remove"), ctrl.removeWorkCenter);
 router.patch("/work-centers/:key", authorize("machines", "update"), logger("work-center", "update"), ctrl.updateWorkCenter);
 router.get("/routings", authorize("mbom", "read"), ctrl.listRoutings);
+router.get('/routing-options', authorize('mbom','read'), ctrl.routingOptions);
+router.get('/parts/:partKey/routing-options', authorize('parts','read'), ctrl.routingOptions);
+router.get('/parts/:partKey/routings', authorize('parts','read'), ctrl.partRoutings);
+router.post('/parts/:partKey/routings', authorize('parts','update'), logger('routing','create'), ctrl.createRouting);
+router.patch('/parts/:partKey/routings/:key', authorize('parts','update'), logger('routing','update'), ctrl.updateRouting);
+router.delete('/parts/:partKey/routings/:key', authorize('parts','update'), logger('routing','remove'), ctrl.removeRouting);
 router.get("/routings/:key", authorize("mbom", "read"), ctrl.getRouting);
 router.post("/routings", authorize("mbom", "create"), logger("routing", "create"), ctrl.createRouting);
+router.patch('/routings/:key', authorize('mbom','update'), logger('routing','update'), ctrl.updateRouting);
+router.delete('/routings/:key', authorize('mbom','delete'), logger('routing','remove'), ctrl.removeRouting);
 router.patch("/mbom-processes/:id/link", authorize("mbom", "update"), logger("mbom-process", "link-routing"), ctrl.linkMbomProcess);
 module.exports = router;

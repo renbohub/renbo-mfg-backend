@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { replaceDeliveryTargets, assertCompleteDeliveryTargets, markDownstreamDemandChange } = require("../../services/planning/demandDeliveryTargetService");
@@ -16,7 +17,7 @@ const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const isGeneratedProcess = (row) => String(row?.notes || "").startsWith("[MRP-PRODUCTION]");
 
 async function nextNumber(tx = prisma) {
-  const year = new Date().getFullYear(); const prefix = `FCT-${year}-`;
+  const year = businessNow().getFullYear(); const prefix = `FCT-${year}-`;
   const rows = await tx.forecast.findMany({ where: { forecastNumber: { startsWith: prefix } }, select: { forecastNumber: true } });
   const max = rows.reduce((value, row) => Math.max(value, Number(row.forecastNumber.slice(prefix.length)) || 0), 0);
   return `${prefix}${String(max + 1).padStart(3, "0")}`;
@@ -346,7 +347,7 @@ exports.monthlyConsumption = async (req, res, next) => {
     // Capacity preview intentionally uses the same production snapshot as the
     // Capacity Planning page. Only the three nearest current/future buckets
     // are calculated so Consume Forecast remains responsive.
-    const currentMonth = monthKey(new Date());
+    const currentMonth = monthKey(businessNow());
     const capacityItems = items.filter((row) => row.month >= currentMonth && (number(row.forecastQty) > 0 || number(row.actualSalesOrderQty) > 0 || number(row.productionTargetQty) > 0)).slice(0, 3);
     const mpsNumbers = capacityItems.map((row) => row.mpsNumber).filter(Boolean);
     const productionPlans = mpsNumbers.length ? await prisma.monthlyProductionPlan.findMany({

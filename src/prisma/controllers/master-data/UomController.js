@@ -72,7 +72,7 @@ exports.get = async (req, res, next) => {
   try {
     const uomCode = normalizeUomCode(req.params.uomCode);
     const doc = await prisma.uom.findFirst({
-      where: { uomCode, isDeleted: false },
+      where: { uomCode: { equals: uomCode, mode: "insensitive" }, isDeleted: false },
     });
     if (!doc) return res.status(404).json({ message: "UOM not found" });
     res.json(mapDoc(doc));

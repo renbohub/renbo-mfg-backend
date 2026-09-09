@@ -1,4 +1,5 @@
 const { prisma } = require("../../index");
+const { assertGenericApprovalAllowed } = require("../../services/sales/salesApprovalBoundary");
 const {
   ACTIVE_REQUEST_STATUSES,
   REQUEST_INCLUDE,
@@ -75,6 +76,7 @@ exports.byDocument = async (req, res, next) => {
 exports.submit = async (req, res, next) => {
   try {
     const input = req.body || {};
+    assertGenericApprovalAllowed(input);
     const rule = await resolveApprovalRule({
       moduleCode: input.moduleCode,
       pageCode: input.pageCode,
@@ -108,6 +110,8 @@ exports.submit = async (req, res, next) => {
 
 async function act(req, res, next, decision) {
   try {
+    const request = await prisma.approvalRequest.findFirst({ where: { requestNumber: req.params.requestNumber, isDeleted: false } });
+    assertGenericApprovalAllowed(request);
     const result = await prisma.$transaction((tx) => processApprovalAction({
       requestNumber: req.params.requestNumber,
       user: req.user,
@@ -132,6 +136,8 @@ exports.reject = (req, res, next) => act(req, res, next, "Rejected");
 
 exports.cancel = async (req, res, next) => {
   try {
+    const request = await prisma.approvalRequest.findFirst({ where: { requestNumber: req.params.requestNumber, isDeleted: false } });
+    assertGenericApprovalAllowed(request);
     const result = await prisma.approvalRequest.updateMany({
       where: {
         requestNumber: req.params.requestNumber,
@@ -144,6 +150,7 @@ exports.cancel = async (req, res, next) => {
     if (!result.count) return res.status(404).json({ message: "Request aktif tidak ditemukan atau bukan milik user." });
     res.json({ ok: true });
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     next(error);
   }
 };

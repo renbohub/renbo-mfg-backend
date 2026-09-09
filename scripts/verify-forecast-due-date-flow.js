@@ -3,6 +3,7 @@ const path = require("path");
 const controller = require("../src/prisma/controllers/planning/MRPController");
 const { DEFAULT_FORMULAS, evaluateFormula } = require("../src/prisma/services/masterFormulaService");
 const { procurementSchedule } = require("../src/prisma/services/planning/procurementSchedulingService");
+const { resolveProductionRequirementDates } = require("../src/prisma/services/planning/mrpDueDateService");
 const { resolveBufferBaseQty, customerDeliveryTargets } = require("../src/prisma/services/planning/monthlyPlanningService");
 const { buildLedger, isCustomerDeliveryPhase } = require("../src/prisma/services/planning/mpsWorkbenchService");
 const mrpControllerSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MRPController.js"), "utf8");
@@ -67,7 +68,19 @@ const pegging = controller.__test.demandPeggingForPhase({
 check("MRP delivery-phase pegging safely converts numeric quantities", pegging.length === 1 && pegging[0].qty === 25.5);
 const phasedPurchaseDates = await procurementSchedule({ materialRequiredDate: "2026-09-15T00:00:00.000Z", supplierLeadTimeDays: 7, asOf: "2026-08-11T00:00:00.000Z" });
 check("Procurement schedule is solved by CP-SAT with ordered milestones", phasedPurchaseDates.solver?.engine === "OR_TOOLS_WASM_CP_SAT" && phasedPurchaseDates.solver?.milestones?.length === 6 && phasedPurchaseDates.latestPrDate < phasedPurchaseDates.latestPoDate && phasedPurchaseDates.latestPoDate < phasedPurchaseDates.supplierRequiredArrivalDate);
-check("dependent production schedule uses the OR-Tools backward calendar", /productionSchedule\s*=\s*orderType\s*===\s*"Production"[\s\S]*resolveProductionRequirementDates[\s\S]*scheduleSource:\s*orderType\s*===\s*"Production"/.test(mrpControllerSource));
+// Customer-supplied material now has its own scheduleSource branch. Exercise
+// the production scheduling service instead of assuming a flat ternary string.
+const dependentProductionDates = await resolveProductionRequirementDates({
+  fgRequiredDate: "2026-09-21T00:00:00.000Z",
+  customerTargetDate: "2026-09-22T00:00:00.000Z",
+  routingMetric: { productionLeadTimeDays: 2, workingHoursPerDay: 8 },
+});
+check("dependent production schedule uses the OR-Tools backward calendar",
+  dependentProductionDates.solver?.engine === "OR_TOOLS_WASM_CP_SAT"
+    && dependentProductionDates.productionLatestStartDate < dependentProductionDates.fgRequiredDate
+    && dependentProductionDates.materialRequiredDate.getTime() === dependentProductionDates.productionLatestStartDate.getTime()
+    && mrpControllerSource.includes('? await resolveProductionRequirementDates({')
+    && mrpControllerSource.includes('productionSchedule?.solver?.engine || "OR_TOOLS_WASM_CP_SAT"'));
 const materialAliasA = { itemType: "RAW", rawType: "MATERIAL", materialId: "material-1", material: { materialCode: "SPHC" } };
 const materialAliasB = { ...materialAliasA };
 check("Raw part aliases share one planning stock key", controller.__test.planningStockKey("RAW-A", materialAliasA) === controller.__test.planningStockKey("RAW-B", materialAliasB));
@@ -154,11 +167,23 @@ const explodeSource = mrpSource.slice(explodeStart, explodeStart + 30000);
 const hybridSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/hybridMrpService.js"), "utf8");
 const monthlySource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/services/planning/monthlyPlanningService.js"), "utf8");
 const mpsSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/planning/MPSController.js"), "utf8");
-const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/ppic-detail.js"), "utf8");
+const ppicDetailSource = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/ppic-detail.js"), "utf8");
 const suggestionSource = fs.readFileSync(path.resolve(__dirname, "../src/prisma/controllers/purchasing/PurchaseSuggestionController.js"), "utf8");
 check("MBOM explosion no longer references out-of-scope MPS precheck", !explodeSource.includes("mpsPrecheck"));
 check("Raw material follows the parent net production driver", explodeSource.includes("const parentOutputMap = netOutputQtyByMbomDetailId") && !explodeSource.includes("relatedSourceCodes.has(sourceCode)"));
-check("Shared material stock is pooled once across part aliases", mrpSource.includes("function planningStockKey") && explodeSource.includes("_planningStockKey: stockKey") && mrpSource.includes("rowsBySupply"));
+// Explosion selects either the customer-owned pool or the common material
+// pool. Verify common RAW aliases consume a single opening balance in FIFO.
+const sharedStockKey = controller.__test.planningStockKey("RAW-A", materialAliasA);
+const aliasDemands = [
+  { id: "alias-a", partCode: "RAW-A", _planningStockKey: sharedStockKey, grossRequirement: 80, requiredDate: new Date("2026-09-15T00:00:00.000Z") },
+  { id: "alias-b", partCode: "RAW-B", _planningStockKey: controller.__test.planningStockKey("RAW-B", materialAliasB), grossRequirement: 80, requiredDate: new Date("2026-09-20T00:00:00.000Z") },
+];
+await controller.__test.applyTimePhasedPurchaseNetting(aliasDemands, [], {
+  initialStockAvailableMap: { [sharedStockKey]: 100 }, asOf: "2026-08-11T00:00:00.000Z",
+});
+check("Shared material stock is pooled once across part aliases",
+  aliasDemands[0].netRequirement === 0 && aliasDemands[1].netRequirement === 60
+    && aliasDemands.reduce((sum, row) => sum + row.plannedOrderQty, 0) === 60);
 check("Failed net-change leaves dirty item in Failed status", hybridSource.includes('status: failedCount > 0 ? "Failed" : "Done"'));
 check("Monthly MPS sync invalidates previous downstream plans", monthlySource.includes("invalidateDownstreamPlans(tx, changedMpsNumbers"));
 check("Monthly MPS removes stale MRP-generated child rows", monthlySource.includes('notes: { startsWith: "[MRP-PRODUCTION]" }') && monthlySource.includes("data: { isDeleted: true }"));

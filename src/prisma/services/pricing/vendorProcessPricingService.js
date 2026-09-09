@@ -1,7 +1,7 @@
 "use strict";
 
 const {
-  legacyPriceValue,
+  nullablePriceValue,
   resolveEffectiveRecord,
 } = require("./effectivePriceService");
 
@@ -46,7 +46,8 @@ function resolveVendorProcessPrice(options = {}) {
   const detail = (priceList.details || []).find((item) => vendorProcessMatches(item, process)) || null;
   if (!detail) return null;
 
-  const originalUnitPrice = legacyPriceValue(detail, costingDate);
+  const price = nullablePriceValue({ ...detail, pricingYear: priceList.pricingYear, effectiveFrom: priceList.effectiveFrom }, costingDate);
+  const originalUnitPrice = price ?? 0;
   const currencyCode = priceList.currencyCode || "IDR";
   const exchangeRate = currencyCode === "IDR" ? 1 : number(currencyRates.get(currencyCode)) || 1;
   return {
@@ -57,7 +58,7 @@ function resolveVendorProcessPrice(options = {}) {
     currencyCode,
     exchangeRate,
     uomCode: detail.uomCode || priceList.uomCode || "PCS",
-    found: originalUnitPrice > 0,
+    found: price !== null && price >= 0,
   };
 }
 

@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const { buildCapacitySnapshot } = require("../../services/planning/capacityPlanningService");
 const { normalizePreset, loadPresetStore, savePresetStore, activePresetId } = require("../../services/planning/capacitySimulationPresetService");
@@ -13,7 +14,7 @@ const SCENARIO_DEFAULTS = {
   "simulation-2": { name: "Simulation 2", shifts: "2", hours: "8", overtime: "4", saturday: "true", sunday: "false", efficiency: "85", granularity: "WEEK", lookbackWeeks: "1", freezeDays: "1" },
 };
 const jakartaTodayKey = () => {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(businessNow());
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
 };

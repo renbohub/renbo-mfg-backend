@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const crypto = require("crypto");
 const { parsePeriod, buildLiveMonthlyDemand } = require("./monthlyDemandReviewService");
@@ -244,7 +245,7 @@ function listWhere(options, period) {
   else if (owner) where.ownerUserId = owner;
   if (["1", "TRUE", "YES"].includes(text(options.overdue).toUpperCase())) {
     where.status = { in: OPEN_STATUSES };
-    where.targetResolutionDate = { lt: new Date() };
+    where.targetResolutionDate = { lt: businessNow() };
   }
   const q = text(options.q);
   if (q) where.OR = [
@@ -256,7 +257,7 @@ function listWhere(options, period) {
   return where;
 }
 
-function compactItem(row, now = new Date()) {
+function compactItem(row, now = businessNow()) {
   return {
     ...row,
     overdue: Boolean(row.targetResolutionDate && OPEN_STATUSES.includes(row.status) && row.targetResolutionDate < now),
@@ -271,7 +272,7 @@ async function listExceptions(prisma, options = {}) {
   const where = listWhere(options, period);
   const baseWhere = { periodYear: period.year, periodMonth: period.month, isDeleted: false };
   const activeWhere = { ...baseWhere, sourceActive: true };
-  const now = new Date();
+  const now = businessNow();
   const [items, filtered, total, open, critical, overdue, unassigned, resolved, cleared, typeRows, users, snapshots] = await Promise.all([
     prisma.demandException.findMany({ where, skip: (page - 1) * pageSize, take: pageSize, orderBy: [{ sourceActive: "desc" }, { priority: "asc" }, { targetResolutionDate: "asc" }, { targetDeliveryDate: "asc" }, { exceptionNumber: "asc" }] }),
     prisma.demandException.count({ where }),
@@ -300,7 +301,7 @@ async function findException(prisma, id, includeActions = false) {
 async function getException(prisma, id) {
   const row = await findException(prisma, id, true);
   const recoveryPlan = row.sourceDeliveryTargetId ? await prisma.dueDateRecoveryPlan.findFirst({ where: { deliveryTargetId: row.sourceDeliveryTargetId, isCurrentPlan: true, isDeleted: false }, orderBy: { revision: "desc" } }) : null;
-  return { ...row, overdue: Boolean(row.targetResolutionDate && OPEN_STATUSES.includes(row.status) && row.targetResolutionDate < new Date()), recoveryPlan };
+  return { ...row, overdue: Boolean(row.targetResolutionDate && OPEN_STATUSES.includes(row.status) && row.targetResolutionDate < businessNow()), recoveryPlan };
 }
 
 async function updateAssignment(prisma, id, input, actor) {

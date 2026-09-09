@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const { mapDoc } = require("../../utils/mapDoc");
 
@@ -28,7 +29,7 @@ const aliases = (source, names) => {
   return null;
 };
 
-function dateMonth(value, fallbackYear = new Date().getFullYear()) {
+function dateMonth(value, fallbackYear = businessNow().getFullYear()) {
   if (!value) return null;
   if (value instanceof Date && !Number.isNaN(value.getTime())) return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), 1));
   const raw = String(value).trim();
@@ -42,7 +43,7 @@ function dateMonth(value, fallbackYear = new Date().getFullYear()) {
 
 function normalizeRow(row, fallback = {}) {
   const source = row?.sourceJson || row?.data || row || {};
-  const defaultYear = Number(fallback.defaultYear) || new Date().getFullYear();
+  const defaultYear = Number(fallback.defaultYear) || businessNow().getFullYear();
   const customerCode = text(aliases(source, ["customer code", "customer", "customer_code", "cust code", "cust"] ) || fallback.customerCode);
   const partCode = text(aliases(source, ["part code", "partcode", "part_code", "kode part", "kode internal"]));
   const partNumber = text(aliases(source, ["part number", "part no", "part no.", "partnumber", "part_number", "drawing number", "drawing no"]));
@@ -97,7 +98,7 @@ async function buildPreview(rows, fallback = {}) {
 }
 
 async function nextForecastNumber(tx) {
-  const year = new Date().getFullYear(); const prefix = `FCT-${year}-`;
+  const year = businessNow().getFullYear(); const prefix = `FCT-${year}-`;
   const rows = await tx.forecast.findMany({ where: { forecastNumber: { startsWith: prefix } }, select: { forecastNumber: true } });
   const max = rows.reduce((value, row) => Math.max(value, Number(row.forecastNumber.slice(prefix.length)) || 0), 0);
   return `${prefix}${String(max + 1).padStart(3, "0")}`;

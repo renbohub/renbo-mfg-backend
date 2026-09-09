@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { randomUUID } = require("crypto");
 const { prisma } = require("../../index");
 const {
@@ -377,7 +378,7 @@ function isValidLinkedMoSupply(mo, plannedOrderByNumber = new Map(), currentSoPl
   return true;
 }
 
-function buildSnapshotPrefix(date = new Date()) {
+function buildSnapshotPrefix(date = businessNow()) {
   const target = new Date(date);
   const year = target.getFullYear();
   const month = String(target.getMonth() + 1).padStart(2, "0");
@@ -385,7 +386,7 @@ function buildSnapshotPrefix(date = new Date()) {
   return `MRP-SNAP-${year}${month}${day}`;
 }
 
-async function generateSnapshotNumber(tx = prisma, date = new Date()) {
+async function generateSnapshotNumber(tx = prisma, date = businessNow()) {
   const prefix = `${buildSnapshotPrefix(date)}-`;
   const lastSnapshot = await tx.mRPPartialSnapshot.findFirst({
     where: { snapshotNumber: { startsWith: prefix } },
@@ -1055,7 +1056,7 @@ async function buildSupplyDemandSnapshot(tx, impactedTree, cutoffDate) {
   };
 }
 
-function buildDatePrefix(date = new Date()) {
+function buildDatePrefix(date = businessNow()) {
   const target = new Date(date);
   const year = target.getFullYear();
   const month = String(target.getMonth() + 1).padStart(2, "0");
@@ -1241,7 +1242,7 @@ async function cleanupSupersededMrpArtifacts(tx = prisma, options = {}) {
   return summary;
 }
 
-async function generateRunNumber(tx = prisma, date = new Date()) {
+async function generateRunNumber(tx = prisma, date = businessNow()) {
   const prefix = `${buildDatePrefix(date)}-`;
   const lastRun = await tx.mRPRun.findFirst({
     where: { runNumber: { startsWith: prefix } },
@@ -1258,7 +1259,7 @@ async function generateRunNumber(tx = prisma, date = new Date()) {
   return `${prefix}${String(nextSeq).padStart(3, "0")}`;
 }
 
-async function generatePlannedOrderNumber(tx = prisma, orderType, date = new Date()) {
+async function generatePlannedOrderNumber(tx = prisma, orderType, date = businessNow()) {
   const target = new Date(date);
   const year = target.getFullYear();
   const month = String(target.getMonth() + 1).padStart(2, "0");
@@ -1304,7 +1305,7 @@ async function generatePlannedOrderNumber(tx = prisma, orderType, date = new Dat
   return `${prefix}${String(nextSeq).padStart(4, "0")}`;
 }
 
-async function createPlannedOrderSequencer(tx = prisma, date = new Date()) {
+async function createPlannedOrderSequencer(tx = prisma, date = businessNow()) {
   const target = new Date(date);
   const year = target.getFullYear();
   const month = String(target.getMonth() + 1).padStart(2, "0");
@@ -1384,7 +1385,7 @@ async function expandImpactedItemIds(tx = prisma, dirtyItemIds = []) {
   return [...impacted];
 }
 
-async function rebuildPartialSnapshot(tx = prisma, dirtyItemIds = [], cutoffDate = new Date()) {
+async function rebuildPartialSnapshot(tx = prisma, dirtyItemIds = [], cutoffDate = businessNow()) {
   const impactedTree = await buildBomImpactTree(tx, dirtyItemIds);
   const snapshot = await buildSupplyDemandSnapshot(tx, impactedTree, cutoffDate);
   return {
@@ -1395,7 +1396,7 @@ async function rebuildPartialSnapshot(tx = prisma, dirtyItemIds = [], cutoffDate
 
 async function persistPartialSnapshot(tx = prisma, payload = {}) {
   const {
-    snapshotDate = new Date(),
+    snapshotDate = businessNow(),
     cutoffDate = null,
     dirtyCount = 0,
     impactedCount = 0,
@@ -1504,7 +1505,7 @@ async function findMpsDetailPartCodes(tx = prisma, mpsNumber) {
   return uniq(details.map((detail) => normalizePartCode(detail.partCode)));
 }
 
-async function findActiveMbomForPart(tx = prisma, partId, targetDate = new Date()) {
+async function findActiveMbomForPart(tx = prisma, partId, targetDate = businessNow()) {
   if (!partId) return null;
   const validDate = new Date(targetDate);
 
@@ -1793,7 +1794,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
 
   const planNumber = buildSoPlanNumber(soNumber);
   const runNumber = await generateRunNumber(tx);
-  const cutoffDate = soHeader.deliveryDate || soHeader.soDate || new Date();
+  const cutoffDate = soHeader.deliveryDate || soHeader.soDate || businessNow();
   const planHorizon = buildSoPlanHorizonDays(soHeader.soDate, cutoffDate);
   try {
     const previousPlanRuns = planNumber
@@ -1895,7 +1896,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
         data: {
           runNumber,
           ...planIdentity,
-          runDate: new Date(),
+          runDate: businessNow(),
           planHorizon,
           cutoffDate,
           status: "Running",
@@ -1908,7 +1909,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
         where: { runNumber },
         data: {
           ...planIdentity,
-          runDate: new Date(),
+          runDate: businessNow(),
           planHorizon,
           cutoffDate,
           status: "Running",
@@ -1922,7 +1923,7 @@ async function runSoOnlyMrp(tx = prisma, soNumber, options = {}) {
     const requirements = [];
     for (const detail of targetDetails) {
       const partCode = normalizePartCode(detail.partCode);
-      const requiredDate = detail.deliveryDate || soHeader.deliveryDate || soHeader.soDate || new Date();
+      const requiredDate = detail.deliveryDate || soHeader.deliveryDate || soHeader.soDate || businessNow();
       const effectiveDemandQty = Math.max(Number(detail.qty || 0) - Number(detail.qtyDelivered || 0), 0);
       const bufferedDemand = applyBufferStockPercent(effectiveDemandQty, detail.part);
       const grossRequirement = bufferedDemand.grossRequirement;
@@ -2200,7 +2201,7 @@ async function buildOpenSoOnlyTargets(tx = prisma) {
   return targets;
 }
 
-async function invokeExistingMrpRun(mpsNumber, runDate = new Date(), runBy = "system", options = {}) {
+async function invokeExistingMrpRun(mpsNumber, runDate = businessNow(), runBy = "system", options = {}) {
   const controller = require("../../controllers/planning/MRPController");
   const runNumber = await generateRunNumber(prisma, runDate);
   const soDemandPartCodes = Array.isArray(options.soDemandPartCodes)
@@ -2245,7 +2246,7 @@ async function invokeExistingMrpRun(mpsNumber, runDate = new Date(), runBy = "sy
 }
 
 async function runFullNightlyMrp(tx = prisma, options = {}) {
-  const { runBy = "system", runDate = new Date() } = options;
+  const { runBy = "system", runDate = businessNow() } = options;
   const monthlySync = await syncMonthlyMps(tx, { runBy });
   const coveredSoNumbers = new Set(monthlySync.coveredSoNumbers);
   const allSoOnlyTargets = await buildOpenSoOnlyTargets(tx);
@@ -2374,7 +2375,7 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
   const dirtyItemIds = dirtyItems.map((item) => item.itemId);
   const impactedTree = await buildBomImpactTree(tx, dirtyItemIds);
   const impactedItemIds = impactedTree.map((node) => node.itemId);
-  const snapshot = await buildSupplyDemandSnapshot(tx, impactedTree, new Date());
+  const snapshot = await buildSupplyDemandSnapshot(tx, impactedTree, businessNow());
   const impactedMpsNumbers = await findImpactedMpsNumbers(tx, impactedItemIds);
   const candidateMpsNumbers = uniq(impactedMpsNumbers);
   const candidateMpsRows = candidateMpsNumbers.length
@@ -2418,7 +2419,7 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
   for (const mpsNumber of mpsNumbers) {
     try {
       const mpsPartCodes = await findMpsDetailPartCodes(tx, mpsNumber);
-      const result = await invokeExistingMrpRun(mpsNumber, new Date(), runBy, {
+      const result = await invokeExistingMrpRun(mpsNumber, businessNow(), runBy, {
         soDemandPartCodes: mpsPartCodes,
       });
       results.push(result);
@@ -2433,8 +2434,8 @@ async function runPartialNetChangeMrp(tx = prisma, options = {}) {
 
   const failedCount = results.filter((result) => result && result.ok === false).length;
   const partialSnapshot = await persistPartialSnapshot(tx, {
-    snapshotDate: new Date(),
-    cutoffDate: new Date(),
+    snapshotDate: businessNow(),
+    cutoffDate: businessNow(),
     status: failedCount > 0 ? "Failed" : "Completed",
     dirtyCount: dirtyItems.length,
     impactedCount: impactedItemIds.length,

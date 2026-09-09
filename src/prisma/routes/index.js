@@ -147,11 +147,22 @@ function registerRoutes(app) {
 
   api.use(licenseGuard());
 
+  // Date-only configuration is also read by the server-rendered frontend.
+  api.get("/system/current-date", require("../controllers/SystemSettingController").getCurrentDate);
+
   // Auth routes (no auth required)
   api.use("/auth", authRouter);
 
+  api.use(require("../utils/businessClock").clockMiddleware(require("../index").prisma));
+
   // Protected routes (require auth)
+  api.use("/home", auth, require("./home"));
+  api.use("/master-data/hmi-reasons", auth, require("./master-data/hmi-reasons"));
   api.use("/users", auth, userRouter);
+  const partnerDb = require("../index").prisma;
+  api.use("/partner-portal", auth, require("./incoming/partner-portal").createPartnerPortalRouter(partnerDb));
+  api.use("/incoming/partner-admin", auth, require("./incoming/partner-admin").createPartnerAdminRouter(partnerDb));
+  api.use("/incoming", auth, require("./incoming/documents-checklist").createIncomingEvidenceRouter(partnerDb));
   api.use("/logs", auth, logsRouter);
   api.use("/page-context", auth, pageContextRouter);
   api.use("/ai", auth, createDefaultAiRouter());
@@ -187,6 +198,8 @@ function registerRoutes(app) {
   api.use("/master-data/price-list", auth, priceListRouter);
   api.use("/master-data/customer-part-prices", auth, customerPartPricesRouter);
   api.use("/master-data/dies", auth, diesRouter);
+  api.use("/master-data/qd-types", auth, require('./master-data/qd-tooling')('types'));
+  api.use("/master-data/qd-units", auth, require('./master-data/qd-tooling')('units'));
   api.use("/master-data/dies-part", auth, diesPartsRouter);
   api.use("/master-data/dies-maintenance", auth, diesMaintenanceRouter);
   api.use("/master-data/dies-usage", auth, diesUsageRouter);
@@ -207,6 +220,7 @@ function registerRoutes(app) {
   api.use("/dashboard/control-tower", auth, controlTowerRouter);
   api.use("/dashboard/executive", auth, executiveDashboardRouter);
   api.use("/incoming", auth, incomingTransactionRouter);
+  api.use("/incoming/customer-supplies", auth, require("./incoming/customer-supplies"));
   api.use("/outgoing", auth, outgoingTransactionRouter);
 
   // Engineering (EBOM) routes
@@ -243,6 +257,7 @@ function registerRoutes(app) {
   api.use("/purchasing/purchase-order", auth, purchaseOrderRouter);
   api.use("/purchasing/purchase-requisitions", auth, purchaseRequisitionsRouter);
   api.use("/purchasing/purchase-suggestions", auth, purchaseSuggestionsRouter);
+  api.use("/purchasing/eta-monitor", auth, require("./purchasing/eta-monitor"));
   api.use("/purchasing/purchase-invoices", auth, purchaseInvoicesRouter);
 
   // Incoming routes

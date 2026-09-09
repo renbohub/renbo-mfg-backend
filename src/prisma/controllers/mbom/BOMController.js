@@ -1,5 +1,8 @@
 const { prisma } = require("../../index");
+const { resolveRoutingMachinePolicy } = require("../../services/planning/routingMachinePolicy");
+const { resolveRoutingExecutionPolicy, loadRoutingExecutionContext } = require("../../services/planning/routingExecutionPolicy");
 const { buildSort } = require("../../utils/buildSort");
+const { latestBomHeaderIds } = require("../../utils/latestBomHeaders");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertNumericFields } = require("../../utils/numericConverter");
 const { notificationHelper } = require("../../utils/notificationHelper");
@@ -10,6 +13,9 @@ const { queueDirtyPartCodes } = require("../../utils/mrpDirtyQueue");
 const { buildMbomReport } = require("../../services/mbomReportService");
 const { validateBomGraphStructure, assertBomGraphStructure } = require("../../services/planning/solver/bomGraphValidationService");
 const { normalizeMaterialSupplyType, isCustomerSupplied } = require("../../utils/materialSupply");
+const { productionRevisionPolicy, attachBomCompleteness } = require("../../services/mbomGovernanceService");
+const { businessNow } = require("../../utils/businessClock");
+const { assertBomDiesPartRelations } = require("../../services/bomDiesPartService");
 
 // ============================================
 // REUSABLE INCLUDES & QUERIES
@@ -35,6 +41,7 @@ const MBOM_DETAIL_INCLUDE = {
     part: {
       include: {
         material: true,
+        supplier: true,
         mbomHeaders: {
           where: { isDeleted: false },
           orderBy: [{ revision: "desc" }, { updatedAt: "desc" }],
@@ -449,18 +456,22 @@ function prepareMBOMProcessData(process, noReg, mbomDetailId) {
     machineId: routingMode === "VENDOR" ? null : process.machineId || null,
     machineSpecificationCode: routingMode === "VENDOR" ? null : process.machineSpecificationCode || process.machine?.machineSpecificationCode || null,
     alternativeMachineIds: [],
+    ...(process.machinePlanningPolicy !== undefined ? { machinePlanningPolicy: process.machinePlanningPolicy || {} } : {}),
     diesId: process.diesId || null,
     routingMode,
     vendorId: routingMode === "VENDOR" ? process.vendorId : null,
     sequence: process.sequence || 0,
     cycleTime: process.cycleTime || 0,
-    notes: process.occurrenceCode || process.notes || null,
+    notes: process.notes || null,
     isDeleted: process.isDeleted ?? false,
   }, ['sequence', 'cycleTime']);
 }
 
 async function syncMBOMDetailProcesses(tx, detailId, noReg, processes) {
   if (!Array.isArray(processes)) return;
+  await assertBomDiesPartRelations(tx, detailId, processes);
+  let executionContext;
+  let executionDetail;
 
   const existingProcesses = await tx.mBOMProcess.findMany({
     where: { mbomDetailId: detailId },
@@ -479,6 +490,21 @@ async function syncMBOMDetailProcesses(tx, detailId, noReg, processes) {
   }
 
   for (const process of processes) {
+    if (process.machinePlanningPolicy?.execution !== undefined) {
+      executionContext ||= await loadRoutingExecutionContext(tx);
+      executionDetail ||= await tx.mBOMDetail.findUnique({ where: { id: detailId }, select: { partId: true } });
+      const execution = resolveRoutingExecutionPolicy({ ...process, mbomDetail: executionDetail }, executionContext);
+      if (execution.errors.length) throw badRequest(execution.errors.join(" "));
+    }
+    if (process.machinePlanningPolicy?.primaryMachineId && String(process.routingMode || "INHOUSE").toUpperCase() !== "VENDOR") {
+      const [machines, dies, detail] = await Promise.all([
+        tx.machine.findMany({ where: { isDeleted: false } }),
+        tx.dies.findMany({ where: { isDeleted: false }, include: { diesParts: true } }),
+        tx.mBOMDetail.findUnique({ where: { id: detailId }, select: { partId: true } }),
+      ]);
+      const result = resolveRoutingMachinePolicy({ ...process, mbomDetail: detail }, machines, dies);
+      if (result.errors.length) throw badRequest(result.errors.join(" "));
+    }
     if (String(process.routingMode || "INHOUSE").toUpperCase() === "VENDOR") {
       const routingProcess = await tx.process.findFirst({
         where: { id: process.processId, isDeleted: false },
@@ -512,7 +538,7 @@ async function syncMBOMDetailProcesses(tx, detailId, noReg, processes) {
         select: { id: true },
       });
       if (!representative) throw badRequest(`Machine Specification ${process.machineSpecificationCode} belum memiliki aset mesin.`);
-      process.machineId = representative.id;
+      process.machineId = process.machinePlanningPolicy?.primaryMachineId || representative.id;
     }
     process.alternativeMachineIds = [];
     const processData = prepareMBOMProcessData(process, noReg, detailId);
@@ -850,10 +876,10 @@ async function generateNoReg() {
 }
 
 // Helper: Get next revision untuk MBOM dengan partId yang sama
-async function getNextRevision(partId) {
+async function getNextRevision(partId, db = prisma) {
   if (!partId) return 1;
 
-  const lastMBOM = await prisma.mBOMHeader.findFirst({
+  const lastMBOM = await db.mBOMHeader.findFirst({
     where: { partId },
     orderBy: { revision: "desc" },
   });
@@ -863,17 +889,6 @@ async function getNextRevision(partId) {
 
 function getActor(req, fallback = "System") {
   return req.user?.username || req.user?.email || req.user?.id || fallback;
-}
-
-function shouldCreateNewRevision(body = {}, headerData = {}) {
-  return (
-    body.createNewRevision === true ||
-    headerData.createNewRevision === true ||
-    body.revisionMode === "newRevision" ||
-    headerData.revisionMode === "newRevision" ||
-    body.updateMode === "newRevision" ||
-    headerData.updateMode === "newRevision"
-  );
 }
 
 function getPreviousRevisionExpiryDate(effectiveDate) {
@@ -909,9 +924,9 @@ async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
   const partId = convertedHeader.partId !== undefined
     ? convertedHeader.partId || null
     : sourceHeader.partId || null;
-  const effectiveDate = headerData.effectiveDate !== undefined
+  const effectiveDate = headerData.effectiveDate
     ? parseLocalDateField(headerData.effectiveDate)
-    : new Date();
+    : businessNow();
   if (sourceHeader.effectiveDate && effectiveDate && effectiveDate <= sourceHeader.effectiveDate) {
     throw badRequest("Tanggal mulai revisi baru harus setelah tanggal mulai revisi sebelumnya.");
   }
@@ -923,7 +938,7 @@ async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
       uomCode: convertedHeader.uomCode !== undefined
         ? convertedHeader.uomCode || null
         : sourceHeader.uomCode || null,
-      revision: await getNextRevision(partId),
+      revision: await getNextRevision(partId, tx),
       revisionOfMbomId: sourceHeader.id,
       revisionNote,
       effectiveDate,
@@ -985,7 +1000,7 @@ async function createMBOMRevision(tx, sourceHeader, headerData, details, req) {
     }
   }
 
-  if (headerData.expirePreviousRevision !== false && headerData.expirePrevious !== false) {
+  {
     const previousExpiryDate = getPreviousRevisionExpiryDate(effectiveDate);
     if (previousExpiryDate) {
       await tx.mBOMHeader.update({
@@ -1014,6 +1029,17 @@ exports.list = async (req, res, next) => {
 
     if (partId) where.partId = partId;
 
+    // Choose the master revision before search/count/pagination, so searching an
+    // old registration number cannot bring a superseded revision back into view.
+    // Opt-in: historical reports and dated planning lookups keep their contract.
+    if (req.query.revisionScope === "LATEST") {
+      const candidates = await prisma.mBOMHeader.findMany({
+        where: { isDeleted: false, ...(partId ? { partId } : {}) },
+        select: { id: true, partId: true, revision: true, noReg: true, expiryDate: true, createdAt: true },
+      });
+      where.id = { in: latestBomHeaderIds(candidates) };
+    }
+
     if (q) {
       where.OR = buildMBOMSearchQuery(q);
     }
@@ -1032,8 +1058,10 @@ exports.list = async (req, res, next) => {
       prisma.mBOMHeader.count({ where }),
     ]);
 
+    const enriched = req.query.includeCompleteness === "true" && includeDetails !== "false"
+      ? await attachBomCompleteness(prisma, items, MBOM_HEADER_INCLUDE) : items;
     res.json({
-      items: items.map(mapDoc),
+      items: enriched.map(mapDoc),
       total,
       page: Number(page),
       limit: Number(limit),
@@ -1060,6 +1088,7 @@ exports.get = async (req, res, next) => {
     await assignProcessOccurrenceCodes(doc.details);
     const transformed = mapDoc(doc);
     transformed.sequenceInsertionPolicy = await getSequenceInsertionPolicy(doc);
+    transformed.revisionPolicy = await productionRevisionPolicy(prisma, doc);
     transformed.graphValidation = validateBomGraphStructure(doc);
     res.json(transformed);
   } catch (e) {
@@ -1070,6 +1099,20 @@ exports.get = async (req, res, next) => {
 exports.report = async (req, res, next) => {
   try { res.json(await buildMbomReport(prisma, req.params.noReg, { costingDate: req.query.costingDate })); }
   catch (error) { next(error); }
+};
+
+exports.history = async (req, res, next) => {
+  try {
+    const source = await prisma.mBOMHeader.findFirst({ where: { OR: [{ id: req.params.noReg }, { noReg: req.params.noReg }] }, select: { id: true, partId: true, part: true } });
+    if (!source) return res.status(404).json({ message: "BOM tidak ditemukan." });
+    const rows = await prisma.mBOMHeader.findMany({
+      where: { isDeleted: false, ...(source.partId ? { partId: source.partId } : { id: source.id }) },
+      select: { id: true, noReg: true, revision: true, revisionOfMbomId: true, revisionNote: true, effectiveDate: true, expiryDate: true, createdBy: true, createdAt: true, updatedAt: true, _count: { select: { details: { where: { isDeleted: false } } } } },
+      orderBy: [{ revision: "desc" }, { createdAt: "desc" }, { noReg: "desc" }],
+    });
+    const latestId = latestBomHeaderIds(rows.map(row => ({ ...row, partId: source.partId })))[0];
+    res.json({ part: source.part, items: rows.map(row => ({ ...row, isLatest: row.id === latestId })) });
+  } catch (error) { next(error); }
 };
 
 exports.create = async (req, res, next) => {
@@ -1223,49 +1266,17 @@ exports.update = async (req, res, next) => {
     // Extract header dan details dari payload
     const { header, details } = req.body;
     let headerData = header || req.body;
-    const createNewRevision = shouldCreateNewRevision(req.body, headerData);
+    let savedAsNewRevision = false;
     const hasHeaderUomCode = Object.prototype.hasOwnProperty.call(
       headerData,
       "uomCode"
     );
     const normalizedPayload = await normalizeMBOMUomCodes(headerData, details);
     headerData = normalizedPayload.headerData;
+    if (!hasHeaderUomCode) delete headerData.uomCode;
     const normalizedDetails = normalizeVendorRoutingDetails(normalizedPayload.details);
     assignProcessRoutingNumbers(normalizedDetails);
     await assignProcessOccurrenceCodes(normalizedDetails);
-
-    if (createNewRevision) {
-      const doc = await prisma.$transaction(async (tx) => {
-        const sourceHeader = await tx.mBOMHeader.findUnique({
-          where: { id: req.params.id },
-          include: MBOM_HEADER_INCLUDE,
-        });
-
-        if (!sourceHeader || sourceHeader.isDeleted) {
-          throw badRequest("MBOM Header not found");
-        }
-
-        const revision = await createMBOMRevision(tx, sourceHeader, headerData, normalizedDetails, req);
-        assertBomGraphStructure(revision);
-        await queueDirtyPartCodes(tx, [
-          revision.part?.partCode,
-          ...(revision.details || []).map((detail) => detail.part?.partCode),
-        ], {
-          reason: "BOM",
-          sourceNumber: revision.noReg,
-          notes: "Revisi mBOM dibuat; struktur kebutuhan MRP berubah.",
-        });
-        return revision;
-      });
-
-      try {
-        await notificationHelper.notifyMBOM("create", doc, getActor(req));
-      } catch (notifErr) {
-        console.error("Failed to send MBOM revision notification:", notifErr);
-      }
-
-      return res.status(201).json(mapDoc(doc));
-    }
 
     // Build data object - exclude immutable fields
     const {
@@ -1293,8 +1304,7 @@ exports.update = async (req, res, next) => {
     
     if (convertedRaw.partId !== undefined) data.partId = convertedRaw.partId || null;
     if (convertedRaw.uomCode !== undefined) data.uomCode = convertedRaw.uomCode || null;
-    // Revision identity is immutable. Structural changes must create a new
-    // MBOMHeader so historical MPS/MRP documents keep their original BOM.
+    // Revision identity is assigned by production usage, never a client number.
     if (rawData.effectiveDate !== undefined)
       data.effectiveDate = parseLocalDateField(rawData.effectiveDate);
     if (rawData.expiryDate !== undefined)
@@ -1303,17 +1313,20 @@ exports.update = async (req, res, next) => {
     if (rawData.isDeleted !== undefined) data.isDeleted = rawData.isDeleted;
 
     const doc = await prisma.$transaction(async (tx) => {
-      if (Array.isArray(normalizedDetails)) {
-        const [mpsUsage, salesUsage] = await Promise.all([
-          tx.mPSDetail.count({ where: { mbomHeaderId: req.params.id, isDeleted: false } }),
-          tx.salesOrderDetail.count({ where: { mbomHeaderId: req.params.id, isDeleted: false, status: { not: "Cancelled" } } }),
-        ]);
-        if (mpsUsage > 0 || salesUsage > 0) {
-          const error = new Error(`Revisi BOM ini sudah dipakai ${mpsUsage} baris MPS dan ${salesUsage} baris Sales Order. Simpan perubahan struktur sebagai revisi baru agar histori tidak berubah.`);
-          error.statusCode = 409;
-          error.code = "MBOM_REVISION_REQUIRED";
-          throw error;
-        }
+      const identity = await tx.mBOMHeader.findUnique({ where: { id: req.params.id }, select: { id: true, partId: true } });
+      if (!identity) throw badRequest("MBOM Header not found");
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`mbom-revision:${identity.partId || identity.id}`}))`;
+      const sourceHeader = await tx.mBOMHeader.findUnique({ where: { id: req.params.id }, include: MBOM_HEADER_INCLUDE });
+      if (!sourceHeader || sourceHeader.isDeleted) throw badRequest("MBOM Header not found");
+      const policy = await productionRevisionPolicy(tx, sourceHeader);
+      if (!policy.isLatest) throw Object.assign(new Error(`Revisi ini sudah menjadi riwayat. Edit BOM terbaru ${policy.latestNoReg}.`), { statusCode: 409 });
+      if (headerData.partId !== undefined && headerData.partId !== sourceHeader.partId) throw badRequest("Produk utama BOM yang sudah tersimpan tidak dapat diganti. Buat BOM untuk produk tersebut.");
+      if (policy.usedInProduction) {
+        const revision = await createMBOMRevision(tx, sourceHeader, { ...headerData, effectiveDate: headerData.effectiveDate || policy.nextEffectiveDate }, normalizedDetails, req);
+        assertBomGraphStructure(revision);
+        await queueDirtyPartCodes(tx, [revision.part?.partCode, ...(revision.details || []).map(detail => detail.part?.partCode)], { reason: "BOM", sourceNumber: revision.noReg, notes: "Revisi mBOM dibuat setelah BOM dipakai produksi." });
+        savedAsNewRevision = true;
+        return revision;
       }
       const updatedHeader = await tx.mBOMHeader.update({
         where: { id: req.params.id },
@@ -1436,12 +1449,12 @@ exports.update = async (req, res, next) => {
 
     // Send notification
     try {
-      await notificationHelper.notifyMBOM('update', doc, req.user?.username || 'System');
+      await notificationHelper.notifyMBOM(savedAsNewRevision ? 'create' : 'update', doc, req.user?.username || 'System');
     } catch (notifErr) {
       console.error('Failed to send MBOM notification:', notifErr);
     }
 
-    res.json(mapDoc(doc));
+    res.status(savedAsNewRevision ? 201 : 200).json({ ...mapDoc(doc), savedAsNewRevision });
   } catch (e) {
     console.error("MBOM Update Error:", e);
     if (e.statusCode) {

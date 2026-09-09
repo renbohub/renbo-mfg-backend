@@ -5,8 +5,8 @@ const path = require("path");
 const controller = fs.readFileSync(path.join(__dirname, "../src/prisma/controllers/mbom/BOMController.js"), "utf8");
 const routes = fs.readFileSync(path.join(__dirname, "../src/prisma/routes/mbom/bom.js"), "utf8");
 const service = fs.readFileSync(path.join(__dirname, "../src/prisma/services/mbomReportService.js"), "utf8");
-const frontend = fs.readFileSync(path.join(__dirname, "../../frontend/public/js/bom-report.js"), "utf8");
-const template = fs.readFileSync(path.join(__dirname, "../../frontend/views/bom/list.ejs"), "utf8");
+const frontend = fs.readFileSync(path.join(__dirname, "../../renbo-mfg-frontend/public/js/bom-report.js"), "utf8");
+const template = fs.readFileSync(path.join(__dirname, "../../renbo-mfg-frontend/views/bom/list.ejs"), "utf8");
 
 assert(controller.includes("buildMbomReport"));
 assert(routes.includes('/:noReg/report'));

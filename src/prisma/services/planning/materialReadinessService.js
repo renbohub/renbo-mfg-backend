@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const ACTIVE_PO_STATUSES = new Set([
   "Approved",
   "Sent",
@@ -297,7 +298,7 @@ async function buildMaterialReadinessSnapshot(prisma, planOrNumber) {
   const procurementSupplierByCode = new Map(
     procurementSuppliers.map((supplier) => [supplier.supplierCode, supplier]),
   );
-  const today = day(new Date());
+  const today = day(businessNow());
   const issues = [];
   const items = await Promise.all(orders.map(async (order) => {
     const linkedDetails = prDetails.filter((detail) => sourceNumbers(detail).has(order.orderNumber));

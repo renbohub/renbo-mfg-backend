@@ -129,7 +129,8 @@ assert.deepStrictEqual(deliveryTargetIdsFromMps({ details: [forecastFallbackDeta
 const mpsController = source("src/prisma/controllers/planning/MPSController.js");
 const mrpController = source("src/prisma/controllers/planning/MRPController.js");
 const workbenchService = source("src/prisma/services/planning/mpsWorkbenchService.js");
-const workbenchUi = source("../frontend/public/js/ppic-mps-workbench.js");
+const frontendRoot = fs.existsSync(path.join(root, "../renbo-mfg-frontend/public/js/ppic-mps-workbench.js")) ? "../renbo-mfg-frontend" : "../frontend";
+const workbenchUi = source(`${frontendRoot}/public/js/ppic-mps-workbench.js`);
 
 assert.match(mpsController, /assertMpsDeliveryApprovalAllowed/);
 assert.match(mrpController, /assertOfficialMpsDeliveryGate/);

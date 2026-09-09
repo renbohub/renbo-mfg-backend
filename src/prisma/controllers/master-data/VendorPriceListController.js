@@ -3,9 +3,13 @@ const { buildSort } = require("../../utils/buildSort");
 const { mapDoc } = require("../../utils/mapDoc");
 const { convertPriceListFields } = require("../../utils/numericConverter");
 const { deleteQuotationFile } = require("../../middleware/uploads");
+const { assertEligiblePricePart, eligibleVendorPartIds, priceEligibility } = require('../../services/pricing/bomVendorPartEligibility');
 const {
   normalizeEffectivePriceInput,
   createEffectiveVersion,
+  normalizeMonthlyPriceInput,
+  saveMonthlyPrice,
+  monthlyPriceView,
 } = require("../../services/pricing/effectivePriceService");
 
 const MONTH_FIELDS = [
@@ -77,6 +81,7 @@ const sanitizeVendorPriceListData = (data) => {
   });
   delete sanitized.treatments;
   delete sanitized.details;
+  for (const field of ["vendorId", "partId", "customerId"]) if (sanitized[field] === "") sanitized[field] = null;
 
   // Convert isDeleted ke Boolean
   if (sanitized.isDeleted !== undefined) {
@@ -125,7 +130,7 @@ const sanitizeVendorPriceListDetails = (rawDetails) => {
       return {
         vendorProcessId: data.vendorProcessId || data.id,
         sequence: Number(data.sequence) || index + 1,
-        unitPrice: Number.isFinite(Number(data.unitPrice)) ? Number(data.unitPrice) : null,
+        unitPrice: data.unitPrice != null && data.unitPrice !== "" && Number.isFinite(Number(data.unitPrice)) ? Number(data.unitPrice) : null,
         uomCode: data.uomCode || null,
         minimumOrderQty: Number.isFinite(Number(data.minimumOrderQty)) ? Number(data.minimumOrderQty) : null,
         orderMultipleQty: Number.isFinite(Number(data.orderMultipleQty)) ? Number(data.orderMultipleQty) : null,
@@ -245,8 +250,9 @@ exports.list = async (req, res, next) => {
       prisma.vendorPriceList.count({ where }),
     ]);
 
+    const eligibleIds=await eligibleVendorPartIds(prisma);
     res.json({
-      items: items.map(formatVendorPriceList),
+      items: items.map(item=>({...formatVendorPriceList(item),priceEligibility:priceEligibility(item.part,eligibleIds)})),
       total,
       page: Number(page),
       limit: Number(limit),
@@ -265,7 +271,9 @@ exports.get = async (req, res, next) => {
     if (!doc)
       return res.status(404).json({ message: "VendorPriceList not found" });
 
-    res.json(formatVendorPriceList(doc));
+    const eligibility=priceEligibility(doc.part,await eligibleVendorPartIds(prisma));
+    if (req.query.monthlyForm === "true") return res.json({...await monthlyPriceView(prisma, "vendorPriceList", doc),priceEligibility:eligibility});
+    res.json({...formatVendorPriceList(doc),priceEligibility:eligibility});
   } catch (e) {
     next(e);
   }
@@ -273,12 +281,14 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { details: rawDetails, ...priceListData } = req.body;
+    const input = req.body.pricingMode === "MONTHLY" ? normalizeMonthlyPriceInput(req.body, { vendor: true }) : req.body;
+    const { details: rawDetails, ...priceListData } = input;
     const details = sanitizeVendorPriceListDetails(rawDetails);
     const data = sanitizeVendorPriceListData({
       ...priceListData,
       createdBy: req.user?.username || req.user?.email || "system",
     });
+    if (req.body.pricingMode === "MONTHLY" && (!data.vendorId || !data.partId)) return res.status(400).json({ message: "Vendor dan part wajib dipilih." });
 
     // Map uploaded quotation files ke JSON array
     if (req.files?.quotationFiles?.length > 0) {
@@ -292,7 +302,8 @@ exports.create = async (req, res, next) => {
     }
 
     if (!data.effectiveFrom) return res.status(400).json({ message: "Tanggal berlaku mulai wajib diisi." });
-    const saved = await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+    const saveVersion = req.body.pricingMode === "MONTHLY" ? saveMonthlyPrice : createEffectiveVersion;
+    const saved = await prisma.$transaction(async (tx) => { await assertEligiblePricePart(tx,data); return saveVersion(tx, {
       model: "vendorPriceList",
       data,
       scopeWhere: {
@@ -302,7 +313,7 @@ exports.create = async (req, res, next) => {
         category: data.category,
         currencyCode: data.currencyCode || "IDR",
       },
-    }));
+    }); }, {isolationLevel:'Serializable'});
     const doc = await prisma.vendorPriceList.findUnique({
       where: { id: saved.id },
       include: includeVendorPriceList,
@@ -335,13 +346,15 @@ exports.update = async (req, res, next) => {
       return res.status(404).json({ message: "VendorPriceList not found" });
     }
 
+    const existingView = req.body.pricingMode === 'MONTHLY' ? await monthlyPriceView(prisma,'vendorPriceList',currentVendorPriceList) : null;
     const {
       details: rawDetails,
       existingQuotationFiles,
       ...priceListData
-    } = req.body;
+    } = req.body.pricingMode === "MONTHLY" ? normalizeMonthlyPriceInput({partId:currentVendorPriceList.partId,vendorId:currentVendorPriceList.vendorId,customerId:currentVendorPriceList.customerId,category:currentVendorPriceList.category,currencyCode:currentVendorPriceList.currencyCode,...req.body}, { vendor: true, existing:existingView }) : req.body;
     const details = rawDetails !== undefined ? sanitizeVendorPriceListDetails(rawDetails) : undefined;
     const data = sanitizeVendorPriceListData(priceListData);
+    if (req.body.pricingMode === "MONTHLY" && (!data.vendorId || !data.partId)) return res.status(400).json({ message: "Vendor dan part wajib dipilih." });
 
     // Hitung quotationFiles akhir: existing yang dipertahankan + file baru
     const dbFiles = Array.isArray(currentVendorPriceList.quotationFiles)
@@ -351,9 +364,7 @@ exports.update = async (req, res, next) => {
       const parsed = parseJsonField(existingQuotationFiles, null);
       return Array.isArray(parsed) ? parsed : dbFiles.map((f) => f.fileUrl);
     })();
-    dbFiles
-      .filter((f) => !keptUrls.includes(f.fileUrl))
-      .forEach((f) => deleteQuotationFile(f.fileUrl));
+    const removedFiles = dbFiles.filter((f) => !keptUrls.includes(f.fileUrl));
     const remaining = dbFiles.filter((f) => keptUrls.includes(f.fileUrl));
     const newFiles = (req.files?.quotationFiles ?? []).map(
       toQuotationFileRecord,
@@ -368,11 +379,13 @@ exports.update = async (req, res, next) => {
     }
 
     // Sekarang baru update
-    const doc = await prisma.vendorPriceList.update({
-      where: { id: req.params.id },
-      data,
-      include: includeVendorPriceList,
-    });
+    const doc = await prisma.$transaction(async tx => {
+      await assertEligiblePricePart(tx,{...data,partId:data.partId??currentVendorPriceList.partId});
+      return req.body.pricingMode === 'MONTHLY'
+        ? saveMonthlyPrice(tx,{model:'vendorPriceList',id:req.params.id,data,include:includeVendorPriceList,scopeWhere:{vendorId:data.vendorId||null,partId:data.partId||null,customerId:data.customerId||null,category:data.category,currencyCode:data.currencyCode||'IDR'}})
+        : tx.vendorPriceList.update({where:{id:req.params.id},data,include:includeVendorPriceList});
+    }, {isolationLevel:'Serializable'});
+    removedFiles.forEach(file=>deleteQuotationFile(file.fileUrl));
 
     res.json(formatVendorPriceList(doc));
   } catch (e) {
@@ -504,13 +517,14 @@ exports.bulkCreate = async (req, res, next) => {
         }
 
         // Create vendor price list baru
-        const saved = data.effectiveFrom
-          ? await prisma.$transaction((tx) => createEffectiveVersion(tx, {
+        delete data.partCode; delete data.vendorCode; delete data.customerCode;
+        const saved = await prisma.$transaction(async tx => { await assertEligiblePricePart(tx,data); return data.effectiveFrom
+          ? createEffectiveVersion(tx, {
               model: "vendorPriceList",
               data,
               scopeWhere: { vendorId: data.vendorId || null, partId: data.partId || null, customerId: data.customerId || null, category: data.category, currencyCode: data.currencyCode || "IDR" },
-            }))
-          : await prisma.vendorPriceList.create({ data });
+            })
+          : tx.vendorPriceList.create({ data }); }, {isolationLevel:'Serializable'});
         const doc = await prisma.vendorPriceList.findUnique({ where: { id: saved.id }, include: includeVendorPriceList });
 
         results.success.push(formatVendorPriceList(doc));

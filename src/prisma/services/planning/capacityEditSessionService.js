@@ -6,6 +6,7 @@ const { dependencyWindow } = require("./capacityQueueService");
 const { resolveDiesAssignment } = require("./diesCapacityService");
 const { syncVendorProcessDraftPrForPlan } = require("./vendorProcessPrService");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
+const { assertSameAllocationExecutor, assertNewAllocationExecutor } = require("./allocationExecutorGuard");
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const editorScopeForPlanStatus = (status) => ["Released", "In Progress"].includes(String(status)) ? "REPLAN" : "PLAN";
@@ -599,7 +600,7 @@ async function applyAllocateRemaining(tx, session, change, actor) {
     : [{ lineNumber: Number(value.lineNumber), qty: Number(value.qty || 0) }];
   const lineNumbers = [...new Set(requestedAllocations.map((allocation) => allocation.lineNumber))];
   const lines = await tx.monthlyProductionPlanDetail.findMany({ where: { planId: session.planId, lineNumber: { in: lineNumbers }, isDeleted: false, status: { not: "Cancelled" } } });
-  const route = await tx.mBOMProcess.findFirst({
+  let route = await tx.mBOMProcess.findFirst({
     where: { id: value.mbomProcessId, isDeleted: false },
     include: {
       machine: { select: { machineSpecificationCode: true } },
@@ -615,6 +616,8 @@ async function applyAllocateRemaining(tx, session, change, actor) {
   if (lines.length !== lineNumbers.length || !route) throw Object.assign(new Error("Line atau routing process untuk remaining allocation tidak ditemukan."), { statusCode: 404 });
   const routingMode = String(value.routingMode || "INHOUSE").toUpperCase();
   const targetDate = asDate(value.targetDate, "Tanggal allocation");
+  const executor = await assertNewAllocationExecutor(tx, route, { routingMode, vendorId: value.vendorId, machineId: value.targetMachineId, diesId: value.diesId }, { period: { start: targetDate, end: targetDate } });
+  route = executor.route;
   const [machine, vendor] = await Promise.all([
     routingMode === "INHOUSE" ? tx.machine.findFirst({ where: { id: value.targetMachineId, isDeleted: false }, select: { id: true, status: true, machineSpecificationCode: true } }) : null,
     routingMode === "VENDOR" ? tx.vendor.findFirst({ where: { id: value.vendorId, isDeleted: false }, select: { id: true, status: true, leadTimeDays: true } }) : null,
@@ -642,7 +645,7 @@ async function applyAllocateRemaining(tx, session, change, actor) {
       const selectedDies = await resolveDiesAssignment(tx, {
         route,
         machine,
-        diesId: value.diesId || null,
+        diesId: value.diesId || executor.resource?.diesId || null,
         scheduleDate: draft.data.scheduleDate,
         plannedStartTime: draft.data.plannedStartTime,
         plannedEndTime: draft.data.plannedEndTime,
@@ -658,6 +661,7 @@ async function applyMove(tx, session, change, actor) {
   const value = change.afterValue || {};
   const source = await tx.productionPlanAllocation.findFirst({ where: { id: value.allocationId, planId: session.planId, isDeleted: false, status: "Draft" } });
   if (!source) throw Object.assign(new Error("Allocation sumber sudah berubah atau bukan Draft."), { statusCode: 409 });
+  assertSameAllocationExecutor(source, { routingMode: value.routingMode, vendorId: value.targetVendorId ?? value.vendorId });
   const qty = Number(value.qty || 0);
   if (qty <= 0 || qty > Number(source.plannedQty)) throw Object.assign(new Error("Qty pindah melebihi allocation sumber."), { statusCode: 400 });
   const route = await tx.mBOMProcess.findUnique({
@@ -686,6 +690,7 @@ async function applyMove(tx, session, change, actor) {
   const scheduleDate = value.targetDate ? asDate(value.targetDate, "Tanggal tujuan") : source.scheduleDate;
   const vendorSendDate = value.vendorSendDate ? asDate(value.vendorSendDate, "Tanggal kirim vendor") : source.vendorSendDate;
   const vendorReturnDate = value.vendorReturnDate ? asDate(value.vendorReturnDate, "Tanggal kembali vendor") : source.vendorReturnDate;
+  const executor = route ? await assertNewAllocationExecutor(tx, route, { routingMode: value.routingMode || source.routingMode, vendorId: value.targetVendorId ?? value.vendorId ?? source.vendorId, machineId: value.targetMachineId || source.machineId, diesId: value.diesId }, { existing: source, period: { start: scheduleDate, end: scheduleDate } }) : null;
   if (String(value.routingMode || source.routingMode || "").toUpperCase() === "VENDOR") {
     validateVendorDateRange(vendorSendDate || scheduleDate, vendorReturnDate);
   }
@@ -708,11 +713,12 @@ async function applyMove(tx, session, change, actor) {
   const targetData = {
     scheduleDate,
     machineId: value.targetMachineId || source.machineId,
+    ...(executor?.resource ? { diesId: executor.resource.diesId || null } : {}),
     vendorId: value.targetVendorId || source.vendorId,
     vendorSendDate,
     vendorReturnDate,
     expectedReturnQty: value.expectedReturnQty == null ? source.expectedReturnQty : Number(value.expectedReturnQty),
-    routingMode: value.routingMode || source.routingMode,
+    routingMode: String(value.routingMode || source.routingMode || "INHOUSE").toUpperCase(),
     plannedQty: qty,
     notes: [source.notes, `Capacity editor ${session.id}: ${value.reason || "reschedule"}`].filter(Boolean).join(" | "),
     createdBy: actor,

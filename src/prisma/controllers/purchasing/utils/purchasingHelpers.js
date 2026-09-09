@@ -1,5 +1,26 @@
 const { prisma } = require("../../../index");
-const { generateConfiguredNumber } = require("../../../services/numberingService");
+const { generateConfiguredNumber, getRule, formatNumber } = require("../../../services/numberingService");
+
+// Read-only estimate. The final number is allocated inside the create transaction.
+async function previewDocNumber(model, prefix, field, client = prisma) {
+  const now = new Date();
+  const ruleKey = prefix === "LOT" ? "LOT" : prefix.includes("PO") ? "PURCHASE_ORDER" : "GENERIC_DOCUMENT";
+  const rule = await getRule(ruleKey, client);
+  if (rule?.isActive) {
+    const year = String(now.getFullYear());
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    const bucket = { YEARLY: year, MONTHLY: year + month, DAILY: year + month + day }[rule.resetPolicy];
+    return formatNumber(rule, bucket && rule.lastResetKey !== bucket ? 1 : rule.nextNumber, { prefix }, now);
+  }
+  const dateStr = now.toISOString().slice(0, 10).replace(/-/g, "");
+  const last = await client[model].findFirst({
+    where: { [field]: { startsWith: `${prefix}-${dateStr}-` } },
+    orderBy: { [field]: "desc" }, select: { [field]: true },
+  });
+  const sequence = Number(last?.[field]?.match(/-(\d+)$/)?.[1] || 0) + 1;
+  return `${prefix}-${dateStr}-${String(sequence).padStart(4, "0")}`;
+}
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -90,4 +111,4 @@ async function generatePONumber(poType = "Other", tx = null, poNumberPrefix = nu
 const calcTotal = (details) =>
   Array.isArray(details) ? details.reduce((sum, d) => sum + (d.totalAmount || 0), 0) : 0;
 
-module.exports = { generateDocNumber, generatePONumber, calcTotal };
+module.exports = { generateDocNumber, previewDocNumber, generatePONumber, calcTotal };

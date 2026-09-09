@@ -1,5 +1,5 @@
 const { calculateLiveMbomCosts } = require("./mbomLiveCostingService");
-const { legacyPriceValue, resolveEffectiveRecord } = require("./pricing/effectivePriceService");
+const { legacyPriceValue, nullablePriceValue, resolveEffectiveRecord } = require("./pricing/effectivePriceService");
 const { resolveVendorProcessPrice } = require("./pricing/vendorProcessPricingService");
 const { resolveMbomRevision } = require("./planning/mbomRevisionService");
 const { isCustomerSupplied } = require("../utils/materialSupply");
@@ -121,6 +121,7 @@ async function buildMbomReport(prisma, noReg, options = {}) {
       unitPrice, unitPriceOriginal, priceExchangeRate, priceUom: selectedPrice?.uomCode, priceCurrency,
       priceSource, supplierCode: selectedPrice?.supplier?.supplierCode, supplierName: selectedPrice?.supplier?.supplierName,
       priceEffectiveFrom: selectedPrice?.effectiveFrom, priceEffectiveUntil: selectedPrice?.effectiveUntil, priceRequired,
+      priceFound: customerSupplied || nullablePriceValue(selectedPrice, date) !== null,
       purchaseAmount, processCostPerUnit, estimatedLineCost: purchaseAmount + processCostPerUnit * number(detail.qty),
       estimatedExtendedCost: unitPrice * (materialPrice && number(detail.grossWeight) > 0 ? context.cumulativeQty * number(detail.grossWeight) : context.cumulativeQty) + processCostPerUnit * context.cumulativeQty,
       processes,
@@ -158,7 +159,7 @@ async function buildMbomReport(prisma, noReg, options = {}) {
   rows.forEach((row, index) => { row.line = index + 1; });
   const liveCost = liveCostMap.get(header.id) || {};
   const priceApplicableLines = rows.filter((row) => row.priceRequired).length;
-  const pricedLines = rows.filter((row) => row.priceRequired && row.unitPrice > 0).length;
+  const pricedLines = rows.filter((row) => row.priceRequired && row.priceFound).length;
   return {
     generatedAt: new Date(), costingDate: date,
     header: { noReg: header.noReg, revision: header.revision, effectiveDate: header.effectiveDate, expiryDate: header.expiryDate, uomCode: header.uomCode, notes: header.notes, partCode: header.part?.partCode, partNumber: header.part?.partNumber, partName: header.part?.partName, customerCode: header.part?.customerCode },

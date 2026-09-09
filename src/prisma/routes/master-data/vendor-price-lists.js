@@ -3,8 +3,15 @@ const ctrl = require("../../controllers/master-data/VendorPriceListController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 const { uploadQuotationFiles } = require("../../middleware/uploads");
+const bomPrice = require('../../controllers/master-data/VendorBomPriceController');
 
 // special routes first
+router.get('/bom-fgs', authorize('vendorPriceLists','read'), bomPrice.fgs);
+router.get('/bom-fgs/:key', authorize('vendorPriceLists','read'), bomPrice.fg);
+router.get('/bom-context/:id', authorize('vendorPriceLists','read'), bomPrice.context);
+router.post('/bom-preview', authorize('vendorPriceLists','read'), bomPrice.preview);
+// Individual create/update permissions are checked for every child-part price in the transaction.
+router.post('/bom-save', authorize('vendorPriceLists','read'), uploadQuotationFiles, logger('vendorPriceList','save-bom-prices'), bomPrice.save);
 router.post("/bulk-create", authorize("vendorPriceLists", "create"), logger("vendorPriceList", "bulk-create"), ctrl.bulkCreate);
 router.patch("/bulk-remove", authorize("vendorPriceLists", "delete"), logger("vendorPriceList", "bulk-remove", { modelName: 'vendorPriceList' }), ctrl.bulkRemove);
 

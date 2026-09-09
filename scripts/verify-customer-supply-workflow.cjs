@@ -1,0 +1,74 @@
+"use strict";
+const assert = require("node:assert/strict");
+const { randomUUID } = require("node:crypto");
+const { prisma } = require("../src/prisma");
+const s = require("../src/prisma/services/planning/customerSupplyService");
+const { allocateMaterials } = require("../src/prisma/services/planning/mpsProductionEvidenceService");
+const { buildMpsFeasibilityAssessment } = require("../src/prisma/services/planning/mpsProductionChecksheetService");
+const { buildPurchasingSupplyTimeline, applyTimePhasedPurchaseNetting } = require("../src/prisma/controllers/planning/MRPController").__test;
+const { businessNow } = require("../src/prisma/utils/businessClock");
+const fixture = { customerCode: "C003", supplyCustomerCode: "C003", partCode: "C003-0010-040", materialCode: "SPCC-SD-0.8-69", uomCode: "kg", materialSupplyType: "CUSTOMER_SUPPLIED" };
+const sum = (events) => events.reduce((a, e) => a + e.qty, 0);
+async function main() {
+  const before = await prisma.customerSupplyRequest.count();
+  const rollback = new Error("ROLLBACK_CUSTOMER_SUPPLY_TEST");
+  let checks = 0;
+  try {
+    await prisma.$transaction(async (tx) => {
+      const today = businessNow().toISOString().slice(0, 10), actor = "TEST-ROLLBACK";
+      const request = await s.create(tx, { ...fixture, qtyRequested: 100, requiredDate: "2026-09-01", idempotencyKey: randomUUID() }, actor);
+      const ship = await s.addShipment(tx, request.id, { qty: 60, eta: today, readyDate: today }, actor);
+      const load = () => tx.customerSupplyRequest.findMany({ where: { id: request.id }, include: { shipments: { include: { receipts: true } } } });
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 0); checks++;
+      await assert.rejects(s.confirmShipment(tx, request.id, ship.id, {}, actor), /Referensi/); checks++;
+      await s.confirmShipment(tx, request.id, ship.id, { confirmationReference: "TEST confirmation" }, actor);
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 60); checks++;
+      assert.equal(sum(s.supplyEventsFor({ ...fixture, supplyCustomerCode: "OTHER" }, await load())), 0); checks++;
+      assert.equal(sum(s.supplyEventsFor({ ...fixture, uomCode: "pcs" }, await load())), 0); checks++;
+      await assert.rejects(s.addShipment(tx, request.id, { qty: 41, eta: today, readyDate: today }, actor), /melebihi/); checks++;
+      const input = { idempotencyKey: randomUUID(), receivedQty: 20, receivedDate: today, warehouseCode: "WH-001", lotNumber: "TEST-LOT", deliveryNoteNumber: "TEST-SJ" };
+      const receipt = await s.receive(tx, request.id, ship.id, input, actor);
+      assert.equal((await s.receive(tx, request.id, ship.id, input, actor)).id, receipt.id); checks++;
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 40, "QC hold removes receipt from ETA and doesn't yet add available stock"); checks++;
+      await assert.rejects(s.inspectReceipt(tx, request.id, receipt.id, { acceptedQty: 21, rejectedQty: 0, qcReference: "TEST" }, actor), /harus sama/); checks++;
+      await s.inspectReceipt(tx, request.id, receipt.id, { acceptedQty: 18, rejectedQty: 2, qcReference: "TEST-QC" }, actor);
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 58, "No double counting, rejects excluded"); checks++;
+      await assert.rejects(s.issue(tx, request.id, receipt.id, { qty: 19, idempotencyKey: randomUUID(), reference: "TEST-MO" }, actor), /melebihi/); checks++;
+      const issueInput = { qty: 5, idempotencyKey: randomUUID(), reference: "TEST-MO" };
+      const issue = await s.issue(tx, request.id, receipt.id, issueInput, actor);
+      assert.equal((await s.issue(tx, request.id, receipt.id, issueInput, actor)).id, issue.id); checks++;
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 53); checks++;
+      await assert.rejects(s.cancelShipment(tx, request.id, ship.id, { reason: "TEST" }, actor), /histori/); checks++;
+
+      const rows = [1, 2].map((offset) => ({ id: randomUUID(), ...fixture, grossRequirement: 40, requiredDate: new Date(businessNow().getTime() + offset * 86400000) }));
+      const events = await buildPurchasingSupplyTimeline(tx, rows, new Date(businessNow().getTime() + 30 * 86400000), { uomCodeByPartCode: { [fixture.partCode]: "kg" } });
+      assert.equal(sum(events), 53, JSON.stringify({ events, rows, requests: await load() }));
+      await applyTimePhasedPurchaseNetting(rows, events, { initialStockAvailableMap: { [fixture.partCode]: 9999 } });
+      assert.equal(rows[0].firmNetRequirement, 0); assert.equal(rows[1].firmNetRequirement, 27); assert.equal(rows[1].plannedOrderQty, 0); checks += 3;
+      const entries = rows.map((r) => ({ materialCoverage: [{ ...fixture, qty: 40, requiredDate: r.requiredDate, openingQty: 0, supplyEvents: s.supplyEventsFor(fixture, []) }] }));
+      for (const entry of entries) entry.materialCoverage[0].supplyEvents = s.supplyEventsFor(fixture, await load());
+      allocateMaterials(entries);
+      assert.equal(entries[0].materialCoverage[0].shortageQty, 0); assert.equal(entries[1].materialCoverage[0].shortageQty, 27); checks += 2;
+      const assessment = buildMpsFeasibilityAssessment({ mpsQty: 1, asOf: today, materials: { components: [{ ...fixture, qty: 40, shortageQty: 40, procurementWindow: "CUSTOMER_SUPPLIED", requiredDate: "2026-09-01", lateSupply: [{ qty: 40, confidence: "FIRM", availableDate: "2026-09-05" }] }] } });
+      assert.equal(assessment.checks[0].status, "FAIL"); checks++;
+      const needs = await s.mrpNeeds(tx, "MRP-202609-R012");
+      assert(needs.items.length); assert.equal(needs.items[0].uomCode, "kg"); checks++;
+      assert(needs.items.some((r) => r.requestedIn === request.requestNumber), "Existing manual request must prevent duplicate MRP request in same material/week"); checks++;
+      const selectedIds = needs.items.filter((r) => !r.requestedIn).slice(0, 2).map((r) => r.id);
+      const generated = await s.createFromMrp(tx, { runNumber: needs.runNumber, requirementIds: selectedIds }, actor);
+      assert(generated.count > 0); checks++;
+      await assert.rejects(s.createFromMrp(tx, { runNumber: needs.runNumber, requirementIds: selectedIds }, actor), /sudah memiliki/); checks++;
+      await s.rescheduleShipment(tx, request.id, ship.id, { eta: "2030-01-01", readyDate: "2030-01-02", reason: "TEST partial receipt reschedule" }, actor);
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 13, "Rescheduled remaining shipment needs confirmation; accepted receipt stays available"); checks++;
+      await s.confirmShipment(tx, request.id, ship.id, { confirmationReference: "TEST revised ETA" }, actor);
+      assert.equal(sum(s.supplyEventsFor(fixture, await load())), 53); checks++;
+      await s.cancelRequest(tx, generated.items[0].id, { reason: "TEST cancel unreceived request" }, actor);
+      assert.equal((await tx.customerSupplyRequest.findUnique({ where: { id: generated.items[0].id } })).status, "CANCELLED"); checks++;
+      await assert.rejects(s.cancelRequest(tx, request.id, { reason: "TEST" }, actor), /histori/); checks++;
+      throw rollback;
+    }, { timeout: 60000 });
+  } catch (error) { if (error !== rollback) throw error; }
+  assert.equal(await prisma.customerSupplyRequest.count(), before, "No test documents may persist");
+  console.log(`PASS ${checks} customer-supply checks: planning, owner/UOM isolation, partial receipt, QC, issue, idempotency, MPS/MRP netting, MRP request grouping; all test changes rolled back.`);
+}
+main().then(() => process.exit(0)).catch((error) => { console.error(error); process.exit(1); });

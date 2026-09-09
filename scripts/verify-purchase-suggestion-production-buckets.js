@@ -3,10 +3,18 @@ const {
   productionScheduleQty,
   routingMetricKey,
   routingMetricsForRequests,
+  suggestionSchedulingRequirements,
 } = require("../src/prisma/controllers/purchasing/PurchaseSuggestionController");
 
 assert.equal(productionScheduleQty([], [{ id: "phase-1", qtyPlanned: 300 }]), 300);
 assert.equal(productionScheduleQty([], [{ id: "phase-2", qtyPlanned: 450 }]), 450);
+const own = {id:"own",mpsDetailId:"bracket",mpsDetail:{qtyPlanned:117}};
+const pulled = {id:"pulled",mpsDetailId:"stay",mpsDetail:{qtyPlanned:2211}};
+const requirements = new Map([["own",own],["pulled",pulled]]);
+const linked = suggestionSchedulingRequirements({mrpRequirementId:"own",sourceRequirements:[{id:"pulled",allocationType:"MOQ_PULL_FORWARD"}]},requirements);
+assert.deepEqual(linked,[own],"all-MOQ source list must not add 2211 unrelated FG to the 117-qty BOM");
+assert.equal(productionScheduleQty(linked),117);
+assert.deepEqual(suggestionSchedulingRequirements({mrpRequirementId:"own",sourceRequirements:[{id:"own",allocationType:"DIRECT_DEMAND"},{id:"pulled",allocationType:"MOQ_PULL_FORWARD"}]},requirements),[own]);
 
 const tx = {
   mBOMHeader: {

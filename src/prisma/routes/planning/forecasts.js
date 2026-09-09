@@ -1,11 +1,14 @@
 const router = require("express").Router();
 const ctrl = require("../../controllers/planning/ForecastController");
 const planningTool = require("../../controllers/planning/ForecastPlanningToolController");
+const history = require("../../controllers/planning/ForecastHistoryController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 const { approvalGate } = require("../../services/approvalRuleService");
 const forecastApproval = approvalGate({ moduleCode: "sales", pageCode: "forecasts", actionCode: "approve", documentType: "Forecast", param: "forecastNumber", model: "forecast", lookupField: "forecastNumber", numberField: "forecastNumber", requireExistingRequest: true });
 router.get("/generate-number", authorize("forecast", "create"), ctrl.generateNumber);
+router.get("/template", authorize("forecast", "read"), history.template);
+router.get("/:forecastNumber/history", authorize("forecast", "read"), history.history);
 router.get("/planning-tool", authorize("forecast", "read"), planningTool.status);
 router.get("/demand-summary", authorize("forecast", "read"), ctrl.demandSummary);
 router.get("/monthly-consumption", authorize("forecast", "read"), ctrl.monthlyConsumption);

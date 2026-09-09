@@ -6,6 +6,9 @@ const { deletePartPhoto, deletePartAttachment } = require("../../middleware/uplo
 const { normalizeAssemblyPolicy } = require("../../utils/assemblyPolicy");
 const { generateConfiguredNumber, getRule, formatNumber } = require("../../services/numberingService");
 const { resolveItemCompatibility } = require("../../services/itemCompatibilityService");
+const { prPartWhere } = require("../../services/purchasing/prPartEligibility");
+const { normalizePurchasePartCategory } = require('../../services/engineering/purchasePartCategory');
+const { eligibleVendorPartIds } = require('../../services/pricing/bomVendorPartEligibility');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -145,6 +148,7 @@ const normalizeItemType = (data) => {
 
 const normalizeRawType = (data, defaultRawType = "PURCHASE_PART") => {
   if (!data) return data;
+  if (data.itemType === undefined) return data;
   if (data.itemType !== "RAW") {
     data.rawType = null;
     return data;
@@ -921,6 +925,19 @@ exports.list = async (req, res, next) => {
     }
     if (category) where.category = category;
     if (rawType) where.rawType = String(rawType).trim().toUpperCase();
+    const prScope = prPartWhere(req.query.prCategory);
+    if (prScope) addWhereCondition(where, prScope);
+    if (['BOM_VENDOR','BOM_VENDOR_PART'].includes(req.query.pricingScope)) {
+      addWhereCondition(where, { id: { in: await eligibleVendorPartIds(prisma) }, OR: [{status:null},{status:'Active'}] });
+      if (req.query.pricingScope === 'BOM_VENDOR_PART') addWhereCondition(where, { itemType:'RAW', rawType:'PURCHASE_PART' });
+    }
+    // Apply drawing filtering before pagination so every eligible PR item is searchable.
+    if (req.query.hasDrawing === "true") {
+      addWhereCondition(where, { partNumber: { not: null } });
+      addWhereCondition(where, { partNumber: { not: "" } });
+    } else if (req.query.hasDrawing === "false") {
+      addWhereCondition(where, { OR: [{ partNumber: null }, { partNumber: "" }] });
+    }
     const itemTypes = normalizeItemTypeFilter(itemType);
     const shouldIncludeEmptyItemType = parseBoolean(includeEmptyItemType);
     if (itemTypes.length > 0 || shouldIncludeEmptyItemType) {
@@ -950,12 +967,7 @@ exports.list = async (req, res, next) => {
         { customerCode: { contains: q, mode: "insensitive" } },
         { noPhp: { contains: q, mode: "insensitive" } },
       ];
-      if (where.OR) {
-        where.AND = [{ OR: where.OR }, { OR: searchOR }];
-        delete where.OR;
-      } else {
-        where.OR = searchOR;
-      }
+      addWhereCondition(where, { OR: searchOR });
     }
 
     const orderBy = buildSort(req.query);
@@ -984,7 +996,7 @@ exports.list = async (req, res, next) => {
 exports.get = async (req, res, next) => {
   try {
     const doc = await prisma.part.findFirst({
-      where: { partCode: req.params.partCode, isDeleted: false },
+      where: { OR: [{ partCode: req.params.partCode }, { id: req.params.partCode }], isDeleted: false },
       include: partInclude(),
     });
     if (!doc) return res.status(404).json({ message: "Part not found" });
@@ -1107,6 +1119,7 @@ exports.create = async (req, res, next) => {
     const data = normalizeCreatePartUoms(normalizePartPermissions(normalizeOptionalSelects(normalizePartType(
       normalizePartAssemblyPolicy(normalizeRawType(normalizeItemType(normalizePlanningPolicy(convertNumericFields(partData, PART_NUMERIC_FIELDS)))))
     ))));
+    normalizePurchasePartCategory(data);
     if (typeof data.customerCodes === 'string') {
       data.customerCodes = parseJsonField(data.customerCodes, data.customerCodes);
     }
@@ -1195,7 +1208,7 @@ exports.clone = async (req, res, next) => {
       componentLevel: req.body?.componentLevel ?? source.componentLevel,
       processSequence: req.body?.processSequence ?? source.processSequence,
       branchCode: req.body?.branchCode ?? source.branchCode,
-      category: source.category,
+      category: req.body?.category ?? source.category,
       status: source.status,
       statusService: source.statusService,
       planningPolicy: source.planningPolicy,
@@ -1212,6 +1225,7 @@ exports.clone = async (req, res, next) => {
       notes: source.notes,
     };
 
+    normalizePurchasePartCategory(createData, source);
     if (source.materialId) createData.material = { connect: { id: source.materialId } };
     if (source.supplierId) createData.supplier = { connect: { id: source.supplierId } };
     if (source.processId) createData.process = { connect: { id: source.processId } };
@@ -1399,6 +1413,7 @@ exports.update = async (req, res, next) => {
       include: { material: true, partBases: true, attachments: true },
     });
     if (!currentPart) return res.status(404).json({ message: "Part not found" });
+    normalizePurchasePartCategory(data, currentPart);
     await normalizeLinkedCustomers(data, currentPart.customerCode);
 
     // Hitung foto akhir: pertahankan URL yang ada di existingPhotos, hapus sisanya dari disk
@@ -1559,6 +1574,7 @@ exports.bulkCreate = async (req, res, next) => {
           )))
         )));
         if (!converted.partCode) converted.partCode = await buildPartCode(converted);
+        normalizePurchasePartCategory(converted);
         const cleanedConverted = stripPartCodeTransientFields(converted);
         const { materialId, supplierId, processId, materialCode, supplierCode, processCode, ...fields } = cleanedConverted;
         const payload = { ...fields };

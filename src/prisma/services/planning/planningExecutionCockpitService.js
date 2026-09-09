@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { periodBounds, getPeriodState, savePeriodState } = require("./periodClosingService");
 const { canonicalMrpLifecycleStatus } = require("./mrpLifecycleService");
 
@@ -158,7 +159,7 @@ async function loadMonthData(prisma, month) {
   }) : [];
   const currentRunByMps = new Map();
   for (const run of planCurrentMrpRuns) if (!currentRunByMps.has(run.mpsNumber)) currentRunByMps.set(run.mpsNumber, run.runNumber);
-  const today = new Date();
+  const today = businessNow();
   today.setUTCHours(0, 0, 0, 0);
   for (const plan of plans) {
     const snapshotRuns = [...new Set(plan.details.map(mrpRunMarker).filter(Boolean))];
@@ -185,7 +186,7 @@ async function loadMonthData(prisma, month) {
 
 function buildBlockers(data) {
   const blockers = [];
-  if (new Date() < data.bounds.end) blockers.push({ code: "PERIOD_END_NOT_REACHED", reference: data.bounds.month, message: `Period closing baru dapat dilakukan setelah ${dateKey(data.bounds.end)}.` });
+  if (businessNow() < data.bounds.end) blockers.push({ code: "PERIOD_END_NOT_REACHED", reference: data.bounds.month, message: `Period closing baru dapat dilakukan setelah ${dateKey(data.bounds.end)}.` });
   if (data.demandTargets.length && !data.demandSnapshot) blockers.push({ code: "MONTHLY_DEMAND_NOT_REVIEWED", reference: data.bounds.month, message: `${data.demandTargets.length} delivery phase belum memiliki Monthly Demand Snapshot.` });
   if (data.demandSnapshot && !["APPROVED", "FROZEN"].includes(String(data.demandSnapshot.status).toUpperCase())) blockers.push({ code: "MONTHLY_DEMAND_NOT_FROZEN", reference: data.demandSnapshot.snapshotNumber, message: `Monthly Demand Snapshot masih ${data.demandSnapshot.status}.` });
   if (data.demandTargets.length && !data.mps.length) blockers.push({ code: "MPS_MISSING", reference: data.bounds.month, message: `${data.demandTargets.length} delivery phase aktif belum memiliki MPS resmi.` });
@@ -215,7 +216,7 @@ function present(data, periodState) {
   const vendorAllocations = allocations.filter((row) => String(row.routingMode).toUpperCase() === "VENDOR");
   const blockers = buildBlockers(data);
   const officialRun = currentCompletedRuns[0] || displayMrpRuns[0] || null;
-  const today = new Date();
+  const today = businessNow();
   const officialMrpDate = new Date(data.bounds.start.getTime() - 24 * 60 * 60 * 1000);
   const isMonthEndReached = today >= officialMrpDate;
   const plannedRows = data.plannedOrders.map((row) => ({

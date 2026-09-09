@@ -12,6 +12,12 @@ router.get("/generate-number", authorize("mps", "create"), ctrl.generateNumber);
 router.get("/monthly-summary", authorize("mps", "read"), ctrl.monthlySummary);
 router.get("/workbench", authorize("mps", "read"), ctrl.workbench);
 router.get("/workbench/lines/:lineId/feasibility", authorize("mps", "read"), ctrl.workbenchFeasibility);
+router.get("/workbench/lines/:lineId/recovery-requests", authorize("mps", "read"), ctrl.workbenchRecoveryContext);
+router.post("/workbench/lines/:lineId/recovery-requests", authorize("mps", "update"), logger("mps", "request-department-recovery"), ctrl.requestWorkbenchRecovery);
+// Global auth is mounted by routes/index.js. These handlers enforce recipient scope,
+// allowing departmental follow-up without granting MPS editing/approval permissions.
+router.get("/recovery-requests", ctrl.listChecklistRecovery);
+router.patch("/recovery-requests/:requestId/feedback", logger("mps", "recovery-feedback"), ctrl.updateChecklistRecovery);
 router.get("/mbom-revision-options", authorize("mps", "read"), ctrl.mbomRevisionOptions);
 router.post("/from-forecast", authorize("mps", "create"), logger("mps", "create-from-forecast"), ctrl.createFromForecast);
 router.post("/monthly-sync", authorize("mps", "create"), guardMonthBody, logger("mps", "sync-monthly-demand"), ctrl.syncMonthly);
@@ -24,6 +30,8 @@ router.post("/production-cut/preview", authorize("mps", "read"), ctrl.previewPro
 router.post("/production-cut", authorize("mps", "update"), logger("mps", "create-production-cut"), ctrl.createProductionCut);
 router.patch("/production-cut/:adjustmentNumber/approve", authorize("mps", "approve"), logger("mps", "approve-production-cut"), ctrl.approveProductionCut);
 router.get("/:mpsNumber/readiness", authorize("mps", "read"), ctrl.readiness);
+router.patch("/:mpsNumber/eta-mode", require("../../services/purchasing/etaModeService").authorize, guardMps, logger("mps", "change-eta-source"), ctrl.updateEtaMode);
+router.post("/:mpsNumber/checksheet/evaluate", authorize("mps", "update"), guardMps, logger("mps", "evaluate-production-checksheet"), ctrl.evaluateProductionChecksheet);
 router.post("/:mpsNumber/delivery-phases", authorize("mps", "update"), guardMps, logger("mps", "create-delivery-phase", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.createDeliveryPhase);
 router.patch("/:mpsNumber/delivery-phases/:phaseId/remove", authorize("mps", "update"), guardMps, logger("mps", "remove-delivery-phase", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.removeDeliveryPhase);
 router.patch("/:mpsNumber/adjustments", authorize("mps", "update"), guardMps, logger("mps", "update-adjustments", { modelName: "MPS", paramKey: "mpsNumber", whereKey: "mpsNumber" }), ctrl.updateAdjustments);

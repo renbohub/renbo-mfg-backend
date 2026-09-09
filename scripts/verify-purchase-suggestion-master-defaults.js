@@ -111,7 +111,7 @@ async function run() {
   assert.strictEqual(alternative.purchasePackageUomCode, "SHEET");
   assert.strictEqual(alternative.sources.form, "MBOM_ALTERNATIVE");
 
-  const frontend = fs.readFileSync(path.resolve(__dirname, "../../frontend/public/js/operations-detail.js"), "utf8");
+  const frontend = fs.readFileSync(path.resolve(__dirname, "../../renbo-mfg-frontend/public/js/operations-detail.js"), "utf8");
   assert.match(frontend, /lookupSuggestionSupplierMaster/);
   assert.match(frontend, /data-confirm-moq-source/);
   assert.match(frontend, /bomDefaultPurchaseForm/);

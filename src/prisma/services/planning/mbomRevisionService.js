@@ -18,8 +18,12 @@ function isRevisionEffectiveAt(revision, selectionDate) {
 function compareRevision(left, right) {
   const leftEffective = asDate(left?.effectiveDate)?.getTime() || 0;
   const rightEffective = asDate(right?.effectiveDate)?.getTime() || 0;
-  return rightEffective - leftEffective
-    || Number(right?.revision || 0) - Number(left?.revision || 0)
+  // Validity is checked separately. Among effective revisions, the highest
+  // revision wins, including a newer revision whose effective date is backdated.
+  return Number(right?.revision || 0) - Number(left?.revision || 0)
+    || rightEffective - leftEffective
+    || Number(!right?.expiryDate) - Number(!left?.expiryDate)
+    || (asDate(right?.createdAt)?.getTime() || 0) - (asDate(left?.createdAt)?.getTime() || 0)
     || String(right?.id || "").localeCompare(String(left?.id || ""));
 }
 

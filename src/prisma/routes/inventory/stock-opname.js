@@ -1,11 +1,16 @@
 const router = require("express").Router();
 const ctrl = require("../../controllers/inventory/StockOpnameController");
+const documents = require("../../controllers/inventory/StockOpnameDocumentController");
 const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 const { approvalGate } = require("../../services/approvalRuleService");
 const stockOpnameApproval = approvalGate({ moduleCode: "inventory", pageCode: "stock-opname", actionCode: "approve", documentType: "StockOpnameHeader", param: "stoNo", model: "stockOpnameHeader", lookupField: "stoNo", numberField: "stoNo", requireExistingRequest: true });
 
 router.get("/", authorize("stockOpname", "read"), ctrl.list);
+router.get("/:stoNo/report.pdf", authorize("stockOpname", "read"), documents.pdf);
+router.get("/:stoNo/report.xlsx", authorize("stockOpname", "read"), documents.xlsx);
+router.get("/:stoNo/labels.pdf", authorize("stockOpname", "read"), documents.labels);
+router.get("/:stoNo/scan", authorize("stockOpname", "read"), documents.scan);
 router.get("/:stoNo", authorize("stockOpname", "read"), ctrl.get);
 router.post("/preview", authorize("stockOpname", "create"), ctrl.previewScope);
 router.post("/", authorize("stockOpname", "create"), logger("stockOpname", "create"), ctrl.create);

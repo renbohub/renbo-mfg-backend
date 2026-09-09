@@ -1,3 +1,4 @@
+const { businessNow } = require("../../utils/businessClock");
 const { prisma } = require("../../index");
 const { getFormulaSet, evaluateFromSet } = require("../../services/masterFormulaService");
 const { normalizeQuantity } = require("../../utils/uomQuantity");
@@ -215,7 +216,7 @@ async function buildMpsReadiness(tx, doc) {
 }
 
 async function nextNumber(tx = prisma) {
-  const year = new Date().getFullYear(); const prefix = `MPS-${year}-`;
+  const year = businessNow().getFullYear(); const prefix = `MPS-${year}-`;
   const rows = await tx.mPS.findMany({ where: { mpsNumber: { startsWith: prefix } }, select: { mpsNumber: true } });
   const max = rows.reduce((value, row) => Math.max(value, Number(row.mpsNumber.slice(prefix.length)) || 0), 0);
   return `${prefix}${String(max + 1).padStart(3, "0")}`;
@@ -273,7 +274,7 @@ exports.mbomRevisionOptions = async (req, res, next) => {
   try {
     const months = String(req.query.months || "").split(",").map((value) => value.trim()).filter(Boolean);
     const selectedDeliveryTargetIds = String(req.query.selectedDeliveryTargetIds || "").split(",").map((value) => value.trim()).filter(Boolean);
-    const anchor = text(req.query.planningAnchorMonth) || months[0] || planningAnchorMonth(new Date());
+    const anchor = text(req.query.planningAnchorMonth) || months[0] || planningAnchorMonth(businessNow());
     const items = await previewMonthlyMbomSelections(prisma, {
       months: months.length ? months : undefined,
       planningAnchorMonth: anchor,
@@ -330,7 +331,7 @@ exports.list = async (req, res, next) => {
 
 exports.workbench = async (req, res, next) => {
   try {
-    res.json(await getMpsWorkbench(prisma, {
+    const result = await getMpsWorkbench(prisma, {
       month: req.query.month,
       q: req.query.q,
       status: req.query.status,
@@ -338,8 +339,26 @@ exports.workbench = async (req, res, next) => {
       pageSize: req.query.pageSize,
       includeSimulation: req.query.includeSimulation,
       detailId: req.query.detailId,
-    }));
+    });
+    const { canManage } = require("../../services/purchasing/etaModeService");
+    result.etaPermissions = {
+      canCreate: canManage(req.user, "create"),
+      canUpdate: canManage(req.user),
+    };
+    res.json(result);
   } catch (error) { next(error); }
+};
+
+exports.updateEtaMode = async (req, res, next) => {
+  try {
+    const result = await prisma.$transaction((tx) => require("../../services/purchasing/etaModeService").setMode(tx,
+      { ...req.body, mpsNumber: req.params.mpsNumber }, req.user), { isolationLevel: "Serializable", timeout: 10000 });
+    res.set("Cache-Control", "no-store").json(result);
+  } catch (error) {
+    if (["P2034", "P2002"].includes(error.code)) return res.status(409).json({ message: "Sumber ETA MPS sedang berubah. Refresh status sebelum mencoba kembali." });
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    next(error);
+  }
 };
 
 async function resolveWorkbenchFeasibility(lineId, month) {
@@ -355,18 +374,45 @@ async function resolveWorkbenchFeasibility(lineId, month) {
   });
   const item = data.items?.[0];
   if (!item) return null;
-  if (normalizedLineId === item.lineId || normalizedLineId === item.id) return item.scheduleFeasibility;
+  const withRevision = (assessment) => assessment ? { ...assessment, identity: { ...assessment.identity, mpsNumber: data.mps?.mpsNumber, mpsRevision: data.mps?.revision } } : null;
+  if (normalizedLineId === item.lineId || normalizedLineId === item.id) return withRevision(item.scheduleFeasibility);
   const phase = [...(item.phases || []), item.bufferPhase].filter(Boolean)
     .find((row) => row.feasibilityLineId === normalizedLineId);
-  return phase?.scheduleFeasibility || null;
+  return withRevision(phase?.scheduleFeasibility);
 }
 
 exports.workbenchFeasibility = async (req, res, next) => {
   try {
     const result = await resolveWorkbenchFeasibility(req.params.lineId, req.query.month);
     if (!result) return res.status(404).json({ message: "Baris MPS atau evaluasi feasibility tidak ditemukan." });
+    const requests = await recoveryRequests.listRequests(prisma, req.user, { lineId: req.params.lineId, month: req.query.month });
+    result.deliverySuggestion = require("../../services/planning/mpsProductionChecksheetService").deliverySuggestion(result, requests);
     return res.json(result);
   } catch (error) { return next(error); }
+};
+
+const recoveryRequests = require("../../services/planning/mpsRecoveryRequestService");
+exports.workbenchRecoveryContext = async (req, res, next) => {
+  try { res.json(await recoveryRequests.requestContext(prisma, req.user, req.params.lineId, req.query.month)); }
+  catch (error) { next(error); }
+};
+exports.requestWorkbenchRecovery = async (req, res, next) => {
+  try {
+    const assessment = await resolveWorkbenchFeasibility(req.params.lineId, req.body.month);
+    const { notificationHelper } = require("../../utils/notificationHelper");
+    const result = await recoveryRequests.createRequest(prisma, req.user, { ...req.body, lineId: req.params.lineId }, assessment, (item) => notificationHelper.broadcast(item));
+    res.status(result.duplicate ? 200 : 201).json(result);
+  } catch (error) { next(error); }
+};
+exports.listChecklistRecovery = async (req, res, next) => {
+  try { res.json({ items: await recoveryRequests.listRequests(prisma, req.user, { month: req.query.month }), canReadMps: recoveryRequests.hasMps(req.user) }); }
+  catch (error) { next(error); }
+};
+exports.updateChecklistRecovery = async (req, res, next) => {
+  try {
+    const { notificationHelper } = require("../../utils/notificationHelper");
+    res.json(await recoveryRequests.updateFeedback(prisma, req.user, req.params.requestId, req.body, (item) => notificationHelper.broadcast(item)));
+  } catch (error) { next(error); }
 };
 
 // Read model for both newly generated monthly MPS and legacy MPS documents
@@ -887,6 +933,8 @@ async function createFromForecastLegacy(req, res, next) {
 async function syncMonthlyDemand(req, res, next, requireForecast = false) {
   try {
     req.body = req.body || {};
+    const initialEtaMode = req.body.etaMode === undefined ? undefined : require("../../services/purchasing/etaModeService").validateMode(req.body.etaMode);
+    if (initialEtaMode !== undefined && !require("../../services/purchasing/etaModeService").canManage(req.user, "create")) return res.status(403).json({ message: "Memilih sumber ETA MPS baru memerlukan akses create MPS Planning PPIC." });
     const explicitSelection = Array.isArray(req.body.selectedDeliveryTargetIds);
     const selectedDeliveryTargetIds = explicitSelection
       ? [...new Set(req.body.selectedDeliveryTargetIds.map((value) => String(value || "").trim()).filter(Boolean))]
@@ -933,7 +981,7 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
       }
     }
     if (!requireForecast && (!Array.isArray(req.body.months) || !req.body.months.length)) {
-      const anchor = text(req.body.planningAnchorMonth) || planningAnchorMonth(new Date());
+      const anchor = text(req.body.planningAnchorMonth) || planningAnchorMonth(businessNow());
       req.body.months = [anchor, nextPlanningMonthKey(anchor), nextPlanningMonthKey(nextPlanningMonthKey(anchor))];
     }
     const normalizedSelection = normalizeMpsRunSelection({
@@ -959,13 +1007,14 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
     const runBy = req.user?.username || req.user?.email || "system";
     const solverRefresh = await refreshMonthlyDemandSolver(prisma, {
       months: normalizedSelection.months.length ? normalizedSelection.months : undefined,
-      planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(new Date()),
+      planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(businessNow()),
       selectedDeliveryTargetIds: normalizedSelection.selectedDeliveryTargetIds,
       runBy,
     });
     const result = await prisma.$transaction((tx) => syncMonthlyMps(tx, {
+      initialEtaMode,
       months: normalizedSelection.months.length ? normalizedSelection.months : undefined,
-      planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(new Date()),
+      planningAnchorMonth: text(req.body.planningAnchorMonth) || req.body.months?.[0] || planningAnchorMonth(businessNow()),
       simulationOnly: req.body.simulationOnly === true,
       selectedDeliveryTargetIds: normalizedSelection.selectedDeliveryTargetIds,
       mbomSelections: req.body.mbomSelections && typeof req.body.mbomSelections === "object"
@@ -996,6 +1045,16 @@ async function syncMonthlyDemand(req, res, next, requireForecast = false) {
 
 exports.createFromForecast = (req, res, next) => syncMonthlyDemand(req, res, next, true);
 exports.syncMonthly = (req, res, next) => syncMonthlyDemand(req, res, next, false);
+
+exports.evaluateProductionChecksheet = async (req, res, next) => {
+  try {
+    const doc = await prisma.mPS.findFirst({ where: { mpsNumber: req.params.mpsNumber, isDeleted: false } });
+    if (!doc) return res.status(404).json({ message: "MPS tidak ditemukan." });
+    if (["Released", "Completed", "Superseded", "Cancelled"].includes(doc.status)) return res.status(409).json({ message: "Periksa checksheet pada revisi MPS yang masih terbuka." });
+    const result = await runAutomaticMpsEvaluation(prisma, [doc], { runBy: req.user?.username || req.user?.email || "system" });
+    return res.json({ ...result, message: "Pemeriksaan produksi selesai. Qty MPS, tanggal delivery, dan approval tidak diubah." });
+  } catch (error) { return next(error); }
+};
 
 exports.recalculateLocked = async (req, res, next) => {
   try {
@@ -1122,7 +1181,7 @@ exports.generateBaseline = async (req, res, next) => {
         });
         const synced = await syncMonthlyMps(tx, {
           months: selection.months.length ? selection.months : undefined,
-          planningAnchorMonth: text(req.body?.planningAnchorMonth) || selection.months[0] || planningAnchorMonth(new Date()),
+          planningAnchorMonth: text(req.body?.planningAnchorMonth) || selection.months[0] || planningAnchorMonth(businessNow()),
           simulationOnly: false,
           selectedDeliveryTargetIds: selection.selectedDeliveryTargetIds,
           mbomSelections: req.body?.mbomSelections && typeof req.body.mbomSelections === "object" ? req.body.mbomSelections : undefined,

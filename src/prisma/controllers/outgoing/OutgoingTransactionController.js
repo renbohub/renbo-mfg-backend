@@ -4,16 +4,19 @@ const { buildSoLineReferenceNumber } = require("../../services/production/sales-
 const { syncOperationalSalesOrderStatus } = require("../../services/production/sales-order/soStatusService");
 const { resolveDeliveryReadiness } = require("../../services/outgoing/deliveryReadinessService");
 const { assertStockBalanceNotFrozen } = require("../inventory/utils/stockOpnameFreezeGuard");
+const { validateShipment, validatePod, saveEvidence, removeEvidence, resolveEvidence } = require("../../services/outgoing/deliveryEvidenceService");
+const { createDeliveryNotePdf, parseDeliveryReference, deliveryReference } = require("../../services/outgoing/deliveryNotePdfService");
 const scheduleNumber = () => `DS-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const numberValue = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+const jakartaTimestamp = value => value ? new Date(new Date(value).getTime() + 7 * 3600000).toISOString().replace('Z', '+07:00') : null;
 
 exports.deliveryBoard = async (req, res, next) => {
   try {
     const today = new Date();
     const defaultFrom = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1));
     const defaultTo = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 0, 23, 59, 59, 999));
-    const from = req.query.from ? new Date(`${req.query.from}T00:00:00.000Z`) : defaultFrom;
-    const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999Z`) : defaultTo;
+    const from = req.query.from ? new Date(`${req.query.from}T00:00:00.000+07:00`) : new Date(defaultFrom.getTime() - 7 * 3600000);
+    const to = req.query.to ? new Date(`${req.query.to}T23:59:59.999+07:00`) : new Date(defaultTo.getTime() - 7 * 3600000);
     if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) return res.status(400).json({ message: "Periode delivery board tidak valid" });
 
     const schedules = await prisma.deliverySchedule.findMany({
@@ -47,8 +50,8 @@ exports.deliveryBoard = async (req, res, next) => {
       partCode: detail.soDetail?.partCode || detail.soDetail?.partNumber || "-",
       partNumber: detail.soDetail?.partNumber,
       partName: detail.soDetail?.partName,
-      plannedAt: schedule.plannedDate,
-      actualAt: schedule.deliveredAt || schedule.actualDate,
+      plannedAt: jakartaTimestamp(schedule.plannedDate),
+      actualAt: jakartaTimestamp(schedule.deliveredAt || schedule.actualDate),
       plannedQty: numberValue(detail.qty),
       deliveredQty: numberValue(detail.qtyDelivered),
       outstandingQty: Math.max(numberValue(detail.qty) - numberValue(detail.qtyDelivered), 0),
@@ -59,14 +62,14 @@ exports.deliveryBoard = async (req, res, next) => {
     })));
 
     res.json({
-      period: { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+      period: { from: jakartaTimestamp(from).slice(0, 10), to: jakartaTimestamp(to).slice(0, 10) },
       generatedAt: new Date(),
       rows,
     });
   } catch (error) { next(error); }
 };
 
-async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy) {
+async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy, deliveryNumber) {
   let remaining = Number(qty || 0);
   const referenceNumber = buildSoLineReferenceNumber(soNumber, soDetail.lineNumber);
   const reservations = await tx.stockReservation.findMany({
@@ -83,18 +86,21 @@ async function consumeSalesReservations(tx, soNumber, soDetail, qty, performedBy
   for (const reservation of reservations) {
     if (remaining <= 0) break;
     const open = Math.max(0, Number(reservation.qtyReserved || 0) - Number(reservation.qtyReleased || 0));
-    const available = Number(reservation.stockBalance?.qtyOnHand || 0);
+    // Multiple reservations may share a balance; re-read after each deduction.
+    const currentBalance = await tx.stockBalance.findUnique({ where: { id: reservation.stockBalanceId } });
+    const available = Number(currentBalance?.qtyOnHand || 0);
     const take = Math.min(remaining, open, available);
     if (take <= 0) continue;
-    const balance = reservation.stockBalance;
+    const balance = currentBalance;
     await assertStockBalanceNotFrozen(tx, balance.id);
     const qtyBefore = Number(balance.qtyOnHand || 0);
     const qtyAfter = qtyBefore - take;
     const reservedAfter = Math.max(0, Number(balance.qtyReserved || 0) - take);
-    await tx.stockBalance.update({ where: { id: balance.id }, data: { qtyOnHand: qtyAfter, qtyReserved: reservedAfter, qtyAvailable: Math.max(0, qtyAfter - reservedAfter - Number(balance.qtyQC || 0)), lastMovement: new Date() } });
+    const balanceChanged = await tx.stockBalance.updateMany({ where: { id: balance.id, qtyOnHand: balance.qtyOnHand, qtyReserved: balance.qtyReserved, isDeleted: false }, data: { qtyOnHand: qtyAfter, qtyReserved: reservedAfter, qtyAvailable: Math.max(0, qtyAfter - reservedAfter - Number(balance.qtyQC || 0)), lastMovement: new Date() } });
+    if (balanceChanged.count !== 1) throw Object.assign(new Error("Saldo berubah selama POD. Muat ulang dan periksa stok."), { statusCode: 409 });
     const releasedAfter = Number(reservation.qtyReleased || 0) + take;
     await tx.stockReservation.update({ where: { id: reservation.id }, data: { qtyReleased: releasedAfter, status: releasedAfter + 0.0001 >= Number(reservation.qtyReserved || 0) ? "Released" : "Active" } });
-    await tx.stockMovement.create({ data: { movementNumber: `OUT-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, movementDate: new Date(), movementType: "OUT", direction: "OUT", transactionType: "SALES", warehouseCode: balance.warehouseCode, rackCode: balance.rackCode || null, lotNumber: balance.lotNumber || null, partCode: balance.partCode, partNumber: balance.partNumber || null, partName: balance.partName || null, materialId: balance.materialId || null, materialCode: balance.materialCode || null, materialName: balance.materialName || null, materialType: balance.materialType || null, productId: balance.productId || null, description: balance.description || null, spec: balance.spec || null, thickness: balance.thickness ?? null, width: balance.width ?? null, CSP: balance.CSP || null, stockType: balance.stockType || "Finished Goods", qty: take, deltaQty: -take, qtyBefore, qtyAfter, uomCode: balance.uomCode || soDetail.uomCode || null, qualityBucket: "GOOD", referenceType: "DELIVERY_SCHEDULE", referenceNumber: soNumber, notes: `Outbound otomatis untuk ${soNumber} / line ${soDetail.lineNumber}`, performedBy: performedBy || "system" } });
+    await tx.stockMovement.create({ data: { movementNumber: `OUT-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`, movementDate: new Date(), movementType: "OUT", direction: "OUT", transactionType: "SALES", warehouseCode: balance.warehouseCode, rackCode: balance.rackCode || null, lotNumber: balance.lotNumber || null, partCode: balance.partCode, partNumber: balance.partNumber || null, partName: balance.partName || null, materialId: balance.materialId || null, materialCode: balance.materialCode || null, materialName: balance.materialName || null, materialType: balance.materialType || null, productId: balance.productId || null, description: balance.description || null, spec: balance.spec || null, thickness: balance.thickness ?? null, width: balance.width ?? null, CSP: balance.CSP || null, stockType: balance.stockType || "Finished Goods", qty: take, deltaQty: -take, qtyBefore, qtyAfter, uomCode: balance.uomCode || soDetail.uomCode || null, qualityBucket: "GOOD", referenceType: "DELIVERY_SCHEDULE", referenceNumber: deliveryNumber, notes: `Outbound otomatis untuk ${soNumber} / line ${soDetail.lineNumber}`, performedBy: performedBy || "system" } });
     remaining -= take;
   }
   if (remaining > 0.0001) throw Object.assign(new Error(`Stok/reservation FG tidak cukup untuk SO ${soNumber} line ${soDetail.lineNumber}. Kekurangan ${remaining}.`), { statusCode: 409 });
@@ -104,8 +110,10 @@ async function transitionSchedule(scheduleNumber, expectedStatus, data) {
   return prisma.$transaction(async (tx) => {
     const schedule = await tx.deliverySchedule.findFirst({ where: { scheduleNumber, status: expectedStatus, isDeleted: false } });
     if (!schedule) throw Object.assign(new Error(`Delivery Schedule must be ${expectedStatus} before this action`), { statusCode: 409 });
-    return tx.deliverySchedule.update({ where: { id: schedule.id }, data });
-  });
+    const changed = await tx.deliverySchedule.updateMany({ where: { id: schedule.id, status: expectedStatus, updatedAt: schedule.updatedAt, isDeleted: false }, data });
+    if (changed.count !== 1) throw Object.assign(new Error("Status pengiriman telah berubah. Muat ulang halaman."), { statusCode: 409 });
+    return tx.deliverySchedule.findUnique({ where: { id: schedule.id } });
+  }, { isolationLevel: "Serializable" });
 }
 
 exports.createSchedule = async (req, res, next) => {
@@ -137,6 +145,7 @@ exports.createSchedule = async (req, res, next) => {
 
 exports.markShipment = async (req, res, next) => {
   try {
+    const shipment = validateShipment(req.body);
     const item = await prisma.$transaction(async (tx) => {
       const schedule = await tx.deliverySchedule.findFirst({
         where: { scheduleNumber: req.params.scheduleNumber, status: "On Process", isDeleted: false },
@@ -144,6 +153,10 @@ exports.markShipment = async (req, res, next) => {
       if (!schedule) {
         throw Object.assign(new Error("Delivery Schedule must be On Process before this action"), { statusCode: 409 });
       }
+      // Claim the transition before reserving stock. A concurrent request cannot
+      // repeat shipment or consume the same transition.
+      const changed = await tx.deliverySchedule.updateMany({ where: { id: schedule.id, status: "On Process", isDeleted: false }, data: { status: "In Transit", actualDate: new Date(), shippedAt: new Date(), ...shipment, shippingMethod: shipment.shippingMethod || schedule.shippingMethod, deliveredBy: req.user?.username || req.user?.email || null } });
+      if (changed.count !== 1) throw Object.assign(new Error("Shipment sudah diproses oleh pengguna lain."), { statusCode: 409 });
       const readiness = await resolveDeliveryReadiness(tx, schedule.scheduleNumber, {
         reserveShortage: true,
         performedBy: req.user?.username || req.user?.email || "system",
@@ -151,11 +164,8 @@ exports.markShipment = async (req, res, next) => {
       if (!readiness.fgReady) {
         throw Object.assign(new Error(readiness.fgReadinessMessage), { statusCode: 409 });
       }
-      return tx.deliverySchedule.update({
-        where: { id: schedule.id },
-        data: { status: "In Transit", actualDate: new Date(), shippedAt: new Date(), trackingNumber: req.body.trackingNumber || null, shippingMethod: req.body.shippingMethod || undefined, vehicle: req.body.vehicle || null, driver: req.body.driver || null, carrier: req.body.carrier || null, deliveredBy: req.user?.username || req.user?.email || null },
-      });
-    });
+      return tx.deliverySchedule.findUnique({ where: { id: schedule.id } });
+    }, { isolationLevel: "Serializable" });
     res.json(item);
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };
@@ -175,20 +185,64 @@ exports.pack = async (req, res, next) => {
 };
 
 exports.confirmPod = async (req, res, next) => {
+  const saved = [];
+  let committed = false;
   try {
+    const evidence = validatePod(req.body);
+    const signatureReference = await saveEvidence(evidence.signature);
+    if (signatureReference) saved.push(signatureReference);
+    const podReference = await saveEvidence(evidence.pod);
+    if (podReference) saved.push(podReference);
     const item = await prisma.$transaction(async (tx) => {
-      const schedule = await tx.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, status: "In Transit", isDeleted: false }, include: { details: { include: { soDetail: true } }, soHeader: true } });
+      const schedule = await tx.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, status: "In Transit", isDeleted: false }, include: { details: { where: { isDeleted: false }, include: { soDetail: true } }, soHeader: true } });
       if (!schedule) throw Object.assign(new Error("Shipment in transit not found"), { statusCode: 409 });
+      const changed = await tx.deliverySchedule.updateMany({ where: { id: schedule.id, status: "In Transit", isDeleted: false }, data: { status: "Delivered", deliveredAt: new Date(), receivedBy: evidence.receivedBy, receivedSignature: signatureReference, podUrl: podReference } });
+      if (changed.count !== 1) throw Object.assign(new Error("POD sudah diproses oleh pengguna lain."), { statusCode: 409 });
+      if (!schedule.details.length) throw Object.assign(new Error("Shipment tidak memiliki detail barang aktif."), { statusCode: 409 });
       for (const detail of schedule.details) {
-        await consumeSalesReservations(tx, schedule.soNumber, detail.soDetail, detail.qty, req.user?.username || req.user?.email || "system");
+        if (!detail.soDetail || detail.soDetail.isDeleted || !Number.isFinite(detail.qty) || detail.qty <= 0 || Number(detail.qtyDelivered) > 0 || Number(detail.soDetail.qtyDelivered) + detail.qty > Number(detail.soDetail.qty) + 0.000001) throw Object.assign(new Error("Qty atau referensi SO berubah. Periksa shipment sebelum POD."), { statusCode: 409 });
+        await consumeSalesReservations(tx, schedule.soNumber, detail.soDetail, detail.qty, req.user?.username || req.user?.email || "system", schedule.scheduleNumber);
         await tx.deliveryScheduleDetail.update({ where: { id: detail.id }, data: { qtyDelivered: detail.qty } });
         await tx.salesOrderDetail.update({ where: { id: detail.soDetailId }, data: { qtyDelivered: { increment: detail.qty } } });
       }
-      const delivered = await tx.deliverySchedule.update({ where: { id: schedule.id }, data: { status: "Delivered", deliveredAt: new Date(), receivedBy: req.body.receivedBy || null, receivedSignature: req.body.receivedSignature || null, podUrl: req.body.podUrl || null } });
       await syncOperationalSalesOrderStatus(tx, schedule.soNumber);
-      return delivered;
-    });
+      return tx.deliverySchedule.findUnique({ where: { id: schedule.id } });
+    }, { isolationLevel: "Serializable" });
+    committed = true;
     res.json(item);
+  } catch (error) {
+    if (!committed) await Promise.allSettled(saved.map((reference) => removeEvidence(reference)));
+    if (error.code === "P2034") return res.status(409).json({ message: "Data berubah saat POD. Muat ulang dan periksa status sebelum mencoba lagi." });
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error);
+  }
+};
+
+exports.deliveryLookup = async (req, res, next) => {
+  try {
+    const scheduleNumber = parseDeliveryReference(req.query.reference);
+    const item = await prisma.deliverySchedule.findFirst({ where: { scheduleNumber, isDeleted: false }, select: { scheduleNumber: true, soNumber: true, status: true, plannedDate: true, shippedAt: true, deliveredAt: true } });
+    if (!item) return res.status(404).json({ message: "Delivery Schedule tidak ditemukan." });
+    res.set("Cache-Control", "no-store").json({ ...item, reference: deliveryReference(item.scheduleNumber), href: `/modules/outgoing/delivery-schedules/${encodeURIComponent(item.scheduleNumber)}` });
+  } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
+};
+
+exports.deliveryNote = async (req, res, next) => {
+  try {
+    const schedule = await prisma.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, isDeleted: false }, include: { soHeader: true, details: { where: { isDeleted: false }, orderBy: { lineNumber: "asc" }, include: { soDetail: true } } } });
+    if (!schedule) return res.status(404).json({ message: "Delivery Schedule tidak ditemukan." });
+    const buffer = await createDeliveryNotePdf(schedule);
+    res.set({ "Content-Type": "application/pdf", "Cache-Control": "no-store", "Content-Disposition": `attachment; filename="Surat-Jalan-${schedule.scheduleNumber.replace(/[^a-zA-Z0-9_-]/g, "-")}.pdf"` }).send(buffer);
+  } catch (error) { next(error); }
+};
+
+exports.downloadEvidence = async (req, res, next) => {
+  try {
+    if (!["pod", "signature"].includes(req.params.kind)) return res.status(404).json({ message: "Jenis bukti tidak tersedia." });
+    const schedule = await prisma.deliverySchedule.findFirst({ where: { scheduleNumber: req.params.scheduleNumber, isDeleted: false }, select: { podUrl: true, receivedSignature: true } });
+    if (!schedule) return res.status(404).json({ message: "Delivery Schedule tidak ditemukan." });
+    const evidence = resolveEvidence(req.params.kind === "pod" ? schedule.podUrl : schedule.receivedSignature);
+    res.set({ "Content-Type": evidence.mime, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    res.download(evidence.path, `${req.params.kind}-${evidence.filename}`, (error) => { if (error && !res.headersSent) res.status(error.code === "ENOENT" ? 404 : 500).json({ message: "Bukti pengiriman tidak dapat dibaca." }); });
   } catch (error) { if (error.statusCode) return res.status(error.statusCode).json({ message: error.message }); next(error); }
 };
 

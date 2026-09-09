@@ -16,6 +16,7 @@ router.get("/tokens", auth, ctrl.listTokens);
 router.delete("/tokens/:jti", auth, ctrl.deleteToken);
 
 // Endpoint export untuk integrasi eksternal (tanpa login user, wajib export token)
+router.get("/hmi/reasons", authExportToken, require("../controllers/HmiReasonExportController").catalog);
 router.get("/parts", authExportToken, partCtrl.list);
 router.get("/machines", authExportToken, machineCtrl.list);
 router.get("/dies", authExportToken, diesCtrl.list);

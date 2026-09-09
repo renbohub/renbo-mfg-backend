@@ -13,6 +13,114 @@ datasource db {
 // ENUM
 // ============================================
 
+// Append-only commitments. A changed source needs a new confirmation; targets
+// and physical receipts remain owned by their original workflows.
+model EtaConfirmation {
+  id                    String   @id @default(uuid())
+  requestId             String   @unique @map("request_id")
+  sourceKey             String   @map("source_key")
+  sourceType            String   @map("source_type")
+  sourceNumber          String   @map("source_number")
+  sourceFingerprint     String   @map("source_fingerprint")
+  sourceSnapshot        Json     @map("source_snapshot")
+  mpsNumber             String?  @map("mps_number")
+  mpsRevision           Int?     @map("mps_revision")
+  partnerCode           String   @map("partner_code")
+  qty                   Float
+  eta                   DateTime
+  readyDate             DateTime? @map("ready_date")
+  confirmationReference String   @map("confirmation_reference")
+  notes                 String?
+  confirmedBy           String   @map("confirmed_by")
+  confirmedAt           DateTime @default(now()) @map("confirmed_at")
+
+  @@index([sourceKey, confirmedAt])
+  @@index([mpsNumber, mpsRevision])
+  @@map("tbl_eta_confirmation")
+}
+
+// Customer-owned material is kept separate from company-owned StockBalance.
+// One request = one material/UOM/owner/need date, with multiple shipments.
+model CustomerSupplyRequest {
+  id             String   @id @default(uuid())
+  requestNumber  String   @unique @map("request_number")
+  sourceKey      String?  @unique @map("source_key")
+  sourceRunNumber String? @map("source_run_number")
+  sourceRequirementIds Json @default("[]") @map("source_requirement_ids")
+  customerCode   String   @map("customer_code")
+  partCode       String   @map("part_code")
+  materialCode   String?  @map("material_code")
+  uomCode        String   @map("uom_code")
+  qtyRequested   Float    @map("qty_requested")
+  requiredDate   DateTime @map("required_date")
+  status         String   @default("REQUESTED")
+  notes          String?
+  createdBy      String   @map("created_by")
+  history        Json     @default("[]")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  shipments      CustomerSupplyShipment[]
+  @@index([customerCode, partCode, requiredDate], map: "tbl_customer_supply_request_customer_code_part_code_required_id")
+  @@map("tbl_customer_supply_request")
+}
+
+model CustomerSupplyShipment {
+  id             String   @id @default(uuid())
+  requestId      String   @map("request_id")
+  qty            Float
+  eta            DateTime
+  readyDate      DateTime @map("ready_date") // ETA + planned receiving/QC time, user confirmed
+  status         String   @default("PLANNED")
+  confirmationReference String? @map("confirmation_reference")
+  confirmedBy    String?  @map("confirmed_by")
+  confirmedAt    DateTime? @map("confirmed_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  request        CustomerSupplyRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+  receipts       CustomerSupplyReceipt[]
+  @@index([requestId, status, readyDate])
+  @@map("tbl_customer_supply_shipment")
+}
+
+model CustomerSupplyReceipt {
+  id             String   @id @default(uuid())
+  receiptNumber  String   @unique @map("receipt_number")
+  shipmentId     String   @map("shipment_id")
+  idempotencyKey String   @unique @map("idempotency_key")
+  receivedQty    Float    @map("received_qty")
+  receivedDate   DateTime @map("received_date")
+  warehouseCode  String   @map("warehouse_code")
+  lotNumber      String   @map("lot_number")
+  deliveryNoteNumber String @map("delivery_note_number")
+  acceptedQty    Float    @default(0) @map("accepted_qty")
+  rejectedQty    Float    @default(0) @map("rejected_qty")
+  issuedQty      Float    @default(0) @map("issued_qty")
+  qcStatus       String   @default("PENDING") @map("qc_status")
+  qcReference    String?  @map("qc_reference")
+  releasedAt     DateTime? @map("released_at")
+  receivedBy     String   @map("received_by")
+  inspectedBy    String?  @map("inspected_by")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  shipment       CustomerSupplyShipment @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+  issues         CustomerSupplyIssue[]
+  @@index([shipmentId, qcStatus])
+  @@map("tbl_customer_supply_receipt")
+}
+
+model CustomerSupplyIssue {
+  id             String   @id @default(uuid())
+  receiptId      String   @map("receipt_id")
+  idempotencyKey String   @unique @map("idempotency_key")
+  qty            Float
+  reference      String // Actual production/material issue reference
+  performedBy    String   @map("performed_by")
+  createdAt      DateTime @default(now()) @map("created_at")
+  receipt        CustomerSupplyReceipt @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+  @@index([receiptId])
+  @@map("tbl_customer_supply_issue")
+}
+
 enum Status {
   Draft
   Pending
@@ -53,6 +161,8 @@ enum DiesOwnerType {
 // ============================================
 
 model User {
+  partnerAccess PartnerAccess?
+
   id           String   @id @default(uuid())
   username     String   @unique
   password     String
@@ -679,6 +789,8 @@ model Customer {
 // ============================================
 
 model Supplier {
+  partnerAccesses PartnerAccess[]
+
   id              String   @id @default(uuid())
   supplierCode    String   @unique @map("supplier_code")
   supplierName    String?  @map("supplier_name")
@@ -722,6 +834,8 @@ model Supplier {
 // ============================================
 
 model Vendor {
+  partnerAccesses PartnerAccess[]
+
   id              String   @id @default(uuid())
   vendorCode      String   @unique @map("vendor_code")
   vendorName      String?  @map("vendor_name")
@@ -1032,7 +1146,8 @@ model Dies {
   cavity                    Int? // Jumlah cavity
   tonnage                   Float? // Tonnage machine yang dibutuhkan
   cycleTime                 Float?                     @map("cycle_time") // Cycle time standar (detik)
-  diesType                  String?                    @map("dies_type") // QD_SMALL, QD_MEDIUM, QD_LARGE, atau klasifikasi tooling lain
+  diesType                  String?                    @map("dies_type") // Tipe dies; nilai QD lama tetap dibaca untuk kompatibilitas
+  sizeClass                 String?                    @map("size_class") // SMALL, MEDIUM, LARGE; klasifikasi oleh pengguna
   // Files & Documentation
   photos                    Json?                      @map("photos") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
   drawings                  Json?                      @map("drawings") // Object Array: [{ fileName, fileUrl, fileType, fileSize }]
@@ -1043,6 +1158,7 @@ model Dies {
   updatedAt                 DateTime                   @updatedAt @map("updated_at")
   // Relations
   diesParts                 DiesPart[]
+  qdMemberships             QdUnitDies[]
   maintenances              DiesMaintenance[]
   usages                    DiesUsage[]
   workOrders                WorkOrder[]
@@ -1069,6 +1185,59 @@ model Dies {
 // ============================================
 // MASTER DATA - DIES-PART RELATION
 // ============================================
+
+model QdType {
+  id             String   @id @default(uuid())
+  typeCode       String   @unique @map("type_code")
+  typeName       String   @map("type_name")
+  dimensionA     Float    @map("dimension_a")
+  dimensionB     Float    @map("dimension_b")
+  dimensionUnit  String   @default("mm") @map("dimension_unit")
+  preferredClass String?  @map("preferred_class")
+  notes          String?
+  isActive       Boolean  @default(true) @map("is_active")
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  units          QdUnit[]
+
+  @@map("tbl_qd_type")
+}
+
+model QdUnit {
+  id        String     @id @default(uuid())
+  qdCode    String     @unique @map("qd_code")
+  qdName    String     @map("qd_name")
+  qdNumber  String?    @map("qd_number")
+  qdTypeId  String     @map("qd_type_id")
+  status    DiesStatus @default(Active)
+  location  String?
+  notes     String?
+  isDeleted Boolean    @default(false) @map("is_deleted")
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+  qdType    QdType     @relation(fields: [qdTypeId], references: [id], onDelete: Restrict)
+  dies      QdUnitDies[]
+
+  @@index([qdTypeId])
+  @@map("tbl_qd_unit")
+}
+
+// Daftar dies yang dapat dipakai bergantian, bukan keluaran bersama per stroke.
+model QdUnitDies {
+  id        String   @id @default(uuid())
+  qdUnitId  String   @map("qd_unit_id")
+  diesId    String   @map("dies_id")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  qdUnit    QdUnit   @relation(fields: [qdUnitId], references: [id], onDelete: Restrict)
+  dies      Dies     @relation(fields: [diesId], references: [id], onDelete: Restrict)
+
+  @@unique([qdUnitId, diesId])
+  @@index([diesId])
+  @@map("tbl_qd_unit_dies")
+}
 
 model DiesPart {
   id             String    @id @default(uuid())
@@ -2622,6 +2791,7 @@ model MBOMProcess {
   machineId                String?  @map("machine_id")
   machineSpecificationCode String?  @map("machine_specification_code") // Capability requirement; physical asset is assigned in Capacity Planning
   alternativeMachineIds    Json?    @map("alternative_machine_ids") // Legacy only; no longer used by BOM or Capacity Planning
+  machinePlanningPolicy    Json?    @map("machine_planning_policy") // Explicit primary, qualified resources, physical tooling and parallel approval
   diesId                   String?  @map("dies_id")
   routingMode              String   @default("INHOUSE") @map("routing_mode") // INHOUSE atau VENDOR
   vendorId                 String?  @map("vendor_id")
@@ -2834,6 +3004,8 @@ model QuotationDetail {
 // ============================================
 
 model SalesOrderHeader {
+  customerPoNumber String? @map("customer_po_number")
+
   id                 String    @id @default(uuid())
   soNumber           String    @unique @map("so_number")
   soDate             DateTime  @default(now()) @map("so_date")
@@ -3152,6 +3324,7 @@ model Warehouse {
 // ============================================
 
 model StockBalance {
+  reorderState InventoryReorderState?
   id            String   @id @default(uuid())
   warehouseCode String   @map("warehouse_code")
   rackCode      String?  @map("rack_code") // Kode rak penyimpanan (opsional)
@@ -3209,6 +3382,17 @@ model StockBalance {
   @@index([qtyAvailable])
   @@index([isDeleted])
   @@map("tbl_stock_balance")
+}
+
+model InventoryReorderState {
+  stockBalanceId String @id @map("stock_balance_id")
+  isLow Boolean @default(false) @map("is_low")
+  notifiedUserIds Json @default("[]") @map("notified_user_ids")
+  lastAvailable Float @map("last_available")
+  threshold Float
+  updatedAt DateTime @updatedAt @map("updated_at")
+  stockBalance StockBalance @relation(fields: [stockBalanceId], references: [id], onDelete: Cascade)
+  @@map("tbl_inventory_reorder_state")
 }
 
 model ManufacturingOrderSourceWip {
@@ -3646,6 +3830,11 @@ model MPS {
   id                             String    @id @default(uuid())
   mpsNumber                      String    @unique @map("mps_number")
   mpsName                        String?   @map("mps_name")
+  etaMode                        String    @default("MANUAL") @map("eta_mode")
+  etaModeVersion                 Int       @default(0) @map("eta_mode_version")
+  etaModeChangedBy               String?   @map("eta_mode_changed_by")
+  etaModeChangedAt               DateTime? @map("eta_mode_changed_at")
+  etaModeHistory                 Json      @default("[]") @map("eta_mode_history")
   sourceKey                      String?   @unique @map("source_key") // Idempotency: FORECAST:<forecastNumber>:<YYYY-MM>
   periodStart                    DateTime  @map("period_start") // Planning period start
   periodEnd                      DateTime  @map("period_end") // Planning period end
@@ -4512,6 +4701,36 @@ model DemandPlanningDecision {
 // Versioned PPIC execution commitment for protecting an exact customer due
 // date. Feasibility remains a simulation; this record makes the agreed
 // corrective actions, owners, dates, and approval immutable and auditable.
+// Department follow-up is separate from delivery disposition/approval.
+model MpsRecoveryRequest {
+  id                 String   @id @default(uuid())
+  mpsNumber          String
+  mpsRevision        Int
+  lineId             String
+  checkpointCode     String
+  planningMonth      String
+  partCode           String
+  title              String
+  departmentId       String
+  departmentName     String
+  recipientIds       Json
+  sourceSnapshot     Json
+  feedbackStatus     String   @default("OPEN")
+  notes              String
+  targetDate         DateTime?
+  feedbackNotes      String?
+  evidenceReference  String?
+  requestedBy        String
+  updatedBy          String?
+  history            Json
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([mpsNumber, mpsRevision, lineId, checkpointCode], map: "tbl_mps_recovery_request_mpsNumber_mpsRevision_lineId_checkpoi_")
+  @@index([planningMonth, departmentId, feedbackStatus], map: "tbl_mps_recovery_request_planningMonth_departmentId_feedback_id")
+  @@map("tbl_mps_recovery_request")
+}
+
 model DueDateRecoveryPlan {
   id                       String    @id @default(uuid())
   deliveryTargetId         String    @map("delivery_target_id")
@@ -5927,6 +6146,8 @@ model PurchaseRequisitionSourcingAllocation {
 // ============================================
 
 model PurchaseOrder {
+  partnerNotices PartnerDeliveryNotice[]
+
   id              String    @id @default(uuid())
   poNumber        String    @unique @map("po_number")
   poDate          DateTime  @default(now()) @map("po_date")
@@ -6093,6 +6314,9 @@ model PurchaseOrderDetail {
 // ============================================
 
 model GoodsReceipt {
+  partnerNotice PartnerDeliveryNotice?
+  incomingDocuments IncomingDocument[]
+
   id                 String    @id @default(uuid())
   grNumber           String    @unique @map("gr_number")
   grDate             DateTime  @default(now()) @map("gr_date")
@@ -6380,6 +6604,8 @@ model IncomingInspection {
 }
 
 model IncomingInspectionDetail {
+  checklist Json?
+
   id                   String    @id @default(uuid())
   inspectionId         String    @map("inspection_id")
   grDetailId           String    @map("gr_detail_id")
@@ -7322,4 +7548,152 @@ model PlanningSolverRun {
   @@index([scope, referenceNumber])
   @@index([inputHash])
   @@map("tbl_planning_solver_run")
+}
+
+// HMI reason IDs remain compatible with legacy exports. Case-insensitive
+// expression indexes are maintained by the HMI master migration.
+model HmiArea {
+  id              Int      @id @default(autoincrement()) @map("area_id")
+  areaCode        String?  @map("area_code") @db.VarChar(50)
+  description     String?  @map("area_name") @db.VarChar(50)
+  areaDescription String?  @map("area_desc") @db.VarChar(50)
+  isActive        Boolean  @default(true) @map("is_active")
+  isDeleted       Boolean  @default(false) @map("is_deleted")
+  sortOrder       Int      @default(0) @map("sort_order")
+  notes           String?
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("hmi_list_area")
+}
+
+model HmiNgReason {
+  id          Int      @id @default(autoincrement()) @map("rejection_id")
+  description String   @default("0") @map("rejection_desc") @db.VarChar(255)
+  areaId      Int      @default(1) @map("area_id")
+  isActive    Boolean  @default(true) @map("is_active")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  sortOrder   Int      @default(0) @map("sort_order")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("hmi_list_rejection")
+}
+
+model HmiNgSubreason {
+  id          Int      @id @default(autoincrement()) @map("rejection_sub_id")
+  description String   @default("0") @map("rejection_sub_desc") @db.VarChar(255)
+  parentId    Int      @default(1) @map("rejection_id")
+  isActive    Boolean  @default(true) @map("is_active")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  sortOrder   Int      @default(0) @map("sort_order")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("hmi_list_rejection_sub")
+}
+
+model HmiDowntimeReason {
+  id           Int      @id @default(autoincrement()) @map("downtime_id")
+  description  String   @default("0") @map("downtime_desc") @db.VarChar(255)
+  areaId       Int      @default(1) @map("area_id")
+  isActive     Boolean  @default(true) @map("is_active")
+  isDeleted    Boolean  @default(false) @map("is_deleted")
+  sortOrder    Int      @default(0) @map("sort_order")
+  notes        String?
+  stopClass    String   @default("UNPLANNED") @map("stop_class") @db.VarChar(16)
+  countsAsLoss Boolean  @default(true) @map("counts_as_loss")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("hmi_list_downtime")
+}
+
+model HmiDowntimeSubreason {
+  id          Int      @id @default(autoincrement()) @map("downtime_sub_id")
+  description String   @default("0") @map("downtime_sub_desc") @db.VarChar(255)
+  parentId    Int      @default(1) @map("downtime_id")
+  isActive    Boolean  @default(true) @map("is_active")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  sortOrder   Int      @default(0) @map("sort_order")
+  notes       String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("hmi_list_downtime_sub")
+}
+
+model HmiReasonAudit {
+  id         BigInt   @id @default(autoincrement())
+  entityKind String   @map("entity_kind") @db.VarChar(24)
+  recordId   Int      @map("record_id")
+  action     String   @db.VarChar(16)
+  actorId    String?  @map("actor_id")
+  beforeData Json?    @map("before_data")
+  afterData  Json?    @map("after_data")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([entityKind, recordId, createdAt], map: "hmi_reason_audit_record")
+  @@map("tbl_hmi_reason_audit")
+}
+
+model PartnerAccess {
+  id String @id @default(uuid())
+  userId String @unique @map("user_id")
+  supplierCode String? @map("supplier_code")
+  vendorCode String? @map("vendor_code")
+  isActive Boolean @default(true) @map("is_active")
+  managedBy String @map("managed_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  supplier Supplier? @relation(fields: [supplierCode], references: [supplierCode], onDelete: Restrict)
+  vendor Vendor? @relation(fields: [vendorCode], references: [vendorCode], onDelete: Restrict)
+  notices PartnerDeliveryNotice[]
+  @@index([supplierCode])
+  @@index([vendorCode])
+  @@map("tbl_partner_access")
+}
+
+model PartnerDeliveryNotice {
+  id String @id @default(uuid())
+  noticeNumber String @unique @map("notice_number")
+  partnerAccessId String @map("partner_access_id")
+  poNumber String @map("po_number")
+  deliveryNoteNumber String @map("delivery_note_number")
+  expectedDate DateTime @map("expected_date")
+  details Json
+  notes String?
+  status String @default("Submitted")
+  grNumber String? @unique @map("gr_number")
+  createdBy String @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  partnerAccess PartnerAccess @relation(fields: [partnerAccessId], references: [id], onDelete: Restrict)
+  po PurchaseOrder @relation(fields: [poNumber], references: [poNumber], onDelete: Restrict)
+  gr GoodsReceipt? @relation(fields: [grNumber], references: [grNumber], onDelete: Restrict)
+  documents IncomingDocument[]
+  @@unique([partnerAccessId, poNumber, deliveryNoteNumber])
+  @@index([poNumber, status])
+  @@index([expectedDate])
+  @@map("tbl_partner_delivery_notice")
+}
+
+model IncomingDocument {
+  id String @id @default(uuid())
+  noticeId String? @map("notice_id")
+  grNumber String? @map("gr_number")
+  fileName String @map("file_name")
+  storageKey String @unique @map("storage_key")
+  fileType String @map("file_type")
+  fileSize Int @map("file_size")
+  uploadedBy String @map("uploaded_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  notice PartnerDeliveryNotice? @relation(fields: [noticeId], references: [id], onDelete: Restrict)
+  gr GoodsReceipt? @relation(fields: [grNumber], references: [grNumber], onDelete: Restrict)
+  @@index([noticeId])
+  @@index([grNumber])
+  @@map("tbl_incoming_document")
 }

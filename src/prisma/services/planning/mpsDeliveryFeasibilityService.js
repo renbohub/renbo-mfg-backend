@@ -347,6 +347,9 @@ async function buildSnapshotInputs(tx, doc) {
           ? decision.constraintDetails.materialCoverage
           : [],
         capacityAssumption: decision?.constraintDetails?.capacityAssumption || null,
+        earliestFgCalculation: decision?.constraintDetails?.earliestFgCalculation || null,
+        processTimeline: decision?.constraintDetails?.processTimeline || [],
+        solver: decision?.constraintDetails?.solver || null,
         requiresRiskApproval: Boolean(decision?.constraintDetails?.requiresRiskApproval),
         waivedRisks: Array.isArray(decision?.constraintDetails?.waivedRisks)
           ? decision.constraintDetails.waivedRisks
@@ -487,6 +490,9 @@ async function getMpsDeliveryGate(tx, mpsOrNumber) {
         earliestFeasibleDeliveryDate: iso(decision?.earliestFeasibleDeliveryDate),
         materialCoverage: Array.isArray(constraintDetails.materialCoverage) ? constraintDetails.materialCoverage : [],
         capacityAssumption: constraintDetails.capacityAssumption || null,
+        earliestFgCalculation: constraintDetails.earliestFgCalculation || null,
+        processTimeline: constraintDetails.processTimeline || [],
+        solver: constraintDetails.solver || null,
         requiresRiskApproval: Boolean(constraintDetails.requiresRiskApproval),
         waivedRisks: Array.isArray(constraintDetails.waivedRisks) ? constraintDetails.waivedRisks : [],
       },
@@ -510,6 +516,7 @@ async function invalidateMpsDeliveryGate(tx, mpsNumber, reason) {
 }
 
 async function assertMpsDeliveryApprovalAllowed(tx, doc) {
+  await require("./mpsEtaService").assertReady(tx, doc.mpsNumber);
   const gate = await getMpsDeliveryGate(tx, doc);
   if (gate.officialGateStatus === "BLOCKED") {
     const error = Object.assign(new Error(gate.reason), { statusCode: 409, code: "MPS_DELIVERY_FEASIBILITY_BLOCKED", deliveryGate: gate });
@@ -520,7 +527,10 @@ async function assertMpsDeliveryApprovalAllowed(tx, doc) {
 
 async function assertOfficialMpsDeliveryGate(tx, docs) {
   const results = [];
-  for (const doc of docs) results.push({ mpsNumber: doc.mpsNumber, ...(await getMpsDeliveryGate(tx, doc)) });
+  for (const doc of docs) {
+    await require("./mpsEtaService").assertReady(tx, doc.mpsNumber);
+    results.push({ mpsNumber: doc.mpsNumber, ...(await getMpsDeliveryGate(tx, doc)) });
+  }
   const blocked = results.find((row) => row.officialGateStatus === "BLOCKED");
   if (blocked) throw Object.assign(new Error(`${blocked.mpsNumber}: ${blocked.reason}`), { statusCode: 409, code: "MRP_OFFICIAL_DELIVERY_GATE_BLOCKED", deliveryGate: blocked, deliveryGates: results });
   return results;

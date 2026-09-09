@@ -1,4 +1,5 @@
 "use strict";
+const { businessNow } = require("../../utils/businessClock");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const asDate = (value) => {
@@ -44,7 +45,7 @@ function buildDueDateRecoveryChecklist(feasibility = {}, options = {}) {
   const fgRequiredDate = feasibility.fgRequiredDate;
   const earliestDeliveryDate = feasibility.earliestFeasibleDeliveryDate;
   const gapDays = calendarGapDays(requestedDeliveryDate, earliestDeliveryDate);
-  const today = options.today || feasibility.simulatedAt || new Date();
+  const today = options.today || feasibility.simulatedAt || businessNow();
   const actions = [];
 
   if ((feasibility.waivedRisks || details.waivedRisks || []).length) {
@@ -263,7 +264,7 @@ function buildDueDateRecoveryChecklist(feasibility = {}, options = {}) {
 function validateRecoveryChecklist(checklist = [], requestedDeliveryDate = null) {
   const errors = [];
   const customerDue = dateKey(requestedDeliveryDate);
-  const today = dateKey(new Date());
+  const today = dateKey(businessNow());
   for (const item of checklist) {
     if (item.required && !item.selected) errors.push(`${item.title}: tindakan wajib belum dicentang.`);
     if (!item.selected) continue;

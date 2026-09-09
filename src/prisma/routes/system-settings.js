@@ -1,6 +1,8 @@
 const router = require("express").Router();
 const ctrl = require("../controllers/SystemSettingController");
 const { authorize } = require("../middleware/auth");
+router.get("/current-date", ctrl.getCurrentDate);
+router.patch("/current-date", authorize("systemSettings", "update"), ctrl.updateCurrentDate);
 
 router.get("/mrp-demand-fence", authorize("systemSettings", "read"), ctrl.getMrpDemandFence);
 router.patch("/mrp-demand-fence", authorize("systemSettings", "update"), ctrl.updateMrpDemandFence);
