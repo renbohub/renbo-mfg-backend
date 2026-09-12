@@ -2193,6 +2193,7 @@ exports.previewFromMps = async (req, res, next) => {
 
 exports.createFromMps = async (req, res, next) => {
   try {
+    const integratedPreview = require("../../services/planning/planningTransactionContext").isPreview();
     const mpsNumber = text(req.body?.mpsNumber);
     if (!mpsNumber) return res.status(400).json({ message: "MPS wajib dipilih." });
     const productionPercent = req.body?.productionPercent == null ? 100 : Number(req.body.productionPercent);
@@ -2202,8 +2203,8 @@ exports.createFromMps = async (req, res, next) => {
       include: { details: { where: { isDeleted: false, status: { not: "Cancelled" } }, include: { part: true }, orderBy: [{ startDate: "asc" }, { lineNumber: "asc" }] } },
     });
     if (!mps) return res.status(404).json({ message: "MPS tidak ditemukan." });
-    if (mps.status !== "Confirmed") return res.status(409).json({ message: "MPS harus Confirmed sebelum dibuat menjadi Production Plan." });
-    if (mps.replanRequired) return res.status(409).json({ message: "MPS berubah. Hitung ulang dan approve MRP terbaru sebelum membuat Production Plan." });
+    if (!integratedPreview && mps.status !== "Confirmed") return res.status(409).json({ message: "MPS harus Confirmed sebelum dibuat menjadi Production Plan." });
+    if (!integratedPreview && mps.replanRequired) return res.status(409).json({ message: "MPS berubah. Hitung ulang dan approve MRP terbaru sebelum membuat Production Plan." });
     // A rolling MRP has one monthly header (the anchor MPS), while its
     // scenarioAssumptions.sourceMpsNumbers records every delivery month in the
     // cycle. Looking up only mRPRun.mpsNumber incorrectly blocks MPP creation
@@ -2215,9 +2216,9 @@ exports.createFromMps = async (req, res, next) => {
     const completedMrpCandidates = await prisma.mRPRun.findMany({
       where: {
         isDeleted: false,
-        isCurrentPlan: true,
+        isCurrentPlan: !integratedPreview,
         status: "Completed",
-        scenarioStatus: "APPROVED",
+        scenarioStatus: integratedPreview ? "SIMULATED" : "APPROVED",
         ...(req.body.sourceMrpRunNumber ? { runNumber: String(req.body.sourceMrpRunNumber) } : {}),
         OR: [
           { mpsNumber },
@@ -2234,8 +2235,8 @@ exports.createFromMps = async (req, res, next) => {
       return run.mpsNumber === mpsNumber || sourceMpsNumbers.includes(mpsNumber);
     });
     if (!completedMrp) return res.status(409).json({ message: "Jalankan dan approve MRP yang menjadi current plan sebelum membuat Production Plan." });
-    assertApprovedCurrentMrp(completedMrp, "Monthly Production Plan");
-    if (!mrpSourceSnapshotMatches(completedMrp.scenarioAssumptions, [mps])) return res.status(409).json({ message: "Snapshot MRP tidak sesuai revisi MPS saat ini. Hitung dan approve MRP terbaru." });
+    if (!integratedPreview) assertApprovedCurrentMrp(completedMrp, "Monthly Production Plan");
+    if (!integratedPreview && !mrpSourceSnapshotMatches(completedMrp.scenarioAssumptions, [mps])) return res.status(409).json({ message: "Snapshot MRP tidak sesuai revisi MPS saat ini. Hitung dan approve MRP terbaru." });
     const rootRequirements = await prisma.mRPRequirement.findMany({
       where: {
         runNumber: completedMrp.runNumber,
@@ -2384,10 +2385,11 @@ exports.createFromMps = async (req, res, next) => {
           // createFromMps already refreshes the detail rows above. Reusing the
           // authoritative sync here also advances sourcePlanSync, so an older
           // capacity audit (for example R005) cannot survive a sync to R006.
-          const sourcePlanSync = await syncDraftPlanWithCurrentMps(item.planNumber, actor);
-          capacityRecommendation = await recommendMonthlyCapacity(prisma, item.planNumber, { actor, flowRule: normalizeCapacityFlowRule({}) });
+          const sourcePlanSync = integratedPreview ? null : await syncDraftPlanWithCurrentMps(item.planNumber, actor);
+          const integratedOptions = require("../../services/planning/planningTransactionContext").active() ? req.body?.integratedOptions : null;
+          capacityRecommendation = await recommendMonthlyCapacity(prisma, item.planNumber, { actor, flowRule: normalizeCapacityFlowRule(integratedOptions ? { delivery: { schedulePolicy: "DELIVERY_JIT", jitSafetyDays: integratedOptions.safetyDays } } : {}), machineSelections: integratedOptions?.machineSelections });
           capacityRecommendation.sourcePlanSync = sourcePlanSync;
-          if (capacityRecommendation.ready) {
+          if (capacityRecommendation.ready && !integratedPreview) {
             await prisma.$transaction((tx) => refreshDraftForMps(tx, mps.mpsNumber, actor));
           }
         } catch (recommendationError) {

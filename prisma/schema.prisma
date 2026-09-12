@@ -262,6 +262,21 @@ model PageComment {
   @@map("tbl_page_comments")
 }
 
+model PpicPreparation {
+  id        String @id @default(uuid())
+  name      String
+  month     String
+  revision  Int @default(1)
+  payload   Json
+  createdBy String? @map("created_by")
+  updatedBy String? @map("updated_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([month, updatedAt])
+  @@map("tbl_ppic_preparation")
+}
+
 model SystemSetting {
   id           String   @id @default(uuid())
   settingKey   String   @unique @map("setting_key")
@@ -3830,7 +3845,7 @@ model MPS {
   id                             String    @id @default(uuid())
   mpsNumber                      String    @unique @map("mps_number")
   mpsName                        String?   @map("mps_name")
-  etaMode                        String    @default("MANUAL") @map("eta_mode")
+  etaMode                        String    @default("BOM") @map("eta_mode")
   etaModeVersion                 Int       @default(0) @map("eta_mode_version")
   etaModeChangedBy               String?   @map("eta_mode_changed_by")
   etaModeChangedAt               DateTime? @map("eta_mode_changed_at")
@@ -7696,4 +7711,131 @@ model IncomingDocument {
   @@index([noticeId])
   @@index([grNumber])
   @@map("tbl_incoming_document")
+}
+// PPIC workspace tables are additive SQL-managed records. Checks and immutable
+// release triggers live in their migrations; this mapping prevents schema drift.
+model PpicWorkspaceScenario {
+  id String @id
+  name String
+  month String
+  revision Int @default(1)
+  status String @default("DRAFT")
+  sourceIdentifier String @map("source_identifier")
+  sourceFingerprint String @map("source_fingerprint")
+  sourceDataFingerprint String @map("source_data_fingerprint")
+  payload Json @db.JsonB
+  createdBy String @map("created_by")
+  updatedBy String @map("updated_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  operations PpicWorkspaceScenarioOperation[]
+  releaseRequests PpicReleaseRequest[]
+  baselines PpicReleasedBaseline[]
+  @@index([month, updatedAt], map: "ppic_workspace_scenario_month_updated_idx")
+  @@map("tbl_ppic_workspace_scenario")
+}
+model PpicWorkspaceScenarioOperation {
+  operationId String @id @map("operation_id")
+  scenarioId String @map("scenario_id")
+  requestHash String @map("request_hash")
+  revision Int
+  action String
+  actorId String @map("actor_id")
+  actor String
+  result Json @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  scenario PpicWorkspaceScenario @relation(fields: [scenarioId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  @@unique([scenarioId, revision], map: "ppic_workspace_operation_revision_unique")
+  @@index([scenarioId, createdAt], map: "ppic_workspace_operation_scenario_idx")
+  @@map("tbl_ppic_workspace_scenario_operation")
+}
+model PpicReleaseRequest {
+  id String @id
+  scenarioId String @map("scenario_id")
+  scenarioRevision Int @map("scenario_revision")
+  month String
+  revision Int @default(1)
+  status String @default("SUBMITTED")
+  sourceFingerprint String @map("source_fingerprint")
+  bundleHash String @map("bundle_hash")
+  review Json @db.JsonB
+  submittedActorId String @map("submitted_actor_id")
+  submittedBy String @map("submitted_by")
+  approvedBy String? @map("approved_by")
+  note String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  scenario PpicWorkspaceScenario @relation(fields: [scenarioId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  operations PpicReleaseOperation[]
+  baseline PpicReleasedBaseline?
+  @@index([month, updatedAt], map: "ppic_release_request_month_idx")
+  @@map("tbl_ppic_release_request")
+}
+model PpicReleaseOperation {
+  operationId String @id @map("operation_id")
+  requestId String @map("request_id")
+  requestHash String @map("request_hash")
+  action String
+  actorId String @map("actor_id")
+  actor String
+  note String
+  result Json @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  request PpicReleaseRequest @relation(fields: [requestId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@index([requestId, createdAt], map: "ppic_release_operation_request_idx")
+  @@map("tbl_ppic_release_operation")
+}
+model PpicReleasedBaseline {
+  id String @id
+  requestId String @unique @map("request_id")
+  month String @unique
+  scenarioId String @map("scenario_id")
+  scenarioRevision Int @map("scenario_revision")
+  bundleHash String @map("bundle_hash")
+  bundle Json @db.JsonB
+  publishedBy String @map("published_by")
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz(6)
+  request PpicReleaseRequest @relation(fields: [requestId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  scenario PpicWorkspaceScenario @relation(fields: [scenarioId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  @@map("tbl_ppic_released_baseline")
+}
+model PpicImprovementAction {
+  id String @id
+  title String
+  month String
+  ownerId String @map("owner_id")
+  dueDate String @map("due_date")
+  revision Int @default(1)
+  status String @default("OPEN")
+  payload Json @db.JsonB
+  measurementContractHash String? @map("measurement_contract_hash")
+  submittedActorId String? @map("submitted_actor_id")
+  verifiedActorId String? @map("verified_actor_id")
+  verifiedBy String? @map("verified_by")
+  verificationNote String? @map("verification_note")
+  createdActorId String @map("created_actor_id")
+  createdBy String @map("created_by")
+  updatedBy String @map("updated_by")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  operations PpicImprovementOperation[]
+  @@index([month, dueDate], map: "ppic_improvement_month_due_idx")
+  @@index([ownerId, status], map: "ppic_improvement_owner_status_idx")
+  @@map("tbl_ppic_improvement_action")
+}
+model PpicImprovementOperation {
+  operationId String @id @map("operation_id")
+  actionId String @map("action_id")
+  revision Int
+  requestHash String @map("request_hash")
+  action String
+  actorId String @map("actor_id")
+  actor String
+  note String
+  result Json @db.JsonB
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  record PpicImprovementAction @relation(fields: [actionId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  @@unique([actionId, revision], map: "ppic_improvement_operation_revision_unique")
+  @@index([actionId, createdAt], map: "ppic_improvement_operation_action_idx")
+  @@map("tbl_ppic_improvement_operation")
 }

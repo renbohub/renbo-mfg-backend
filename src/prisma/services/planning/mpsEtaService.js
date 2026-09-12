@@ -57,7 +57,7 @@ function buildRows(doc, inputKey, masters = {}) {
     if (detail.isDeleted || String(detail.notes || "").startsWith("[MRP-PRODUCTION]") || n(detail.qtyPlanned) <= 0) continue;
     const saved = detail.calculationTrace?.productionChecksheet;
     const current = !doc.replanRequired && saved?.version === evidence.VERSION && saved.mpsRevision === doc.revision && saved.sourceKey === inputKey && saved.mbomHeaderId === detail.mbomHeaderId;
-    const base = { etaMode: doc.etaMode || "MANUAL", source: doc.mpsNumber, mpsNumber: doc.mpsNumber, mpsRevision: doc.revision, documentStatus: doc.status, bomId: detail.mbomHeaderId, detailId: detail.id, href: href(doc), action: "Buka checksheet MPS", stage: "Sebelum release MPS", receivedQty: null, confirmed: false, stale: !current, blockReason: current ? null : "Checksheet belum diperiksa untuk data terbaru. Jalankan Periksa checksheet." };
+    const base = { etaMode: doc.etaMode || "BOM", source: doc.mpsNumber, mpsNumber: doc.mpsNumber, mpsRevision: doc.revision, documentStatus: doc.status, bomId: detail.mbomHeaderId, detailId: detail.id, href: href(doc), action: "Buka checksheet MPS", stage: "Sebelum release MPS", receivedQty: null, confirmed: false, stale: !current, blockReason: current ? null : "Checksheet belum diperiksa untuk data terbaru. Jalankan Periksa checksheet." };
     const phases = Object.entries(saved?.phases || {});
     const total = phases.reduce((sum, [, p]) => sum + n(p.plannedProductionQty), 0);
     if (!current || !phases.length || Math.abs(total - n(detail.qtyPlanned)) > .0001 || phases.some(([, p]) => !p.complete || p.error)) {
@@ -171,7 +171,7 @@ async function list(db, month, mpsNumber = null) {
   if (requested && !selected) store.fail("MPS tidak tersedia pada periode yang dipilih.", 404, "MPS_ETA_SELECTION_INVALID");
   const items = selected ? await forDocuments(db, [selected]) : [];
   return { month, selectedMpsNumber: selected?.mpsNumber || null, items,
-    documents: available.map((doc) => ({ mpsNumber: doc.mpsNumber, revision: doc.revision, status: doc.status, href: href(doc), etaMode: doc.etaMode || "MANUAL", etaModeVersion: doc.etaModeVersion || 0, etaModeChangedBy: doc.etaModeChangedBy, etaModeChangedAt: doc.etaModeChangedAt,
+    documents: available.map((doc) => ({ mpsNumber: doc.mpsNumber, revision: doc.revision, status: doc.status, href: href(doc), etaMode: doc.etaMode || "BOM", etaModeVersion: doc.etaModeVersion || 0, etaModeChangedBy: doc.etaModeChangedBy, etaModeChangedAt: doc.etaModeChangedAt,
       periodStart: doc.periodStart, periodEnd: doc.periodEnd, sourceKey: doc.sourceKey, simulationOnly: Boolean(doc.simulationOnly),
       capacityStatus: doc.capacityStatus, deliveryStatus: doc.deliveryFeasibilityStatus,
       eta: doc.mpsNumber === selected?.mpsNumber ? summary(items) : null })) };

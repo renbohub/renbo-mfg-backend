@@ -155,6 +155,18 @@ function registerRoutes(app) {
 
   api.use(require("../utils/businessClock").clockMiddleware(require("../index").prisma));
 
+  // Invalidate read-only proposals after successful source mutations. No document
+  // contents are sent over the event, and previews cannot trigger refresh loops.
+  api.use((req, res, next) => {
+    const sourceMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method)
+      && /^\/(planning|sales|purchasing|inventory|production|engineering|master-data|mbom)\//.test(req.path)
+      && !/^\/planning\/workspace\/(?:seed|scenarios|comparison)(?:\/|$)/.test(req.path)
+      && !/preview|simulate|feasibility|workbench|generate-number/.test(req.path);
+    if (sourceMutation) res.once("finish", () => {
+      if (res.statusCode >= 200 && res.statusCode < 300 && req.user) global.io?.emit("planning:source-changed", { updatedAt: new Date().toISOString() });
+    });
+    next();
+  });
   // Protected routes (require auth)
   api.use("/home", auth, require("./home"));
   api.use("/master-data/hmi-reasons", auth, require("./master-data/hmi-reasons"));
@@ -252,6 +264,8 @@ function registerRoutes(app) {
   api.use("/planning/demand-planning", auth, demandPlanningRouter);
   api.use("/planning/solver-runs", auth, planningSolverRunsRouter);
   api.use("/planning/execution-cockpit", auth, planningExecutionCockpitRouter);
+  api.use("/planning/preparation", auth, require("./planning/preparation"));
+  api.use("/planning/workspace", auth, require("./planning/workspace"));
 
   // Purchasing routes
   api.use("/purchasing/purchase-order", auth, purchaseOrderRouter);

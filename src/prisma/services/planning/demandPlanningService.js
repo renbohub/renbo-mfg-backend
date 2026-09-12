@@ -1,5 +1,5 @@
 "use strict";
-const { businessNow } = require("../../utils/businessClock");
+const { businessNow } = require("../../utils/businessClock");
 
 const { assessDemandFeasibility } = require("./demandFeasibilityService");
 const { buildCapacitySnapshot } = require("./capacityPlanningService");
@@ -335,12 +335,18 @@ async function buildDemandRows(prisma, filters = {}) {
   };
   const [forecastTargets, salesOrderTargets, decisions] = await Promise.all([
     prisma.demandDeliveryTarget.findMany({ where, include: { forecastDetail: { include: { forecast: true } } }, orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }] }),
-    prisma.demandDeliveryTarget.findMany({ where: { isDeleted: false, status: "ACTIVE", sourceType: "SALES_ORDER", soDetail: { isDeleted: false, status: { not: "Cancelled" }, soHeader: { isDeleted: false, status: { notIn: ["Cancelled", "Superseded"] } } }, ...(filters.startDate || filters.endDate ? { targetDate: { ...(filters.startDate ? { gte: asDate(filters.startDate) } : {}), ...(filters.endDate ? { lte: asDate(filters.endDate) } : {}) } } : {}), ...(filters.customerCode ? { customerCode: filters.customerCode } : {}), ...(filters.partCode ? { partCode: filters.partCode } : {}) }, include: { soDetail: { include: { soHeader: true } } }, orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }] }),
+    prisma.demandDeliveryTarget.findMany({ where: { isDeleted: false, status: "ACTIVE", sourceType: "SALES_ORDER", soDetail: { isDeleted: false, status: { not: "Cancelled" }, soHeader: { isDeleted: false, status: { notIn: ["Cancelled", "Superseded"] } } }, ...(filters.startDate || filters.endDate ? { targetDate: { ...(filters.startDate ? { gte: asDate(filters.startDate) } : {}), ...(filters.endDate ? { lte: asDate(filters.endDate) } : {}) } } : {}), ...(filters.customerCode ? { customerCode: filters.customerCode } : {}), ...(filters.partCode ? { partCode: filters.partCode } : {}) }, include: { soDetail: { include: { soHeader: true, deliveryTargets: { where: { isDeleted: false, status: "ACTIVE" }, select: { id: true, qty: true, targetDate: true, phaseNumber: true }, orderBy: [{ targetDate: "asc" }, { phaseNumber: "asc" }] } } } }, orderBy: [{ targetDate: "asc" }, { sourceNumber: "asc" }, { phaseNumber: "asc" }] }),
     prisma.demandPlanningDecision.findMany({ where: { isDeleted: false, ...(filters.status ? { status: filters.status } : {}) } }),
   ]);
   const activeForecastTargets = forecastTargets.filter((row) => row.forecastDetail && !row.forecastDetail.isDeleted && isOpenForecast(row.forecastDetail.forecast));
   const validSalesTargets = salesOrderTargets.filter((row) => row.soDetail && !row.soDetail.isDeleted && row.soDetail.status !== "Cancelled" && row.soDetail.soHeader && !row.soDetail.soHeader.isDeleted && !["Cancelled", "Superseded"].includes(row.soDetail.soHeader.status));
-  const activeSalesTargets = validSalesTargets.filter((row) => row.soDetail.soHeader.status !== "Draft").map((row) => ({ ...row, deliveredQty: number(row.soDetail.qtyDelivered), soStatus: row.soDetail.soHeader.status }));
+  const activeSalesTargets = validSalesTargets.filter((row) => row.soDetail.soHeader.status !== "Draft").map((row) => {
+    const siblings = row.soDetail.deliveryTargets || [];
+    const index = siblings.findIndex(target => target.id === row.id);
+    const earlierQty = siblings.slice(0, Math.max(index, 0)).reduce((sum, target) => sum + Math.max(number(target.qty), 0), 0);
+    const deliveredQty = Math.min(Math.max(number(row.qty), 0), Math.max(number(row.soDetail.qtyDelivered) - earlierQty, 0));
+    return { ...row, deliveredQty, soStatus: row.soDetail.soHeader.status };
+  });
   const draftSalesTargets = validSalesTargets.filter((row) => row.soDetail.soHeader.status === "Draft").map((row) => ({ ...row, deliveredQty: number(row.soDetail.qtyDelivered), soStatus: "Draft" }));
   const allTargets = [...activeForecastTargets, ...activeSalesTargets, ...draftSalesTargets];
   const [customers, parts] = await Promise.all([

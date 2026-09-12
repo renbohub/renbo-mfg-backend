@@ -24,7 +24,12 @@ function buildMpsCalculationBreakdown(input = {}) {
     0,
   ));
   const authoritativeFinal = round(planMetrics.totalPlanQty ?? metrics.plannedProductionQty ?? input.mpsQty ?? 0);
-  const rawNetRequirement = round(metrics.plannedProductionQty ?? input.mpsQty ?? 0);
+  // A delivery-phase calculation can carry its parent's trace. Only reuse
+  // that rounding trace when it reconciles to this row's own production.
+  const traceRoundingApplies = finite(trace.rawPlannedProductionQty)
+    && Math.abs(Number(trace.rawPlannedProductionQty) + Number(trace.lotRoundingDeltaQty || 0)
+      - Number(metrics.plannedProductionQty ?? input.mpsQty ?? 0)) <= EPSILON;
+  const rawNetRequirement = round(traceRoundingApplies ? trace.rawPlannedProductionQty : metrics.plannedProductionQty ?? input.mpsQty ?? 0);
 
   return {
     formulaVersion: trace.formulaVersion || "MPS_EXISTING_NETTING_V1",
@@ -46,8 +51,8 @@ function buildMpsCalculationBreakdown(input = {}) {
     usableStockQty: numberOrNull(inventory.usableStockQty),
     firmReceiptQty: round(metrics.firmReceiptQty ?? input.firmReceiptQty ?? 0),
     rawNetRequirementQty: rawNetRequirement,
-    lotRoundingDeltaQty: round(input.lotRoundingDeltaQty ?? 0),
-    baselineMpsQty: round(planMetrics.baselineMpsQty ?? rawNetRequirement ?? 0),
+    lotRoundingDeltaQty: round(input.lotRoundingDeltaQty ?? (traceRoundingApplies ? trace.lotRoundingDeltaQty : 0) ?? 0),
+    baselineMpsQty: round(planMetrics.baselineMpsQty ?? metrics.plannedProductionQty ?? input.mpsQty ?? 0),
     deltaMpsQty: round(planMetrics.deltaMpsQty ?? 0),
     approvedCutQty: round(planMetrics.approvedCutQty ?? 0),
     finalMpsQty: authoritativeFinal,

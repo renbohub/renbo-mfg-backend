@@ -1,0 +1,10 @@
+"use strict";
+const router = require("express").Router(), service = require("../../services/planning/ppicImprovementService"), { logger } = require("../../middleware/logger");
+const db = () => require("../../index").prisma;
+const handle = fn => async (req, res) => { try { res.set("Cache-Control", "no-store").json(await fn(req)); } catch (error) { if (error.statusCode && error.statusCode < 500) return res.status(error.statusCode).json({ message: error.message, code: error.code }); console.error("PPIC improvement action failed:", error); res.status(500).json({ message: "Tindakan perbaikan belum dapat diproses. Silakan muat ulang.", code: "PPIC_IMPROVEMENT_ERROR" }); } };
+router.get("/", handle(req => service.list(db(), req.query, req.user)));
+router.get("/:id", handle(req => service.get(db(), req.params.id, req.query, req.user)));
+router.post("/", logger("ppicImprovement", "create"), handle(req => service.save(db(), req.body, req.user)));
+router.put("/:id", logger("ppicImprovement", "update"), handle(req => service.save(db(), req.body, req.user, req.params.id)));
+router.post("/:id/transition", logger("ppicImprovement", "transition"), handle(req => service.transition(db(), req.params.id, req.body, req.user)));
+module.exports = router;

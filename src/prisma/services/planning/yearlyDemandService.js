@@ -1,5 +1,5 @@
 "use strict";
-const { businessNow } = require("../../utils/businessClock");
+const { businessNow } = require("../../utils/businessClock");
 
 const { consumeDeliveryTargets, planningPolicy } = require("./demandConsumptionService");
 const { loadEfdConfiguration, resolveEfd } = require("./effectiveDemandRuleService");

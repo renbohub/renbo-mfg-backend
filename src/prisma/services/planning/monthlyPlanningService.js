@@ -770,7 +770,7 @@ async function syncMonthlyMps(tx, options = {}) {
           mpsNumber,
           sourceKey,
           mpsName: `MPS Bulanan ${month}`,
-          etaMode: options.initialEtaMode === undefined ? "MANUAL" : require("../purchasing/etaModeService").validateMode(options.initialEtaMode),
+          etaMode: options.initialEtaMode === undefined ? "BOM" : require("../purchasing/etaModeService").validateMode(options.initialEtaMode),
           periodStart: utcMonthStart(month),
           periodEnd: utcMonthEnd(month),
           forecastNumber: null,
@@ -898,7 +898,7 @@ async function syncMonthlyMps(tx, options = {}) {
       const demandEvents = buildDatedMpsDemand({ targets: deliveryTargets, policyDemandQty, productionPercent, reservations: appliedReservationRows, fallbackDate: utcMonthEnd(month) });
       if (carryoverShortageQty > 0) demandEvents.push({ date: utcMonthStart(month), qty: carryoverShortageQty * productionPercent / 100 });
       const receiptEvents = datedReceiptsByPartMonth.get(`${month}|${bucket.partCode}`) || [];
-      const netting = netMpsBucket({ openingAvailableQty, timePhasedOpeningAvailableQty: openingFreeQty, firmScheduledReceiptQty, grossDemandQty: grossDemandWithCarryoverQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty, demandEvents, receiptEvents });
+      const netting = netMpsBucket({ uomCode, openingAvailableQty, timePhasedOpeningAvailableQty: openingFreeQty, firmScheduledReceiptQty, grossDemandQty: grossDemandWithCarryoverQty, targetEndingStockQty: bufferQty, productionPercent, actualSalesOrderQty, demandEvents, receiptEvents });
       const qtyPlanned = normalizeQuantity(netting.plannedProductionQty, uomCode);
       projectedFgByPart.set(bucket.partCode, normalizeQuantity(netting.projectedEndingStockQty, uomCode));
       const customerCodes = uniq(bucket.customerCodes);

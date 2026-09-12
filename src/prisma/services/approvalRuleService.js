@@ -355,11 +355,13 @@ function approvalGate(config) {
       const parameter = config.param || "id";
       const identifier = req.params[parameter];
       let document = null;
-      if (config.model && prisma[config.model]) {
+      if (config.resolveDocument) {
+        document = await config.resolveDocument(req, prisma);
+      } else if (config.model && prisma[config.model]) {
         const lookupField = config.lookupField || parameter;
         document = await prisma[config.model].findUnique({ where: { [lookupField]: identifier } });
       }
-      const context = { ...(document || {}), ...(req.body?.approvalContext || {}) };
+      const context = { ...(document || {}), ...(config.allowBodyContext === false ? {} : req.body?.approvalContext || {}) };
       const documentId = document?.[config.idField || "id"] || identifier;
       const documentNumber = document?.[config.numberField || config.lookupField || parameter] || identifier;
       const amount = document?.[config.amountField || "totalAmount"] ?? req.body?.amount;

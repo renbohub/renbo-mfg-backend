@@ -9,6 +9,12 @@ const { authorize } = require("../../middleware/auth");
 const { logger } = require("../../middleware/logger");
 
 router.get("/", authorize("mps", "read"), ctrl.list);
+router.get("/delivery-calendar", authorize("mps", "read"), async (req, res, next) => {
+  try {
+    const { prisma } = require("../../index");
+    res.json(await require("../../services/planning/deliveryCalendarService").deliveryCalendar(prisma));
+  } catch (error) { next(error); }
+});
 router.get("/yearly", authorize("mps", "read"), yearlyCtrl.list);
 router.get("/yearly/additional-coverage", authorize("mps", "read"), yearlyCtrl.additionalCoverage);
 router.put("/yearly/rule", authorize("mps", "update"), logger("demandPlanning", "update-efd-rule"), yearlyCtrl.updateRule);

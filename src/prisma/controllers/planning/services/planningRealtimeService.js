@@ -1,9 +1,10 @@
+const { afterCommit } = require("../../../services/planning/planningTransactionContext");
 const emitPlanningMrpRunUpdate = (run, action = "sync", actionBy = "system") => {
   try {
     const io = global.io;
     if (!io || !run?.runNumber) return;
 
-    io.emit("planning:mrp-run", {
+    afterCommit(() => io.emit("planning:mrp-run", {
       runNumber: run.runNumber,
       planNumber: run.planNumber,
       planRevision: run.planRevision,
@@ -18,7 +19,7 @@ const emitPlanningMrpRunUpdate = (run, action = "sync", actionBy = "system") => 
       executionTime: run.executionTime,
       errorMessage: run.errorMessage,
       item: run,
-    });
+    }));
   } catch (err) {
     console.error("Failed to emit MRP run update:", err);
   }
@@ -29,7 +30,7 @@ const emitPlanningPlannedOrderUpdate = (order, action = "sync", actionBy = "syst
     const io = global.io;
     if (!io || !order?.orderNumber) return;
 
-    io.emit("planning:planned-order", {
+    afterCommit(() => io.emit("planning:planned-order", {
       orderNumber: order.orderNumber,
       runNumber: order.runNumber,
       status: order.status,
@@ -38,7 +39,7 @@ const emitPlanningPlannedOrderUpdate = (order, action = "sync", actionBy = "syst
       actionBy,
       updatedAt: order.updatedAt,
       item: order,
-    });
+    }));
   } catch (err) {
     console.error("Failed to emit Planned Order update:", err);
   }

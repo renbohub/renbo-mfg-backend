@@ -51,10 +51,10 @@ const trace = buildMpsCalculationTrace({
   netting: netMpsBucket({ openingAvailableQty: 10, grossDemandQty: 100, targetEndingStockQty: 20 }),
   sourceRows: [],
 });
-assert.equal(trace.version, 3);
+assert.equal(trace.version, 4);
 assert.deepEqual(trace.steps.map((step) => step.key), [
   "FORECAST", "SALES_ORDER", "GROSS_DEMAND", "OPENING_FREE_FG", "PEGGED_SO_RESERVATION", "OPENING_NETTABLE",
-  "FIRM_RECEIPT", "BUFFER_TARGET", "NET_PRODUCTION", "PROJECTED_ENDING",
+  "FIRM_RECEIPT", "BUFFER_TARGET", "NET_PRODUCTION", "LOT_ROUNDING", "PROJECTED_ENDING",
 ]);
 
 const read = (file) => fs.readFileSync(path.join(__dirname, file), "utf8");

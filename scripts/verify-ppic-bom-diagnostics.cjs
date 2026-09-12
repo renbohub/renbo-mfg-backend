@@ -1,0 +1,8 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');const {diagnoseBom}=require('../src/prisma/services/planning/ppicBomDiagnostics');
+const item={id:'mps',partCode:'FG',components:[{processes:[{id:'p'}]}]};
+const header={noReg:'BOM-REV1',revision:1,uomCode:'pcs',details:[{id:'c',qty:1,uomCode:'pcs',part:{partCode:'CHILD'}}]};
+const run=(h=header,r=[])=>diagnoseBom([item],[{id:'mps',mbom:h}],r);
+test('missing selected BOM is actionable; no latest revision invented',()=>{const rows=run(null);assert.equal(rows[0].status,'BLOCKER');assert.match(rows[0].recommendation,/detail MPS/);});
+test('zero quantity and null UOM identify exact component and revision',()=>{const rows=run({...header,details:[{id:'c',qty:0,uomCode:null,part:{partCode:'CHILD'}}]});const bad=rows.filter(x=>x.status==='BLOCKER');assert.equal(bad.length,2);assert.equal(bad[0].component,'CHILD');assert.equal(bad[0].actual,0);assert.match(bad[0].route,/BOM-REV1$/);});
+test('vendor cycle time zero is valid; inhouse zero is not',()=>{const r={id:'p',noReg:'NESTED',process:{processCode:'PAINT'},vendorId:'v',vendor:{vendorCode:'V1'},cycleTime:0};assert.equal(run(header,[{...r,routingMode:'VENDOR'}]).filter(x=>x.status==='BLOCKER').length,0);assert.equal(run(header,[{...r,routingMode:'INHOUSE'}]).filter(x=>x.status==='BLOCKER').length,1);});
+test('basic diagnostics no longer append an unconditional integration gap',()=>{const rows=run();assert.equal(rows.filter(x=>x.status==='BLOCKER').length,0);assert.equal(rows.some(row=>row.systemGap||row.field==='Validasi lanjutan'),false);assert.equal(diagnoseBom([],[],[]).length,0);});

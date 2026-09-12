@@ -1,0 +1,11 @@
+"use strict";
+const router=require('express').Router();
+const service=require('../../services/planning/ppicWorkspaceReleaseService');
+const db=()=>require('../../index').prisma;
+const handle=fn=>async(req,res)=>{try{res.set('Cache-Control','no-store').json(await fn(req));}catch(error){if(error.statusCode)return res.status(error.statusCode).json({message:error.message,code:error.code,details:error.details});console.error('[PPIC release]',error);res.status(500).json({message:'Paket release belum dapat diproses. Muat ulang daftar untuk memeriksa hasil terakhir.',code:'RELEASE_UNAVAILABLE'});}};
+router.get('/review',handle(req=>service.capture(db(),req.query.scenario,req.query,req.user)));
+router.get('/requests',handle(req=>service.list(db(),req.query,req.user)));
+router.get('/requests/:id',handle(req=>service.get(db(),req.params.id,req.query,req.user)));
+router.post('/requests',handle(req=>service.submit(db(),req.body,req.user)));
+router.post('/requests/:id/:action',handle(req=>service.decide(db(),req.params.id,req.params.action,req.body,req.user)));
+module.exports=router;

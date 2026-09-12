@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test:ppic-sandbox": "node --test scripts/verify-ppic-sandbox.cjs scripts/verify-ppic-material-pools.cjs",
+    "test:ppic-sandbox:live": "node scripts/verify-ppic-sandbox-live.cjs",
     "test:pricing": "node --test scripts/verify-monthly-price-inheritance.cjs scripts/verify-purchase-part-routing.cjs && node scripts/verify-monthly-price-maintenance.js && node scripts/verify-effective-price-history.js",
     "test:pricing:live-readonly": "node scripts/verify-pricing-live-readonly.cjs",
     "test:step1": "node --test scripts/verify-step1-*.cjs",

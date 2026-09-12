@@ -1,6 +1,7 @@
 const { businessNow } = require("../../utils/businessClock");
 const { canonicalizeRoutingOperations, compareRoutingOperations } = require("../../utils/routingSequence");
 const { isDiscreteUom, normalizeQuantity } = require("../../utils/uomQuantity");
+const { findRoundedShiftPlacement } = require("./shiftQuantityPolicy");
 const { findPreset, findActivePreset, shiftDurationMinutes } = require("./capacitySimulationPresetService");
 const { isDiesCapacityBlockingEnabled, isDiesTonnageCompatible, isPressResource, maintenanceInterval } = require("./diesCapacityService");
 const { buildProductionMaterialGate, materialGateForJob } = require("./materialReadinessService");
@@ -14,7 +15,7 @@ const DEFAULT_CANDIDATE_BUDGET = 50000;
 const MAX_CANDIDATE_BUDGET = 500000;
 const RETAINED_PLACEMENT_CANDIDATES = 4;
 const AUTO_CAPACITY_OVERRIDE_PREFIX = "[AUTO-CAPACITY-RECOMMENDATION]";
-const VERSION = "PRIMARY-MACHINE-TOOLING-V2";
+const VERSION = "PRIMARY-MACHINE-TOOLING-V3-SHIFT-1000";
 const { resolveRoutingMachinePolicy } = require("./routingMachinePolicy");
 function automaticCandidates(route, machines) {
   return route.resolvedMachinePolicy ? machines.filter((m) => route.resolvedMachinePolicy.automaticMachineIds.includes(m.id)) : machines;
@@ -1369,6 +1370,57 @@ function scheduleFitFirstPerRoute({ graph, job, batches, receiptQty, receiptQtyB
     if (!machineResources.machines.length) return { failed: { code: machineResources.excludedPressMachineIds.length ? "DIES_UNAVAILABLE" : "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty: totalQty, specificationCode: spec }, allocations, usage: trialUsage, diesUsage: trialDiesUsage, manualByRoute: trialManualByRoute, batches };
     const candidateMachines = machineResources.machines;
     const scoringContext = { bestCycleMinutes: cycle, cycleByMachine, partCode: task.detail.partCode, processCode: route.process?.processCode || null, lanePolicy: pinMachineLane ? "PIN_BY_LOGICAL_ROUTE" : "ALLOW_PARALLEL_SCORING", pinnedMachineId };
+    if (isDiscreteUom(task.detail.uomCode)) {
+      // Recombine provisional transfer chunks before sizing each process's
+      // actual shift output. BOM ratios and manual coverage otherwise leave
+      // every chunk with a different, non-rounded process quantity.
+      const groups = [];
+      for (const chunk of routeChunks) {
+        const segment = preserveBatchBoundaries
+          ? campaignSegmentForBatch(job, chunk.receiptQtyBeforeBatch, receiptQtyBeforeJob)
+          : null;
+        let group = groups.at(-1);
+        if (!group || group.segment !== segment) {
+          group = { segment, qty: 0, receiptBatchQty: 0, manualConsumedQty: 0, receiptQtyBeforeBatch: chunk.receiptQtyBeforeBatch };
+          groups.push(group);
+        }
+        group.qty += chunk.qty;
+        group.receiptBatchQty += chunk.receiptBatchQty;
+        group.manualConsumedQty += chunk.manualConsumedQty;
+      }
+      const routeIndexes = [];
+      let earliest = predecessorEnd;
+      for (const group of groups) {
+        let remaining = group.qty, assignedReceipt = 0;
+        while (remaining > EPSILON) {
+          const chunkPinnedMachineId = pinnedMachineByLane.get(laneKey) || null;
+          const chunkMachines = candidateMachinesForLane(candidateMachines, cycleByMachine, chunkPinnedMachineId, pinMachineLane);
+          const selected = findRoundedShiftPlacement(remaining, (qty) => findPlacement({
+            machines: chunkMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine,
+            diesUsage: trialDiesUsage, earliest, due,
+            duration: (machine) => Math.max(qty * cycleByMachine(machine) + setupMinutesForMachine(route, machine), 1),
+            mode, periodStart, periodEnd, preset, scoringContext: { ...scoringContext, pinnedMachineId: chunkPinnedMachineId },
+          }));
+          if (!selected) return { failed: { code: "CAPACITY_BEFORE_DUE_UNAVAILABLE", route, qty: remaining, specificationCode: spec }, allocations, usage: trialUsage, manualByRoute: trialManualByRoute, batches };
+          const { qty, placement, quantityReason } = selected;
+          const receiptBatchQty = remaining === qty ? group.receiptBatchQty - assignedReceipt : group.receiptBatchQty * qty / group.qty;
+          if (pinMachineLane && !chunkPinnedMachineId) pinnedMachineByLane.set(laneKey, placement.machine.id);
+          occupy(trialUsage, placement.machine.id, { ...placement, partCode: task.detail.partCode, processCode: route.process?.processCode || null });
+          occupyDies(trialDiesUsage, placement.dies?.id, placement);
+          allocations.push({ task, qty, ...placement, quantityReason, predecessorDraftIndexes,
+            batchNumber: routeIndexes.length + 1, receiptBatchQty, receiptQtyBeforeBatch: group.receiptQtyBeforeBatch + assignedReceipt,
+            manualConsumedQty: remaining === group.qty ? group.manualConsumedQty : 0 });
+          routeIndexes.push(allocations.length - 1);
+          assignedReceipt += receiptBatchQty;
+          remaining -= qty;
+          earliest = placement.end;
+        }
+      }
+      usedSplit ||= routeIndexes.length > 1;
+      allocationIndexesByRoute.set(route.id, routeIndexes);
+      completionByRoute.set(route.id, earliest);
+      continue;
+    }
     const fullPlacement = findPlacement({ machines: candidateMachines, usage: trialUsage, diesCandidatesByMachine: machineResources.diesCandidatesByMachine, diesUsage: trialDiesUsage, earliest: predecessorEnd, due, duration: (machine) => Math.max(totalQty * cycleByMachine(machine) + setupMinutesForMachine(route, machine), 1), mode, periodStart, periodEnd, preset, scoringContext });
     if (fullPlacement && !preserveBatchBoundaries) {
       if (pinMachineLane && !pinnedMachineId) pinnedMachineByLane.set(laneKey, fullPlacement.machine.id);
@@ -1838,6 +1890,13 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
   const diesById = new Map(dies.map((row) => [row.id, row]));
   const policyDies = dies.map((d) => ({ ...d, diesParts: diesParts.filter((mapping) => mapping.diesId === d.id) }));
   for (const route of routes) if (routeMode(route) !== "VENDOR") route.resolvedMachinePolicy = resolveRoutingMachinePolicy(route, machines, policyDies, { start: plan.periodStart, end: schedulingHorizonEnd });
+  for (const route of routes) {
+    const selected = options.machineSelections?.[route.id];
+    if (!selected) continue;
+    const policy = route.resolvedMachinePolicy;
+    if (!policy || policy.errors.length || !policy.resources.some(resource => resource.machineId === selected)) throw Object.assign(new Error("Mesin pilihan belum memenuhi kualifikasi routing dan tooling."), { statusCode: 409 });
+    route.resolvedMachinePolicy = { ...policy, automaticMachineIds: [selected], mode: "SINGLE", maxParallelMachines: 1 };
+  }
   const diesPartsByPartId = new Map();
   for (const mapping of diesParts) {
     if (!diesPartsByPartId.has(mapping.partId)) diesPartsByPartId.set(mapping.partId, []);
@@ -2301,6 +2360,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
         ...baseScoreAudit,
         audit: {
           ...(baseScoreAudit.audit || {}),
+          shiftQuantityPolicy: draft.quantityReason ? { multiple: 1000, reason: draft.quantityReason, allocatedQty: draft.qty } : null,
           lineage: { key: lineageKey, predecessorKeys: predecessorLineageKeys, transferBatchNumber: draft.batchNumber },
           demandTrace: {
             sourceType: job.sourceType || null,
@@ -2698,7 +2758,7 @@ async function recommendMonthlyCapacity(prisma, planNumber, options = {}) {
     preservedCompletedDppCount: (linkedSchedules || []).filter((row) => row.status === "Completed").length,
     ...(options.persist === false ? { previewAllocations: generated.map((row) => ({
       lineNumber: row.task.detail.lineNumber, partCode: row.task.detail.partCode, processCode: row.task.route.process?.processCode || null,
-      qty: round(row.qty), phaseNumber: row.phase.phaseNumber, batchNumber: row.batchNumber,
+      qty: round(row.qty), quantityReason: row.quantityReason || null, phaseNumber: row.phase.phaseNumber, batchNumber: row.batchNumber,
       machineCode: row.machine?.machineCode || null, shift: row.shift,
       scheduleDate: dateKey(dateFromAbsolute(plan.periodStart, row.start)),
       plannedStartTime: timeText(row.start),
@@ -2747,6 +2807,7 @@ module.exports = {
   campaignSegmentForBatch,
   splitFlowBatches,
   fitFirstBatchStrategies,
+  scheduleFitFirstPerRoute,
   shiftCapacityTransferQuantity,
   shiftWindows,
   buildCapacityRuleIndex,

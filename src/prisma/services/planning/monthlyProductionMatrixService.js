@@ -1,3 +1,4 @@
+const { buildProductionLots, machineWindows } = require("./productionLotPlanService");
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, precision = 2) => {
   const factor = 10 ** precision;
@@ -22,6 +23,9 @@ function editorAllocation(item = {}, inputStockByPart = new Map()) {
     vendorId: item.vendorId || null,
     routingMode: item.routingMode || null,
     shift: item.shift || null,
+    customerCode: item.customerCode || null,
+    demandSources: item.demandSources || item.customerPegging || [],
+    woNumber: item.woNumber || null,
     plannedStartTime: item.plannedStartTime || null,
     plannedEndTime: item.plannedEndTime || null,
     minutes: round(item.minutes, 2),
@@ -613,6 +617,16 @@ function buildMonthlyProductionMatrix(snapshot = {}, workCenters = [], partCatal
     }
   }
 
+  for (const row of rows.values()) {
+    for (const owner of [row, ...row.children.values()]) for (const [key, day] of Object.entries(owner.days)) {
+      const result = buildProductionLots(day.allocations.map(item => ({ ...item, scheduleDate: item.scheduleDate || key })), { windowsFor: item => machineWindows((snapshot.machines || []).find(machine => machine.id === item.machineId), item) });
+      day.lots = result.lots;
+      day.lotCount = result.lots.length;
+      day.lotExceptions = result.exceptions;
+      day.shiftCount = new Set(result.lots.map(lot => lot.shift)).size;
+      day.quantities = day.allocations.reduce((totals, item) => { const unit = item.uomCode || "UNKNOWN"; totals[unit] = (totals[unit] || 0) + number(item.qty); return totals; }, {});
+    }
+  }
   const resultRows = [...rows.values()].map((row) => ({
     ...row,
     children: [...row.children.values()].map((child) => ({

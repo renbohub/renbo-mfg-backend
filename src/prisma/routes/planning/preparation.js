@@ -1,0 +1,14 @@
+const router=require('express').Router();
+const {authorize}=require('../../middleware/auth');
+const service=require('../../services/planning/preparationService');
+const run=fn=>async(req,res,next)=>{try{res.json(await fn(req));}catch(error){if(error.statusCode)return res.status(error.statusCode).json({message:error.message});next(error);}};
+const db=()=>require('../../index').prisma;
+const actor=req=>req.user?.username||req.user?.email||'system';
+router.use(authorize('monthlyProductionPlan','read'));
+router.get('/',run(req=>service.list(db(),req.query.month)));
+router.get('/source',authorize('mps','read'),authorize('mrp','read'),authorize('purchaseOrder','read'),run(req=>service.seed(db(),req.query.month)));
+router.post('/simulate',authorize('mrp','read'),run(req=>service.simulate(db(),req.body)));
+router.get('/:id',run(req=>service.get(db(),req.params.id)));
+router.post('/',authorize('monthlyProductionPlan','create'),run(req=>service.save(db(),req.body,actor(req))));
+router.put('/:id',authorize('monthlyProductionPlan','update'),run(req=>service.save(db(),req.body,actor(req),req.params.id)));
+module.exports=router;

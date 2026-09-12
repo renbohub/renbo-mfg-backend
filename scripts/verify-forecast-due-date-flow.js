@@ -47,6 +47,12 @@ const stockNettedExpanded = controller.__test.expandMpsDetailsByDeliveryPhases(s
   ["target-2", { demandQty: 200, stockUsedQty: 0, plannedProductionQty: 200, uncoveredQty: 0 }],
 ]));
 check("MRP phase expansion uses official FIFO stock netting", stockNettedExpanded.length === 3 && stockNettedExpanded[0].qtyPlanned === 0 && stockNettedExpanded[0]._deliveryDemandQty === 100 && stockNettedExpanded[1].qtyPlanned === 200 && stockNettedExpanded[2].qtyPlanned === 120);
+const distributedExpanded=controller.__test.expandMpsDetailsByDeliveryPhases([stockNettedDetail],stockNettedPhases,new Map([
+ ["target-1",{stockUsedQty:100,plannedProductionQty:0}],["target-2",{stockUsedQty:0,plannedProductionQty:200}]
+]),{distributeBuffer:true});
+check("sandbox uses delivery-count allocation while preserving original stock coverage",distributedExpanded.length===2&&distributedExpanded[0].qtyPlanned===500&&distributedExpanded[1].qtyPlanned===500&&distributedExpanded[0]._ppicSplit.stockCoveredQty===100&&distributedExpanded.reduce((sum,row)=>sum+row.bufferQty,0)===120);
+const splitExpanded=controller.__test.expandMpsDetailsByDeliveryPhases([{...stockNettedDetail,qtyPlanned:150}],stockNettedPhases.map(p=>({...p,sourceDeliveryTargetId:'same-target'})),new Map([['same-target',{stockUsedQty:150,plannedProductionQty:150}]]));
+check("opening stock covers earliest split rather than proportional shortages",splitExpanded[0].qtyPlanned===0&&splitExpanded[1].qtyPlanned===150);
 const multiPhaseSoDemand = { "FG-TEST": [{ dueDate: new Date("2026-08-31T00:00:00.000Z"), remainingQty: 300, sourceNumber: "SO-TEST#1" }] };
 const soPhaseDetail = { ...detail, partCode: "FG-TEST", _deliveryPhaseId: "so-phase-1", _deliveryPhaseSourceType: "SALES_ORDER", qtyPlanned: 100, demandSources: [{ sourceType: "SALES_ORDER", sourceNumber: "SO-TEST" }] };
 const firstSoPhase = controller.__test.consumeSalesOrdersAlreadyRepresentedByMps(multiPhaseSoDemand, soPhaseDetail, null);

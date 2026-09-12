@@ -112,4 +112,4 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
-module.exports = { prisma, connectDatabase, disconnectDatabase };
+module.exports = { prisma: require("./services/planning/planningTransactionContext").scopedClient(prisma), connectDatabase, disconnectDatabase };

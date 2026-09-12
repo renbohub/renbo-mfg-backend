@@ -145,9 +145,9 @@ test('stale edits and missing/inactive master references cannot modify a routing
 
 function linkFixture(override = {}) {
   const state = { writes: [], locks: 0 };
-  const operation = { id: 'operation-a', isActive: true, processId: proc.id, routingHeaderId: 'route-a', routingHeader: { id: 'route-a', partId: part.id, status: 'ACTIVE', isDeleted: false }, ...override.operation };
+  const operation = { id: 'operation-a', isActive: true, yieldPercent:100, isSubcontract:false, processId: proc.id, routingHeaderId: 'route-a', routingHeader: { id: 'route-a', partId: part.id, status: 'ACTIVE', isDeleted: false }, ...override.operation };
   const bom = { id: 'bom-process', processId: proc.id, process: proc, mbomDetail: { partId: part.id, isDeleted: false, part, mbomHeader: { isDeleted: false } }, ...override.bom };
-  const tx = { $queryRaw: async () => { state.locks++; return []; }, routingOperation: { findUnique: async () => operation }, mBOMProcess: { findFirst: async () => bom, update: async ({ data }) => { state.writes.push(data); return { ...bom, ...data }; } } };
+  const tx = { workOrder:{count:async()=>override.used?1:0},dailyProductionSchedule:{count:async()=>0},vendorProcessOrder:{count:async()=>0},$queryRaw: async () => { state.locks++; return []; }, routingOperation: { findUnique: async () => operation }, mBOMProcess: { findFirst: async () => bom, update: async ({ data }) => { state.writes.push(data); return { ...bom, ...data }; } } };
   return { state, client: { $transaction: async (fn, options) => { assert.equal(options.isolationLevel, 'Serializable'); return fn(tx); } } };
 }
 test('BOM routing link checks same component part and process, then permits explicit unlink', async () => {
@@ -171,3 +171,5 @@ test('BOM routing links reject cross-part/process, inactive/deleted master and o
   }
   for (const body of [{}, { routingOperationId: '' }, { routingOperationId: null, processId: proc.id }]) await assert.rejects(() => service.linkMbomProcess({}, 'bom-process', body), e => e.statusCode === 400);
 });
+
+test('BOM operation links reject execution references, stale version, mode mismatch and zero yield',async()=>{for(const override of [{used:true},{bom:{updatedAt:'2026-09-02'}},{operation:{isSubcontract:true}},{operation:{yieldPercent:0}}]){const f=linkFixture(override);await assert.rejects(()=>service.linkMbomProcess(f.client,'bom-process',{routingOperationId:'operation-a',...(override.bom?{expectedUpdatedAt:'2026-09-01'}:{})}),e=>[400,409].includes(e.statusCode));assert.equal(f.state.writes.length,0);}});

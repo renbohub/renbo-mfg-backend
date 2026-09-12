@@ -1,0 +1,26 @@
+process.env.NODE_ENV='test';
+const assert=require('node:assert/strict');
+const timing=require('../src/prisma/services/planning/integratedMaterialSchedule');
+const {attachDeliveryProgress}=require('../src/prisma/services/planning/deliveryCalendarService');
+const {netTimePhasedDemand}=require('../src/prisma/services/planning/timePhasedNettingService');
+const parent={id:'process',orderType:'Production',mbomDetailId:'child'};
+const material={id:'raw',parentRequirementId:'process',orderType:'Purchase',mpsDetailId:'fg',deliveryTargetId:'delivery',mbomDetailId:'raw-detail',partCode:'STEEL',materialSupplyType:'SUPPLIER_PURCHASE',supplyCustomerCode:null,treePath:'1.1.1',grossRequirement:1000,effectiveDemandQty:900,bufferQty:100,requiredDate:'2026-10-08'};
+function slot(date,qty,sequence=1){return {scheduleDate:date,plannedQty:qty,lineNumber:1,plan:{details:[{lineNumber:1,mrpRequirementIds:['process']}]},mbomProcess:{mbomDetailId:'child',sequence}};}
+const derived=timing.deriveSchedule([parent,material],[slot('2026-10-06',650),slot('2026-10-08',350),slot('2026-10-09',1000,2)]);
+assert.deepEqual(derived.exceptions,[]);
+const dated=timing.applySchedule([material],derived.schedule);
+assert.deepEqual(dated.map(row=>row.grossRequirement),[650,350]);
+assert.equal(dated.reduce((sum,row)=>sum+row.bufferQty,0),100);
+assert.equal(new Set(dated.map(row=>row.id)).size,2);
+assert.deepEqual(dated.map(row=>row.requiredDate.toISOString().slice(0,10)),['2026-10-06','2026-10-08']);
+const net=netTimePhasedDemand({openingQty:100,supplyEvents:[{id:'po',availableDate:'2026-10-08',qty:500,confidence:'FIRM'}],demandEvents:dated.map(row=>({id:row.id,qty:row.grossRequirement,requiredDate:row.requiredDate}))});
+assert.equal(net[0].netRequirement,550,'Thursday supply cannot cover Tuesday shortage');
+assert.equal(net[1].netRequirement,0);assert.equal(net[1].eligibleSupply[0].qty,350);
+assert.equal(net.reduce((sum,row)=>sum+row.openingAllocatedQty,0),100,'Stock allocated once');
+assert.equal(timing.deriveSchedule([parent,material],[]).exceptions.length,1);
+const customerMaterial={...material,id:'customer',materialSupplyType:'CUSTOMER_SUPPLIED',supplyCustomerCode:'C2'};
+assert.equal(timing.applySchedule([customerMaterial],derived.schedule)[0].requiredDate,'2026-10-08','Ownership is part of material schedule identity');
+const demand=[{id:'forecast-a',partCode:'FG',actualSalesOrders:[{sourceLineId:'so-line',deliveryTargetId:'phase-a',sourceNumber:'SO1',deliveredQty:30}],fgFinishSplits:[],effectiveDeliverySplits:[{deliveryTargetId:'phase-a',sourceNumber:'SO1',sourceType:'SALES_ORDER',targetDate:'2026-10-02',qty:40}]},{id:'forecast-b',partCode:'FG',actualSalesOrders:[{sourceLineId:'so-line',deliveryTargetId:'phase-b',sourceNumber:'SO1',deliveredQty:20}],fgFinishSplits:[],effectiveDeliverySplits:[{deliveryTargetId:'phase-b',sourceNumber:'SO1',sourceType:'SALES_ORDER',targetDate:'2026-10-05',qty:60}]}];
+const progress=attachDeliveryProgress(demand,[{scheduleNumber:'DLV1',details:[{soDetailId:'so-line',qty:50,qtyDelivered:50}]}]).flatMap(row=>row.effectiveDeliverySplits);
+assert.deepEqual(progress.map(row=>row.deliveredQty),[40,10]);assert.deepEqual(progress.map(row=>row.remainingQty),[0,50]);assert.equal(progress[0].schedules[0].scheduleNumber,'DLV1');
+console.log('PASS PPIC R3 detail: dated material allocation, quantity/buffer conservation, no late receipt coverage, one-time stock allocation, material ownership isolation, missing process gate and delivery phase allocation.');

@@ -85,7 +85,8 @@ async function removeRouting(db,key,partKey=null){
   },{isolationLevel:'Serializable'});
 }
 async function linkMbomProcess(db,id,body){
-  if(!body||typeof body!=='object'||Array.isArray(body)||!Object.hasOwn(body,'routingOperationId')||Object.keys(body).some(key=>key!=='routingOperationId'))fail('Pilih operasi routing, atau kirim null untuk melepas tautan.');
+  if(!body||typeof body!=='object'||Array.isArray(body)||!Object.hasOwn(body,'routingOperationId')||Object.keys(body).some(key=>!['routingOperationId','expectedUpdatedAt'].includes(key)))fail('Pilih operasi routing, atau kirim null untuk melepas tautan.');
+  if(body.expectedUpdatedAt!==undefined&&!Number.isFinite(new Date(body.expectedUpdatedAt).getTime()))fail('Versi proses tidak valid.');
   if(body.routingOperationId!==null&&(typeof body.routingOperationId!=='string'||!body.routingOperationId.trim()))fail('ID operasi routing tidak valid.');
   const routingOperationId=body.routingOperationId===null?null:body.routingOperationId.trim();
   return db.$transaction(async tx=>{
@@ -102,10 +103,21 @@ async function linkMbomProcess(db,id,body){
     await tx.$queryRaw`SELECT id FROM "tbl_mbomprocess" WHERE id = ${id} FOR UPDATE`;
     const process=await tx.mBOMProcess.findFirst({where:{id,isDeleted:false},include:{process:true,mbomDetail:{include:{mbomHeader:true,part:true}}}});
     if(!process||!process.mbomDetail||process.mbomDetail.isDeleted||process.mbomDetail.mbomHeader?.isDeleted)fail('Proses BOM aktif tidak ditemukan.',404);
+    if(body.expectedUpdatedAt!==undefined&&new Date(body.expectedUpdatedAt).getTime()!==new Date(process.updatedAt).getTime())fail('Proses BOM telah berubah; muat ulang sebelum menyimpan tautan.',409);
     if(operation){
       if(process.process?.isDeleted||!process.process||process.processId!==operation.processId)fail('Proses master pada routing harus sama dengan proses BOM.',400);
       if(!process.mbomDetail.partId||process.mbomDetail.partId!==operation.routingHeader.partId)fail('Routing harus milik part pada detail BOM yang ditautkan.',400);
       if(!process.mbomDetail.part||process.mbomDetail.part.isDeleted||(process.mbomDetail.part.status&&process.mbomDetail.part.status!=='Active'))fail('Part pada detail BOM tidak aktif.',409);
+      if(Boolean(operation.isSubcontract)!==(process.routingMode==='VENDOR'))fail('Pelaksana internal/vendor pada operasi harus sesuai proses BOM.',400);
+      if(!(Number(operation.yieldPercent)>0&&Number(operation.yieldPercent)<=100))fail('Yield operasi harus lebih dari 0 hingga 100 persen.',400);
+    }
+    if((process.routingOperationId||null)!==routingOperationId){
+      const used=await Promise.all([
+        tx.workOrder.count({where:{mbomProcessId:id}}),
+        tx.dailyProductionSchedule.count({where:{mbomProcessId:id}}),
+        tx.vendorProcessOrder.count({where:{mbomProcessId:id}}),
+      ]);
+      if(used.some(count=>count>0))fail('Proses BOM sudah direferensikan eksekusi. Buat revisi BOM baru sebelum mengubah tautan operasi.',409);
     }
     return tx.mBOMProcess.update({where:{id},data:{routingOperationId},include:{routingOperation:true,machine:true,process:true}});
   },{isolationLevel:'Serializable'});

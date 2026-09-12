@@ -1,4 +1,5 @@
 "use strict";
+const { roundProductionAfterBuffer } = require("./mpsQuantityPolicy");
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 const round = (value, digits = 6) => {
@@ -57,7 +58,9 @@ function netMpsBucket(input = {}) {
   const netProductionBeforeOverride = Math.max(grossDemandQty + targetEndingStockQty - availableBeforeProduction, 0);
   const firmSalesOrderShortageQty = Math.max(actualSalesOrderQty - availableBeforeProduction, 0);
   const timePhasedMinimumQty = timePhasedProductionFloor({ openingAvailableQty: input.timePhasedOpeningAvailableQty ?? openingAvailableQty, receipts: input.receiptEvents, demands: input.demandEvents });
-  const plannedProductionQty = Math.max(netProductionBeforeOverride * productionPercent / 100, firmSalesOrderShortageQty, timePhasedMinimumQty);
+  const rawPlannedProductionQty = Math.max(netProductionBeforeOverride * productionPercent / 100, firmSalesOrderShortageQty, timePhasedMinimumQty);
+  const rounding = roundProductionAfterBuffer(rawPlannedProductionQty, input.uomCode);
+  const plannedProductionQty = rounding.roundedQty;
   const projectedEndingStockQty = Math.max(availableBeforeProduction + plannedProductionQty - grossDemandQty, 0);
   return {
     openingAvailableQty: round(openingAvailableQty), firmScheduledReceiptQty: round(firmScheduledReceiptQty),
@@ -65,6 +68,7 @@ function netMpsBucket(input = {}) {
     targetEndingStockQty: round(targetEndingStockQty), netProductionBeforeOverride: round(netProductionBeforeOverride),
     productionPercent: round(productionPercent), firmSalesOrderShortageQty: round(firmSalesOrderShortageQty),
     plannedProductionQty: round(plannedProductionQty), projectedEndingStockQty: round(projectedEndingStockQty), timePhasedMinimumQty,
+    rawPlannedProductionQty: round(rawPlannedProductionQty), lotRoundingDeltaQty: rounding.roundingQty, productionRoundingMultiple: rounding.multiple,
   };
 }
 
@@ -87,7 +91,7 @@ function allocateMpsProductionToPhases({ openingAvailableQty = 0, firmScheduledR
 }
 
 function buildMpsCalculationTrace({ month, partCode, policy, forecastQty, actualSalesOrderQty, bufferBaseQty, bufferPercent, openingFreeQty, peggedReservationQty, reservationRows = [], netting, sourceRows = [] } = {}) {
-  return { version: 3, formula: "max((grossDemand + targetEnding - (freeFG + peggedSOReservation) - firmReceipts) * productionPercent / 100, actualSO - availableBeforeProduction, timePhasedMinimumQty)", month, partCode, policy, steps: [
+  return { version: 4, formulaVersion: "MPS_MONTHLY_INITIAL_1000_V2", rawPlannedProductionQty: netting.rawPlannedProductionQty, lotRoundingDeltaQty: netting.lotRoundingDeltaQty, productionRoundingMultiple: netting.productionRoundingMultiple, formula: "net produksi setelah buffer dan batas demand bertanggal; jumlah awal bulanan satuan utuh positif dibulatkan ke atas kelipatan 1000", month, partCode, policy, steps: [
     { order: 1, key: "FORECAST", label: "Forecast setelah consumption", formula: "sum(forecast delivery target - qty yang dikonsumsi SO)", value: round(forecastQty), sources: sourceRows.filter((row) => row.sourceType === "FORECAST") },
     { order: 2, key: "SALES_ORDER", label: "Firm Sales Order", formula: "sum(outstanding confirmed SO delivery target)", value: round(actualSalesOrderQty), sources: sourceRows.filter((row) => row.sourceType === "SALES_ORDER") },
     { order: 3, key: "GROSS_DEMAND", label: "Gross demand sesuai policy", formula: "sum(effective delivery target Forecast/SO setelah consumption)", value: netting.grossDemandQty },
@@ -102,10 +106,11 @@ function buildMpsCalculationTrace({ month, partCode, policy, forecastQty, actual
     },
     {
       order: 9, key: "NET_PRODUCTION", label: "Net planned production",
-      formula: "max(max(grossDemand + targetEnding - openingAvailable - firmReceipt, 0) * productionPercent / 100, actualSO - openingAvailable - firmReceipt, timePhasedMinimumQty)", value: netting.plannedProductionQty,
+      formula: "net produksi setelah buffer/stock/receipt dan batas tanggal, lalu bulatkan ke atas kelipatan 1000 untuk jumlah awal bulanan satuan utuh positif", value: netting.plannedProductionQty,
       inputs: { timePhasedMinimumQty: netting.timePhasedMinimumQty || 0 },
     },
-    { order: 10, key: "PROJECTED_ENDING", label: "Projected ending FG", formula: "max(openingAvailable + firmReceipt + netProduction - grossDemand, 0)", value: netting.projectedEndingStockQty },
+    { order: 10, key: "LOT_ROUNDING", label: "Tambahan pembulatan setelah buffer", formula: "rounded production - raw net production", value: netting.lotRoundingDeltaQty || 0, inputs: { rawQty: netting.rawPlannedProductionQty, multiple: netting.productionRoundingMultiple } },
+    { order: 11, key: "PROJECTED_ENDING", label: "Projected ending FG", formula: "max(openingAvailable + firmReceipt + netProduction - grossDemand, 0)", value: netting.projectedEndingStockQty },
   ] };
 }
 

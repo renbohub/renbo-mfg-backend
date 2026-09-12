@@ -8,6 +8,11 @@ const { guardMonthBody, guardMps } = require("../../middleware/planningPeriodGua
 
 const mpsApproval = approvalGate({ moduleCode: "planning-ppic", pageCode: "master-production-schedule", actionCode: "approve", documentType: "MPS", param: "mpsNumber", model: "mPS", lookupField: "mpsNumber", numberField: "mpsNumber" });
 
+const integratedPlan = require("../../controllers/planning/IntegratedPlanController");
+const integratedApproval = approvalGate({ moduleCode: "planning-ppic", pageCode: "master-production-schedule", actionCode: "approve", documentType: "MPS", param: "mpsNumber", numberField: "mpsNumber", resolveDocument: integratedPlan.resolveApprovalSource, allowBodyContext: false });
+router.post("/:mpsNumber/integrated-preview", authorize("mps", "read"), authorize("mrp", "read"), authorize("monthlyProductionPlan", "read"), integratedPlan.review);
+router.post("/:mpsNumber/experiment-seed", authorize("mps", "read"), authorize("mrp", "read"), authorize("monthlyProductionPlan", "read"), require("../../controllers/planning/PpicSandboxController").seed);
+router.post("/:mpsNumber/confirm-plan", authorize("mps", "create"), authorize("mps", "update"), authorize("mps", "approve"), authorize("mrp", "create"), authorize("mrp", "release"), authorize("monthlyProductionPlan", "create"), integratedPlan.replay, guardMps, integratedApproval, logger("mps", "confirm-integrated-plan"), integratedPlan.confirm);
 router.get("/generate-number", authorize("mps", "create"), ctrl.generateNumber);
 router.get("/monthly-summary", authorize("mps", "read"), ctrl.monthlySummary);
 router.get("/workbench", authorize("mps", "read"), ctrl.workbench);
